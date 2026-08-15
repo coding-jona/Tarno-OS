@@ -164,7 +164,7 @@ impl InstallerApp {
         if self.is_root {
             return;
         }
-        theme::danger_card(ui).show(ui, |ui| {
+        theme::danger_card(ui, |ui| {
             ui.label(RichText::new("Root erforderlich").color(theme::DANGER).strong());
             ui.label(
                 RichText::new("Zum Schreiben auf ein Blockgerät wird Root benötigt. Mit z.B. `sudo tarno-installer` neu starten.")
@@ -174,7 +174,7 @@ impl InstallerApp {
     }
 
     fn render_image_section(&mut self, ui: &mut egui::Ui) {
-        theme::card(ui).show(ui, |ui| {
+        theme::card(ui, |ui| {
             ui.label(RichText::new("1. Image").color(theme::TEXT_MUTED).small());
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -200,7 +200,7 @@ impl InstallerApp {
     }
 
     fn render_device_section(&mut self, ui: &mut egui::Ui) {
-        theme::card(ui).show(ui, |ui| {
+        theme::card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("2. Zielgerät").color(theme::TEXT_MUTED).small());
                 if ui.small_button("↻ neu scannen").clicked() {
@@ -230,7 +230,7 @@ impl InstallerApp {
         let Some(device) = self.devices.get(idx) else { return };
         let Some(Ok(image_size)) = self.image_size else { return };
 
-        theme::danger_card(ui).show(ui, |ui| {
+        theme::danger_card(ui, |ui| {
             ui.label(RichText::new("3. Bestätigung").color(theme::DANGER).strong());
             ui.add_space(4.0);
             if image_size > device.size_bytes {
@@ -256,7 +256,7 @@ impl InstallerApp {
     }
 
     fn render_action_section(&mut self, ui: &mut egui::Ui) {
-        theme::card(ui).show(ui, |ui| {
+        theme::card(ui, |ui| {
             match &self.flash_state {
                 FlashState::Idle | FlashState::Done { .. } | FlashState::Cancelled | FlashState::Error(_) => {
                     let can_flash = self.is_root

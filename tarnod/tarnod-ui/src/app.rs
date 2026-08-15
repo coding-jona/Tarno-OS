@@ -284,7 +284,7 @@ impl TarnodApp {
         ui.add_space(12.0);
 
         ui.columns(2, |cols| {
-            theme::card(&cols[0]).show(&mut cols[0], |ui| {
+            theme::card(&mut cols[0], |ui| {
                 ui.label(RichText::new("GAMING-MODE").color(theme::TEXT_MUTED).small());
                 ui.add_space(4.0);
                 match &self.isolated_cpus {
@@ -299,7 +299,7 @@ impl TarnodApp {
                     }
                 }
             });
-            theme::card(&cols[1]).show(&mut cols[1], |ui| {
+            theme::card(&mut cols[1], |ui| {
                 ui.label(RichText::new("SECURITY (eBPF)").color(theme::TEXT_MUTED).small());
                 ui.add_space(4.0);
                 match self.ebpf_active {
@@ -317,7 +317,7 @@ impl TarnodApp {
         ui.label(RichText::new("CPU-Governor performance/powersave umschalten (siehe scripts/gaming-mode.sh für den vollen Funktionsumfang inkl. THP).").color(theme::TEXT_MUTED));
         ui.add_space(12.0);
 
-        theme::card(ui).show(ui, |ui| {
+        theme::card(ui, |ui| {
             ui.horizontal(|ui| {
                 let on_clicked = ui
                     .add_enabled(
@@ -368,7 +368,7 @@ impl TarnodApp {
         ui.label(RichText::new("Behavioral-Security-Status (eBPF, Feature \"ebpf\") und manuelles Fortsetzen angehaltener Prozesse.").color(theme::TEXT_MUTED));
         ui.add_space(12.0);
 
-        theme::card(ui).show(ui, |ui| {
+        theme::card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("eBPF-Guard:").color(theme::TEXT_MUTED));
                 match self.ebpf_active {
@@ -380,7 +380,7 @@ impl TarnodApp {
         });
 
         ui.add_space(12.0);
-        theme::card(ui).show(ui, |ui| {
+        theme::card(ui, |ui| {
             ui.label(RichText::new("Prozess fortsetzen (SIGCONT)").color(theme::TEXT_MUTED).small());
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -416,7 +416,7 @@ impl TarnodApp {
         ui.label(RichText::new("Werte liegen ausschließlich im RAM des Daemons (siehe docs/month3-tarno-layer.md#api-key-vault) — hier nur zur Kontrolle abrufbar.").color(theme::TEXT_MUTED));
         ui.add_space(12.0);
 
-        theme::card(ui).show(ui, |ui| {
+        theme::card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.api_key_name)
@@ -482,7 +482,7 @@ impl eframe::App for TarnodApp {
             .show(ctx, |ui| {
                 if let Some(status) = self.status_line.clone() {
                     if !self.connected {
-                        theme::card(ui).show(ui, |ui| {
+                        theme::card(ui, |ui| {
                             ui.label(RichText::new("Nicht verbunden").color(theme::WARNING).strong());
                             ui.label(RichText::new(status).color(theme::TEXT_MUTED).small());
                         });
