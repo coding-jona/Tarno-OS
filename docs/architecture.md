@@ -36,6 +36,13 @@ Dieses Dokument beschreibt die technische Gesamtarchitektur der in [`ROADMAP.md`
 │  │ scripts/gaming-mode.sh│   │ cage (Wayland-Compositor)       │  │
 │  │ scripts/jvm-launch.sh │   │ → Minecraft/JVM Direct-Fullscreen│  │
 │  └──────────────────────┘   └─────────────────────────────────┘  │
+│                                                                   │
+│                              ┌─────────────────────────────────┐  │
+│                              │ tarno-desktop (eigener Compositor)│  │
+│                              │ Wayland (smithay) + fusionierte   │  │
+│                              │ Taskleiste im selben Prozess      │  │
+│                              │ → Alltagsbetrieb (Nicht-Gaming)   │  │
+│                              └─────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -78,6 +85,25 @@ Dieses Dokument beschreibt die technische Gesamtarchitektur der in [`ROADMAP.md`
 - Schreibt ein per [`tarno-br2-external`](#buildroot-integration-tarno-br2-external) gebautes `sdcard.img` blockweise auf ein Zielgerät (reine Rust-Kopier-Engine statt `dd`-Subprozess, für volle Kontrolle über Fortschritt/Abbruch).
 - Sicherheitsmodell (siehe `tarno-installer/src/devices.rs`): nur Geräte mit `/sys/block/<dev>/removable == 1` werden überhaupt zur Auswahl angeboten, das Root-Gerät ist zusätzlich explizit ausgeschlossen (Heuristik über `/proc/mounts`), und vor dem Schreiben muss der Nutzer eine explizite Bestätigung mit vollem Geräte-Label anhaken.
 - Teilt sich das visuelle Theme (`tarno-ui-theme`) mit `tarnod-ui`, damit alle Tarno-OS-Werkzeuge optisch aus einem Guss wirken.
+
+### `tarno-desktop` (eigener Compositor + fusionierte Taskleiste)
+- Eigener, minimaler Wayland-Compositor (Rust/`smithay`), ausschließlich für den **Nicht-Gaming-Alltagsbetrieb** — `cage` bleibt unverändert für den Gaming-Modus (Kiosk, ein Fenster fullscreen, kein Fensterverwaltungs-Overhead).
+- Die Taskleiste ist **kein separater Panel-Client** (kein `wlr-layer-shell`, kein zweiter Prozess) — sie wird als einzelnes texturiertes Rechteck direkt im Compositor-Render-Loop gezeichnet, gerendert aus einem flachen RGBA8-Softwarepuffer (`fontdue` für Text, kein Widget-Toolkit). Begründung (Performance statt Funktionsumfang, verglichen mit `sway`+`waybar`): [`month-desktop.md`](month-desktop.md#warum-ein-zweiter-compositor-statt-nur-cage).
+- Zeigt live `tarnod`-Status (Verbindung, `isolcpus`, eBPF-Wächter) über einen read-only Poll-Thread gegen denselben Unix-Socket wie `tarnod-ui`/`tarnoctl` (`tarnod-protocol`-Typen, kein Steuer-Zugriff).
+- Stage 1 (Compositor + Taskleiste rendern, Socket wird exponiert) ist verifiziert; XDG-Shell-Client-Rendering mit einem echten verbundenen Client, DRM/KMS-Bare-Metal-Backend und die Boot-Moduswahl `cage` vs. `tarno-desktop` sind Stage-2-Arbeit. Details: [`month-desktop.md`](month-desktop.md#scope-stage-1-diese-runde-vs-stage-2).
+
+## Dual-Mode: Gaming vs. Desktop
+
+Tarno OS startet je nach Anwendungsfall einen von zwei Wayland-Compositors — nie beide gleichzeitig:
+
+| | Gaming-Modus | Desktop-Modus |
+|---|---|---|
+| Compositor | `cage` | `tarno-desktop` |
+| Zweck | Ein Spiel/eine JVM, fullscreen | Alltag: Browser, `tarnod-ui`, `tarno-installer`, mehrere Fenster |
+| Taskleiste | keine | fusioniert im Compositor-Prozess |
+| Overhead-Ziel | minimal möglich (Kiosk) | minimal für echte Fensterverwaltung |
+
+Beide Compositors nutzen dasselbe visuelle Theme (`tarno-ui-theme`) für alle darüber laufenden nativen GUIs, damit der Wechsel zwischen den Modi optisch konsistent wirkt. Die Umschaltung selbst (welcher Compositor beim Login startet) ist noch nicht in `tarno-br2-external` verdrahtet (Stage 2, siehe [`month-desktop.md`](month-desktop.md)).
 
 ## Sicherheitsmodell (Userspace-Isolation statt Kernel-Vault)
 

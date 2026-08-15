@@ -4,7 +4,7 @@
 
 **Zielhardware:** Dell Precision M6700 (Ivy Bridge, AHCI, PS/2) — läuft problemlos mit Standard-Linux-Kernel + Treibern, kein Custom-Boot nötig.
 
-> Dieses Dokument ist die Übersicht. Die technische Ausarbeitung mit konkreten Befehlen, Paketnamen, Kernel-Configs und Abnahmekriterien steht in [`docs/architecture.md`](docs/architecture.md), [`docs/month1-foundation.md`](docs/month1-foundation.md), [`docs/month2-gaming-tuning.md`](docs/month2-gaming-tuning.md) und [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md). Lauffähiger Code liegt in [`tarnod/`](tarnod/) (Daemon+CLI), [`tarno-guard-ebpf/`](tarno-guard-ebpf/) (eBPF-Security), [`scripts/`](scripts/) (Gaming-Mode-Tuning) und [`tarno-br2-external/`](tarno-br2-external/) (Buildroot-Integration).
+> Dieses Dokument ist die Übersicht. Die technische Ausarbeitung mit konkreten Befehlen, Paketnamen, Kernel-Configs und Abnahmekriterien steht in [`docs/architecture.md`](docs/architecture.md), [`docs/month1-foundation.md`](docs/month1-foundation.md), [`docs/month2-gaming-tuning.md`](docs/month2-gaming-tuning.md), [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md) und [`docs/month-desktop.md`](docs/month-desktop.md) (Desktop-Modus, über den ursprünglichen 3-Monats-Rahmen hinaus ergänzt). Lauffähiger Code liegt in [`tarnod/`](tarnod/) (Daemon+CLI+GUI), [`tarno-guard-ebpf/`](tarno-guard-ebpf/) (eBPF-Security), [`scripts/`](scripts/) (Gaming-Mode-Tuning), [`tarno-br2-external/`](tarno-br2-external/) (Buildroot-Integration), [`tarno-installer/`](tarno-installer/) (USB-Installer-GUI) und [`tarno-desktop/`](tarno-desktop/) (eigener Compositor + Taskleiste für den Desktop-Modus).
 
 ---
 
@@ -70,7 +70,8 @@
 |---|---|
 | Basis-OS | Alpine Linux oder Buildroot |
 | Init | OpenRC / eigenes Minimal-Init |
-| Compositor | cage / minimales wlroots |
+| Compositor (Gaming) | cage (Kiosk, Direct-Fullscreen) |
+| Compositor (Desktop) | eigener Compositor `tarno-desktop` (Rust/smithay) mit fusionierter Taskleiste, Dual-Mode neben `cage` — siehe [`docs/month-desktop.md`](docs/month-desktop.md) |
 | Core-Isolation | isolcpus, cset, sched_setaffinity |
 | Security-Monitoring | eBPF |
 | Daemon | Rust oder C++ (nativ, kein Electron) |

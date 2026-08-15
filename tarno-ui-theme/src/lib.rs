@@ -19,7 +19,12 @@
 //! Ziel ist ein sofort als "Windows 11" erkennbarer neutraler Grauton statt
 //! der vorherigen blaustichigen Palette, nicht Pixel-Identität.
 
-use egui::{Color32, CornerRadius, InnerResponse, Margin, Stroke};
+use egui::{CornerRadius, InnerResponse, Margin, Stroke};
+
+// Re-Export, damit Konsumenten ohne eigene direkte egui-Abhängigkeit (z.B.
+// `tarno-desktop`, das keine eframe-UI hat) trotzdem `Color32`-Werte aus
+// diesem Crate direkt weiterverwenden können.
+pub use egui::Color32;
 
 // Neutrale Mica-Grauskala (Fluent 2, dunkel) — bewusst blaustichfrei, im
 // Gegensatz zur vorherigen BuildMC-Palette.
