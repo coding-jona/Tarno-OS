@@ -1,0 +1,1 @@
+source "$BR2_EXTERNAL_TARNO_OS_PATH/package/tarnod/Config.in"

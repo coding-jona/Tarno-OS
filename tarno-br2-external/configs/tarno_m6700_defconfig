@@ -1,0 +1,40 @@
+# Tarno OS defconfig für den Dell Precision M6700.
+#
+# ACHTUNG (siehe docs/month1-foundation.md, Scope-Hinweis): dieses
+# defconfig wurde von Hand nach aktueller Buildroot-Manual-Syntax
+# geschrieben, aber NICHT gegen einen echten Buildroot-Checkout gebaut
+# (kein Buildroot-Build in der Entwicklungs-Sandbox möglich — mehrere GB
+# Downloads, Stunden Bauzeit, reale Zielhardware zum Booten). Vor dem
+# ersten echten Build:
+#
+#   make BR2_EXTERNAL=/pfad/zu/tarno-br2-external tarno_m6700_defconfig
+#   make menuconfig   # zur Kontrolle/Anpassung an die tatsächliche Hardware
+#   make
+#
+# und Ergebnisse (Fehler, tatsächlicher Idle-RAM-Wert) in
+# docs/month1-foundation.md nachtragen.
+
+BR2_x86_64=y
+
+BR2_TOOLCHAIN_BUILDROOT_GLIBC=y
+
+# Kein systemd — OpenRC statt (siehe docs/month1-foundation.md#init-openrc-statt-systemd)
+BR2_INIT_OPENRC=y
+
+# Kernel: eigener Kernel-Build mit dem M6700-Config-Fragment aus Woche 1-2
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="board/tarno-m6700/linux.config.fragment"
+
+# tarnod (dieser BR2_EXTERNAL-Tree)
+BR2_PACKAGE_TARNOD=y
+
+# Minimaler Wayland-Compositor für Direct-Fullscreen (siehe
+# docs/month1-foundation.md#compositor-cage)
+BR2_PACKAGE_CAGE=y
+
+# Rootfs-Overlay: tarnod-OpenRC-Service (etc/init.d/tarnod +
+# etc/runlevels/default/tarnod-Symlink)
+BR2_ROOTFS_OVERLAY="board/tarno-m6700/rootfs-overlay"
+
+BR2_TARGET_GENERIC_GETTY_PORT="ttyS0"

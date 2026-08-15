@@ -1,0 +1,35 @@
+# Kernel-Config-Fragment für Tarno OS auf dem Dell Precision M6700
+# (Ivy Bridge, AHCI, PS/2, Intel-GPU). Nur was diese konkrete Hardware
+# braucht — siehe docs/month1-foundation.md#kernel-config-strippen.
+#
+# Eingebunden über BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES in
+# configs/tarno_m6700_defconfig.
+
+# Storage (SATA/AHCI)
+CONFIG_ATA=y
+CONFIG_SATA_AHCI=y
+CONFIG_ATA_PIIX=y
+
+# GPU (Intel i915, Ivy Bridge)
+CONFIG_DRM=y
+CONFIG_DRM_I915=y
+
+# Input (PS/2 Tastatur/Maus)
+CONFIG_SERIO_I8042=y
+CONFIG_KEYBOARD_ATKBD=y
+CONFIG_MOUSE_PS2=y
+
+# Netzwerk (onboard Intel NIC + ggf. Realtek)
+CONFIG_E1000E=y
+CONFIG_R8169=y
+
+# eBPF (für tarno-guard-ebpf, siehe docs/month3-tarno-layer.md)
+CONFIG_BPF=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_DEBUG_INFO_BTF=y
+
+# Optionaler Phase-2-Ausbau (LSM-Hook statt Tracepoint, siehe
+# docs/month3-tarno-layer.md#hook-wahl-tracepoint-statt-lsm-phase-1) —
+# standardmäßig aus, da für Phase 1 nicht nötig:
+# CONFIG_BPF_LSM=y
+# CONFIG_LSM="...,bpf"
