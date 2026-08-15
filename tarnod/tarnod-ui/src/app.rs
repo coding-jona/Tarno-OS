@@ -262,24 +262,32 @@ impl TarnodApp {
             });
     }
 
+    /// Windows-11-`NavigationView`-Stil: ausgewählter Eintrag bekommt eine
+    /// dezente neutrale Fläche + einen schmalen Akzent-Balken am linken
+    /// Rand, statt vollflächig akzentgefärbt zu sein (siehe
+    /// `theme::paint_nav_selection_bar`).
     fn nav_button(&mut self, ui: &mut egui::Ui, section: Section, label: &str) {
         let selected = self.section == section;
         let text = if selected {
-            RichText::new(label).color(theme::ACCENT).strong()
+            RichText::new(label).color(theme::TEXT_PRIMARY).strong()
         } else {
-            RichText::new(label).color(theme::TEXT_PRIMARY)
+            RichText::new(label).color(theme::TEXT_MUTED)
         };
         let button = egui::Button::new(text)
-            .fill(if selected { theme::ACCENT_DIM } else { theme::BG_APP })
+            .fill(if selected { theme::BG_PANEL } else { theme::BG_APP })
             .min_size(egui::vec2(ui.available_width(), 34.0));
-        if ui.add(button).clicked() {
+        let response = ui.add(button);
+        if selected {
+            theme::paint_nav_selection_bar(ui, response.rect);
+        }
+        if response.clicked() {
             self.section = section;
         }
     }
 
     fn render_dashboard(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.label(RichText::new("Dashboard").size(22.0).strong());
+        ui.label(RichText::new("Dashboard").size(22.0).strong().color(theme::TEXT_PRIMARY));
         ui.label(RichText::new("Überblick über Gaming-Mode und Security-Status.").color(theme::TEXT_MUTED));
         ui.add_space(12.0);
 
@@ -313,7 +321,7 @@ impl TarnodApp {
 
     fn render_gaming_mode(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.label(RichText::new("Gaming-Mode").size(22.0).strong());
+        ui.label(RichText::new("Gaming-Mode").size(22.0).strong().color(theme::TEXT_PRIMARY));
         ui.label(RichText::new("CPU-Governor performance/powersave umschalten (siehe scripts/gaming-mode.sh für den vollen Funktionsumfang inkl. THP).").color(theme::TEXT_MUTED));
         ui.add_space(12.0);
 
@@ -364,7 +372,7 @@ impl TarnodApp {
 
     fn render_security(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.label(RichText::new("Security").size(22.0).strong());
+        ui.label(RichText::new("Security").size(22.0).strong().color(theme::TEXT_PRIMARY));
         ui.label(RichText::new("Behavioral-Security-Status (eBPF, Feature \"ebpf\") und manuelles Fortsetzen angehaltener Prozesse.").color(theme::TEXT_MUTED));
         ui.add_space(12.0);
 
@@ -412,7 +420,7 @@ impl TarnodApp {
 
     fn render_api_keys(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.label(RichText::new("API-Keys").size(22.0).strong());
+        ui.label(RichText::new("API-Keys").size(22.0).strong().color(theme::TEXT_PRIMARY));
         ui.label(RichText::new("Werte liegen ausschließlich im RAM des Daemons (siehe docs/month3-tarno-layer.md#api-key-vault) — hier nur zur Kontrolle abrufbar.").color(theme::TEXT_MUTED));
         ui.add_space(12.0);
 
