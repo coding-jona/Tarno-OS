@@ -53,3 +53,5 @@ sudo ./target/release/tarno-installer
 
 Details, Architektur-Begründungen und der Status je Roadmap-Meilenstein:
 siehe [`docs/architecture.md`](docs/architecture.md).
+
+https://claude.ai/code/artifact/fc9d3a9d-46c5-4d48-92b9-dc6fe59121b8
