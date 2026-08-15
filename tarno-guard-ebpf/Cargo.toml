@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["tarnod-guard", "tarnod-guard-common", "tarnod-guard-ebpf"]
+default-members = ["tarnod-guard", "tarnod-guard-common"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[workspace.dependencies]
+aya = { version = "0.14", default-features = false }
+aya-build = { version = "0.2", default-features = false }
+aya-ebpf = { version = "0.2", default-features = false }
+aya-log = { version = "0.3", default-features = false }
+aya-log-ebpf = { version = "0.2", default-features = false }
+anyhow = "1"
+tokio = { version = "1", default-features = false }
+tarnod-guard-common = { path = "tarnod-guard-common" }
+
+# Das eBPF-Objekt wird mit dem no_std/no_main-Target gebaut (bpfel-unknown-none)
+# und braucht daher ein eigenes Profil ohne die Default-Optimierungsannahmen des
+# Userspace-Codes. debug=false (statt debug=2/BTF.ext-Funcinfo) vermeidet einen
+# Verifier-Fehler ("number of funcs in func_info doesn't match number of
+# subprogs"), der mit der in dieser Sandbox verfügbaren bpf-linker-Version
+# (0.10.4, s. tarno-guard-ebpf/BPF_LINKER.md) bei aktivem BTF.ext auftritt.
+[profile.release.package.tarnod-guard-ebpf]
+debug = false
+codegen-units = 1

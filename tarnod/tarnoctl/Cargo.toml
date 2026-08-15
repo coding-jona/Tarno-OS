@@ -1,0 +1,12 @@
+[package]
+name = "tarnoctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI-Client fuer tarnod (Unix-Socket-IPC)"
+
+[[bin]]
+name = "tarnoctl"
+path = "src/main.rs"
+
+[dependencies]
