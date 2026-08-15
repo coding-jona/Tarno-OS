@@ -1,0 +1,24 @@
+[package]
+name = "tarnod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tarno OS root daemon: IPC, API-key vault, gaming-mode tuning, eBPF behavioral security"
+
+[[bin]]
+name = "tarnod"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+libc.workspace = true
+anyhow.workspace = true
+tarnod-guard = { path = "../../tarno-guard-ebpf/tarnod-guard", optional = true }
+
+[features]
+default = []
+# Aktiviert das eBPF-Behavioral-Security-Subsystem (tarno-guard-ebpf).
+# Siehe docs/month3-tarno-layer.md.
+ebpf = ["dep:tarnod-guard"]

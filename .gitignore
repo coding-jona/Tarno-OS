@@ -1,0 +1,5 @@
+# Rust build artifacts
+/tarnod/target/
+/tarno-guard-ebpf/target/
+/tarno-guard-ebpf/tarnod-guard-ebpf/target/
+**/*.rs.bk

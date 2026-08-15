@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+# Tarno OS Root-Daemon. Siehe docs/architecture.md und
+# docs/month3-tarno-layer.md.
+
+name="tarnod"
+description="Tarno OS root daemon (IPC, API-key vault, gaming-mode, eBPF security)"
+command="/usr/bin/tarnod"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+	need net
+	after bootmisc
+}

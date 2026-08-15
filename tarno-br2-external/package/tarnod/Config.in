@@ -1,0 +1,12 @@
+config BR2_PACKAGE_TARNOD
+	bool "tarnod"
+	depends on BR2_PACKAGE_HOST_RUSTC_TARGET_ARCH_SUPPORTS
+	select BR2_PACKAGE_HOST_RUSTC
+	help
+	  Tarno OS Root-Daemon: Unix-Socket-IPC, API-Key-Vault,
+	  Gaming-Mode-Steuerung und (optional, Feature "ebpf")
+	  eBPF-basierte Behavioral Security.
+
+	  Installiert außerdem den CLI-Client tarnoctl.
+
+	  https://github.com/coding-jona/Tarno-OS
