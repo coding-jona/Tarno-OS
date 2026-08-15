@@ -1,0 +1,10 @@
+[package]
+name = "tarnod-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Geteilte Request/Response-Typen fuer den tarnod-IPC-Socket (Daemon + CLI + GUI)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

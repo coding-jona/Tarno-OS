@@ -11,6 +11,9 @@ Dieses Dokument beschreibt die technische Gesamtarchitektur der in [`ROADMAP.md`
 │  ┌───────────────┐   Unix-Socket    ┌────────────────────────┐  │
 │  │   tarnoctl    │◄────/run/tarnod/────►│        tarnod        │  │
 │  │  (CLI-Client) │   tarnod.sock    │   (Root-Daemon, Rust)   │  │
+│  ├───────────────┤        ▲          │                          │  │
+│  │   tarnod-ui   │────────┘          │                          │  │
+│  │ (natives GUI) │                   │                          │  │
 │  └───────────────┘   0600, tokio    │                          │  │
 │                                     │  ┌──────────┐ ┌────────┐ │  │
 │                                     │  │ vault.rs │ │gaming.rs│ │  │
@@ -46,6 +49,15 @@ Dieses Dokument beschreibt die technische Gesamtarchitektur der in [`ROADMAP.md`
 ### `tarnoctl` (CLI-Client)
 - Dünner Client, verbindet sich auf denselben Unix-Socket, schickt JSON-Requests (`GetGamingMode`, `SetGamingMode`, `GetApiKey`, `SecurityStatus`, `ResumeProcess`), zeigt Antwort formatiert an.
 - Kein eigener State, keine Privilegien nötig außer Socket-Zugriff (Gruppe `tarno` oder root).
+
+### `tarnod-ui` (natives GUI)
+- Eframe/egui-App (ein natives Binary, kein Browser/Electron/Node-Overhead — passt zur "schlank + nativ"-Linie des restlichen Stacks), verbindet sich auf denselben Unix-Socket.
+- Vier Panels: Dashboard (Überblick), Gaming-Mode (Governor an/aus + isolcpus-Status), Security (eBPF-Status + Prozess-Resume), API-Keys (Abfrage einzelner Werte zur Kontrolle).
+- IPC läuft in einem eigenen OS-Thread synchron (die GUI selbst ist immediate-mode, kein async nötig); Requests/Antworten werden über Channels mit der egui-Render-Schleife verbunden (`tarnod-ui/src/client.rs`).
+- Nutzt dieselben Typen wie der Daemon über das gemeinsame Crate `tarnod-protocol` (statt eigener JSON-String-Literale wie in `tarnoctl`).
+
+### `tarnod-protocol` (geteiltes Typen-Crate)
+- `Request`/`Response`-Enums (siehe `tarnod/src/ipc.rs` früher, jetzt hier zentral), von `tarnod`, potenziell `tarnoctl` und `tarnod-ui` genutzt — eine Protokolländerung muss nur an einer Stelle nachgezogen werden.
 
 ### `tarno-guard-ebpf` (Behavioral Security)
 - Eigenständiger 3-Crate-Workspace (Kernel-Space-Programm + Common-Types + Userspace-Loader-Lib), von `tarnod` als optionales Cargo-Feature `ebpf` eingebunden.

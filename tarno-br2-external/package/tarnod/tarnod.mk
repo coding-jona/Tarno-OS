@@ -16,6 +16,14 @@ TARNOD_LICENSE_FILES = $(BR2_EXTERNAL_TARNO_OS_PATH)/../LICENSE
 
 TARNOD_DEPENDENCIES = host-rustc
 
+# tarnod/Cargo.toml setzt default-members bewusst auf [tarnod, tarnoctl,
+# tarnod-protocol] (ohne tarnod-ui): das native GUI braucht X11/Wayland/GL
+# (winit/glutin) — ein plain `cargo build` respektiert default-members und
+# baut die GUI hier NICHT mit. Wer tarnod-ui auf dem Zielsystem will, muss
+# zusätzlich BR2_PACKAGE_XORG7 (oder Wayland-Äquivalent) + BR2_PACKAGE_MESA3D
+# + BR2_PACKAGE_LIBXKBCOMMON aktivieren und den Build-Aufruf explizit auf
+# `--workspace` umstellen — als separater, bewusster Schritt, nicht Default.
+
 # Das "ebpf"-Feature (eBPF-Behavioral-Security) einzubinden braucht HIER
 # keine Host-BPF-Toolchain (kein nightly Rust, kein bpf-linker): das
 # eBPF-Objekt in tarno-guard-ebpf/tarnod-guard/assets/tarnod-guard.bpf.o

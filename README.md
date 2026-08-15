@@ -12,7 +12,7 @@ Kernels.
 
 | Pfad | Zweck |
 |---|---|
-| [`tarnod/`](tarnod/) | Root-Daemon (`tarnod`) + CLI-Client (`tarnoctl`) — Rust-Workspace |
+| [`tarnod/`](tarnod/) | Root-Daemon (`tarnod`), CLI-Client (`tarnoctl`), natives GUI (`tarnod-ui`) — Rust-Workspace |
 | [`tarno-guard-ebpf/`](tarno-guard-ebpf/) | eBPF-Behavioral-Security (Tracepoint auf `execve`, RingBuf-Events, Userspace-Loader) |
 | [`scripts/`](scripts/) | Gaming-Mode-Tuning (CPU-Governor, THP, JVM-Start-Wrapper, FPS-Benchmark) |
 | [`tarno-br2-external/`](tarno-br2-external/) | Buildroot-`BR2_EXTERNAL`-Tree (Kernel-Config, `tarnod`-Package, Board-Support M6700) |
@@ -26,6 +26,7 @@ cargo build --workspace
 cargo test --workspace
 ./target/debug/tarnod &         # TARNOD_DRY_RUN=1 für Sandboxes ohne echte cpufreq/THP-Pfade
 ./target/debug/tarnoctl ping
+./target/debug/tarnod-ui        # natives GUI (egui/eframe), verbindet sich auf denselben Socket
 ```
 
 eBPF-Feature (Behavioral Security) aktivieren — braucht root/`CAP_BPF`+`CAP_PERFMON`
