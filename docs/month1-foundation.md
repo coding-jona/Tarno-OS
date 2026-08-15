@@ -23,7 +23,7 @@ Details zur Package-Struktur: siehe [`architecture.md`](architecture.md#buildroo
 
 ### Init: OpenRC statt systemd
 - `BR2_INIT_OPENRC=y` in der defconfig (zieht automatisch `BR2_PACKAGE_OPENRC`).
-- `tarnod` wird über `board/tarno-m6700/rootfs-overlay/etc/init.d/S60tarnod` gestartet (OpenRC-kompatibles SysV-Skript, siehe Datei im Repo).
+- `tarnod` wird über `board/tarno-m6700/rootfs-overlay/etc/init.d/tarnod` gestartet (echtes `openrc-run`-Service-Skript, per Symlink unter `etc/runlevels/default/tarnod` im `default`-Runlevel aktiviert — siehe Dateien im Repo).
 
 ### Kernel-Config strippen (`board/tarno-m6700/linux.config.fragment`)
 Nur was das M6700 (Ivy Bridge, AHCI, PS/2, Intel-GPU, Ethernet) tatsächlich braucht:
@@ -42,6 +42,41 @@ Fragment wird via `BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y` + `BR2_LINUX_KERNEL_CON
 ### Telemetrie/unnötige Daemons deaktivieren
 - Keine `BR2_PACKAGE_*` für: `chrony`-NTP-Auto-Update-Checker (nur falls gebraucht, sonst raus), `dbus` nur falls ein Paket es zwingend braucht, keine Log-Rotation-Daemons über das Minimum hinaus.
 - Busybox statt vollwertiger Coreutils/systemd-Tools (`BR2_PACKAGE_BUSYBOX=y`, Standard in Buildroot).
+
+### USB-Boot-Image (Anforderung: Installation/Auslieferung per USB-Stick)
+
+Tarno OS muss als **ein** Image ausgeliefert werden, das direkt per `dd` auf
+einen USB-Stick geschrieben wird und danach ohne separaten Installer
+bootet — Stick rein, im BIOS-Bootmenü auswählen, fertig. Der M6700
+unterstützt klassisches BIOS-Boot (Ivy Bridge, kein UEFI-only-Zwang), daher
+**SYSLINUX** statt GRUB2: einfacher, weniger Abhängigkeiten, für ein
+"Stick rein, bootet"-Szenario völlig ausreichend.
+
+**Buildroot-Bausteine** (siehe `tarno-br2-external/board/tarno-m6700/`):
+- `BR2_TARGET_ROOTFS_EXT2=y` + `BR2_TARGET_ROOTFS_EXT2_4=y` (ext4-Rootfs-Image)
+- `BR2_TARGET_SYSLINUX=y` (Bootloader für BIOS-Boot von USB/HDD)
+- `syslinux.cfg` — Bootmenü-Eintrag, der den Kernel mit den richtigen
+  Kernel-Parametern (`root=/dev/sda2` o.ä., je nach genimage-Layout) startet
+- `genimage.cfg` — beschreibt das finale Disk-Image: MBR-Partitionstabelle,
+  kleine Boot-Partition (vfat, enthält Kernel + `syslinux.cfg`) + Rootfs-
+  Partition (ext4), zusammengesetzt via `genimage` (läuft automatisch über
+  `BR2_ROOTFS_POST_IMAGE_SCRIPT` → `board/tarno-m6700/post-image.sh`)
+- Ergebnis: `output/images/sdcard.img` — trotz des Namens ein normales
+  Disk-Image, genauso für USB-Sticks geeignet (Buildroot-Konvention)
+
+**Auf den Stick schreiben:**
+```sh
+sudo dd if=output/images/sdcard.img of=/dev/sdX bs=4M status=progress conv=fsync
+```
+(`/dev/sdX` durch den tatsächlichen USB-Stick-Gerätepfad ersetzen — **nicht**
+eine bestehende Festplatte, `dd` überschreibt ohne Rückfrage.)
+
+**Scope-Hinweis:** Wie beim restlichen Buildroot-Teil (siehe unten) sind
+`genimage.cfg`/`syslinux.cfg`/`post-image.sh` nach aktueller Buildroot-
+Doku-Syntax geschrieben, aber in dieser Sandbox weder gebaut noch tatsächlich
+von einem USB-Stick gebootet worden (dafür fehlen ein echter Buildroot-Build
+und reale M6700-Hardware). Erster Praxistest: Image bauen, auf einen Stick
+schreiben, am M6700 tatsächlich booten, Ergebnis hier nachtragen.
 
 **Meilenstein-Abnahmekriterium:** System bootet bis zum Login-Prompt, `free -m` zeigt Idle-RSS. Zielkorridor: deutlich unter 500 MB (Referenzwert aus dem Manifest); konkreter Zahlenwert wird nach dem ersten realen Boot auf dem M6700 in dieses Dokument nachgetragen (kann in dieser Sandbox nicht gemessen werden, da kein Boot-Test möglich ist — siehe Scope-Hinweis unten).
 

@@ -15,7 +15,8 @@
 - Kein systemd → OpenRC oder eigenes minimales Init-Script
 - Kernel-Config strippen: nur Treiber für M6700-Hardware (AHCI, i915/Intel-GPU, PS/2, Netzwerk) einkompilieren, Rest raus
 - Alle Telemetrie/Update-Checker/unnötigen Daemons deaktivieren
-- **Meilenstein:** System bootet, Idle-RAM messen (Ziel-Check: wo stehst du gegenüber 500MB?)
+- **Anforderung:** Auslieferung/Installation als bootfähiges USB-Stick-Image (kein separater Installer nötig — Image per `dd` auf den Stick schreiben, Stick rein, im BIOS-Bootmenü auswählen, bootet direkt)
+- **Meilenstein:** System bootet (auch tatsächlich vom USB-Stick), Idle-RAM messen (Ziel-Check: wo stehst du gegenüber 500MB?)
 
 **Woche 3-4: JVM & Minecraft-Pfad**
 - OpenJDK/Temurin für die Zielarchitektur einbinden und testen
