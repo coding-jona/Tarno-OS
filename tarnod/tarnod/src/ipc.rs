@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::protocol::{Request, Response};
+use tarnod_protocol::{Request, Response};
 use crate::AppState;
 
 pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {

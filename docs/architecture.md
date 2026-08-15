@@ -11,6 +11,9 @@ Dieses Dokument beschreibt die technische Gesamtarchitektur der in [`ROADMAP.md`
 │  ┌───────────────┐   Unix-Socket    ┌────────────────────────┐  │
 │  │   tarnoctl    │◄────/run/tarnod/────►│        tarnod        │  │
 │  │  (CLI-Client) │   tarnod.sock    │   (Root-Daemon, Rust)   │  │
+│  ├───────────────┤        ▲          │                          │  │
+│  │   tarnod-ui   │────────┘          │                          │  │
+│  │ (natives GUI) │                   │                          │  │
 │  └───────────────┘   0600, tokio    │                          │  │
 │                                     │  ┌──────────┐ ┌────────┐ │  │
 │                                     │  │ vault.rs │ │gaming.rs│ │  │
@@ -47,6 +50,15 @@ Dieses Dokument beschreibt die technische Gesamtarchitektur der in [`ROADMAP.md`
 - Dünner Client, verbindet sich auf denselben Unix-Socket, schickt JSON-Requests (`GetGamingMode`, `SetGamingMode`, `GetApiKey`, `SecurityStatus`, `ResumeProcess`), zeigt Antwort formatiert an.
 - Kein eigener State, keine Privilegien nötig außer Socket-Zugriff (Gruppe `tarno` oder root).
 
+### `tarnod-ui` (natives GUI)
+- Eframe/egui-App (ein natives Binary, kein Browser/Electron/Node-Overhead — passt zur "schlank + nativ"-Linie des restlichen Stacks), verbindet sich auf denselben Unix-Socket.
+- Vier Panels: Dashboard (Überblick), Gaming-Mode (Governor an/aus + isolcpus-Status), Security (eBPF-Status + Prozess-Resume), API-Keys (Abfrage einzelner Werte zur Kontrolle).
+- IPC läuft in einem eigenen OS-Thread synchron (die GUI selbst ist immediate-mode, kein async nötig); Requests/Antworten werden über Channels mit der egui-Render-Schleife verbunden (`tarnod-ui/src/client.rs`).
+- Nutzt dieselben Typen wie der Daemon über das gemeinsame Crate `tarnod-protocol` (statt eigener JSON-String-Literale wie in `tarnoctl`).
+
+### `tarnod-protocol` (geteiltes Typen-Crate)
+- `Request`/`Response`-Enums (siehe `tarnod/src/ipc.rs` früher, jetzt hier zentral), von `tarnod`, potenziell `tarnoctl` und `tarnod-ui` genutzt — eine Protokolländerung muss nur an einer Stelle nachgezogen werden.
+
 ### `tarno-guard-ebpf` (Behavioral Security)
 - Eigenständiger 3-Crate-Workspace (Kernel-Space-Programm + Common-Types + Userspace-Loader-Lib), von `tarnod` als optionales Cargo-Feature `ebpf` eingebunden.
 - Hook: Tracepoint `sched_process_exec` (kein LSM-Hook in Phase 1 — robuster, keine `CONFIG_BPF_LSM`-Abhängigkeit im Kernel).
@@ -60,6 +72,12 @@ Dieses Dokument beschreibt die technische Gesamtarchitektur der in [`ROADMAP.md`
 ### Buildroot-Integration (`tarno-br2-external/`)
 - `BR2_EXTERNAL`-Tree mit eigenem Package `tarnod` (cargo-package-Infra) und Board-Definition `tarno-m6700` (Kernel-Config-Fragment, Rootfs-Overlay).
 - Das eBPF-Objekt wird **vorkompiliert** eingebettet (nicht im Buildroot-Cross-Build erzeugt), um Host-BPF-Toolchain-Bootstrapping im Cross-Build zu vermeiden. Details: [`month1-foundation.md`](month1-foundation.md#woche-1-2-basis-system).
+
+### `tarno-installer` (natives GUI, läuft NICHT auf Tarno OS selbst)
+- Eframe/egui-App, die auf dem Rechner läuft, der den USB-Stick erstellt (z. B. der Alltags-Rechner des Nutzers) — vergleichbar mit Raspberry Pi Imager/Rufus/balenaEtcher, kein Teil des Tarno-OS-Images.
+- Schreibt ein per [`tarno-br2-external`](#buildroot-integration-tarno-br2-external) gebautes `sdcard.img` blockweise auf ein Zielgerät (reine Rust-Kopier-Engine statt `dd`-Subprozess, für volle Kontrolle über Fortschritt/Abbruch).
+- Sicherheitsmodell (siehe `tarno-installer/src/devices.rs`): nur Geräte mit `/sys/block/<dev>/removable == 1` werden überhaupt zur Auswahl angeboten, das Root-Gerät ist zusätzlich explizit ausgeschlossen (Heuristik über `/proc/mounts`), und vor dem Schreiben muss der Nutzer eine explizite Bestätigung mit vollem Geräte-Label anhaken.
+- Teilt sich das visuelle Theme (`tarno-ui-theme`) mit `tarnod-ui`, damit alle Tarno-OS-Werkzeuge optisch aus einem Guss wirken.
 
 ## Sicherheitsmodell (Userspace-Isolation statt Kernel-Vault)
 

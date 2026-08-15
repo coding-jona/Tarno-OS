@@ -25,6 +25,7 @@ BR2_INIT_OPENRC=y
 BR2_LINUX_KERNEL=y
 BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
 BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="board/tarno-m6700/linux.config.fragment"
+BR2_LINUX_KERNEL_BZIMAGE=y
 
 # tarnod (dieser BR2_EXTERNAL-Tree)
 BR2_PACKAGE_TARNOD=y
@@ -38,3 +39,14 @@ BR2_PACKAGE_CAGE=y
 BR2_ROOTFS_OVERLAY="board/tarno-m6700/rootfs-overlay"
 
 BR2_TARGET_GENERIC_GETTY_PORT="ttyS0"
+
+# USB-Boot-Image (Anforderung: per dd auf einen Stick schreibbar, bootet
+# direkt ohne separaten Installer) — siehe
+# docs/month1-foundation.md#usb-boot-image-anforderung-installationauslieferung-per-usb-stick
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+# Stellt host-syslinux (u.a. mbr.bin) bereit, das post-image.sh für den
+# MBR-Bootstrap-Code braucht.
+BR2_TARGET_SYSLINUX=y
+BR2_PACKAGE_HOST_GENIMAGE=y
+BR2_ROOTFS_POST_IMAGE_SCRIPT="board/tarno-m6700/post-image.sh"

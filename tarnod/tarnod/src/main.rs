@@ -8,7 +8,6 @@ mod config;
 mod gaming;
 mod ipc;
 mod process_ctl;
-mod protocol;
 mod security;
 mod vault;
 
@@ -16,7 +15,7 @@ use std::sync::Arc;
 
 use config::Config;
 use gaming::GamingController;
-use protocol::{Request, Response};
+use tarnod_protocol::{Request, Response};
 use vault::Vault;
 
 pub struct AppState {

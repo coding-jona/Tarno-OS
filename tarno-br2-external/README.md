@@ -19,8 +19,20 @@ git clone https://github.com/buildroot/buildroot.git
 cd buildroot
 make BR2_EXTERNAL=/pfad/zu/Tarno-OS/tarno-br2-external tarno_m6700_defconfig
 make menuconfig   # zur Kontrolle/Anpassung an die tatsächliche Hardware
-make
+make              # Ergebnis: output/images/sdcard.img
 ```
+
+**Auf einen USB-Stick schreiben und booten** (Anforderung: Installation
+ohne separaten Installer, siehe
+[`../docs/month1-foundation.md`](../docs/month1-foundation.md#usb-boot-image-anforderung-installationauslieferung-per-usb-stick)):
+
+```sh
+sudo dd if=output/images/sdcard.img of=/dev/sdX bs=4M status=progress conv=fsync
+```
+
+(`/dev/sdX` durch den tatsächlichen USB-Stick-Gerätepfad ersetzen — nicht
+eine bestehende Festplatte, `dd` überschreibt ohne Rückfrage.) Stick in den
+M6700, im BIOS-Bootmenü auswählen — bootet direkt über SYSLINUX.
 
 ## Struktur
 
@@ -30,6 +42,7 @@ make
 | `package/tarnod/` | Buildroot-Package (cargo-package-Infra) für `tarnod`/`tarnoctl` |
 | `board/tarno-m6700/linux.config.fragment` | Kernel-Config-Fragment (nur M6700-Hardware) |
 | `board/tarno-m6700/rootfs-overlay/` | OpenRC-Service für `tarnod` |
+| `board/tarno-m6700/genimage.cfg`, `syslinux.cfg`, `post-image.sh` | USB-Boot-Image (SYSLINUX/BIOS, per `dd` auf Stick schreibbar) |
 | `configs/tarno_m6700_defconfig` | Buildroot-defconfig |
 
 Details/Begründungen: [`../docs/architecture.md`](../docs/architecture.md),

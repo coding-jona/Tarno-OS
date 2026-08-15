@@ -1,11 +1,15 @@
 //! JSON-Request/Response-Protokoll für den `tarnod`-IPC-Socket.
 //!
-//! Framing: newline-delimited JSON (siehe `ipc.rs`). Das Protokoll ist
-//! bewusst klein gehalten, siehe docs/month3-tarno-layer.md#ipc-design.
+//! Framing: newline-delimited JSON (siehe `tarnod/src/ipc.rs`). Geteilt
+//! zwischen dem Daemon (`tarnod`), dem CLI-Client (`tarnoctl`, aktuell noch
+//! mit eigenen JSON-String-Literalen) und der GUI (`tarnod-ui`), damit
+//! Protokolländerungen nicht mehrfach nachgezogen werden müssen. Das
+//! Protokoll ist bewusst klein gehalten, siehe
+//! docs/month3-tarno-layer.md#ipc-design.
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     /// Erreichbarkeits-Check.
@@ -22,7 +26,7 @@ pub enum Request {
     ResumeProcess { pid: i32 },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
     Ok { data: serde_json::Value },
@@ -90,5 +94,18 @@ mod tests {
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("\"status\":\"error\""));
         assert!(s.contains("\"message\":\"boom\""));
+    }
+
+    #[test]
+    fn request_round_trips_through_serialize_deserialize() {
+        // Wichtig fuer tarnod-ui: die GUI serialisiert Request selbst
+        // (statt wie tarnoctl rohe JSON-Strings zu bauen).
+        let req = Request::ResumeProcess { pid: 1234 };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Request::ResumeProcess { pid } => assert_eq!(pid, 1234),
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }

@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["tarnod", "tarnoctl"]
+members = ["tarnod", "tarnoctl", "tarnod-protocol", "tarnod-ui"]
+# tarnod-ui bewusst NICHT in default-members: braucht X11/Wayland/GL-
+# Bibliotheken (winit/glutin), die der Buildroot-Cross-Build des tarnod-
+# Packages (tarno-br2-external/package/tarnod/tarnod.mk) nicht automatisch
+# mitziehen soll. `cargo build --workspace`/`cargo test --workspace` (z.B.
+# in CI/lokaler Entwicklung) bauen weiterhin alles, inklusive tarnod-ui.
+default-members = ["tarnod", "tarnoctl", "tarnod-protocol"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,3 +19,4 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "signal", "time"] }
 libc = "0.2"
 anyhow = "1"
+tarnod-protocol = { path = "tarnod-protocol" }
