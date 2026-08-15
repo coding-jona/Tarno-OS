@@ -64,12 +64,18 @@ unterstützt klassisches BIOS-Boot (Ivy Bridge, kein UEFI-only-Zwang), daher
 - Ergebnis: `output/images/sdcard.img` — trotz des Namens ein normales
   Disk-Image, genauso für USB-Sticks geeignet (Buildroot-Konvention)
 
-**Auf den Stick schreiben:**
+**Auf den Stick schreiben — per `dd`:**
 ```sh
 sudo dd if=output/images/sdcard.img of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 (`/dev/sdX` durch den tatsächlichen USB-Stick-Gerätepfad ersetzen — **nicht**
 eine bestehende Festplatte, `dd` überschreibt ohne Rückfrage.)
+
+**Auf den Stick schreiben — per GUI:** [`tarno-installer`](../tarno-installer/)
+macht denselben Vorgang weniger fehleranfällig: listet nur Wechseldatenträger
+(schließt das eigene Root-Gerät aus), zeigt Fortschritt/Geschwindigkeit/ETA,
+verlangt eine explizite Bestätigung mit vollem Geräte-Label vor dem
+Überschreiben. Siehe [`docs/architecture.md`](architecture.md#tarno-installer-natives-gui-läuft-nicht-auf-tarno-os-selbst).
 
 **Scope-Hinweis:** Wie beim restlichen Buildroot-Teil (siehe unten) sind
 `genimage.cfg`/`syslinux.cfg`/`post-image.sh` nach aktueller Buildroot-

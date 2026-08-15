@@ -6,7 +6,7 @@ use eframe::egui::{self, RichText};
 use tarnod_protocol::{Request, Response};
 
 use crate::client::{Client, ClientEvent};
-use crate::theme;
+use tarno_ui_theme as theme;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 

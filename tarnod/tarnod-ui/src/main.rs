@@ -12,11 +12,11 @@
 
 mod app;
 mod client;
-mod theme;
 
 use std::path::PathBuf;
 
 use eframe::egui;
+use tarno_ui_theme as theme;
 
 fn socket_path() -> PathBuf {
     std::env::var("TARNOD_SOCKET")

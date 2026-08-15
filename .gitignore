@@ -2,4 +2,6 @@
 /tarnod/target/
 /tarno-guard-ebpf/target/
 /tarno-guard-ebpf/tarnod-guard-ebpf/target/
+/tarno-installer/target/
+/tarno-ui-theme/target/
 **/*.rs.bk

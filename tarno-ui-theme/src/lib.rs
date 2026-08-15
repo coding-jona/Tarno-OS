@@ -1,9 +1,10 @@
-//! Visuelles Theme: dunkel, ruhig, "Stealth-Tech" — passend zu einem
-//! Security-/Tuning-Daemon namens "Tarno" (von "tarnen"). Ein Farbsatz,
-//! konsequent auf Panels/Buttons/Status-Badges angewendet statt
-//! egui-Defaults zu benutzen.
+//! Geteiltes visuelles Theme für alle Tarno-OS-GUIs: dunkel, ruhig,
+//! "Stealth-Tech" — passend zum Namen "Tarno" (von "tarnen"). Ein
+//! Farbsatz, konsequent auf Panels/Buttons/Status-Badges angewendet statt
+//! egui-Defaults zu benutzen, damit `tarnod-ui` und `tarno-installer`
+//! (und künftige Tarno-OS-Tools) optisch aus einem Guss wirken.
 
-use eframe::egui::{self, Color32, CornerRadius, Margin, Stroke};
+use egui::{Color32, CornerRadius, Margin, Stroke};
 
 pub const BG_APP: Color32 = Color32::from_rgb(0x0d, 0x0f, 0x13);
 pub const BG_PANEL: Color32 = Color32::from_rgb(0x15, 0x18, 0x1f);
@@ -19,6 +20,7 @@ pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x1b, 0x4b, 0x47);
 pub const SUCCESS: Color32 = Color32::from_rgb(0x4a, 0xde, 0x80);
 pub const WARNING: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
 pub const DANGER: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
+pub const DANGER_DIM: Color32 = Color32::from_rgb(0x4a, 0x1f, 0x1f);
 
 pub fn apply(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
@@ -77,6 +79,23 @@ pub fn card(ui: &egui::Ui) -> egui::Frame {
     egui::Frame::new()
         .fill(BG_PANEL)
         .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(16))
+        .outer_margin(Margin {
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: (ui.spacing().item_spacing.y) as i8,
+        })
+}
+
+/// Wie `card`, aber mit rotem Warn-Rand — für gefährliche/destruktive
+/// Aktionen (z.B. die Bestätigung vor dem Überschreiben eines Datenträgers
+/// in `tarno-installer`).
+pub fn danger_card(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::new()
+        .fill(DANGER_DIM)
+        .stroke(Stroke::new(1.4, DANGER))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::same(16))
         .outer_margin(Margin {
