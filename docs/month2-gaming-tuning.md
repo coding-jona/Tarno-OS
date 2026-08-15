@@ -27,6 +27,7 @@
 
 ### Compositor-Bypass / Direct-Scanout
 - `cage` (siehe Monat 1) rendert bereits ohne zusätzlichen Compositor-Layer über einen anderen Fenstermanager — das ist der Hauptteil des "Bypass". Zusätzlicher Test: DRM-Direct-Scanout verifizieren mit `WAYLAND_DEBUG=1` oder `wlr-randr`, ob die JVM/das Spiel im Fullscreen tatsächlich einen eigenen DRM-Plane bekommt (kein Extra-Compositing-Pass) — dokumentiert als manueller Verifikationsschritt auf der echten Hardware (GPU-abhängig, in dieser Sandbox ohne GPU nicht sinnvoll testbar).
+- `cage` bleibt bewusst ausschließlich dem Gaming-Modus vorbehalten und bekommt keine Taskleiste/Fensterverwaltung aufgesetzt — für den Alltagsbetrieb gibt es stattdessen den separaten Compositor [`tarno-desktop`](../tarno-desktop/), der nie parallel zu `cage` läuft. Begründung/Details: [`architecture.md`](architecture.md#dual-mode-gaming-vs-desktop), [`month-desktop.md`](month-desktop.md).
 
 ### FPS/Frametime-Messung
 - `scripts/benchmark.sh` parst ein `mangohud`-kompatibles CSV-Log (Mangohud kann Frametimes in eine Datei loggen: `MANGOHUD_CONFIG=output_folder=/path,log_duration=60`) und berechnet: Durchschnitts-FPS, 1%-Low, Frametime-Standardabweichung (Konsistenz-Metrik) — Grundlage für den Vorher/Nachher-Vergleich aus der Roadmap.

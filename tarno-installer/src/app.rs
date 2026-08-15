@@ -368,7 +368,7 @@ impl eframe::App for InstallerApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG_APP).inner_margin(egui::Margin::symmetric(24, 20)))
             .show(ctx, |ui| {
-                ui.label(RichText::new("USB-Stick beschreiben").size(22.0).strong());
+                ui.label(RichText::new("USB-Stick beschreiben").size(22.0).strong().color(theme::TEXT_PRIMARY));
                 ui.label(
                     RichText::new("Schreibt ein Tarno-OS-Boot-Image (siehe tarno-br2-external/) auf einen Wechseldatenträger.")
                         .color(theme::TEXT_MUTED),

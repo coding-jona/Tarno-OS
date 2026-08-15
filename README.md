@@ -17,7 +17,8 @@ Kernels.
 | [`scripts/`](scripts/) | Gaming-Mode-Tuning (CPU-Governor, THP, JVM-Start-Wrapper, FPS-Benchmark) |
 | [`tarno-br2-external/`](tarno-br2-external/) | Buildroot-`BR2_EXTERNAL`-Tree (Kernel-Config, `tarnod`-Package, Board-Support M6700, USB-Boot-Image) |
 | [`tarno-installer/`](tarno-installer/) | Natives GUI zum Schreiben des USB-Boot-Images auf einen Stick (läuft auf dem Alltags-Rechner, nicht auf Tarno OS selbst) |
-| [`tarno-ui-theme/`](tarno-ui-theme/) | Geteiltes egui-Theme für `tarnod-ui` und `tarno-installer` |
+| [`tarno-desktop/`](tarno-desktop/) | Eigener Wayland-Compositor (smithay) mit fusionierter Taskleiste für den Desktop-Modus — Gaming-Modus nutzt weiterhin `cage` (Dual-Mode, siehe [`docs/architecture.md`](docs/architecture.md#dual-mode-gaming-vs-desktop)) |
+| [`tarno-ui-theme/`](tarno-ui-theme/) | Geteiltes egui-Theme für `tarnod-ui`, `tarno-installer` und `tarno-desktop` |
 | [`docs/`](docs/) | Architektur + detaillierte Monatspläne mit Befehlen/Configs/Abnahmekriterien |
 
 ## Schnellstart (Entwicklung, ohne Buildroot)
@@ -49,6 +50,16 @@ cd tarno-installer
 cargo build --release
 cargo test              # Kopier-Engine + Geräte-Erkennung, ohne root testbar
 sudo ./target/release/tarno-installer
+```
+
+Desktop-Modus (eigener Compositor, siehe [`tarno-desktop/README.md`](tarno-desktop/README.md)):
+
+```sh
+cd tarno-desktop
+cargo build
+cargo test
+mkdir -p /tmp/xdg-runtime && chmod 0700 /tmp/xdg-runtime
+XDG_RUNTIME_DIR=/tmp/xdg-runtime ./target/debug/tarno-desktop
 ```
 
 Details, Architektur-Begründungen und der Status je Roadmap-Meilenstein:
