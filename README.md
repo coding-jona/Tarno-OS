@@ -65,4 +65,38 @@ XDG_RUNTIME_DIR=/tmp/xdg-runtime ./target/debug/tarno-desktop
 Details, Architektur-Begründungen und der Status je Roadmap-Meilenstein:
 siehe [`docs/architecture.md`](docs/architecture.md).
 
-https://claude.ai/code/artifact/fc9d3a9d-46c5-4d48-92b9-dc6fe59121b8
+## Screenshots
+
+Alle Screenshots sind unter Xvfb aufgenommen (native egui-Screenshot-API
+bzw. `xwd` für `tarno-desktop`, siehe [`docs/architecture.md`](docs/architecture.md)),
+gegen einen echten laufenden `tarnod` im Dry-Run — keine Mockups. Windows
+11 Fluent Design, dunkel, Cyan-Akzent (`#0BC7FF`), siehe Begründung in
+[`tarno-ui-theme/`](tarno-ui-theme/).
+
+### `tarnod-ui` — Steuerung für Gaming-Mode & Security
+
+| Dashboard | Gaming-Mode |
+|---|---|
+| ![tarnod-ui Dashboard](docs/screenshots/tarnod-ui-dashboard.png) | ![tarnod-ui Gaming-Mode](docs/screenshots/tarnod-ui-gaming-mode.png) |
+
+| Security | API-Keys |
+|---|---|
+| ![tarnod-ui Security](docs/screenshots/tarnod-ui-security.png) | ![tarnod-ui API-Keys](docs/screenshots/tarnod-ui-api-keys.png) |
+
+### `tarno-installer` — USB-Boot-Image schreiben
+
+| Bereit | Bestätigung |
+|---|---|
+| ![tarno-installer bereit](docs/screenshots/tarno-installer-idle.png) | ![tarno-installer Bestätigung](docs/screenshots/tarno-installer-confirm.png) |
+
+| Läuft | Fertig | Fehler |
+|---|---|---|
+| ![tarno-installer läuft](docs/screenshots/tarno-installer-running.png) | ![tarno-installer fertig](docs/screenshots/tarno-installer-done.png) | ![tarno-installer Fehler](docs/screenshots/tarno-installer-error.png) |
+
+### `tarno-desktop` — eigener Compositor mit fusionierter Taskleiste
+
+![tarno-desktop mit Taskleiste](docs/screenshots/tarno-desktop.png)
+
+Taskleiste (unten): Wordmark, `tarnod`-Verbindungsstatus, `isolcpus`- und
+eBPF-Status, laufende Uhrzeit — alles live vom echten Daemon, kein
+statischer Platzhalter. Details: [`tarno-desktop/README.md`](tarno-desktop/README.md).
