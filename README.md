@@ -17,7 +17,7 @@ Kernels.
 | [`scripts/`](scripts/) | Gaming-Mode-Tuning (CPU-Governor, THP, JVM-Start-Wrapper, FPS-Benchmark) |
 | [`tarno-br2-external/`](tarno-br2-external/) | Buildroot-`BR2_EXTERNAL`-Tree (Kernel-Config, `tarnod`-Package, Board-Support M6700, USB-Boot-Image) |
 | [`tarno-installer/`](tarno-installer/) | Natives GUI zum Schreiben des USB-Boot-Images auf einen Stick (läuft auf dem Alltags-Rechner, nicht auf Tarno OS selbst) |
-| [`tarno-desktop/`](tarno-desktop/) | Eigener Wayland-Compositor (smithay) mit fusionierter Taskleiste für den Desktop-Modus — Gaming-Modus nutzt weiterhin `cage` (Dual-Mode, siehe [`docs/architecture.md`](docs/architecture.md#dual-mode-gaming-vs-desktop)) |
+| [`tarno-desktop/`](tarno-desktop/) | **Primäre OS-Experience**: eigener Wayland-Compositor (smithay) mit fusionierter Taskleiste, `tarnod-ui` als integrierte Settings-App. `cage` bleibt nur als dedizierter Gaming-Vollbild-Pfad (Dual-Mode, siehe [`docs/architecture.md`](docs/architecture.md#dual-mode-gaming-vs-desktop)) |
 | [`tarno-ui-theme/`](tarno-ui-theme/) | Geteiltes egui-Theme für `tarnod-ui`, `tarno-installer` und `tarno-desktop` |
 | [`docs/`](docs/) | Architektur + detaillierte Monatspläne mit Befehlen/Configs/Abnahmekriterien |
 
@@ -52,13 +52,23 @@ cargo test              # Kopier-Engine + Geräte-Erkennung, ohne root testbar
 sudo ./target/release/tarno-installer
 ```
 
-Desktop-Modus (eigener Compositor, siehe [`tarno-desktop/README.md`](tarno-desktop/README.md)):
+**Stick von Windows aus erstellen?** `tarno-installer` läuft nativ auch
+auf Windows (kein Rust-Aufbau auf Windows nötig — fertige `.exe` aus der
+CI herunterladen oder von Linux/WSL2 aus cross-kompilieren). Details:
+[`tarno-installer/README.md#windows-nutzung`](tarno-installer/README.md#windows-nutzung).
+
+Desktop-Modus (primäre OS-Experience, eigener Compositor + Taskleiste,
+`tarnod-ui` als integrierte Settings-App — siehe
+[`tarno-desktop/README.md`](tarno-desktop/README.md)):
 
 ```sh
 cd tarno-desktop
 cargo build
 cargo test
 mkdir -p /tmp/xdg-runtime && chmod 0700 /tmp/xdg-runtime
+# tarnod-ui muss im $PATH liegen (oder TARNO_DESKTOP_SETTINGS_BIN setzen),
+# damit ein Klick auf die TARNO-Wordmark in der Taskleiste sie als
+# Settings-Fenster öffnen kann.
 XDG_RUNTIME_DIR=/tmp/xdg-runtime ./target/debug/tarno-desktop
 ```
 
@@ -93,10 +103,15 @@ gegen einen echten laufenden `tarnod` im Dry-Run — keine Mockups. Windows
 |---|---|---|
 | ![tarno-installer läuft](docs/screenshots/tarno-installer-running.png) | ![tarno-installer fertig](docs/screenshots/tarno-installer-done.png) | ![tarno-installer Fehler](docs/screenshots/tarno-installer-error.png) |
 
-### `tarno-desktop` — eigener Compositor mit fusionierter Taskleiste
+### `tarno-desktop` — primäre OS-Experience: Compositor + Taskleiste + Settings
 
-![tarno-desktop mit Taskleiste](docs/screenshots/tarno-desktop.png)
+| Desktop | Settings-App per Klick geöffnet |
+|---|---|
+| ![tarno-desktop mit Taskleiste](docs/screenshots/tarno-desktop.png) | ![tarno-desktop mit geöffneter Settings-App](docs/screenshots/tarno-desktop-settings.png) |
 
-Taskleiste (unten): Wordmark, `tarnod`-Verbindungsstatus, `isolcpus`- und
-eBPF-Status, laufende Uhrzeit — alles live vom echten Daemon, kein
-statischer Platzhalter. Details: [`tarno-desktop/README.md`](tarno-desktop/README.md).
+Taskleiste (unten): Wordmark (klickbar — öffnet die Settings-App),
+`tarnod`-Verbindungsstatus, `isolcpus`- und eBPF-Status, laufende Uhrzeit —
+alles live vom echten Daemon, kein statischer Platzhalter. Rechts: ein
+Klick auf die Wordmark spawnt `tarnod-ui` als echten Wayland-Client, der
+als Fenster innerhalb des Compositors rendert — die einzige
+Einstellungs-Oberfläche von Tarno OS. Details: [`tarno-desktop/README.md`](tarno-desktop/README.md).

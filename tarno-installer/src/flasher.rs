@@ -3,7 +3,9 @@
 //! Channel. Bewusst in reinem Rust implementiert (kein `dd`-Shell-Aufruf)
 //! für volle Kontrolle über Fortschritt/Abbruch/Fehlerbehandlung.
 
-use std::fs::{File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,7 +109,18 @@ fn open_dest(dest: &Path) -> Result<File, String> {
         })
 }
 
-#[cfg(not(unix))]
+/// Windows: kein `O_SYNC`-Äquivalent über `OpenOptions` — stattdessen
+/// öffnet `win32::open_dest_handle` das physische Laufwerk direkt über
+/// `CreateFileW` und sperrt/dismountet vorher die zugehörigen
+/// Laufwerksbuchstaben (siehe `win32.rs`). `sync_all()` in `flash_inner`
+/// entspricht unter Windows `FlushFileBuffers`, das `std::fs::File`
+/// automatisch für uns aufruft.
+#[cfg(windows)]
+fn open_dest(dest: &Path) -> Result<File, String> {
+    crate::win32::open_dest_handle(dest)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_dest(dest: &Path) -> Result<File, String> {
     OpenOptions::new()
         .write(true)

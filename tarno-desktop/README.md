@@ -1,36 +1,58 @@
 # tarno-desktop
 
-Eigener, minimaler Wayland-Compositor (Rust/[smithay](https://github.com/Smithay/smithay))
-für den Tarno-OS-Desktop-Modus, mit direkt in den Compositor-Prozess
-eingebauter Taskleiste (kein separater Panel-Client, kein `wlr-layer-shell`,
-kein zweiter Prozess/Event-Loop/GL-Context).
+**Primäre OS-Experience von Tarno OS.** Eigener, minimaler
+Wayland-Compositor (Rust/[smithay](https://github.com/Smithay/smithay)),
+mit direkt in den Compositor-Prozess eingebauter Taskleiste (kein
+separater Panel-Client, kein `wlr-layer-shell`, kein zweiter
+Prozess/Event-Loop/GL-Context) — das ist, was beim normalen Login startet.
 
 Der Gaming-Modus nutzt weiterhin `cage` (Kiosk-Compositor, ein Fenster
-fullscreen, kein Fensterverwaltungs-Overhead) — `tarno-desktop` ist nur für
-den Nicht-Gaming-Alltagsbetrieb (Browser, Dateimanager, `tarnod-ui`,
-`tarno-installer` parallel offen).
+fullscreen, kein Fensterverwaltungs-Overhead) als dedizierten, minimalen
+Vollbild-Pfad — aber `tarno-desktop` ist der Standardfall.
 
 Details/Begründung: [`../docs/architecture.md`](../docs/architecture.md#dual-mode-gaming-vs-desktop),
 [`../docs/month-desktop.md`](../docs/month-desktop.md).
 
+## Settings-App: `tarnod-ui` läuft im Desktop
+
+`tarnod-ui` (Dashboard, Gaming-Mode, Security, API-Keys) ist die einzige
+Einstellungs-Oberfläche von Tarno OS — kein eigenständiges Programm mehr,
+sondern aus der Taskleiste heraus gestartet:
+
+- Klick auf die "TARNO"-Wordmark (links, mit Akzentlinie als
+  Start-Knopf-Affordanz markiert) spawnt `tarnod-ui` als Kindprozess.
+  `WAYLAND_DISPLAY` wird vererbt — die App verbindet sich als echter
+  Wayland-Client gegen den eigenen Compositor-Socket und rendert als
+  XDG-Toplevel-Fenster **innerhalb** von `tarno-desktop`.
+- `TARNO_DESKTOP_SETTINGS_BIN` überschreibt den Pfad zur Settings-Binary
+  (Default: `tarnod-ui` aus `$PATH`).
+- Wiederholtes Klicken öffnet kein zweites Fenster (`Child::try_wait()`-
+  Check in `state.rs`).
+
 ## Scope
 
-**Stage 1 (aktueller Stand):** Compositor bootet, rendert Hintergrund +
-fusionierte Taskleiste (Wordmark, `tarnod`-Verbindungsstatus, `isolcpus`-
-und eBPF-Status, live Uhrzeit — alles gegen einen echten laufenden `tarnod`
-verifiziert), exponiert einen echten `WAYLAND_DISPLAY`-Socket.
+**Verifiziert:** Compositor bootet, rendert Hintergrund + fusionierte
+Taskleiste (Wordmark, `tarnod`-Verbindungsstatus, `isolcpus`- und
+eBPF-Status, live Uhrzeit — gegen einen echten laufenden `tarnod`
+bestätigt), exponiert einen echten `WAYLAND_DISPLAY`-Socket. **Echtes
+XDG-Client-Rendering ist jetzt mit `tarnod-ui` als realem Client
+verifiziert** (per simuliertem Klick unter Xvfb) — vormals der einzige
+offene Punkt.
 
-**Stage 2 (offen):** echter XDG-Shell-Client wurde in dieser Runde nicht
-gegen den Socket verbunden getestet (nur code-seitig verdrahtet); DRM/KMS-
-Backend für Bare-Metal-Boot ohne Host-Compositor; Boot-Integration
-(Moduswahl `cage` vs. `tarno-desktop`). Details: [`../docs/month-desktop.md`](../docs/month-desktop.md#scope-stage-1-diese-runde-vs-stage-2).
+**Offen:** DRM/KMS-Backend für Bare-Metal-Boot ohne Host-Compositor;
+Boot-Integration (Moduswahl `cage` vs. `tarno-desktop`); Zeiger-Events
+werden noch nicht an Client-Fenster weitergereicht (nur Tastatur) — echte
+Maus-Interaktion *innerhalb* der Settings-App ist entsprechend noch nicht
+verifiziert, nur dass das Fenster korrekt rendert. Details:
+[`../docs/month-desktop.md`](../docs/month-desktop.md#scope-was-in-dieser-runde-verifiziert-wurde).
 
 ## Verwendung
 
 ```sh
 cargo build
-cargo test               # 8 Tests, ohne Wayland-Socket/GPU: Uhrzeit, Text-Rasterizer, Taskleiste
+cargo test               # 12 Tests, ohne Wayland-Socket/GPU: Uhrzeit, Text-Rasterizer, Taskleiste, Klick-Hittest
 mkdir -p /tmp/xdg-runtime && chmod 0700 /tmp/xdg-runtime
+# tarnod-ui muss im $PATH liegen (oder TARNO_DESKTOP_SETTINGS_BIN setzen)
 XDG_RUNTIME_DIR=/tmp/xdg-runtime ./target/debug/tarno-desktop
 ```
 

@@ -9,8 +9,11 @@
 //! Komfort-/Sicherheitsschicht zusätzlich zur expliziten Bestätigung in
 //! der UI (siehe `app.rs`), kein Ersatz dafür.
 
+#[cfg(unix)]
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use crate::flasher::format_bytes;
 
@@ -36,21 +39,41 @@ impl BlockDevice {
     }
 }
 
+#[cfg(unix)]
 const NON_PHYSICAL_PREFIXES: &[&str] = &["loop", "zram", "dm-", "md", "sr", "ram"];
 
-/// Listet alle als "removable" markierten Block-Devices unter
-/// `/sys/block`, abzüglich des Root-Geräts. Gibt bei Zugriffsproblemen
-/// (z.B. kein `/sys/block` vorhanden) eine leere Liste zurück statt eines
-/// Fehlers — der Installer soll auch dann noch starten, nur eben ohne
-/// automatisch erkannte Geräte.
+/// Listet alle als Wechseldatenträger erkannten Blockgeräte, abzüglich des
+/// Root-/Systemgeräts. Plattformunabhängige Fassade — die eigentliche
+/// Enumeration (`/sys/block` unter Linux, Win32-`IOCTL`s unter Windows,
+/// siehe `win32.rs`) und Root-Geräte-Erkennung stecken hinter
+/// `list_removable_devices_raw()`/`root_device_name()`. Gibt bei
+/// Zugriffsproblemen eine leere Liste zurück statt eines Fehlers — der
+/// Installer soll auch dann noch starten, nur eben ohne automatisch
+/// erkannte Geräte.
 pub fn list_removable_devices() -> Vec<BlockDevice> {
     let root = root_device_name();
-    list_removable_devices_in(Path::new("/sys/block"))
+    list_removable_devices_raw()
         .into_iter()
         .filter(|d| Some(&d.name) != root.as_ref())
         .collect()
 }
 
+#[cfg(unix)]
+fn list_removable_devices_raw() -> Vec<BlockDevice> {
+    list_removable_devices_in(Path::new("/sys/block"))
+}
+
+#[cfg(windows)]
+fn list_removable_devices_raw() -> Vec<BlockDevice> {
+    crate::win32::list_physical_drives()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn list_removable_devices_raw() -> Vec<BlockDevice> {
+    Vec::new()
+}
+
+#[cfg(unix)]
 fn list_removable_devices_in(sys_block: &Path) -> Vec<BlockDevice> {
     let Ok(entries) = fs::read_dir(sys_block) else {
         return Vec::new();
@@ -86,16 +109,19 @@ fn list_removable_devices_in(sys_block: &Path) -> Vec<BlockDevice> {
     devices
 }
 
+#[cfg(unix)]
 fn is_removable(dev_dir: &Path) -> bool {
     read_trimmed(&dev_dir.join("removable")).as_deref() == Some("1")
 }
 
 /// `/sys/block/<dev>/size` ist in 512-Byte-Sektoren angegeben.
+#[cfg(unix)]
 fn read_size_bytes(dev_dir: &Path) -> Option<u64> {
     let raw = read_trimmed(&dev_dir.join("size"))?;
     raw.parse::<u64>().ok().map(|sectors| sectors * 512)
 }
 
+#[cfg(unix)]
 fn read_trimmed(path: &Path) -> Option<String> {
     fs::read_to_string(path)
         .ok()
@@ -103,12 +129,28 @@ fn read_trimmed(path: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Liefert den Root-Block-Device-Namen (z.B. "vda"), falls ermittelbar.
+/// Liefert den Namen des Root-/System-Geräts, falls ermittelbar — unter
+/// Linux z.B. "vda" (aus `/proc/mounts`), unter Windows z.B.
+/// "PhysicalDrive0" (aus `win32::system_physical_drive_name`). Wird gegen
+/// `BlockDevice::name` verglichen, um dieses Gerät aus der Auswahlliste
+/// auszuschließen (siehe `list_removable_devices`).
+#[cfg(unix)]
 pub fn root_device_name() -> Option<String> {
     let mounts = fs::read_to_string("/proc/mounts").ok()?;
     root_device_name_from_mounts(&mounts)
 }
 
+#[cfg(windows)]
+pub fn root_device_name() -> Option<String> {
+    crate::win32::system_physical_drive_name()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn root_device_name() -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
 fn root_device_name_from_mounts(mounts: &str) -> Option<String> {
     for line in mounts.lines() {
         let mut fields = line.split_whitespace();
@@ -125,6 +167,7 @@ fn root_device_name_from_mounts(mounts: &str) -> Option<String> {
 /// "vda2" -> "vda", "sda1" -> "sda", "nvme0n1p2" -> "nvme0n1". Eine
 /// Heuristik (kein vollständiger Geräte-Namen-Parser) — ausreichend als
 /// zusätzliche Sicherheitsebene, siehe Modul-Kommentar.
+#[cfg(unix)]
 fn strip_partition_suffix(name: &str) -> String {
     if let Some(idx) = name.rfind('p') {
         let (head, tail) = name.split_at(idx);

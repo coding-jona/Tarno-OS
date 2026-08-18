@@ -151,9 +151,13 @@ impl InstallerApp {
                     ui.label(RichText::new("· USB-Boot-Image schreiben").color(theme::TEXT_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if !self.is_root {
-                            ui.label(RichText::new("● nicht root").color(theme::WARNING).strong());
+                            ui.label(
+                                RichText::new(format!("● nicht {}", privilege_label()))
+                                    .color(theme::WARNING)
+                                    .strong(),
+                            );
                         } else {
-                            ui.label(RichText::new("● root").color(theme::SUCCESS).strong());
+                            ui.label(RichText::new(format!("● {}", privilege_label())).color(theme::SUCCESS).strong());
                         }
                     });
                 });
@@ -165,11 +169,16 @@ impl InstallerApp {
             return;
         }
         theme::danger_card(ui, |ui| {
-            ui.label(RichText::new("Root erforderlich").color(theme::DANGER).strong());
             ui.label(
-                RichText::new("Zum Schreiben auf ein Blockgerät wird Root benötigt. Mit z.B. `sudo tarno-installer` neu starten.")
-                    .color(theme::TEXT_MUTED),
+                RichText::new(format!("{} erforderlich", privilege_label()))
+                    .color(theme::DANGER)
+                    .strong(),
             );
+            #[cfg(windows)]
+            let hint = "Zum Schreiben auf ein Laufwerk werden Administrator-Rechte benötigt. Rechtsklick auf tarno-installer.exe → \"Als Administrator ausführen\".";
+            #[cfg(not(windows))]
+            let hint = "Zum Schreiben auf ein Blockgerät wird Root benötigt. Mit z.B. `sudo tarno-installer` neu starten.";
+            ui.label(RichText::new(hint).color(theme::TEXT_MUTED));
         });
     }
 
@@ -321,14 +330,40 @@ impl InstallerApp {
     }
 }
 
+/// Prüft, ob der Prozess mit den nötigen Rechten für Rohschreibzugriff
+/// läuft — unter Unix root (`geteuid() == 0`), unter Windows eine erhöhte
+/// ("Als Administrator ausführen") Sitzung (siehe `win32::is_elevated`).
 fn is_root() -> bool {
     #[cfg(unix)]
     {
         unsafe { libc::geteuid() == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::win32::is_elevated()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
+    }
+}
+
+/// UI-Label für die in `is_root()` geprüfte Berechtigung — "root" unter
+/// Unix, "Administrator" unter Windows, damit die Warnung auf beiden
+/// Plattformen korrekt beschriftet ist statt Unix-Jargon auf Windows
+/// anzuzeigen.
+fn privilege_label() -> &'static str {
+    #[cfg(unix)]
+    {
+        "root"
+    }
+    #[cfg(windows)]
+    {
+        "Administrator"
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        "root"
     }
 }
 
