@@ -21,9 +21,21 @@ BR2_TOOLCHAIN_BUILDROOT_GLIBC=y
 # Kein systemd — OpenRC statt (siehe docs/month1-foundation.md#init-openrc-statt-systemd)
 BR2_INIT_OPENRC=y
 
-# Kernel: eigener Kernel-Build mit dem M6700-Config-Fragment aus Woche 1-2
+# Kernel: Standard-x86_64-Kernel-Defconfig als Basis (liefert einen
+# lauffähigen Kernel out-of-the-box) + M6700-Fragment obendrauf, das nur
+# die für diese konkrete Hardware nötigen Treiber zusätzlich aktiviert
+# (AHCI/i915/PS2/Netzwerk/eBPF) — siehe linux.config.fragment.
+#
+# ACHTUNG (nachgetragen nach dem ersten echten CI-Build, siehe
+# .github/workflows/build-os-image.yml): BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG
+# allein (ohne BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE) reicht NICHT -
+# CONFIG_FRAGMENT_FILES ist nur ein Zusatz obendrauf, keine eigenständige
+# Kernel-Konfigurationsquelle. Erster Build schlug deshalb sofort mit
+# "No kernel configuration file specified" fehl - dieser Commit behebt das
+# durch BR2_LINUX_KERNEL_USE_DEFCONFIG als Basis.
 BR2_LINUX_KERNEL=y
-BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
+BR2_LINUX_KERNEL_USE_DEFCONFIG=y
+BR2_LINUX_KERNEL_DEFCONFIG="x86_64"
 BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="board/tarno-m6700/linux.config.fragment"
 BR2_LINUX_KERNEL_BZIMAGE=y
 
