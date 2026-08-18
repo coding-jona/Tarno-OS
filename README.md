@@ -53,9 +53,17 @@ sudo ./target/release/tarno-installer
 ```
 
 **Stick von Windows aus erstellen?** `tarno-installer` läuft nativ auch
-auf Windows (kein Rust-Aufbau auf Windows nötig — fertige `.exe` aus der
-CI herunterladen oder von Linux/WSL2 aus cross-kompilieren). Details:
-[`tarno-installer/README.md#windows-nutzung`](tarno-installer/README.md#windows-nutzung).
+auf Windows — am einfachsten mit
+[`scripts/windows/build-tarno-installer.ps1`](scripts/windows/build-tarno-installer.ps1)
+(ein Doppelklick/Aufruf, prüft und installiert Git/Rust bei Bedarf
+selbst). Details: [`tarno-installer/README.md#windows-nutzung`](tarno-installer/README.md#windows-nutzung).
+
+**Die eigentliche `sdcard.img` bauen** (das Tarno-OS-Image selbst, nicht
+der Installer): `.github/workflows/build-os-image.yml` per GitHub Actions
+manuell auslösen (Actions-Tab → "Build Tarno OS image" → "Run workflow")
+— läuft komplett auf GitHub-Infrastruktur, kein eigener Linux-Rechner
+nötig. Dauert je nach Paketumfang etwa eine bis mehrere Stunden, Ergebnis
+liegt danach als Artifact zum Download bereit.
 
 Desktop-Modus (primäre OS-Experience, eigener Compositor + Taskleiste,
 `tarnod-ui` als integrierte Settings-App — siehe

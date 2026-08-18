@@ -34,16 +34,33 @@ Geräteliste auftaucht.
 
 ## Windows-Nutzung
 
-Zwei Wege, eine fertige `tarno-installer.exe` zu bekommen — **kein
-eigener Rust-/Compiler-Aufbau auf Windows nötig**:
+Drei Wege, eine fertige `tarno-installer.exe` zu bekommen — **kein
+manueller Rust-/Compiler-Aufbau nötig**:
 
-1. **Vorgebaut aus der CI** (empfohlen): jeder Push auf `main` baut in
+1. **`scripts/windows/build-tarno-installer.ps1` ausführen** (empfohlen,
+   wenn du direkt am Windows-Rechner sitzt): ein einziges Skript, das
+   selbst prüft, ob Git und Rust vorhanden sind, beides bei Bedarf still
+   nachinstalliert (Rust mit dem GNU-Toolchain-Profil, damit keine
+   Visual-Studio-Build-Tools nötig sind), das Repo klont (falls noch
+   nicht vorhanden) und `tarno-installer` im Release-Modus baut — direkt
+   auf Windows, kein Cross-Compile.
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File build-tarno-installer.ps1
+   ```
+   Die Ablauflogik (Erkennung von vorhandenem Checkout, `cargo build
+   --release`, Fehlerbehandlung) ist in dieser Sandbox mit echtem
+   PowerShell 7 End-to-End getestet — die beiden Windows-spezifischen
+   Installationszweige (Git-for-Windows-/rustup-Download+Silent-Install)
+   lassen sich hier naturgemäß nicht ausführen (kein Windows verfügbar),
+   folgen aber den offiziellen Silent-Install-Flags von Git for Windows
+   (`/VERYSILENT /NORESTART`) bzw. `rustup-init` (`-y --default-host
+   x86_64-pc-windows-gnu --profile minimal`).
+2. **Vorgebaut aus der CI**: jeder Push auf `main` baut in
    [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) automatisch
    eine `tarno-installer.exe` für Windows (Cross-Compile von Linux aus via
    `mingw-w64`). Im GitHub-Actions-Tab des Repos den neuesten `CI`-Run
    öffnen → Artifact `tarno-installer-windows-x86_64` herunterladen.
-2. **Selbst cross-kompilieren** von einem Linux-Rechner/WSL2 aus (z. B.
-   falls kein GitHub-Zugriff verfügbar ist):
+3. **Selbst cross-kompilieren** von einem Linux-Rechner/WSL2 aus:
    ```sh
    rustup target add x86_64-pc-windows-gnu
    sudo apt install mingw-w64          # Debian/Ubuntu
@@ -54,6 +71,19 @@ eigener Rust-/Compiler-Aufbau auf Windows nötig**:
    Diese exakte Kommandofolge ist in dieser Sandbox gegen das
    `x86_64-pc-windows-gnu`-Target verifiziert: es entsteht eine reale,
    startfähige PE32+-EXE (~14 MB im Release-Build).
+
+## Woher kommt die eigentliche `sdcard.img`?
+
+`tarno-installer` selbst enthält **kein** Betriebssystem (daher die
+kleine Dateigröße von ~14 MB) — es ist nur das Flash-Werkzeug. Die
+tatsächliche `sdcard.img` (das, was auf den Stick geschrieben wird)
+entsteht über einen echten Buildroot-Build aus
+[`../tarno-br2-external/`](../tarno-br2-external/), der über
+[`.github/workflows/build-os-image.yml`](../.github/workflows/build-os-image.yml)
+angestoßen werden kann (Actions-Tab → "Build Tarno OS image" → "Run
+workflow") und dauert je nach Paketumfang gut eine bis mehrere Stunden.
+Ergebnis liegt danach als Artifact `tarno-os-sdcard-img` zum Download
+bereit.
 
 Danach auf dem Windows-Rechner: `tarno-installer.exe` **als Administrator
 ausführen** (Rechtsklick → "Als Administrator ausführen" — Rohschreibzugriff

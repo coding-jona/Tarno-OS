@@ -4,7 +4,7 @@
 
 **Zielhardware:** Dell Precision M6700 (Ivy Bridge, AHCI, PS/2) — läuft problemlos mit Standard-Linux-Kernel + Treibern, kein Custom-Boot nötig.
 
-> Dieses Dokument ist die Übersicht. Die technische Ausarbeitung mit konkreten Befehlen, Paketnamen, Kernel-Configs und Abnahmekriterien steht in [`docs/architecture.md`](docs/architecture.md), [`docs/month1-foundation.md`](docs/month1-foundation.md), [`docs/month2-gaming-tuning.md`](docs/month2-gaming-tuning.md), [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md) und [`docs/month-desktop.md`](docs/month-desktop.md) (Desktop-Modus, über den ursprünglichen 3-Monats-Rahmen hinaus ergänzt). Lauffähiger Code liegt in [`tarnod/`](tarnod/) (Daemon+CLI+GUI), [`tarno-guard-ebpf/`](tarno-guard-ebpf/) (eBPF-Security), [`scripts/`](scripts/) (Gaming-Mode-Tuning), [`tarno-br2-external/`](tarno-br2-external/) (Buildroot-Integration), [`tarno-installer/`](tarno-installer/) (USB-Installer-GUI) und [`tarno-desktop/`](tarno-desktop/) (eigener Compositor + Taskleiste für den Desktop-Modus).
+> Dieses Dokument ist die Übersicht. Die technische Ausarbeitung mit konkreten Befehlen, Paketnamen, Kernel-Configs und Abnahmekriterien steht in [`docs/architecture.md`](docs/architecture.md), [`docs/month1-foundation.md`](docs/month1-foundation.md), [`docs/month2-gaming-tuning.md`](docs/month2-gaming-tuning.md), [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md), [`docs/month-desktop.md`](docs/month-desktop.md) (Desktop-Modus) und [`docs/month4-full-os.md`](docs/month4-full-os.md) (Festplatten-Installer, Updates/App-Marktplatz, Terminal, Netzwerk — alle über den ursprünglichen 3-Monats-Rahmen hinaus ergänzt). Lauffähiger Code liegt in [`tarnod/`](tarnod/) (Daemon+CLI+GUI), [`tarno-guard-ebpf/`](tarno-guard-ebpf/) (eBPF-Security), [`scripts/`](scripts/) (Gaming-Mode-Tuning), [`tarno-br2-external/`](tarno-br2-external/) (Buildroot-Integration), [`tarno-installer/`](tarno-installer/) (USB-Installer-GUI), [`tarno-desktop/`](tarno-desktop/) (eigener Compositor + Taskleiste) und [`tarno-disk-installer/`](tarno-disk-installer/) (Installation von USB auf die interne Platte).
 
 ---
 
@@ -60,6 +60,39 @@
 
 ---
 
+## Monat 4 — Vollständiges Betriebssystem-Erlebnis (über den ursprünglichen 3-Monats-Rahmen hinaus)
+
+Der USB-Stick war ursprünglich als reines Boot-Medium gedacht (Live-Betrieb,
+kein Installationsschritt). Jetzt kommt eine echte Installation auf die
+interne Platte dazu — und alles, was ein System danach braucht, um nicht
+bei jedem Update wieder zum Stick greifen zu müssen. Details:
+[`docs/month4-full-os.md`](docs/month4-full-os.md).
+
+**Festplatten-Installer** (`tarno-disk-installer`)
+- Läuft AUF Tarno OS selbst (live vom Stick gebootet), nicht auf dem
+  Erstellungsrechner — anders als `tarno-installer`, das nur den Stick
+  beschreibt. Partitioniert die interne Platte, formatiert, kopiert das
+  laufende System dorthin, installiert den Bootloader. Danach bootet der
+  Laptop ohne Stick.
+
+**System-Updates + App-Marktplatz — ein gemeinsamer Paketmanager**
+- Keine zwei getrennten Systeme: derselbe Paketmanager (`opkg`-basiert,
+  Buildroot bringt das schon mit) bedient sowohl System-Updates
+  (Kernel/Kernpakete) als auch den App-Marktplatz (Nutzer-Apps) aus
+  einem Repository — ein Update-Mechanismus statt zwei.
+
+**Terminal**
+- `foot` (Wayland-natives, sehr schlankes Terminal) als Buildroot-Paket
+  statt eines selbstgeschriebenen Terminal-Emulators — passt zur
+  "wiederverwenden statt neu erfinden"-Linie, wo ein ausgereiftes
+  Standardwerkzeug existiert.
+
+**Netzwerk (WLAN, Bluetooth)**
+- `iwd` (schlanker als NetworkManager+wpa_supplicant) für WLAN, `bluez`
+  für Bluetooth, Steuerung über ein neues Panel in `tarnod-ui`.
+
+---
+
 ## Was aus dem Original-Manifest bewusst gestrichen/verschoben ist
 - Eigener Kernel (Multiboot2, eigener Scheduler, Zero-Copy-Framebuffer von Grund auf) → auf unbestimmte Zeit verschoben, nicht in 3 Monaten machbar
 - "0% I/O-Overhead" Security → realistisches Ziel: minimaler, messbarer Overhead statt Null
@@ -75,3 +108,7 @@
 | Core-Isolation | isolcpus, cset, sched_setaffinity |
 | Security-Monitoring | eBPF |
 | Daemon | Rust oder C++ (nativ, kein Electron) |
+| Festplatten-Installer | `tarno-disk-installer` (Rust) — sfdisk/mkfs.vfat/mkfs.ext4/rsync/extlinux, siehe [`docs/month4-full-os.md`](docs/month4-full-os.md) |
+| Updates + App-Marktplatz | ein gemeinsamer `opkg`-basierter Paketmanager statt zwei getrennter Systeme |
+| Terminal | `foot` (Wayland-natives Standardwerkzeug, kein Eigenbau) |
+| Netzwerk | `iwd` (WLAN), `bluez` (Bluetooth) |
