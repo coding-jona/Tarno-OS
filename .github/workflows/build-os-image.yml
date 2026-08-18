@@ -1,0 +1,107 @@
+name: Build Tarno OS image
+
+# Baut das eigentliche Tarno-OS-Boot-Image (output/images/sdcard.img) mit
+# einem echten Buildroot-Checkout — der Schritt, der bisher in keiner
+# Sandbox lief (siehe Scope-Hinweise in docs/month1-foundation.md und
+# tarno-br2-external/configs/tarno_m6700_defconfig). Läuft NICHT bei jedem
+# Push (ein voller Buildroot-Build lädt mehrere GB herunter und dauert
+# potenziell Stunden) — nur manuell oder bei einem Versions-Tag.
+#
+# Ergebnis: sdcard.img als Workflow-Artifact zum Download. Dieses Image ist
+# das, was tarno-installer (siehe ci.yml) tatsächlich auf einen USB-Stick
+# schreibt — der Installer selbst enthält keinen Teil des Betriebssystems.
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-image:
+    name: Buildroot-Build (tarno_m6700_defconfig)
+    runs-on: ubuntu-latest
+    # Hosted-Runner-Obergrenze ist 360 Minuten - etwas Puffer lassen, damit
+    # ein Timeout als sauberer Fehlschlag im Actions-Log auftaucht statt
+    # eines harten Runner-Kills ohne Log.
+    timeout-minutes: 340
+    steps:
+      - name: Tarno-OS-Repo auschecken
+        uses: actions/checkout@v4
+        with:
+          path: tarno-os
+
+      - name: Buildroot-Host-Abhängigkeiten installieren
+        # Standard-Paketliste laut Buildroot-Manual ("System requirements").
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex git rsync unzip cpio \
+            libncurses-dev libssl-dev python3 wget cvs mercurial \
+            subversion whois
+
+      # Buildroot selbst wird NICHT in diesem Repo vendored (mehrere
+      # hundert MB) - stattdessen bei jedem Lauf frisch geklont, gepinnt
+      # auf eine konkrete LTS-Version für Reproduzierbarkeit.
+      - name: Buildroot klonen (gepinnt)
+        run: git clone --branch 2024.02.10 --depth 1 https://github.com/buildroot/buildroot.git buildroot
+
+      # dl/ (heruntergeladene Quell-Tarballs von Kernel/Toolchain/Paketen)
+      # und ccache über Runs hinweg cachen - macht einen erneuten Trigger
+      # nach einem Timeout/Fehlschlag erheblich schneller, weil nur noch
+      # tatsächlich fehlende/geänderte Teile neu geladen/kompiliert werden.
+      - name: Buildroot-Downloads + ccache cachen
+        uses: actions/cache@v4
+        with:
+          path: |
+            buildroot-dl
+            ~/.buildroot-ccache
+          key: buildroot-dl-ccache-tarno-m6700-${{ hashFiles('tarno-os/tarno-br2-external/configs/tarno_m6700_defconfig', 'tarno-os/tarno-br2-external/board/tarno-m6700/linux.config.fragment') }}
+          restore-keys: |
+            buildroot-dl-ccache-tarno-m6700-
+
+      - name: defconfig anwenden
+        working-directory: buildroot
+        run: |
+          make BR2_EXTERNAL="${GITHUB_WORKSPACE}/tarno-os/tarno-br2-external" \
+               O="${GITHUB_WORKSPACE}/br-output" \
+               tarno_m6700_defconfig
+
+      - name: dl-Verzeichnis + ccache in die Build-Config eintragen
+        working-directory: br-output
+        run: |
+          {
+            echo 'BR2_DL_DIR="'"${GITHUB_WORKSPACE}"'/buildroot-dl"'
+            echo 'BR2_CCACHE=y'
+            echo 'BR2_CCACHE_DIR="'"${HOME}"'/.buildroot-ccache"'
+          } >> .config
+          make olddefconfig
+
+      - name: Buildroot-Build (Kernel + Toolchain + Rootfs + Image)
+        working-directory: br-output
+        run: make
+
+      - name: sdcard.img prüfen
+        working-directory: br-output
+        run: |
+          ls -la images/
+          file images/sdcard.img
+          sha256sum images/sdcard.img | tee images/sdcard.img.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarno-os-sdcard-img
+          path: |
+            br-output/images/sdcard.img
+            br-output/images/sdcard.img.sha256
+          if-no-files-found: error
+          # sdcard.img ist mehrere hundert MB - nicht ewig aufheben.
+          retention-days: 14
+
+      - name: Build-Log als Artifact (auch bei Fehlschlag)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildroot-build-log
+          path: br-output/build/build-time.log
+          if-no-files-found: ignore
