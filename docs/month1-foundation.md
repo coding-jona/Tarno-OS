@@ -37,7 +37,7 @@ Nur was das M6700 (Ivy Bridge, AHCI, PS/2, Intel-GPU, Ethernet) tatsächlich bra
 | eBPF (für Monat 3) | `CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y`, optional `CONFIG_BPF_LSM=y` |
 | Explizit AUS | `CONFIG_SOUND` (falls nicht gebraucht), alle nicht-M6700-Treiber (WLAN-Chipsätze anderer Hersteller, andere Storage-Controller, Bluetooth falls ungenutzt), `CONFIG_USB_*` nur PS/2-relevante behalten falls USB-Tastatur/Maus genutzt wird |
 
-Fragment wird via `BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y` + `BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES` eingebunden (siehe `configs/tarno_m6700_defconfig`).
+Eingebunden über `BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y` mit zwei Teilen: `BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE` zeigt auf `board/tarno-m6700/linux.config` (die vollständige Basis-Kernel-Config), `BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES` auf `linux.config.fragment` obendrauf für die M6700-spezifischen Ergänzungen (siehe `configs/tarno_m6700_defconfig`). Ein Fragment allein reicht nicht als Konfigurationsquelle — das war ursprünglich falsch verdrahtet (nur Fragment, keine Basis-Config) und ließ den allerersten echten Build sofort mit "No kernel configuration file specified" fehlschlagen.
 
 ### Telemetrie/unnötige Daemons deaktivieren
 - Keine `BR2_PACKAGE_*` für: `chrony`-NTP-Auto-Update-Checker (nur falls gebraucht, sonst raus), `dbus` nur falls ein Paket es zwingend braucht, keine Log-Rotation-Daemons über das Minimum hinaus.
