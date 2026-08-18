@@ -1,0 +1,90 @@
+name: CI
+
+# Baut und testet die Rust-Crates dieses Repos, und stellt zusätzlich
+# fertige tarno-installer-Binaries für Linux und Windows als Download
+# bereit (Artifacts-Tab dieses Workflow-Runs) — damit niemand einen
+# eigenen Rust-/mingw-Toolchain-Aufbau braucht, nur um einen USB-Stick zu
+# erstellen. Siehe docs/architecture.md#tarno-installer-natives-gui-läuft-nicht-auf-tarno-os-selbst
+# für die Begründung, warum tarno-installer plattformübergreifend läuft,
+# obwohl Tarno OS selbst Linux-basiert ist.
+#
+# Baut NICHT das eigentliche Tarno-OS-Boot-Image (`sdcard.img`) — das ist
+# ein separater, mehrstündiger Buildroot-Build, siehe
+# docs/month1-foundation.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Tests (tarnod, tarno-ui-theme, tarno-installer, tarno-desktop)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: apt-Abhängigkeiten (GUI-/Compositor-Build)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-x11-0 libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev shellcheck
+      - name: tarnod-Workspace (Daemon, CLI, tarnod-ui, Protocol)
+        working-directory: tarnod
+        run: |
+          cargo build --workspace
+          cargo test --workspace
+      - name: tarno-ui-theme
+        working-directory: tarno-ui-theme
+        run: cargo test
+      - name: tarno-installer
+        working-directory: tarno-installer
+        run: |
+          cargo build
+          cargo test
+      - name: tarno-desktop
+        working-directory: tarno-desktop
+        run: |
+          cargo build
+          cargo test
+      - name: shellcheck (scripts/)
+        run: shellcheck scripts/*.sh
+
+  build-installer-linux:
+    name: tarno-installer (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: apt-Abhängigkeiten
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-x11-0 libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev
+      - name: Release-Build
+        working-directory: tarno-installer
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarno-installer-linux-x86_64
+          path: tarno-installer/target/release/tarno-installer
+          if-no-files-found: error
+
+  build-installer-windows:
+    name: tarno-installer (Windows x86_64, cross-kompiliert)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: mingw-w64 (Windows-Cross-Toolchain)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+      - name: Release-Build für x86_64-pc-windows-gnu
+        working-directory: tarno-installer
+        run: cargo build --release --target x86_64-pc-windows-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarno-installer-windows-x86_64
+          path: tarno-installer/target/x86_64-pc-windows-gnu/release/tarno-installer.exe
+          if-no-files-found: error

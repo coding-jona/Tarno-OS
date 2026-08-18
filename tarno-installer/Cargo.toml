@@ -14,4 +14,19 @@ tarno-ui-theme = { path = "../tarno-ui-theme" }
 eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts", "persistence", "x11", "wayland"] }
 egui = "0.32"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Win32-Backend für Geräte-Enumeration + Raw-Disk-Write (siehe src/win32.rs)
+# — läuft auf dem Rechner, mit dem der USB-Stick erstellt wird, nicht auf
+# Tarno OS selbst (das bleibt Linux-basiert).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+    "Win32_UI_Shell",
+] }

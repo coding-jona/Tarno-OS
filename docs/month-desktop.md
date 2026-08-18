@@ -82,36 +82,75 @@ Host-Fenster-Erstellung, sich selbst als Wayland-**Client** mit dem eigenen,
 noch nicht bedienenden Compositor-Socket zu verbinden — ein
 Henne-Ei-Deadlock statt des gewünschten X11-Fallbacks.
 
-## Scope: Stage 1 (diese Runde) vs. Stage 2
+## tarno-desktop ist die primäre OS-Experience
 
-**Stage 1 — verifiziert in dieser Sandbox (Xvfb + echter laufender `tarnod`
-im Dry-Run):**
+Ursprünglich als zweiter Modus neben `cage` eingeführt, ist `tarno-desktop`
+jetzt die **Haupt-Version von Tarno OS** — das ist, was beim normalen Login
+startet. `cage` bleibt als dedizierter, minimaler Kiosk-Pfad ausschließlich
+für den Gaming-Vollbild-Start bestehen (siehe
+[`architecture.md`](architecture.md#dual-mode-gaming-vs-desktop)), ist aber
+nicht mehr der Standardfall — der ist jetzt der Desktop mit Taskleiste und
+Settings.
+
+### Settings-App als Teil des Desktops (kein separates Fenster-Konzept)
+
+`tarnod-ui` (Dashboard, Gaming-Mode, Security, API-Keys — siehe
+[`../tarnod/tarnod-ui/`](../tarnod/tarnod-ui/)) ist die **einzige**
+Einstellungs-Oberfläche von Tarno OS. Sie läuft nicht mehr als
+eigenständiges, vom Desktop unabhängiges Programm, sondern wird direkt aus
+dem Compositor heraus gestartet:
+
+- Klick auf die "TARNO"-Wordmark links in der Taskleiste (mit dünner
+  Akzentlinie als Start-Knopf-Affordanz markiert, siehe `taskbar.rs`)
+  spawnt `tarnod-ui` als Kindprozess mit vererbtem `WAYLAND_DISPLAY` —
+  es verbindet sich als echter Wayland-Client gegen `tarno-desktop-0` und
+  rendert als XDG-Toplevel-Fenster **innerhalb** des Compositors, nicht in
+  einem eigenen Host-Fenster.
+- `WINIT_UNIX_BACKEND=wayland` wird dem Kindprozess explizit gesetzt, damit
+  eframes winit-Backend nicht versehentlich X11 statt Wayland wählt, falls
+  (wie im Xvfb-Testaufbau) zusätzlich `DISPLAY` gesetzt ist.
+- Wiederholtes Klicken spawnt kein zweites Fenster — `state.rs` prüft über
+  `Child::try_wait()`, ob der Settings-Prozess noch läuft.
+- Der Pfad zur Settings-Binary ist über `TARNO_DESKTOP_SETTINGS_BIN`
+  konfigurierbar (Default: `tarnod-ui` aus `$PATH`) — in der finalen
+  Buildroot-Rootfs liegen beide Binaries im selben `/usr/bin`.
+
+## Scope: was in dieser Runde verifiziert wurde
+
+**Verifiziert in dieser Sandbox (Xvfb + echter laufender `tarnod` im
+Dry-Run):**
 - Compositor startet, öffnet ein Fenster (winit-Backend), rendert den
   Hintergrund in `tarno-ui-theme::BG_APP`.
-- Taskleiste wird fusioniert gerendert: Wordmark, Verbindungsstatus-Punkt
-  (grün/rot), `isolcpus`-Status, eBPF-Status, live laufende Uhrzeit —
-  alles mit echten Daten von einem tatsächlich laufenden `tarnod`-Prozess
-  über den echten Unix-Socket bestätigt (per Screenshot verifiziert, siehe
-  `git log` zu diesem Commit für den Verifikationsablauf).
+- Taskleiste wird fusioniert gerendert: Wordmark (klickbar, siehe oben),
+  Verbindungsstatus-Punkt (grün/rot), `isolcpus`-Status, eBPF-Status, live
+  laufende Uhrzeit — alles mit echten Daten von einem tatsächlich
+  laufenden `tarnod`-Prozess über den echten Unix-Socket bestätigt.
 - `ListeningSocket::bind("tarno-desktop-0")` exponiert einen echten
-  `WAYLAND_DISPLAY`-Socket, gegen den sich Clients grundsätzlich verbinden
-  können (Compositor-Seite ist vollständig verdrahtet: `CompositorState`,
-  `XdgShellState`, `ShmState`, Buffer-Handling, Frame-Callbacks).
+  `WAYLAND_DISPLAY`-Socket.
+- **XDG-Shell-Client-Rendering ist jetzt tatsächlich mit einem echten
+  Client verifiziert**, nicht mehr nur auf Kompilier-Ebene: ein Klick auf
+  die Taskleiste (per `xdotool` unter Xvfb simuliert) spawnt `tarnod-ui`
+  als echten Wayland-Client, der sich verbindet und sein Dashboard als
+  XDG-Toplevel-Fenster innerhalb des Compositor-Fensters rendert — inkl.
+  laufender Live-Verbindung zum `tarnod`-Daemon in diesem Fenster. Das war
+  zuvor der einzige offene Stage-2-Punkt aus der ersten Runde.
+- Dedup-Verhalten (kein zweites Fenster bei wiederholtem Klick) per
+  Prozessbeobachtung bestätigt.
 
-**Stage 2 — NICHT in dieser Runde verifiziert, ausdrücklich offen:**
-- Ein echter XDG-Shell-Client (z. B. `weston-terminal`, ein Browser) wurde
-  in dieser Sandbox **nicht** gegen `tarno-desktop-0` verbunden und
-  gerendert getestet. Der Code-Pfad dafür existiert (XDG-Toplevel-Handling,
-  `render_elements_from_surface_tree`), ist aber nur auf
-  Kompiliert-Ebene, nicht auf Laufzeit-Ebene mit einem echten Client
-  verifiziert.
-- Fenster-Interaktion (Verschieben, Größe ändern, Fokus-Wechsel per Klick
-  statt nur Pointer-Motion), Tastatur-Layout-Konfiguration über das
-  Nutzer-Profil hinaus.
+**Weiterhin offen:**
+- Allgemeine Fenster-Interaktion über den Settings-Anwendungsfall hinaus
+  (Verschieben, Größe ändern beliebiger Client-Fenster, Fokus-Wechsel per
+  Klick statt nur Pointer-Motion, Zeigerereignisse werden aktuell nicht an
+  Client-Fenster weitergereicht — nur Tastatur). Für den Settings-Fall
+  reicht das aktuelle Verhalten (ein Fenster, Tastatureingabe genügt für
+  `tarnod-ui`s eigene Klick-Handhabung über egui... aber egui braucht auch
+  Zeiger-Events; **echte Maus-Interaktion in `tarnod-ui`, sobald es im
+  Desktop läuft, ist entsprechend noch nicht verifiziert** — nur dass das
+  Fenster überhaupt korrekt rendert.
+- Tastatur-Layout-Konfiguration über das Nutzer-Profil hinaus.
 - DRM/KMS-Backend für Bare-Metal-Boot ohne Host-Compositor.
-- Start/Stop-Integration in den Boot-Prozess (welcher Modus — `cage` oder
-  `tarno-desktop` — beim Login gestartet wird, und wie zwischen beiden
-  gewechselt wird) ist noch nicht in `tarno-br2-external` verdrahtet.
+- Start/Stop-Integration in den Boot-Prozess (`tarno-desktop` statt `cage`
+  standardmäßig starten) ist noch nicht in `tarno-br2-external` verdrahtet.
 
 ## Verwendung (Entwicklung)
 

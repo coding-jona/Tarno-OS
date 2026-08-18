@@ -2168,6 +2168,7 @@ dependencies = [
  "image",
  "libc",
  "tarno-ui-theme",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

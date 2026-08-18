@@ -8,7 +8,10 @@
 //! Schreiben muss der Nutzer eine explizite Bestätigung anhaken (siehe
 //! `app.rs`). Dieses Werkzeug läuft auf dem Rechner, der den Stick
 //! erstellt (nicht auf Tarno OS selbst) — vergleichbar mit Raspberry Pi
-//! Imager / Rufus / balenaEtcher.
+//! Imager / Rufus / balenaEtcher. Läuft nativ auf Linux **und** Windows
+//! (siehe `win32.rs` für das Win32-Geräte-/Schreib-Backend — gebraucht,
+//! wenn der Stick z. B. von einem Windows-11-Rechner aus erstellt wird,
+//! obwohl Tarno OS selbst Linux-basiert ist).
 //!
 //! Env-Variablen:
 //!   TARNO_INSTALLER_SCREENSHOT   wenn gesetzt: nach dem ersten Render
@@ -20,6 +23,8 @@
 mod app;
 mod devices;
 mod flasher;
+#[cfg(windows)]
+mod win32;
 
 use std::path::PathBuf;
 

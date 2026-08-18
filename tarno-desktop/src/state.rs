@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::input::{InputEvent, KeyboardKeyEvent};
+use smithay::backend::input::{
+    AbsolutePositionEvent, ButtonState, InputEvent, KeyboardKeyEvent, MouseButton, PointerButtonEvent,
+};
 use smithay::backend::renderer::element::surface::{
     render_elements_from_surface_tree, WaylandSurfaceRenderElement,
 };
@@ -79,6 +81,16 @@ struct TarnoDesktop {
     /// Frame. Performance-Grund, siehe Modul-Kommentar in `taskbar.rs`.
     taskbar_texture: Option<(TextureBuffer<smithay::backend::renderer::gles::GlesTexture>, i32)>,
     taskbar_rendered_at: Option<Instant>,
+
+    /// Letzte bekannte Zeigerposition in Bildschirmkoordinaten (aus
+    /// `PointerMotionAbsolute`) — für den Klick-Hittest gegen die
+    /// Settings-Zone der Taskleiste, siehe `handle_pointer_button`.
+    pointer_pos: (f64, f64),
+    /// Aktuelle Bildschirmgröße, für denselben Hittest.
+    output_size: (i32, i32),
+    /// Prozess-Handle der gespawnten Settings-App (`tarnod-ui`), falls
+    /// gerade offen — verhindert doppeltes Spawnen bei mehrfachem Klick.
+    settings_child: Option<std::process::Child>,
 }
 
 #[derive(Default)]
@@ -88,6 +100,48 @@ struct ClientState {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+impl TarnoDesktop {
+    /// Hittest der zuletzt bekannten Zeigerposition gegen die
+    /// Settings-Zone der Taskleiste (linke Wordmark, siehe
+    /// `taskbar::SETTINGS_HIT_WIDTH`) und Spawnen/Fokussieren von
+    /// `tarnod-ui` als echtem Wayland-Client dieses Compositors.
+    fn handle_settings_click(&mut self) {
+        if !is_in_settings_zone(self.pointer_pos, self.output_size.1) {
+            return;
+        }
+        self.launch_settings();
+    }
+
+    fn launch_settings(&mut self) {
+        // Schon offen (Prozess läuft noch)? Dann nichts tun — kein
+        // zweites Fenster pro Klick. `try_wait()` gibt `Ok(None)` zurück,
+        // solange der Kindprozess noch läuft.
+        if let Some(child) = &mut self.settings_child {
+            match child.try_wait() {
+                Ok(None) => return,
+                _ => self.settings_child = None,
+            }
+        }
+
+        let bin = std::env::var("TARNO_DESKTOP_SETTINGS_BIN").unwrap_or_else(|_| "tarnod-ui".to_string());
+        // WAYLAND_DISPLAY ist im eigenen Prozess-Environment schon auf
+        // unseren Socket gesetzt (siehe run_inner) und wird an das Kind
+        // vererbt. WINIT_UNIX_BACKEND=wayland erzwingt zusätzlich, dass
+        // eframes winit-Backend Wayland statt X11 wählt, falls (wie im
+        // Xvfb-Testaufbau) zusätzlich noch DISPLAY gesetzt ist —
+        // ansonsten würde winit X11 bevorzugen und tarnod-ui liefe als
+        // eigenständiges Fenster statt als Client dieses Compositors.
+        match std::process::Command::new(&bin)
+            .env("WINIT_UNIX_BACKEND", "wayland")
+            .env_remove("DISPLAY")
+            .spawn()
+        {
+            Ok(child) => self.settings_child = Some(child),
+            Err(e) => eprintln!("tarno-desktop: Settings-App '{bin}' konnte nicht gestartet werden: {e}"),
+        }
+    }
 }
 
 impl BufferHandler for TarnoDesktop {
@@ -204,6 +258,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         tarnod_status,
         taskbar_texture: None,
         taskbar_rendered_at: None,
+        pointer_pos: (0.0, 0.0),
+        output_size: (0, 0),
+        settings_child: None,
     };
 
     let listener = ListeningSocket::bind(SOCKET_NAME)?;
@@ -225,16 +282,28 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let keyboard = state.seat.add_keyboard(Default::default(), 200, 200)?;
 
     loop {
+        let current_size = backend.window_size();
+        state.output_size = (current_size.w, current_size.h);
+
         let status = winit_input.dispatch_new_events(|event| match event {
             WinitEvent::Input(InputEvent::Keyboard { event }) => {
                 keyboard.input::<(), _>(&mut state, event.key_code(), event.state(), 0.into(), 0, |_, _, _| {
                     FilterResult::Forward
                 });
             }
-            WinitEvent::Input(InputEvent::PointerMotionAbsolute { .. }) => {
+            WinitEvent::Input(InputEvent::PointerMotionAbsolute { event }) => {
+                let logical = smithay::utils::Size::from((state.output_size.0, state.output_size.1));
+                let pos = event.position_transformed(logical);
+                state.pointer_pos = (pos.x, pos.y);
+
                 if let Some(surface) = state.xdg_shell_state.toplevel_surfaces().first().cloned() {
                     let surface = surface.wl_surface().clone();
                     keyboard.set_focus(&mut state, Some(surface), 0.into());
+                }
+            }
+            WinitEvent::Input(InputEvent::PointerButton { event }) => {
+                if event.state() == ButtonState::Pressed && event.button() == Some(MouseButton::Left) {
+                    state.handle_settings_click();
                 }
             }
             _ => {}
@@ -245,7 +314,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             smithay::reexports::winit::platform::pump_events::PumpStatus::Exit(_) => return Ok(()),
         }
 
-        let size = backend.window_size();
+        let size = current_size;
         let damage = Rectangle::from_size(size);
 
         {
@@ -369,4 +438,45 @@ fn send_frames_surface_tree(surface: &wl_surface::WlSurface, time: u32) {
         },
         |_, _, &()| true,
     );
+}
+
+/// Reine Hittest-Funktion (kein Compositor-State nötig) für die
+/// Settings-Zone der Taskleiste: unten links, `SETTINGS_HIT_WIDTH` breit,
+/// `TASKBAR_HEIGHT` hoch. Ausgelagert aus `handle_settings_click`, damit
+/// sich der Klickbereich ohne laufenden Compositor testen lässt.
+fn is_in_settings_zone(pointer: (f64, f64), output_height: i32) -> bool {
+    let (px, py) = pointer;
+    let taskbar_top = f64::from(output_height) - f64::from(TASKBAR_HEIGHT);
+    let in_taskbar = py >= taskbar_top && py <= f64::from(output_height);
+    let in_settings_zone = px >= 0.0 && px <= f64::from(crate::taskbar::SETTINGS_HIT_WIDTH);
+    in_taskbar && in_settings_zone
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn click_inside_wordmark_hits_settings_zone() {
+        assert!(is_in_settings_zone((40.0, 780.0), 800));
+    }
+
+    #[test]
+    fn click_outside_taskbar_misses() {
+        assert!(!is_in_settings_zone((40.0, 400.0), 800));
+    }
+
+    #[test]
+    fn click_in_taskbar_but_right_of_wordmark_misses() {
+        assert!(!is_in_settings_zone((500.0, 780.0), 800));
+    }
+
+    #[test]
+    fn click_at_zone_edges_hits() {
+        assert!(is_in_settings_zone((0.0, 760.0), 800));
+        assert!(is_in_settings_zone(
+            (f64::from(crate::taskbar::SETTINGS_HIT_WIDTH), 800.0),
+            800
+        ));
+    }
 }

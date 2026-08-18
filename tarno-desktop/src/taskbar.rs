@@ -12,6 +12,13 @@ use crate::text::TextRenderer;
 
 pub const HEIGHT: u32 = 40;
 
+/// Breite der klickbaren "TARNO"-Wordmark-Zone links in der Taskleiste (wie
+/// ein Start-Button) — öffnet die Settings-App (`tarnod-ui`), siehe
+/// `state.rs::handle_pointer_button`. Großzügig über die tatsächliche
+/// Textbreite hinaus bemessen, damit die Trefferfläche nicht pixelgenau an
+/// die Schrift gebunden ist.
+pub const SETTINGS_HIT_WIDTH: i32 = 90;
+
 pub struct Taskbar {
     text: TextRenderer,
 }
@@ -35,6 +42,13 @@ impl Taskbar {
         let accent = tarno_ui_theme::ACCENT;
         self.text
             .draw(&mut buf, w, h, 14, 25, "TARNO", 17.0, rgb(accent));
+        // Startknopf-artige Affordanz: dünne Akzentlinie unter der
+        // Wordmark signalisiert, dass die Zone klickbar ist (öffnet die
+        // Settings-App, siehe state.rs). Nur gezeichnet, wenn die
+        // Taskleiste breit genug für die volle Trefferzone ist.
+        if w as i32 >= SETTINGS_HIT_WIDTH {
+            draw_settings_underline(&mut buf, w, accent);
+        }
 
         let (dot_color, status_text): (Color32, &str) = if status.connected {
             (tarno_ui_theme::SUCCESS, "verbunden")
@@ -98,6 +112,23 @@ fn fill_bg(buf: &mut [u8], color: Color32) {
         px[1] = color.g();
         px[2] = color.b();
         px[3] = 255;
+    }
+}
+
+/// Dünne Akzentlinie am unteren Rand der Wordmark-Zone (Start-Button-
+/// Affordanz), siehe `SETTINGS_HIT_WIDTH`.
+fn draw_settings_underline(buf: &mut [u8], width: usize, color: Color32) {
+    let h = buf.len() / 4 / width;
+    if h == 0 {
+        return;
+    }
+    let y = h - 3;
+    for x in 8..(SETTINGS_HIT_WIDTH as usize - 8).min(width) {
+        let idx = (y * width + x) * 4;
+        buf[idx] = color.r();
+        buf[idx + 1] = color.g();
+        buf[idx + 2] = color.b();
+        buf[idx + 3] = 160;
     }
 }
 
