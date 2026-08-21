@@ -16,3 +16,9 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "signal",
 libc = "0.2"
 anyhow = "1"
 tarnod-protocol = { path = "tarnod-protocol" }
+# Tarno-AI-Phase-2 (Mistral-API-Backend, siehe docs/month3-tarno-layer.md
+# #tarno-ai): rustls statt OpenSSL, damit kein System-OpenSSL/C++-Toolchain-
+# Bezug in den Build kommt (dieselbe Begründung wie an anderer Stelle im
+# Projekt gegen C++-Toolchain-Abhängigkeiten, siehe docs/).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-trait = "0.1"

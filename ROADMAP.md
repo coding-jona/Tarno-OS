@@ -67,8 +67,8 @@ konzentrierst.
 Tarno AI ist ein Assistent, direkt in `tarnod` integriert (kein separater
 Prozess, kein separates Crate) — Shell-Chat-Interface über `tarnoctl`,
 proaktives Tuning, perspektivisch eine Intelligenzschicht über der
-eBPF-Security. Geplant in drei Phasen, wovon **Phase 1 in dieser Session
-umgesetzt** ist:
+eBPF-Security. Geplant in drei Phasen, wovon **Phase 1 und ein erster
+Phase-2-Cut umgesetzt** sind:
 
 - **Phase 1 (fertig, echter Code, kein LLM):** Modul `tarnod/tarnod/src/ai/`
   mit einem heuristischen `AiBackend` (`ai/heuristic.rs`) — mustererkennt
@@ -80,12 +80,22 @@ umgesetzt** ist:
   pusht. Erreichbar über `tarnoctl ai <status|suggestions|<frage...>>`
   bzw. die neuen `AiQuery`/`AiStatus`/`AiSuggestions`-IPC-Requests. Mit
   Unit-Tests abgedeckt.
-- **Phase 2 (nicht in dieser Session umgesetzt, nur dokumentiert):**
-  austauschbares Backend, das **Mistral-AI-Cloud-Modelle über deren
-  REST-API** anspricht (API-Key, Bearer-Auth gegen
-  `api.mistral.ai/v1/chat/completions`) — kein lokales LLM. API-Key landet
-  in der bestehenden `Vault`, kein neuer Speichermechanismus. Volle
-  Recherche (Kurskorrektur gegenüber der ursprünglich geplanten
+- **Phase 2 (erster Cut umgesetzt, echter Code):** austauschbares Backend
+  (`ai/mistral.rs`), das **Mistral-AI-Cloud-Modelle über deren REST-API**
+  anspricht (Bearer-Auth gegen `api.mistral.ai/v1/chat/completions`,
+  Modell `mistral-small-latest`) — kein lokales LLM. API-Key landet in der
+  bestehenden `Vault` (`MISTRAL_API_KEY`), kein neuer Speichermechanismus;
+  ohne konfigurierten Key läuft Tarno AI automatisch im Phase-1-
+  Heuristik-Modus weiter (`AiState::from_vault`, kein Absturz). Fällt bei
+  Netzwerk-/API-Fehlern transparent auf `HeuristicBackend` zurück
+  (`ai/fallback.rs`). **Ehrlich benannte Einschränkungen ggü. der
+  Python-Referenz-Implementierung** (`coding-jona/tarno`), auf der dieser
+  Cut basiert: feste Default-Rate-Limit statt Per-Modell-RPS-Tabelle, kein
+  Streaming, kein Tool-/Function-Calling, kein Modell-Reasoning-Tuning —
+  ein erster, funktionsfähiger Cut, keine volle Parität. Setup (manuell,
+  kein First-Boot-Wizard vorhanden):
+  [`docs/month3-tarno-layer.md#mistral-api-key-einrichten`](docs/month3-tarno-layer.md#mistral-api-key-einrichten).
+  Volle Recherche (Kurskorrektur gegenüber der ursprünglich geplanten
   lokalen-`candle`-Lösung, Modelle/Kosten, Rust-Crate-Optionen):
   [`docs/knowledge-base/05-mistral-ai-api-integration.md`](docs/knowledge-base/05-mistral-ai-api-integration.md).
 - **Phase 3 (nicht in dieser Session umgesetzt, nur dokumentiert):**
@@ -151,7 +161,7 @@ künftiger Ort dafür: `docs/knowledge-base/`.
 | Core-Isolation | isolcpus, cset, sched_setaffinity |
 | Security-Monitoring | eBPF |
 | Daemon | Rust oder C++ (nativ, kein Electron) |
-| Tarno AI | phasenweise, in `tarnod` integriert (Mistral-AI-API für ein künftiges Cloud-Backend, siehe [`docs/knowledge-base/05-mistral-ai-api-integration.md`](docs/knowledge-base/05-mistral-ai-api-integration.md)) — Details siehe [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md) |
+| Tarno AI | phasenweise, in `tarnod` integriert — Phase 1 (Heuristik) + erster Phase-2-Cut (Mistral-AI-Cloud-API mit Heuristik-Fallback) umgesetzt, siehe [`docs/knowledge-base/05-mistral-ai-api-integration.md`](docs/knowledge-base/05-mistral-ai-api-integration.md) — Details siehe [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md) |
 | Festplatten-Installer | `tarno-disk-installer` (Rust) — sfdisk/mkfs.vfat/mkfs.ext4/rsync/extlinux, zurückgestellt, siehe [`docs/month4-full-os.md`](docs/month4-full-os.md) |
 | Updates + App-Marktplatz | ein gemeinsamer `opkg`-basierter Paketmanager statt zwei getrennter Systeme, zurückgestellt |
 | Terminal | `foot` (Wayland-natives Standardwerkzeug, kein Eigenbau), zurückgestellt |

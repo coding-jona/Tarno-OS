@@ -4,6 +4,8 @@
 //! keine Halluzination möglich, weil nichts generiert wird. Details/Scope:
 //! docs/month3-tarno-layer.md#tarno-ai.
 
+use async_trait::async_trait;
+
 use super::backend::{AiBackend, SystemContext};
 
 pub struct HeuristicBackend;
@@ -67,8 +69,9 @@ fn fallback(question: &str) -> String {
     )
 }
 
+#[async_trait]
 impl AiBackend for HeuristicBackend {
-    fn answer(&self, question: &str, ctx: &SystemContext) -> String {
+    async fn answer(&self, question: &str, ctx: &SystemContext) -> String {
         let q = question.to_lowercase();
 
         let asks_gaming = q.contains("gaming");
@@ -105,59 +108,59 @@ mod tests {
         }
     }
 
-    #[test]
-    fn answers_gaming_mode_question_german() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn answers_gaming_mode_question_german() {
         let backend = HeuristicBackend;
-        let answer = backend.answer("ist gaming mode an?", &ctx(true));
+        let answer = backend.answer("ist gaming mode an?", &ctx(true)).await;
         assert!(answer.contains("an"));
         assert!(answer.contains("2-3"));
     }
 
-    #[test]
-    fn answers_gaming_mode_question_when_off() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn answers_gaming_mode_question_when_off() {
         let backend = HeuristicBackend;
-        let answer = backend.answer("is gaming mode on", &ctx(false));
+        let answer = backend.answer("is gaming mode on", &ctx(false)).await;
         assert!(answer.contains("aus"));
     }
 
-    #[test]
-    fn answers_ram_question() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn answers_ram_question() {
         let backend = HeuristicBackend;
-        let answer = backend.answer("was frisst RAM?", &ctx(false));
+        let answer = backend.answer("was frisst RAM?", &ctx(false)).await;
         assert!(answer.contains("MiB"));
         assert!(answer.contains("80%")); // 200_000/1_000_000 verfügbar -> 80% genutzt
     }
 
-    #[test]
-    fn answers_memory_status_question_english() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn answers_memory_status_question_english() {
         let backend = HeuristicBackend;
-        let answer = backend.answer("memory status", &ctx(false));
+        let answer = backend.answer("memory status", &ctx(false)).await;
         assert!(answer.contains("MiB"));
     }
 
-    #[test]
-    fn answers_security_status_question() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn answers_security_status_question() {
         let backend = HeuristicBackend;
         let mut c = ctx(false);
         c.ebpf_active = true;
-        let answer = backend.answer("security status", &c);
+        let answer = backend.answer("security status", &c).await;
         assert!(answer.contains("aktiv"));
     }
 
-    #[test]
-    fn unknown_question_returns_fallback() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn unknown_question_returns_fallback() {
         let backend = HeuristicBackend;
-        let answer = backend.answer("wie ist das Wetter?", &ctx(false));
+        let answer = backend.answer("wie ist das Wetter?", &ctx(false)).await;
         assert!(answer.contains("noch nicht beantworten"));
     }
 
-    #[test]
-    fn ram_status_without_meminfo_does_not_panic() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn ram_status_without_meminfo_does_not_panic() {
         let backend = HeuristicBackend;
         let mut c = ctx(false);
         c.mem_total_kb = None;
         c.mem_available_kb = None;
-        let answer = backend.answer("ram status", &c);
+        let answer = backend.answer("ram status", &c).await;
         assert!(answer.contains("nicht lesbar"));
     }
 }

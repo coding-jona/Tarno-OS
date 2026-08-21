@@ -66,7 +66,7 @@ async fn handle_client(stream: UnixStream, state: Arc<AppState>) -> anyhow::Resu
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => crate::dispatch(&state, req),
+            Ok(req) => crate::dispatch(&state, req).await,
             Err(e) => Response::err(format!("invalid request: {e}")),
         };
         let out = serde_json::to_string(&response)?;

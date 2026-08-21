@@ -85,7 +85,7 @@ Tuning-Regel (`ai::tuning::evaluate`, isoliert von Timer/IO testbar), für
 drei neuen `Request`-Varianten in `tarnod-protocol` — im selben
 `#[cfg(test)]`-Stil wie der Rest des Codebase.
 
-### Phase 2 (nicht umgesetzt, nur dokumentiert): Mistral-AI-API-Backend
+### Phase 2 (erster Cut umgesetzt): Mistral-AI-API-Backend
 
 **Kurskorrektur:** die ursprüngliche Phase-2-Planung ging von einem
 lokal laufenden, quantisierten LLM aus (`candle`, GGUF, 1-3B Parameter,
@@ -95,23 +95,117 @@ verworfen — Tarno AI läuft stattdessen auf **Mistral-AI-Cloud-Modellen
 Modell, keine Q4-Quantisierung, keine CPU-Inferenz-Latenz auf der
 Zielhardware. Vollständige Recherche dazu (API-Schema, Modelle/Kosten,
 Rust-Crate-Optionen, Anbindung an Bestehendes):
-[`docs/knowledge-base/05-mistral-ai-api-integration.md`](knowledge-base/05-mistral-ai-api-integration.md)
-— bewusst *vor* jeglichem Phase-2-Code entstanden, noch offen sind dort
-nur die reinen Implementierungsdetails (Crate-Wahl, Fallback-/
-Timeout-Verhalten, Prompt-Aufbau aus `SystemContext`), keine
-Grundsatzfragen mehr.
+[`docs/knowledge-base/05-mistral-ai-api-integration.md`](knowledge-base/05-mistral-ai-api-integration.md).
 
-Kurzfassung: Auth über `Authorization: Bearer $MISTRAL_API_KEY` gegen
-`https://api.mistral.ai/v1/chat/completions`; der Key landet in der
-bereits existierenden `Vault` (`tarnod/tarnod/src/vault.rs`) — exakt
-dieselbe generische `KEY=VALUE`-Mechanik, mit der heute schon z. B.
-`MOJANG_API_KEY` gespeichert wird, keine Änderung an `vault.rs` nötig.
-Ein `MistralBackend` würde den bestehenden `AiBackend`-Trait aus Phase 1
-implementieren (Anpassung auf `async fn` statt `fn` nötig, da ein
-Netzwerk-Request nicht blockierend im IPC-Handler laufen soll) und
-braucht einen sauberen Fallback auf `HeuristicBackend`, wenn kein Netz
-da ist oder die API fehlschlägt — die M6700-Zielhardware hat nicht
-garantiert immer Internetzugang.
+Modul `tarnod/tarnod/src/ai/`, Geschwister von `heuristic.rs`:
+
+- **`ai/mistral.rs`**: `MistralBackend` — Auth über `Authorization: Bearer
+  $MISTRAL_API_KEY` gegen `https://api.mistral.ai/v1/chat/completions`,
+  OpenAI-kompatibler Payload (`model` = `mistral-small-latest`,
+  `messages: [{system-prompt mit knappem SystemContext}, {user-frage}]`,
+  `max_tokens` = 512, `temperature` = 0.7, `stream: false`). Direkter,
+  minimaler `reqwest`-Aufruf (`json`+`rustls-tls`-Features, kein
+  System-OpenSSL) statt einer der drei recherchierten Mistral-Crates — für
+  einen einzelnen Chat-Completion-Call pro `AiQuery` ist eine
+  Zusatz-Abhängigkeit nicht nötig. Retry/Backoff: bei HTTP 429 wird der
+  `Retry-After`-Header respektiert (gedeckelt auf 60s), sonst
+  exponentielles Backoff ab 500ms; bis zu 4 Versuche bei 429, bis zu 2 bei
+  5xx/Netzwerkfehlern. Rate-Limiting: ein simpler
+  Minimum-Intervall-Limiter (0.8 Requests/Sekunde, fest — **kein** Port der
+  vollständigen Per-Modell-RPS-Tabelle aus der Python-Referenz, das wäre
+  für diesen ersten Cut Over-Engineering, siehe Kommentar im Code). Bei
+  endgültigem Fehlschlag gibt `MistralBackend::answer` eine ehrliche
+  deutsche Fehlermeldung zurück statt zu paniken — die Trait-Signatur aus
+  Phase 1 (`fn answer(...) -> String`, jetzt `async fn`) kennt kein
+  `Result`.
+- **`ai/fallback.rs`**: `FallbackBackend` — versucht `MistralBackend`
+  zuerst (über dessen inhärente `try_answer(...) -> Result<...>`-Methode,
+  die den eigentlichen Erfolg/Fehlschlag kennt) und fällt bei jedem Fehler
+  (Netzwerk, alle Retries ausgeschöpft, HTTP-Fehler) transparent auf
+  `HeuristicBackend` zurück — der Nutzer bekommt nie eine rohe
+  Fehlermeldung. Vereinfachte Zwei-Stufen-Version des
+  `FallbackProvider`-Konzepts aus der Python-Referenz (`coding-jona/tarno`),
+  bewusst ohne generische Provider-Chain.
+- **`AiBackend`-Trait-Umstellung**: `fn answer(...)` → `async fn
+  answer(...)` (via `#[async_trait]`, da der Trait weiterhin als `Box<dyn
+  AiBackend + Send + Sync>` dynamisch dispatcht wird) — ein Netzwerk-Request
+  darf nicht blockierend im IPC-Handler laufen. `dispatch()` in `main.rs`
+  ist entsprechend jetzt `async fn` und wird in `ipc.rs` per `.await`
+  aufgerufen; kein neues Concurrency-Modell, derselbe `tokio`-Event-Loop
+  wie beim IPC-Server selbst.
+- **Backend-Wahl beim Start**: `AiState::from_vault(&vault)` prüft
+  `vault.get("MISTRAL_API_KEY")`. Ist ein nicht-leerer Key vorhanden, wird
+  `FallbackBackend::new(MistralBackend::new(key), Box::new(HeuristicBackend))`
+  aktiv; fehlt der Key, bleibt es bei reiner `HeuristicBackend` — **kein
+  Absturz, keine Fehlermeldung**, falls kein Key konfiguriert ist (die
+  M6700-Zielhardware hat nicht garantiert immer Internetzugang, und ein
+  fehlender Key ist der Normalfall vor der manuellen Einrichtung, siehe
+  unten). `Request::AiStatus`/`tarnoctl ai status` melden den aktiven Modus
+  über ein neues `mistral_configured`-Feld plus einen `mode_note`-Text, der
+  ohne Key auf die Einrichtung unten verweist.
+
+**Bewusste Vereinfachungen ggü. der Python-Referenz** (`coding-jona/tarno`,
+`mistral_client.py`/`provider.py`/`factory.py`) — kein Anspruch auf volle
+Parität in diesem ersten Rust-Cut:
+
+- Feste Default-RPS (0.8) statt einer Tabelle pro Modell.
+- Kein Streaming (`stream: false` fest) — `tarnoctl ai <frage...>` ist ein
+  einzelner Request/Response-Zyklus über den Unix-Socket, kein
+  interaktives Chat-REPL; als spätere Ausbaustufe denkbar.
+- Kein Function-/Tool-Calling.
+- Kein `reasoning_effort`-Parameter/Modell-Tuning.
+- Minimaler, knapper Prompt-Aufbau aus `SystemContext` (keine ausgefeilte
+  Prompt-Engineering-Schicht).
+- Nicht getestet: ein echter, erfolgreicher Roundtrip gegen die reale
+  Mistral-API — in der Entwicklungsumgebung dieser Änderung gab es weder
+  einen echten `MISTRAL_API_KEY` noch Netzwerkzugriff auf
+  `api.mistral.ai`. Getestet sind Payload-Aufbau, Response-Parsing (anhand
+  fester JSON-Fixtures), die Backoff-Berechnung (reine Funktion) und die
+  Fallback-Umschaltung (Mistral-Fehler → Heuristik) gegen einen lokalen,
+  garantiert nicht erreichbaren Endpoint.
+
+Ausdrücklich **nicht** Teil dieses ersten Cuts: das im Rahmen dieser
+Recherche/Umsetzung diskutierte spätere Ziel, Tarno AI als eigene
+Laufzeitabhängigkeit per gRPC an ein externes `tarno_backend` anzubinden
+(analog zur Python-Referenz-Architektur) — das bleibt ein möglicher
+späterer Schritt, hier bewusst nicht angegangen; der aktuelle Stand ruft
+Mistral direkt aus `tarnod` per `reqwest` auf, kein separater Prozess,
+kein RPC.
+
+### Mistral-API-Key einrichten
+
+Ohne konfigurierten Key läuft Tarno AI automatisch und ohne Fehler im
+Phase-1-Heuristik-Modus weiter (siehe oben, `AiState::from_vault`) — das
+Folgende ist optional, aber nötig, um Phase 2 tatsächlich zu aktivieren.
+
+**Ehrlicher Hinweis:** Tarno OS hat aktuell keinen First-Boot-/Setup-Wizard
+(keine GUI, kein interaktiver Installer-Schritt dafür) — das ist bewusst
+zurückgestellt (siehe `ROADMAP.md`, "Zurückgestellt — Desktop-/GUI-
+Erlebnis"). Die folgenden Schritte sind daher rein manuell/doku-getrieben,
+nicht automatisiert. Sobald Tarno OS einen echten Ersteinrichtungs-Ablauf
+bekommt, sollte das Setzen des Mistral-Keys ein interaktiver Schritt darin
+werden statt einer manuellen Dateibearbeitung.
+
+1. Auf [console.mistral.ai](https://console.mistral.ai/) registrieren
+   bzw. anmelden.
+2. Im Menü **"API Keys"** → **"Create API Key"** auswählen.
+3. Den erzeugten Key kopieren (wird nur einmal angezeigt).
+4. Den Key in die Vault-Datei eintragen, die `tarnod` beim Start liest
+   (`Vault::load_from_file`, siehe `tarnod/tarnod/src/vault.rs` und
+   `tarnod/tarnod/src/config.rs`) — Standardpfad `/etc/tarnod/secrets.conf`
+   (überschreibbar über die Umgebungsvariable `TARNOD_VAULT_PATH`),
+   root-only (`0600`), eine `KEY=VALUE`-Zeile pro Eintrag:
+
+   ```
+   MISTRAL_API_KEY=<dein-key>
+   ```
+
+5. `tarnod` neu starten, damit die Vault erneut eingelesen wird (die Vault
+   wird — wie alle Einträge — nur einmal beim Start gelesen, siehe
+   [`#api-key-vault`](#api-key-vault) oben).
+6. Prüfen: `tarnoctl ai status` sollte jetzt `"mistral_configured":true`
+   und den entsprechenden `mode_note`-Text zeigen statt des Hinweises auf
+   diese Anleitung.
 
 ### Phase 3 (nicht umgesetzt, nur dokumentiert): Security-Intelligenz
 

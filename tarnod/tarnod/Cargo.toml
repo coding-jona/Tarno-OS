@@ -17,6 +17,9 @@ libc.workspace = true
 anyhow.workspace = true
 tarnod-protocol.workspace = true
 tarnod-guard = { path = "../../tarno-guard-ebpf/tarnod-guard", optional = true }
+# Tarno-AI-Phase-2 (Mistral-API-Backend): siehe ai/mistral.rs.
+reqwest.workspace = true
+async-trait.workspace = true
 
 [features]
 default = []

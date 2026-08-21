@@ -28,8 +28,13 @@ pub struct AppState {
 }
 
 /// Verarbeitet eine einzelne Anfrage gegen den aktuellen Daemon-Zustand.
-/// Reine Funktion (kein IO-Framework-Bezug) — leicht testbar, siehe unten.
-pub fn dispatch(state: &AppState, req: Request) -> Response {
+/// Reine Funktion (kein IO-Framework-Bezug, außer dem für `AiQuery` nötigen
+/// `.await` seit Tarno-AI-Phase-2) — leicht testbar, siehe unten. `async`
+/// seit Phase 2, weil `AiState::answer` bei aktivem Mistral-Backend einen
+/// Netzwerk-Request macht; `ipc.rs`s `handle_client` ist bereits `async`,
+/// daher passt ein `.await` hier ohne neues Concurrency-Modell (siehe
+/// docs/month3-tarno-layer.md#ipc-design).
+pub async fn dispatch(state: &AppState, req: Request) -> Response {
     match req {
         Request::Ping => Response::ok(serde_json::json!("pong")),
         Request::GetGamingMode => match state.gaming.isolated_cpus() {
@@ -56,17 +61,36 @@ pub fn dispatch(state: &AppState, req: Request) -> Response {
         },
         Request::AiQuery { text } => {
             let ctx = ai::backend::SystemContext::gather(&state.gaming);
-            let answer = state.ai.answer(&text, &ctx);
+            let answer = state.ai.answer(&text, &ctx).await;
             Response::ok(serde_json::json!({ "answer": answer }))
         }
         Request::AiStatus => {
             let ctx = ai::backend::SystemContext::gather(&state.gaming);
+            let mistral_configured = state.ai.mistral_configured();
+            // Ohne konfigurierten Mistral-Key läuft Tarno AI im reinen
+            // Heuristik-Modus — das soll für `tarnoctl ai status` sofort
+            // erkennbar sein, inklusive eines Zeigers auf die Setup-Doku,
+            // statt den Nutzer raten zu lassen, warum Antworten "einfach"
+            // bleiben. Siehe docs/month3-tarno-layer.md#mistral-api-key-einrichten.
+            let mode_note = if mistral_configured {
+                "Tarno AI läuft im Mistral-Modus (Phase 2) mit Heuristik-Fallback bei Netzwerk-/API-Fehlern.".to_string()
+            } else {
+                format!(
+                    "Kein {} in der Vault konfiguriert — Tarno AI läuft im \
+                     Heuristik-Modus (Phase 1). Siehe \
+                     docs/month3-tarno-layer.md#mistral-api-key-einrichten \
+                     für die Einrichtung.",
+                    ai::MISTRAL_API_KEY_NAME
+                )
+            };
             Response::ok(serde_json::json!({
                 "gaming_mode_active": ctx.gaming_mode_active,
                 "isolated_cpus": ctx.isolated_cpus,
                 "ebpf_active": ctx.ebpf_active,
                 "mem_total_kb": ctx.mem_total_kb,
                 "mem_available_kb": ctx.mem_available_kb,
+                "mistral_configured": mistral_configured,
+                "mode_note": mode_note,
             }))
         }
         Request::AiSuggestions => {
@@ -90,11 +114,15 @@ fn main() -> anyhow::Result<()> {
     };
 
     let gaming = GamingController::new(config.dry_run);
+    // `AiState::from_vault` wählt Mistral+Fallback (Phase 2) vs. reine
+    // Heuristik (Phase 1) je nachdem, ob MISTRAL_API_KEY in der Vault
+    // steht — siehe docs/month3-tarno-layer.md#mistral-api-key-einrichten.
+    let ai = AiState::from_vault(&vault);
     let state = Arc::new(AppState {
         vault,
         gaming,
         config,
-        ai: AiState::new(),
+        ai,
     });
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -123,6 +151,11 @@ mod tests {
     use std::path::PathBuf;
 
     fn state_with_vault(vault: Vault) -> AppState {
+        // `AiState::from_vault` statt `AiState::new()`, damit Tests, die
+        // gezielt einen MISTRAL_API_KEY in der Vault setzen (siehe unten),
+        // auch tatsächlich das erwartete Backend/den erwarteten
+        // AiStatus-Modus sehen.
+        let ai = AiState::from_vault(&vault);
         AppState {
             vault,
             gaming: GamingController::new(true),
@@ -132,80 +165,100 @@ mod tests {
                 vault_path: PathBuf::from("/nonexistent"),
                 dry_run: true,
             },
-            ai: AiState::new(),
+            ai,
         }
     }
 
-    #[test]
-    fn dispatch_ping_returns_pong() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_ping_returns_pong() {
         let state = state_with_vault(Vault::default());
-        let resp = dispatch(&state, Request::Ping);
+        let resp = dispatch(&state, Request::Ping).await;
         assert!(matches!(resp, Response::Ok { .. }));
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("pong"));
     }
 
-    #[test]
-    fn dispatch_get_api_key_found() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_get_api_key_found() {
         let state = state_with_vault(Vault::parse("SECRET=hunter2\n"));
         let resp = dispatch(
             &state,
             Request::GetApiKey {
                 name: "SECRET".into(),
             },
-        );
+        )
+        .await;
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("hunter2"));
     }
 
-    #[test]
-    fn dispatch_get_api_key_missing_returns_error() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_get_api_key_missing_returns_error() {
         let state = state_with_vault(Vault::default());
         let resp = dispatch(
             &state,
             Request::GetApiKey {
                 name: "MISSING".into(),
             },
-        );
+        )
+        .await;
         assert!(matches!(resp, Response::Error { .. }));
     }
 
-    #[test]
-    fn dispatch_security_status_reflects_feature_flag() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_security_status_reflects_feature_flag() {
         let state = state_with_vault(Vault::default());
-        let resp = dispatch(&state, Request::SecurityStatus);
+        let resp = dispatch(&state, Request::SecurityStatus).await;
         let s = serde_json::to_string(&resp).unwrap();
         // Ohne "ebpf"-Feature (Default-Build) muss dies false sein.
         assert!(s.contains("\"ebpf_active\":false") || cfg!(feature = "ebpf"));
     }
 
-    #[test]
-    fn dispatch_ai_query_returns_grounded_answer() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_ai_query_returns_grounded_answer() {
         let state = state_with_vault(Vault::default());
         let resp = dispatch(
             &state,
             Request::AiQuery {
                 text: "ist gaming mode an?".into(),
             },
-        );
+        )
+        .await;
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("\"status\":\"ok\""));
         assert!(s.contains("Gaming-Mode"));
     }
 
-    #[test]
-    fn dispatch_ai_status_returns_system_context() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_ai_status_returns_system_context() {
         let state = state_with_vault(Vault::default());
-        let resp = dispatch(&state, Request::AiStatus);
+        let resp = dispatch(&state, Request::AiStatus).await;
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("gaming_mode_active"));
         assert!(s.contains("ebpf_active"));
     }
 
-    #[test]
-    fn dispatch_ai_suggestions_starts_empty() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_ai_status_reports_heuristic_mode_without_mistral_key() {
         let state = state_with_vault(Vault::default());
-        let resp = dispatch(&state, Request::AiSuggestions);
+        let resp = dispatch(&state, Request::AiStatus).await;
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("\"mistral_configured\":false"));
+        assert!(s.contains("mistral-api-key-einrichten"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_ai_status_reports_mistral_mode_when_key_configured() {
+        let state = state_with_vault(Vault::parse("MISTRAL_API_KEY=test-key-123\n"));
+        let resp = dispatch(&state, Request::AiStatus).await;
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("\"mistral_configured\":true"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_ai_suggestions_starts_empty() {
+        let state = state_with_vault(Vault::default());
+        let resp = dispatch(&state, Request::AiSuggestions).await;
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("\"suggestions\":[]"));
     }

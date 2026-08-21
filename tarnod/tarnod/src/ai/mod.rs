@@ -3,13 +3,23 @@
 //! Geschwister-Modul von `gaming.rs`, `security/`, `vault.rs`.
 
 pub mod backend;
+pub mod fallback;
 pub mod heuristic;
+pub mod mistral;
 pub mod tuning;
 
 use std::sync::Mutex;
 
 use backend::AiBackend;
+use fallback::FallbackBackend;
 use heuristic::HeuristicBackend;
+use mistral::MistralBackend;
+
+/// Name des Vault-Eintrags, unter dem der Mistral-API-Key erwartet wird —
+/// dieselbe generische `KEY=VALUE`-Vault wie für `MOJANG_API_KEY` (siehe
+/// `vault.rs`). Siehe auch
+/// docs/month3-tarno-layer.md#mistral-api-key-einrichten.
+pub const MISTRAL_API_KEY_NAME: &str = "MISTRAL_API_KEY";
 
 /// Maximale Anzahl gespeicherter Tuning-Vorschläge — der Daemon läuft
 /// dauerhaft, die Queue darf nicht unbegrenzt wachsen. Älteste Einträge
@@ -28,18 +38,57 @@ const MAX_SUGGESTIONS: usize = 50;
 pub struct AiState {
     backend: Box<dyn AiBackend + Send + Sync>,
     suggestions: Mutex<Vec<String>>,
+    /// Ob beim Start ein `MISTRAL_API_KEY` in der Vault gefunden wurde
+    /// (Phase-2-Modus aktiv) oder nicht (Phase-1-Heuristik-Modus). Für
+    /// `Request::AiStatus`/`tarnoctl ai status`, siehe `main.rs`.
+    mistral_configured: bool,
 }
 
 impl AiState {
+    /// Baut `AiState` ohne Vault-Zugriff — immer Phase-1-Heuristik-Modus.
+    /// Bleibt für bestehende Aufrufer/Tests erhalten, die keinen `Vault`
+    /// zur Hand haben; der reale Startpfad (`main.rs`) nutzt `from_vault`.
     pub fn new() -> Self {
         Self {
             backend: Box::new(HeuristicBackend),
             suggestions: Mutex::new(Vec::new()),
+            mistral_configured: false,
         }
     }
 
-    pub fn answer(&self, question: &str, ctx: &backend::SystemContext) -> String {
-        self.backend.answer(question, ctx)
+    /// Baut `AiState` und wählt das Backend anhand der Vault: ist
+    /// `MISTRAL_API_KEY` gesetzt und nicht leer, wird
+    /// `FallbackBackend(MistralBackend -> HeuristicBackend)` aktiv (Phase 2
+    /// mit Netzwerk-/API-Fallback), sonst bleibt es bei reiner
+    /// `HeuristicBackend` (Phase 1) — kein Absturz, kein Fehler, falls kein
+    /// Key konfiguriert ist. Siehe
+    /// docs/month3-tarno-layer.md#mistral-api-key-einrichten.
+    pub fn from_vault(vault: &crate::vault::Vault) -> Self {
+        match vault.get(MISTRAL_API_KEY_NAME).filter(|k| !k.is_empty()) {
+            Some(key) => Self {
+                backend: Box::new(FallbackBackend::new(
+                    MistralBackend::new(key.to_string()),
+                    Box::new(HeuristicBackend),
+                )),
+                suggestions: Mutex::new(Vec::new()),
+                mistral_configured: true,
+            },
+            None => Self {
+                backend: Box::new(HeuristicBackend),
+                suggestions: Mutex::new(Vec::new()),
+                mistral_configured: false,
+            },
+        }
+    }
+
+    pub async fn answer(&self, question: &str, ctx: &backend::SystemContext) -> String {
+        self.backend.answer(question, ctx).await
+    }
+
+    /// Ob Tarno AI im Phase-2-Modus (Mistral konfiguriert) oder im
+    /// Phase-1-Heuristik-Modus läuft — für `Request::AiStatus`.
+    pub fn mistral_configured(&self) -> bool {
+        self.mistral_configured
     }
 
     /// Fügt einen Vorschlag hinzu, kappt die Queue auf `MAX_SUGGESTIONS`

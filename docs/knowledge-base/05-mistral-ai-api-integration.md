@@ -1,11 +1,15 @@
 # Mistral AI API — Recherche für Tarno-AI-Phase-2
 
 Wie [`04-tarno-os-debian-migration-notes.md`](04-tarno-os-debian-migration-notes.md)
-für die Debian-Migration: reine Recherche, **kein Code geändert**. Diese
-Datei entsteht bewusst *vor* der Phase-2-Implementierung von Tarno AI
-(siehe [`../month3-tarno-layer.md`](../month3-tarno-layer.md#phase-2-nicht-umgesetzt-nur-dokumentiert-mistral-ai-api-backend)),
-weil Phase 1 (heuristisches Backend) keinerlei Netzwerk-/API-Wissen
-brauchte und Phase 2 das grundlegend ändert.
+für die Debian-Migration entstand dieses Dokument zunächst als reine
+Recherche *vor* jeglichem Phase-2-Code, weil Phase 1 (heuristisches
+Backend) keinerlei Netzwerk-/API-Wissen brauchte und Phase 2 das
+grundlegend ändert. **Update:** der erste Phase-2-Cut ist inzwischen
+umgesetzt — siehe
+[`../month3-tarno-layer.md`](../month3-tarno-layer.md#phase-2-erster-cut-umgesetzt-mistral-ai-api-backend)
+für Code/Architektur/Testabdeckung. Der Abschnitt "Offene Fragen" unten ist
+entsprechend nicht mehr offen, sondern zeigt, was tatsächlich entschieden
+wurde.
 
 **Kurskorrektur gegenüber der ursprünglichen Phase-2-Planung:** die erste
 Fassung dieses Dokuments (inzwischen überholt) ging von einem lokal
@@ -113,18 +117,45 @@ Quellen: [crates.io/mistralai-client](https://crates.io/crates/mistralai-client)
   `tarnoctl ai <frage>` sollte das im Response klar erkennbar machen,
   z. B. welches Backend geantwortet hat).
 
-## Offene Fragen für die eigentliche Phase-2-Umsetzung (nicht hier beantwortet)
+## Offene Fragen — wie sie in der Umsetzung tatsächlich beantwortet wurden
 
-- Crate-Wahl (`mistralai-client` vs. eigener schlanker `reqwest`-Call).
-- Konkretes Fallback-/Timeout-Verhalten (`HeuristicBackend` als
-  Rückfallebene, wenn `MistralBackend` fehlschlägt — Reihenfolge, nicht
-  nur Ersatz).
-- Wie System-Kontext (`SystemContext`, siehe Phase 1) in den
-  `messages`-Payload übersetzt wird (z. B. als System-Prompt mit
-  eingebettetem Live-Status), ohne bei jeder Anfrage unnötig viele Tokens
-  zu verbrauchen.
-- Rate-Limit-Handling gegenüber dem 2-RPM-Experiment-Tier während der
-  Entwicklung.
+Diese Fragen waren bewusst offengelassen, um in die Implementierungsarbeit
+selbst zu gehören statt in die Recherche-Phase. Mit dem ersten Phase-2-Cut
+(`tarnod/tarnod/src/ai/mistral.rs`, `ai/fallback.rs`) sind sie beantwortet:
 
-Diese Fragen sind bewusst offengelassen — sie gehören in die
-Implementierungsarbeit selbst, nicht in die Recherche-Phase.
+- **Crate-Wahl**: entschieden für den eigenen schlanken `reqwest`-Call,
+  nicht eine der drei recherchierten Mistral-Crates
+  (`mistralai-client`/`mistral-rouille`/`mistral-api`). Begründung: für
+  einen einzelnen Chat-Completion-Call pro `AiQuery` bringt keine der
+  Crates einen Vorteil, der die Zusatz-Abhängigkeit (inkl. deren eigener
+  transitiver Abhängigkeiten) rechtfertigt — `reqwest` selbst (mit
+  `rustls-tls`, kein System-OpenSSL) ist bereits die einzige wirklich neue
+  schwergewichtige Abhängigkeit in diesem Cut.
+- **Fallback-/Timeout-Verhalten**: `FallbackBackend` (`ai/fallback.rs`) —
+  eine feste, einfache Zwei-Stufen-Kette Mistral → Heuristik, kein
+  generischer `Vec<Box<dyn AiBackend>>`-Chain wie im Python-Original
+  (`FallbackProvider`). `MistralBackend::try_answer` liefert intern ein
+  `Result`, das `FallbackBackend` auswertet, um zu entscheiden, ob auf
+  `HeuristicBackend` umgeschaltet wird — nach außen (`AiBackend::answer`)
+  bleibt es bei `String`, wie in Phase 1 festgelegt. Retry/Backoff: 429
+  respektiert `Retry-After` (gedeckelt), sonst exponentielles Backoff;
+  begrenzte Versuchszahl für 429 und separat für 5xx/Netzwerkfehler, siehe
+  Code-Kommentare in `mistral.rs`.
+- **System-Kontext im Payload**: als knapper System-Prompt-Satz
+  (`ai::mistral::system_prompt`) — Gaming-Mode-Status, isolierte CPUs,
+  eBPF-Status, RAM-Auslastung in einem Satz, keine ausführliche
+  Prompt-Engineering-Schicht. Bewusst minimal gehalten, um Tokens zu
+  sparen (`max_tokens` der Antwort selbst ist ebenfalls auf 512 gedeckelt).
+- **Rate-Limit-Handling**: ein fester Default-Limiter (0.8 Requests/
+  Sekunde, angelehnt an den von Mistral für das Standardmodell
+  veröffentlichten Durchsatz) statt der vollständigen Per-Modell-RPS-
+  Tabelle aus der Python-Referenz — für Tarno AIs Anwendungsfall (ein
+  einziges festes Modell, `mistral-small-latest`) reicht das; die
+  Tabellen-Variante wäre für diesen ersten Rust-Cut Over-Engineering
+  gewesen (siehe Kommentar in `mistral.rs`).
+
+**Nicht angegangen, bewusst außerhalb dieses Cuts:** die perspektivische
+Anbindung von Tarno AI als eigene Laufzeitabhängigkeit per gRPC an ein
+externes `tarno_backend` (analog zur Python-Referenz-Architektur aus
+`coding-jona/tarno`) — der aktuelle Stand ruft Mistral direkt aus `tarnod`
+per `reqwest` auf, ohne separaten Prozess/RPC-Layer.

@@ -3,6 +3,8 @@
 //! Phase-2-LLM-Backend (siehe docs/month3-tarno-layer.md#tarno-ai) denselben
 //! Trait implementieren kann, ohne `dispatch()` in main.rs anzufassen.
 
+use async_trait::async_trait;
+
 use crate::gaming::GamingController;
 
 /// Live-Zustand des Systems, wie ihn Tarno AI für eine Antwort/einen
@@ -50,9 +52,18 @@ impl SystemContext {
 
 /// Ein Tarno-AI-Backend beantwortet eine Freitextfrage anhand des aktuellen
 /// System-Kontexts. Phase 1 (`heuristic.rs`) mustererkennt bekannte Fragen,
-/// ein künftiges Phase-2-Backend (siehe docs/month3-tarno-layer.md) könnte
-/// stattdessen ein lokales LLM befragen — beide implementieren denselben
-/// Trait, `AiState`/`dispatch()` bleiben unverändert.
-pub trait AiBackend {
-    fn answer(&self, question: &str, ctx: &SystemContext) -> String;
+/// Phase 2 (`mistral.rs`) befragt stattdessen die Mistral-AI-Cloud-API —
+/// beide implementieren denselben Trait, `AiState`/`dispatch()` bleiben
+/// unverändert.
+///
+/// `async fn` statt `fn` (Umstellung ggü. Phase 1): ein Netzwerk-Request
+/// (Mistral) darf nicht blockierend im IPC-Handler laufen. `#[async_trait]`
+/// statt eines nativen `async fn` im Trait, weil der Trait als
+/// `Box<dyn AiBackend + Send + Sync>` dynamisch dispatcht wird (native
+/// async-fn-in-trait ist dafür in dieser Edition noch nicht ergonomisch
+/// nutzbar) — `HeuristicBackend` braucht dafür kein echtes `.await` intern,
+/// `async_trait` macht daraus einfach einen sofort auflösenden Future.
+#[async_trait]
+pub trait AiBackend: Send + Sync {
+    async fn answer(&self, question: &str, ctx: &SystemContext) -> String;
 }
