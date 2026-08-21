@@ -108,7 +108,8 @@ schreiben, am M6700 tatsächlich booten, Ergebnis hier nachtragen.
 ### Compositor: `cage`
 - `cage` ist ein Kiosk-Wayland-Compositor, der genau eine Anwendung fullscreen startet — passt exakt zu "Direct-Fullscreen ohne Desktop-Overhead".
 - Buildroot-Package `BR2_PACKAGE_CAGE` (sofern in der gewählten Buildroot-Version vorhanden; sonst als eigenes Package im `tarno-br2-external`-Tree ergänzen, analog zum `tarnod`-Package-Pattern).
-- Start: `cage -- /opt/jdk/bin/java -jar minecraft-launcher.jar` (bzw. über `scripts/jvm-launch.sh`, siehe [`month2-gaming-tuning.md`](month2-gaming-tuning.md)).
+- Start: `WLR_NO_HARDWARE_CURSORS=1 cage -- /opt/jdk/bin/java -jar minecraft-launcher.jar` (bzw. über `scripts/jvm-launch.sh`, siehe [`month2-gaming-tuning.md`](month2-gaming-tuning.md)).
+- **`WLR_NO_HARDWARE_CURSORS=1` vorsorglich gesetzt**, auch ohne aktuellen Multi-Monitor-Betrieb: bekannter wlroots-Bug, bei dem der Mauszeiger beim Wechsel zwischen mehreren Outputs (unterschiedliche Auflösung/Skalierung/Refresh-Rate) an der Hardware-Cursor-Plane hängen bleibt/stockt — live bestätigt auf einem KDE/KWin-System (dort behoben über `KWIN_CURSOR_FORCE_SOFTWARE=1`, den KWin-eigenen Namen für denselben Software-Cursor-Workaround). `WLR_NO_HARDWARE_CURSORS` ist die generische wlroots-Variable für exakt dasselbe Prinzip (erzwingt Software- statt Hardware-Cursor-Rendering) und gilt für jeden wlroots-basierten Compositor, also auch `cage`. Kostet minimal CPU (Cursor wird pro Frame mit-compositiert statt per Hardware-Plane verschoben) — auf einem einzelnen Fullscreen-Output ohnehin kaum messbar, deshalb schon jetzt Standard statt erst bei Bedarf nachzurüsten.
 
 **Meilenstein-Abnahmekriterium:** `java -version` liefert die erwartete Version, Minecraft startet in `cage` fullscreen, Baseline-FPS wird mit `scripts/benchmark.sh` (siehe Monat 2) protokolliert.
 
