@@ -85,32 +85,33 @@ Tuning-Regel (`ai::tuning::evaluate`, isoliert von Timer/IO testbar), für
 drei neuen `Request`-Varianten in `tarnod-protocol` — im selben
 `#[cfg(test)]`-Stil wie der Rest des Codebase.
 
-### Phase 2 (nicht umgesetzt, nur dokumentiert): lokales LLM-Backend
+### Phase 2 (nicht umgesetzt, nur dokumentiert): Mistral-AI-API-Backend
 
-Eine neue, optionale Crate `tarnod/tarnod-ai/` würde als
-Workspace-Mitglied ergänzt (siehe reservierter Kommentar in
-`tarnod/Cargo.toml`), aber **nicht** als Default-Member — genau das
-Muster, mit dem früher `tarnod-ui` ausgeschlossen war, bevor es entfernt
-wurde. Eingebunden in `tarnod` über ein neues optionales Cargo-Feature
-`ai-llm`, das exakt so verdrahtet würde wie das bestehende `ebpf`-Feature
-den `tarnod-guard`-Pfad-Dependency einbindet (`Cargo.toml`:
-`tarnod-ai = { path = "../tarnod-ai", optional = true }`,
-`ai-llm = ["dep:tarnod-ai"]`).
+**Kurskorrektur:** die ursprüngliche Phase-2-Planung ging von einem
+lokal laufenden, quantisierten LLM aus (`candle`, GGUF, 1-3B Parameter,
+mit den entsprechenden Hardware-Grenzen der M6700-Zielhardware). Das ist
+verworfen — Tarno AI läuft stattdessen auf **Mistral-AI-Cloud-Modellen
+über deren REST-API**, angesprochen mit einem API-Key. Kein lokales
+Modell, keine Q4-Quantisierung, keine CPU-Inferenz-Latenz auf der
+Zielhardware. Vollständige Recherche dazu (API-Schema, Modelle/Kosten,
+Rust-Crate-Optionen, Anbindung an Bestehendes):
+[`docs/knowledge-base/05-mistral-ai-api-integration.md`](knowledge-base/05-mistral-ai-api-integration.md)
+— bewusst *vor* jeglichem Phase-2-Code entstanden, noch offen sind dort
+nur die reinen Implementierungsdetails (Crate-Wahl, Fallback-/
+Timeout-Verhalten, Prompt-Aufbau aus `SystemContext`), keine
+Grundsatzfragen mehr.
 
-Empfehlung für die Inferenz-Bibliothek: **`candle`**
-(huggingface/candle) statt `llama.cpp`-Bindings — reines Rust, kein
-C++-Toolchain-Dependency im Build, aus derselben Begründung, mit der
-dieses Dokument bereits `aya` statt libbpf-C für die eBPF-Anbindung
-gewählt hat (siehe oben, "Sprache/Runtime: Rust").
-
-Hardware-Realität, ehrlich benannt statt schöngeredet: die Zielhardware
-(Dell Precision M6700) ist eine Laptop-CPU aus der Ivy-Bridge-Generation
-ohne dedizierte KI-Beschleunigung. Realistisch ist ein kleines,
-quantisiertes Modell — **1 bis 3 Milliarden Parameter, Q4-Quantisierung
-(GGUF-Format-Klasse)** — mit entsprechend begrenzten Fähigkeiten
-(einfache Frage-Antwort-Muster, kein komplexes Reasoning, spürbare
-Latenz auf CPU-only-Inferenz). Das ist eine reale Hardware-Grenze dieses
-Zielsystems, kein Implementierungsdetail, das sich wegoptimieren ließe.
+Kurzfassung: Auth über `Authorization: Bearer $MISTRAL_API_KEY` gegen
+`https://api.mistral.ai/v1/chat/completions`; der Key landet in der
+bereits existierenden `Vault` (`tarnod/tarnod/src/vault.rs`) — exakt
+dieselbe generische `KEY=VALUE`-Mechanik, mit der heute schon z. B.
+`MOJANG_API_KEY` gespeichert wird, keine Änderung an `vault.rs` nötig.
+Ein `MistralBackend` würde den bestehenden `AiBackend`-Trait aus Phase 1
+implementieren (Anpassung auf `async fn` statt `fn` nötig, da ein
+Netzwerk-Request nicht blockierend im IPC-Handler laufen soll) und
+braucht einen sauberen Fallback auf `HeuristicBackend`, wenn kein Netz
+da ist oder die API fehlschlägt — die M6700-Zielhardware hat nicht
+garantiert immer Internetzugang.
 
 ### Phase 3 (nicht umgesetzt, nur dokumentiert): Security-Intelligenz
 

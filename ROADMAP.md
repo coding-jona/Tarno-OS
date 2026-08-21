@@ -81,12 +81,13 @@ umgesetzt** ist:
   bzw. die neuen `AiQuery`/`AiStatus`/`AiSuggestions`-IPC-Requests. Mit
   Unit-Tests abgedeckt.
 - **Phase 2 (nicht in dieser Session umgesetzt, nur dokumentiert):**
-  austauschbares lokales LLM-Backend in einer neuen, optionalen Crate
-  `tarnod/tarnod-ai/` (Cargo-Feature `ai-llm`, analog zum bestehenden
-  `ebpf`-Feature) — geplant mit `candle` (reines Rust, kein C++-
-  Toolchain-Dep, aus demselben Grund wie `aya` statt libbpf-C), kleines
-  quantisiertes 1-3B-Parameter-Modell (Q4) als realistische
-  Hardware-Grenze für den M6700.
+  austauschbares Backend, das **Mistral-AI-Cloud-Modelle über deren
+  REST-API** anspricht (API-Key, Bearer-Auth gegen
+  `api.mistral.ai/v1/chat/completions`) — kein lokales LLM. API-Key landet
+  in der bestehenden `Vault`, kein neuer Speichermechanismus. Volle
+  Recherche (Kurskorrektur gegenüber der ursprünglich geplanten
+  lokalen-`candle`-Lösung, Modelle/Kosten, Rust-Crate-Optionen):
+  [`docs/knowledge-base/05-mistral-ai-api-integration.md`](docs/knowledge-base/05-mistral-ai-api-integration.md).
 - **Phase 3 (nicht in dieser Session umgesetzt, nur dokumentiert):**
   `security::ebpf_loader`-Event-Stream zusätzlich in `SystemContext`/
   `AiState` einspeisen, damit die Assistenz auch über jüngste
@@ -150,7 +151,7 @@ künftiger Ort dafür: `docs/knowledge-base/`.
 | Core-Isolation | isolcpus, cset, sched_setaffinity |
 | Security-Monitoring | eBPF |
 | Daemon | Rust oder C++ (nativ, kein Electron) |
-| Tarno AI | phasenweise, in `tarnod` integriert (`candle` für ein künftiges LLM-Backend) — Details siehe [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md) |
+| Tarno AI | phasenweise, in `tarnod` integriert (Mistral-AI-API für ein künftiges Cloud-Backend, siehe [`docs/knowledge-base/05-mistral-ai-api-integration.md`](docs/knowledge-base/05-mistral-ai-api-integration.md)) — Details siehe [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md) |
 | Festplatten-Installer | `tarno-disk-installer` (Rust) — sfdisk/mkfs.vfat/mkfs.ext4/rsync/extlinux, zurückgestellt, siehe [`docs/month4-full-os.md`](docs/month4-full-os.md) |
 | Updates + App-Marktplatz | ein gemeinsamer `opkg`-basierter Paketmanager statt zwei getrennter Systeme, zurückgestellt |
 | Terminal | `foot` (Wayland-natives Standardwerkzeug, kein Eigenbau), zurückgestellt |

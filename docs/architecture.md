@@ -56,7 +56,7 @@ Dieses Dokument beschreibt die technische Gesamtarchitektur der in [`ROADMAP.md`
 - `ai/heuristic.rs`: Phase-1-Backend `HeuristicBackend` — mustererkennt bekannte Fragenformen (Gaming-Mode/RAM/Security-Status) und antwortet templated anhand von echtem, live gelesenem `SystemContext`. Kein LLM, kein generativer Text, daher auch keine Halluzinationsgefahr.
 - `ai/tuning.rs`: eigener `tokio::spawn`'ter Endlos-Task (analog zum eBPF-RingBuf-Poller), pollt alle 30s RAM- und Gaming-Mode-Status und pusht bei einer einfachen Regel-Verletzung (z. B. RAM knapp bei inaktivem Gaming-Mode) einen Vorschlag in `AiState`s Suggestions-Queue.
 - IPC: `Request::AiQuery{text}`, `Request::AiStatus`, `Request::AiSuggestions` in `tarnod-protocol`, per `tarnoctl ai <status|suggestions|<frage...>>` erreichbar.
-- Details, Testabdeckung und der ehrliche Phase-2/3-Ausblick (lokales LLM via `candle`, Security-Event-Integration): [`month3-tarno-layer.md`](month3-tarno-layer.md#tarno-ai).
+- Details, Testabdeckung und der ehrliche Phase-2/3-Ausblick (Mistral-AI-API-Backend statt lokalem LLM, Security-Event-Integration): [`month3-tarno-layer.md`](month3-tarno-layer.md#tarno-ai).
 
 ### `tarno-guard-ebpf` (Behavioral Security)
 - Eigenständiger 3-Crate-Workspace (Kernel-Space-Programm + Common-Types + Userspace-Loader-Lib), von `tarnod` als optionales Cargo-Feature `ebpf` eingebunden.
