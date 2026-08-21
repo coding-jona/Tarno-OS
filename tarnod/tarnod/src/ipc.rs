@@ -94,6 +94,7 @@ mod tests {
                 vault_path: PathBuf::from("/nonexistent"),
                 dry_run: true,
             },
+            ai: crate::ai::AiState::new(),
         })
     }
 

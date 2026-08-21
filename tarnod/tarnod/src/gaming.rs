@@ -102,6 +102,23 @@ impl GamingController {
         Ok(())
     }
 
+    /// Liest den aktuell gesetzten CPU-Governor des ersten gefundenen Cores
+    /// (alle Cores werden von `set_governor` immer gemeinsam umgeschaltet,
+    /// daher reicht ein Core als Repräsentant). Wird u.a. von Tarno AI
+    /// genutzt, um "ist Gaming-Mode an"-Fragen faktisch zu beantworten
+    /// (siehe `ai/backend.rs`).
+    pub fn current_governor(&self) -> Result<String, GamingError> {
+        let paths = self.cpu_governor_paths()?;
+        let path = paths.first().ok_or_else(|| {
+            GamingError::NotAvailable(
+                "keine cpufreq/scaling_governor-Pfade gefunden (in virtualisierten \
+                 Umgebungen ohne cpufreq-Treiber normal)"
+                    .into(),
+            )
+        })?;
+        Ok(fs::read_to_string(path)?.trim().to_string())
+    }
+
     /// Setzt den Transparent-HugePages-Modus (empfohlen: "madvise", siehe
     /// docs/month2-gaming-tuning.md#transparent-hugepages-thp).
     pub fn set_thp_mode(&self, mode: &str) -> Result<(), GamingError> {
@@ -148,5 +165,13 @@ mod tests {
         // echter Schreibversuch (dry_run loggt nur).
         let _ = ctl.isolated_cpus();
         let _ = ctl.set_governor("performance");
+    }
+
+    #[test]
+    fn current_governor_does_not_panic_without_hardware() {
+        // Wie oben: NotAvailable ist in Sandboxen ohne cpufreq ein gültiges
+        // Ergebnis, kein Testfehler.
+        let ctl = GamingController::new(true);
+        let _ = ctl.current_governor();
     }
 }

@@ -4,6 +4,7 @@
 //! und (mit Feature `ebpf`) das Behavioral-Security-Subsystem. Architektur:
 //! docs/architecture.md.
 
+mod ai;
 mod config;
 mod gaming;
 mod ipc;
@@ -13,6 +14,7 @@ mod vault;
 
 use std::sync::Arc;
 
+use ai::AiState;
 use config::Config;
 use gaming::GamingController;
 use tarnod_protocol::{Request, Response};
@@ -22,6 +24,7 @@ pub struct AppState {
     pub vault: Vault,
     pub gaming: GamingController,
     pub config: Config,
+    pub ai: AiState,
 }
 
 /// Verarbeitet eine einzelne Anfrage gegen den aktuellen Daemon-Zustand.
@@ -51,6 +54,24 @@ pub fn dispatch(state: &AppState, req: Request) -> Response {
             Ok(()) => Response::ok(serde_json::json!({ "resumed": pid })),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::AiQuery { text } => {
+            let ctx = ai::backend::SystemContext::gather(&state.gaming);
+            let answer = state.ai.answer(&text, &ctx);
+            Response::ok(serde_json::json!({ "answer": answer }))
+        }
+        Request::AiStatus => {
+            let ctx = ai::backend::SystemContext::gather(&state.gaming);
+            Response::ok(serde_json::json!({
+                "gaming_mode_active": ctx.gaming_mode_active,
+                "isolated_cpus": ctx.isolated_cpus,
+                "ebpf_active": ctx.ebpf_active,
+                "mem_total_kb": ctx.mem_total_kb,
+                "mem_available_kb": ctx.mem_available_kb,
+            }))
+        }
+        Request::AiSuggestions => {
+            Response::ok(serde_json::json!({ "suggestions": state.ai.suggestions() }))
+        }
     }
 }
 
@@ -73,6 +94,7 @@ fn main() -> anyhow::Result<()> {
         vault,
         gaming,
         config,
+        ai: AiState::new(),
     });
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -88,6 +110,9 @@ fn main() -> anyhow::Result<()> {
                 }
             });
         }
+        // Tarno-AI-Tuning-Task: läuft unabhängig vom `ebpf`-Feature, siehe
+        // ai/tuning.rs und docs/month3-tarno-layer.md#tarno-ai.
+        tokio::spawn(ai::tuning::run(Arc::clone(&state)));
         ipc::serve(state).await
     })
 }
@@ -107,6 +132,7 @@ mod tests {
                 vault_path: PathBuf::from("/nonexistent"),
                 dry_run: true,
             },
+            ai: AiState::new(),
         }
     }
 
@@ -151,5 +177,36 @@ mod tests {
         let s = serde_json::to_string(&resp).unwrap();
         // Ohne "ebpf"-Feature (Default-Build) muss dies false sein.
         assert!(s.contains("\"ebpf_active\":false") || cfg!(feature = "ebpf"));
+    }
+
+    #[test]
+    fn dispatch_ai_query_returns_grounded_answer() {
+        let state = state_with_vault(Vault::default());
+        let resp = dispatch(
+            &state,
+            Request::AiQuery {
+                text: "ist gaming mode an?".into(),
+            },
+        );
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("\"status\":\"ok\""));
+        assert!(s.contains("Gaming-Mode"));
+    }
+
+    #[test]
+    fn dispatch_ai_status_returns_system_context() {
+        let state = state_with_vault(Vault::default());
+        let resp = dispatch(&state, Request::AiStatus);
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("gaming_mode_active"));
+        assert!(s.contains("ebpf_active"));
+    }
+
+    #[test]
+    fn dispatch_ai_suggestions_starts_empty() {
+        let state = state_with_vault(Vault::default());
+        let resp = dispatch(&state, Request::AiSuggestions);
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("\"suggestions\":[]"));
     }
 }

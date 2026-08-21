@@ -21,6 +21,7 @@ langfristige, zurückgestellte Ziel — siehe `ROADMAP.md`, Abschnitt
 | [`scripts/`](scripts/) | Gaming-Mode-Tuning (CPU-Governor, THP, JVM-Start-Wrapper, FPS-Benchmark) |
 | [`tarno-br2-external/`](tarno-br2-external/) | Buildroot-`BR2_EXTERNAL`-Tree (Kernel-Config, `tarnod`-Package, Board-Support M6700, USB-Boot-Image) |
 | [`docs/`](docs/) | Architektur + detaillierte Monatspläne mit Befehlen/Configs/Abnahmekriterien |
+| [`docs/knowledge-base/`](docs/knowledge-base/) | Recherche zu Linux-/Debian-Systembau für das zurückgestellte Debian-Basis-Ziel — reine Referenz, nichts davon ist umgesetzt |
 
 ## Schnellstart (Entwicklung, ohne Buildroot)
 

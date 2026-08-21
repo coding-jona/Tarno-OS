@@ -23,6 +23,14 @@ pub enum Request {
     SecurityStatus,
     /// Einen zuvor per SIGSTOP angehaltenen Prozess fortsetzen (SIGCONT).
     ResumeProcess { pid: i32 },
+    /// Freitext-Frage an Tarno AI (Phase 1: heuristisches Backend, kein
+    /// LLM — siehe docs/month3-tarno-layer.md#tarno-ai).
+    AiQuery { text: String },
+    /// Aktuellen System-Kontext, wie ihn Tarno AI sieht (Gaming-Mode, RAM,
+    /// eBPF-Status).
+    AiStatus,
+    /// Proaktive Tuning-Vorschläge, die der Hintergrund-Task gesammelt hat.
+    AiSuggestions,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -93,6 +101,43 @@ mod tests {
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("\"status\":\"error\""));
         assert!(s.contains("\"message\":\"boom\""));
+    }
+
+    #[test]
+    fn parses_ai_query() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"ai_query","text":"ist gaming mode an"}"#).unwrap();
+        match req {
+            Request::AiQuery { text } => assert_eq!(text, "ist gaming mode an"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ai_status() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"ai_status"}"#).unwrap();
+        assert!(matches!(req, Request::AiStatus));
+    }
+
+    #[test]
+    fn parses_ai_suggestions() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"ai_suggestions"}"#).unwrap();
+        assert!(matches!(req, Request::AiSuggestions));
+    }
+
+    #[test]
+    fn ai_query_round_trips_through_serialize_deserialize() {
+        // Freitext kann Sonderzeichen (Anführungszeichen etc.) enthalten —
+        // stellt sicher, dass Serialize/Deserialize damit korrekt umgeht.
+        let req = Request::AiQuery {
+            text: "was \"frisst\" RAM?".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Request::AiQuery { text } => assert_eq!(text, "was \"frisst\" RAM?"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]

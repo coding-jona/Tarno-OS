@@ -63,7 +63,39 @@ konzentrierst.
 - Das gibt dir 80% des "Behavioral Kernel Shield" ohne Kernel-Entwicklung
 
 **Woche 12: Tarno AI + Polish**
-- Tarno AI: ein Assistent, direkt in `tarnod` integriert (Shell-Chat-Interface, proaktives Tuning, Intelligenzschicht über der eBPF-Security). Detaillierter Tarno-AI-Plan siehe [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md).
+
+Tarno AI ist ein Assistent, direkt in `tarnod` integriert (kein separater
+Prozess, kein separates Crate) — Shell-Chat-Interface über `tarnoctl`,
+proaktives Tuning, perspektivisch eine Intelligenzschicht über der
+eBPF-Security. Geplant in drei Phasen, wovon **Phase 1 in dieser Session
+umgesetzt** ist:
+
+- **Phase 1 (fertig, echter Code, kein LLM):** Modul `tarnod/tarnod/src/ai/`
+  mit einem heuristischen `AiBackend` (`ai/heuristic.rs`) — mustererkennt
+  bekannte Fragen ("ist gaming mode an", "was frisst RAM", "security
+  status") und beantwortet sie templated anhand von echtem, live gelesenem
+  System-Zustand (`gaming.rs`, `/proc/meminfo`, `ebpf`-Feature-Flag). Dazu
+  ein proaktiver Tuning-Task (`ai/tuning.rs`, alle 30s), der bei
+  auffälligem RAM-/Gaming-Mode-Zustand einen Vorschlag in eine Queue
+  pusht. Erreichbar über `tarnoctl ai <status|suggestions|<frage...>>`
+  bzw. die neuen `AiQuery`/`AiStatus`/`AiSuggestions`-IPC-Requests. Mit
+  Unit-Tests abgedeckt.
+- **Phase 2 (nicht in dieser Session umgesetzt, nur dokumentiert):**
+  austauschbares lokales LLM-Backend in einer neuen, optionalen Crate
+  `tarnod/tarnod-ai/` (Cargo-Feature `ai-llm`, analog zum bestehenden
+  `ebpf`-Feature) — geplant mit `candle` (reines Rust, kein C++-
+  Toolchain-Dep, aus demselben Grund wie `aya` statt libbpf-C), kleines
+  quantisiertes 1-3B-Parameter-Modell (Q4) als realistische
+  Hardware-Grenze für den M6700.
+- **Phase 3 (nicht in dieser Session umgesetzt, nur dokumentiert):**
+  `security::ebpf_loader`-Event-Stream zusätzlich in `SystemContext`/
+  `AiState` einspeisen, damit die Assistenz auch über jüngste
+  Security-Events reden kann — additiv zur bestehenden
+  Tracepoint/Policy-Engine, ersetzt sie nicht.
+
+Detaillierte Begründung, Architektur und Testabdeckung:
+[`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md#tarno-ai).
+
 - FPS/Frametime-Live-Profiling-Overlay (z.B. via `mangohud` angepasst oder eigenes leichtgewichtiges Overlay)
 - Aufräumen, Doku, Reproduzierbarkeit (Build-Script, damit du das System neu bauen kannst)
 - Realistischer Abschlussbericht: was wurde erreicht vs. Manifest

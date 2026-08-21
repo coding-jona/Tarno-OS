@@ -16,7 +16,8 @@ fn socket_path() -> PathBuf {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tarnoctl <ping|gaming-mode <on|off|status>|api-key <name>|security-status|resume <pid>>"
+        "usage: tarnoctl <ping|gaming-mode <on|off|status>|api-key <name>|security-status|\
+         resume <pid>|ai <status|suggestions|<frage...>>>"
     );
     std::process::exit(2);
 }
@@ -39,6 +40,18 @@ fn build_request(args: &[String]) -> String {
             let pid = args.get(1).unwrap_or_else(|| usage());
             format!(r#"{{"cmd":"resume_process","pid":{pid}}}"#)
         }
+        Some("ai") => match args.get(1).map(|s| s.as_str()) {
+            Some("status") => r#"{"cmd":"ai_status"}"#.to_string(),
+            Some("suggestions") => r#"{"cmd":"ai_suggestions"}"#.to_string(),
+            Some(_) => {
+                // Freitext-Frage: über serde_json bauen statt roher
+                // String-Interpolation, damit Anführungszeichen/Sonder-
+                // zeichen in der Frage korrekt escaped werden.
+                let text = args[1..].join(" ");
+                serde_json::json!({ "cmd": "ai_query", "text": text }).to_string()
+            }
+            None => usage(),
+        },
         _ => usage(),
     }
 }
@@ -105,5 +118,46 @@ mod tests {
             build_request(&["resume".into(), "1234".into()]),
             r#"{"cmd":"resume_process","pid":1234}"#
         );
+    }
+
+    #[test]
+    fn builds_ai_status_request() {
+        assert_eq!(
+            build_request(&["ai".into(), "status".into()]),
+            r#"{"cmd":"ai_status"}"#
+        );
+    }
+
+    #[test]
+    fn builds_ai_suggestions_request() {
+        assert_eq!(
+            build_request(&["ai".into(), "suggestions".into()]),
+            r#"{"cmd":"ai_suggestions"}"#
+        );
+    }
+
+    #[test]
+    fn builds_ai_query_request_joining_words() {
+        let req = build_request(&[
+            "ai".into(),
+            "ist".into(),
+            "gaming".into(),
+            "mode".into(),
+            "an".into(),
+        ]);
+        let parsed: serde_json::Value = serde_json::from_str(&req).unwrap();
+        assert_eq!(parsed["cmd"], "ai_query");
+        assert_eq!(parsed["text"], "ist gaming mode an");
+    }
+
+    #[test]
+    fn builds_ai_query_request_escapes_special_characters() {
+        // Naive String-Interpolation würde hier kaputtes JSON erzeugen —
+        // dieser Test stellt sicher, dass serde_json korrekt escaped.
+        let req = build_request(&["ai".into(), r#"was "frisst" RAM?"#.into()]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&req).expect("build_request muss gültiges JSON liefern");
+        assert_eq!(parsed["cmd"], "ai_query");
+        assert_eq!(parsed["text"], r#"was "frisst" RAM?"#);
     }
 }

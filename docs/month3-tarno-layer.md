@@ -33,6 +33,96 @@ eBPF-Programme können nur `bpf_send_signal()`/`bpf_send_signal_thread()` an den
 - `CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y` im Kernel (bereits in Woche 1-2 als Kernel-Fragment vorgesehen).
 - Capabilities für `tarnod`: `cap_bpf`, `cap_perfmon` (für Tracing-Programme seit Kernel 5.8 zusätzlich zu `cap_bpf` nötig).
 
+## Tarno AI
+
+Tarno AI ist als Assistent direkt in `tarnod` integriert (kein separater
+Prozess) — in drei Phasen geplant. Phase 1 ist in dieser Session real
+gebaut und getestet; Phase 2 und 3 sind bewusst nur dokumentiert, nicht
+umgesetzt.
+
+### Phase 1 (fertig): heuristisches Backend, kein LLM
+
+Modul `tarnod/tarnod/src/ai/` — Geschwister von `gaming.rs`, `security/`,
+`vault.rs`, kein neues Crate, keine neue Cargo-Abhängigkeit:
+
+- **`ai/backend.rs`**: `trait AiBackend { fn answer(&self, question: &str, ctx: &SystemContext) -> String; }`
+  plus `SystemContext` — trägt Gaming-Mode-Status (`GamingController::current_governor`),
+  isolierte CPUs (`GamingController::isolated_cpus`), das `ebpf`-Feature-
+  Flag sowie `MemTotal`/`MemAvailable` aus `/proc/meminfo`. Der Trait ist
+  bewusst so geschnitten, dass ein künftiges Phase-2-Backend ihn ohne
+  Umbau an `AppState`/`dispatch()` implementieren kann.
+- **`ai/heuristic.rs`**: `HeuristicBackend`, das Phase-1-Backend.
+  Mustererkennt eine kleine Menge bekannter Fragenformen (deutsch/englisch:
+  Gaming-Mode-Status, RAM-Status, Security-Status) per einfachem
+  Substring-Match auf die kleingeschriebene Frage und antwortet templated
+  anhand des echten `SystemContext` — kein generativer Text, daher auch
+  keine Halluzinationsgefahr. Unbekannte Fragen bekommen eine ehrliche
+  Fallback-Antwort statt einer erfundenen.
+- **`ai/tuning.rs`**: proaktiver Tuning-Task, `tokio::spawn`'t neben dem
+  IPC-Server (`main.rs`) — analog zum eBPF-RingBuf-Poller-Pattern aus
+  `security/ebpf_loader.rs`. Pollt alle **30 Sekunden** (bewusst lang: ein
+  Hintergrund-Task in einem Daemon, kein interaktiver Prozess) RAM- und
+  Gaming-Mode-Status über denselben `SystemContext::gather` und pusht bei
+  einer einfachen Regel-Verletzung (verfügbares RAM < 15 % **und**
+  Gaming-Mode aus) einen Vorschlagstext in `AiState`s Suggestions-Queue
+  (FIFO, auf 50 Einträge gedeckelt).
+- **IPC**: drei neue `Request`-Varianten in `tarnod-protocol`
+  (`AiQuery{text}`, `AiStatus`, `AiSuggestions`), mit denselben
+  Serde-Attributen und demselben Response-Muster wie alle bestehenden
+  Commands. `dispatch()` in `main.rs` behandelt sie wie jeden anderen
+  Request.
+- **CLI**: `tarnoctl ai status` (System-Kontext), `tarnoctl ai suggestions`
+  (aktuelle Vorschlagsliste), `tarnoctl ai <frage...>` (Freitext-Frage).
+  Der Freitext-Payload wird über `serde_json::json!`/`to_string` gebaut,
+  nicht über rohe String-Interpolation wie bei den übrigen, festen
+  `tarnoctl`-Commands — eine Frage kann Anführungszeichen/Sonderzeichen
+  enthalten, die sonst kaputtes JSON erzeugen würden.
+
+Testabdeckung: Unit-Tests für `HeuristicBackend::answer` (alle drei
+Fragenformen + Fallback + fehlendes `/proc/meminfo`), für die
+Tuning-Regel (`ai::tuning::evaluate`, isoliert von Timer/IO testbar), für
+`AiState`s Queue-Deckelung, sowie Roundtrip-Serialisierungstests für die
+drei neuen `Request`-Varianten in `tarnod-protocol` — im selben
+`#[cfg(test)]`-Stil wie der Rest des Codebase.
+
+### Phase 2 (nicht umgesetzt, nur dokumentiert): lokales LLM-Backend
+
+Eine neue, optionale Crate `tarnod/tarnod-ai/` würde als
+Workspace-Mitglied ergänzt (siehe reservierter Kommentar in
+`tarnod/Cargo.toml`), aber **nicht** als Default-Member — genau das
+Muster, mit dem früher `tarnod-ui` ausgeschlossen war, bevor es entfernt
+wurde. Eingebunden in `tarnod` über ein neues optionales Cargo-Feature
+`ai-llm`, das exakt so verdrahtet würde wie das bestehende `ebpf`-Feature
+den `tarnod-guard`-Pfad-Dependency einbindet (`Cargo.toml`:
+`tarnod-ai = { path = "../tarnod-ai", optional = true }`,
+`ai-llm = ["dep:tarnod-ai"]`).
+
+Empfehlung für die Inferenz-Bibliothek: **`candle`**
+(huggingface/candle) statt `llama.cpp`-Bindings — reines Rust, kein
+C++-Toolchain-Dependency im Build, aus derselben Begründung, mit der
+dieses Dokument bereits `aya` statt libbpf-C für die eBPF-Anbindung
+gewählt hat (siehe oben, "Sprache/Runtime: Rust").
+
+Hardware-Realität, ehrlich benannt statt schöngeredet: die Zielhardware
+(Dell Precision M6700) ist eine Laptop-CPU aus der Ivy-Bridge-Generation
+ohne dedizierte KI-Beschleunigung. Realistisch ist ein kleines,
+quantisiertes Modell — **1 bis 3 Milliarden Parameter, Q4-Quantisierung
+(GGUF-Format-Klasse)** — mit entsprechend begrenzten Fähigkeiten
+(einfache Frage-Antwort-Muster, kein komplexes Reasoning, spürbare
+Latenz auf CPU-only-Inferenz). Das ist eine reale Hardware-Grenze dieses
+Zielsystems, kein Implementierungsdetail, das sich wegoptimieren ließe.
+
+### Phase 3 (nicht umgesetzt, nur dokumentiert): Security-Intelligenz
+
+`security::ebpf_loader`s Event-Stream (`ExecEvent{pid, uid, comm,
+filename}`, siehe oben) würde zusätzlich in `SystemContext`/`AiState`
+eingespeist, damit `AiQuery`/`AiSuggestions` auch über jüngste
+Security-Events reden können ("was wurde zuletzt geblockt", "warum wurde
+Prozess X angehalten"). Das ist **additiv** zur bestehenden
+Tracepoint/Policy-Engine gedacht — Tarno AI würde Events nur lesend
+konsumieren und erklären, nicht die SIGSTOP-Entscheidung selbst treffen
+oder ersetzen.
+
 ## Woche 12: Polish & Dokumentation
 
 - FPS/Frametime-Overlay: siehe `scripts/benchmark.sh` in [`month2-gaming-tuning.md`](month2-gaming-tuning.md) — ein Live-Overlay (angepasstes MangoHud) ist als Stretch-Goal vorgesehen, sobald die Kernkomponenten stabil laufen; nicht Teil des initialen Full-Stack-Durchstichs in diesem Repo.

@@ -10,3 +10,4 @@ name = "tarnoctl"
 path = "src/main.rs"
 
 [dependencies]
+serde_json.workspace = true
