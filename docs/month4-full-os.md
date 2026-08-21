@@ -1,5 +1,12 @@
 # Monat 4 — Vollständiges Betriebssystem-Erlebnis (Detailplan)
 
+> **Zurückgestellt.** Dieser Plan hing von der inzwischen entfernten GUI
+> (`tarnod-ui`, `tarno-installer`, `tarno-desktop`) ab und vom
+> Boot-Image-Ziel, das ebenfalls zurückgestellt wurde (siehe `ROADMAP.md`,
+> Abschnitt "Zurückgestellt — Desktop-/GUI-Erlebnis"). Das Dokument bleibt
+> als historischer Planungsstand erhalten, ist aber **kein aktives
+> Arbeitsziel** — nichts hier ist umgesetzt oder wird aktuell umgesetzt.
+
 Übersicht siehe [`ROADMAP.md`](../ROADMAP.md#monat-4--vollständiges-betriebssystem-erlebnis-über-den-ursprünglichen-3-monats-rahmen-hinaus). Dieser Monat liegt außerhalb des ursprünglichen 3-Monats-Rahmens — er entstand aus der Klarstellung, dass der USB-Stick nicht nur ein Boot-Medium sein soll, sondern eine echte Installation ermöglichen muss, die sich danach auch aktualisieren lässt, Apps installieren kann und die Basis-Funktionen bietet, die man von einem alltagstauglichen System erwartet.
 
 ## Festplatten-Installer (`tarno-disk-installer`)
@@ -20,18 +27,18 @@ Sicherheitsmodell: dieselbe explizite Bestätigung mit vollem Geräte-Label wie 
 Bewusste Entscheidung: **kein separates Update-System und kein separates Marktplatz-System** — beides läuft über denselben Paketmanager, weil beides strukturell dasselbe Problem ist ("hole ein signiertes Paket aus einem Repository und installiere/aktualisiere es"). Buildroot bringt `BR2_PACKAGE_OPKG` bereits mit (ein für eingebettete Systeme entwickelter, sehr schlanker `apt`-Verwandter) — kein Grund, ein eigenes Paketformat zu erfinden.
 
 - **System-Updates**: Kernpakete (Kernel, `tarnod`, Compositor, …) liegen im selben Repository wie Apps, nur mit einer eigenen Kategorie/Priorität.
-- **App-Marktplatz**: eine GUI (`tarnod-ui` bekommt ein neues Panel, oder ein eigenständiges Werkzeug — Entscheidung fällt bei der Umsetzung) listet verfügbare Pakete aus dem Repository, zeigt Beschreibung/Größe, installiert per Klick über denselben `opkg`-Aufruf.
+- **App-Marktplatz**: eine GUI listet verfügbare Pakete aus dem Repository, zeigt Beschreibung/Größe, installiert per Klick über denselben `opkg`-Aufruf. Da die frühere GUI-Schicht (`tarnod-ui`) entfernt wurde, ist der konkrete GUI-Ansatz dafür offen — Entscheidung fällt, sobald es wieder eine GUI-Schicht gibt.
 - **Kein A/B-Partitionsschema** (wie ChromeOS/Android) in Version 1 — passt nicht zur "so schlank wie möglich, ein Zielgerät"-Linie des Projekts und würde den Festplatten-Installer oben verkomplizieren (zwei Rootfs-Partitionen statt einer). Rollback-Fähigkeit bei fehlgeschlagenen Updates ist ein bekannter Kompromiss, der später nachgerüstet werden kann, falls nötig.
 
 ## Terminal
 
-`foot` — ein sehr schlankes, natives Wayland-Terminal (kein X11-Unterbau nötig, passt direkt zu `tarno-desktop`) — als Buildroot-Paket, **kein Eigenbau**. Ein Terminal-Emulator ist ein gelöstes Problem; Zeit lieber in projekteigene Teile stecken. Taskleisten-Integration: ein weiteres Icon neben der Settings-Wordmark (derselbe Spawn-Mechanismus wie bei `tarnod-ui`, siehe [`month-desktop.md`](month-desktop.md#settings-app-als-teil-des-desktops-kein-separates-fenster-konzept)).
+`foot` — ein sehr schlankes, natives Wayland-Terminal (kein X11-Unterbau nötig) — als Buildroot-Paket, **kein Eigenbau**. Ein Terminal-Emulator ist ein gelöstes Problem; Zeit lieber in projekteigene Teile stecken. Taskleisten-/Launcher-Integration hing an der inzwischen entfernten Desktop-GUI und ist offen, sobald es wieder eine GUI-Schicht gibt.
 
 ## Netzwerk (WLAN, Bluetooth)
 
 - **WLAN**: `iwd` (von Intel entwickelt, deutlich schlanker als die klassische Kombination NetworkManager+wpa_supplicant, passt zur RAM-Trimm-Linie des Projekts) statt eines schwereren Netzwerk-Stacks.
 - **Bluetooth**: `bluez` (der de-facto-Standard-Linux-Bluetooth-Stack, keine schlankere ausgereifte Alternative verfügbar).
-- **UI**: neues Panel in `tarnod-ui` (WLAN-Scan/Verbinden, Bluetooth-Pairing) — folgt demselben Muster wie die bestehenden Panels (Dashboard/Gaming-Mode/Security/API-Keys), IPC über `tarnod` und `tarnod-protocol` wie gehabt.
+- **UI**: WLAN-Scan/Verbinden, Bluetooth-Pairing über IPC gegen `tarnod`/`tarnod-protocol` wie gehabt — die frühere GUI-Schicht (`tarnod-ui`), in der das als Panel gedacht war, wurde entfernt; der konkrete GUI-Ansatz dafür ist offen, sobald es wieder eine GUI-Schicht gibt.
 
 ## Scope-Hinweis
 

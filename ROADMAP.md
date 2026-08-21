@@ -1,10 +1,19 @@
 # Tarno OS – Realistische 3-Monats-Roadmap
 
-**Prämisse:** Kein eigener Kernel. Stattdessen ein extrem gestripptes Linux (Buildroot oder Alpine als Basis) mit eigenem `tarnod`-Daemon und minimaler Shell. Erreicht ~90% der Ziele aus dem Manifest in umsetzbarer Zeit, weil JVM, Treiber, Dateisystem und Scheduler schon funktionieren und du dich auf Tuning statt Kernel-Entwicklung konzentrierst.
+**Prämisse:** Tarno OS ist heute **shell-only** — kein GUI-Layer im Repo (der
+frühere GUI/Interface-Kram wurde bewusst entfernt, siehe "Zurückgestellt"
+unten). Kein eigener Kernel. Basis ist aktuell ein extrem gestripptes Linux
+via Buildroot-Cross-Compile mit eigenem `tarnod`-Daemon und minimaler Shell;
+langfristig soll diese Basis durch ein **Debian**-Fundament ersetzt werden
+(siehe "Zukunft — Debian-Basis" unten) — das ist ein Kurswechsel, der aktuell
+nur dokumentiert, aber noch nicht umgesetzt ist. Erreicht ~90% der Ziele aus
+dem Manifest in umsetzbarer Zeit, weil JVM, Treiber, Dateisystem und
+Scheduler schon funktionieren und du dich auf Tuning statt Kernel-Entwicklung
+konzentrierst.
 
 **Zielhardware:** Dell Precision M6700 (Ivy Bridge, AHCI, PS/2) — läuft problemlos mit Standard-Linux-Kernel + Treibern, kein Custom-Boot nötig.
 
-> Dieses Dokument ist die Übersicht. Die technische Ausarbeitung mit konkreten Befehlen, Paketnamen, Kernel-Configs und Abnahmekriterien steht in [`docs/architecture.md`](docs/architecture.md), [`docs/month1-foundation.md`](docs/month1-foundation.md), [`docs/month2-gaming-tuning.md`](docs/month2-gaming-tuning.md), [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md), [`docs/month-desktop.md`](docs/month-desktop.md) (Desktop-Modus) und [`docs/month4-full-os.md`](docs/month4-full-os.md) (Festplatten-Installer, Updates/App-Marktplatz, Terminal, Netzwerk — alle über den ursprünglichen 3-Monats-Rahmen hinaus ergänzt). Lauffähiger Code liegt in [`tarnod/`](tarnod/) (Daemon+CLI+GUI), [`tarno-guard-ebpf/`](tarno-guard-ebpf/) (eBPF-Security), [`scripts/`](scripts/) (Gaming-Mode-Tuning), [`tarno-br2-external/`](tarno-br2-external/) (Buildroot-Integration), [`tarno-installer/`](tarno-installer/) (USB-Installer-GUI), [`tarno-desktop/`](tarno-desktop/) (eigener Compositor + Taskleiste) und [`tarno-disk-installer/`](tarno-disk-installer/) (Installation von USB auf die interne Platte).
+> Dieses Dokument ist die Übersicht. Die technische Ausarbeitung mit konkreten Befehlen, Paketnamen, Kernel-Configs und Abnahmekriterien steht in [`docs/architecture.md`](docs/architecture.md), [`docs/month1-foundation.md`](docs/month1-foundation.md), [`docs/month2-gaming-tuning.md`](docs/month2-gaming-tuning.md), [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md) und [`docs/month4-full-os.md`](docs/month4-full-os.md) (zurückgestellter Detailplan: Festplatten-Installer, Updates/App-Marktplatz, Terminal, Netzwerk). Lauffähiger Code liegt in [`tarnod/`](tarnod/) (Daemon+CLI), [`tarno-guard-ebpf/`](tarno-guard-ebpf/) (eBPF-Security), [`scripts/`](scripts/) (Gaming-Mode-Tuning) und [`tarno-br2-external/`](tarno-br2-external/) (Buildroot-Integration).
 
 ---
 
@@ -41,7 +50,7 @@
 
 ---
 
-## Monat 3 — Tarno-Layer (Daemon, Security, AI)
+## Monat 3 — Tarno-Layer (Daemon, Security, Tarno AI)
 
 **Woche 9-10: tarnod als Userspace-Service**
 - `tarnod` als privilegierter Root-Service (kein Kernel-Modul) in C++/Rust oder .NET Native AOT
@@ -53,43 +62,44 @@
 - Bei verdächtigem Prozess: SIGSTOP via eBPF-Trigger + Userspace-Handler auslösen
 - Das gibt dir 80% des "Behavioral Kernel Shield" ohne Kernel-Entwicklung
 
-**Woche 12: Polish & Dokumentation**
+**Woche 12: Tarno AI + Polish**
+- Tarno AI: ein Assistent, direkt in `tarnod` integriert (Shell-Chat-Interface, proaktives Tuning, Intelligenzschicht über der eBPF-Security). Detaillierter Tarno-AI-Plan siehe [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md).
 - FPS/Frametime-Live-Profiling-Overlay (z.B. via `mangohud` angepasst oder eigenes leichtgewichtiges Overlay)
 - Aufräumen, Doku, Reproduzierbarkeit (Build-Script, damit du das System neu bauen kannst)
 - Realistischer Abschlussbericht: was wurde erreicht vs. Manifest
 
 ---
 
-## Monat 4 — Vollständiges Betriebssystem-Erlebnis (über den ursprünglichen 3-Monats-Rahmen hinaus)
+## Zurückgestellt — Desktop-/GUI-Erlebnis
 
-Der USB-Stick war ursprünglich als reines Boot-Medium gedacht (Live-Betrieb,
-kein Installationsschritt). Jetzt kommt eine echte Installation auf die
-interne Platte dazu — und alles, was ein System danach braucht, um nicht
-bei jedem Update wieder zum Stick greifen zu müssen. Details:
+Der frühere GUI/Interface-Kram (`tarno-desktop`, `tarno-installer`,
+`tarno-ui-theme`, `tarnod-ui`) wurde komplett aus dem Repo entfernt
+(Git-Historie bleibt als Sicherheitsnetz erhalten). Grund: "Man kann nicht
+direkt mit Interfaces anfangen, wenn man ein OS baut" — bevor eine GUI-Schicht
+wieder aufgebaut wird, soll erst der darunterliegende Daemon/Security/AI-Kern
+(`tarnod`, Monat 3) tragfähig sein.
+
+Die alten Monat-4-Pläne (Festplatten-Installer, System-Updates +
+App-Marktplatz, Terminal, Netzwerk) hingen an dieser jetzt entfernten GUI und
+sind **on hold, ohne Zeitplan** — nicht gestrichen, nur zurückgestellt, bis
+eine GUI-Schicht neu aufgebaut wird. Details/historischer Planungsstand:
 [`docs/month4-full-os.md`](docs/month4-full-os.md).
 
-**Festplatten-Installer** (`tarno-disk-installer`)
-- Läuft AUF Tarno OS selbst (live vom Stick gebootet), nicht auf dem
-  Erstellungsrechner — anders als `tarno-installer`, das nur den Stick
-  beschreibt. Partitioniert die interne Platte, formatiert, kopiert das
-  laufende System dorthin, installiert den Bootloader. Danach bootet der
-  Laptop ohne Stick.
+---
 
-**System-Updates + App-Marktplatz — ein gemeinsamer Paketmanager**
-- Keine zwei getrennten Systeme: derselbe Paketmanager (`opkg`-basiert,
-  Buildroot bringt das schon mit) bedient sowohl System-Updates
-  (Kernel/Kernpakete) als auch den App-Marktplatz (Nutzer-Apps) aus
-  einem Repository — ein Update-Mechanismus statt zwei.
+## Zukunft — Debian-Basis
 
-**Terminal**
-- `foot` (Wayland-natives, sehr schlankes Terminal) als Buildroot-Paket
-  statt eines selbstgeschriebenen Terminal-Emulators — passt zur
-  "wiederverwenden statt neu erfinden"-Linie, wo ein ausgereiftes
-  Standardwerkzeug existiert.
+Langfristige Entscheidung: die Basis von Tarno OS soll perspektivisch von
+Buildroot-Cross-Compile auf ein **Debian**-Fundament (z. B. `debootstrap` +
+`live-build`) wechseln — bessere Paketverfügbarkeit, ausgereiftere
+Werkzeugkette, weniger Cross-Compile-Eigenheiten. **Explizit: keine
+Code-Änderung jetzt.** Buildroot bleibt der einzige aktuell funktionierende
+Build-Weg (`tarno-br2-external/`, `.github/workflows/build-os-image.yml`).
 
-**Netzwerk (WLAN, Bluetooth)**
-- `iwd` (schlanker als NetworkManager+wpa_supplicant) für WLAN, `bluez`
-  für Bluetooth, Steuerung über ein neues Panel in `tarnod-ui`.
+Bevor an dieser Migration oder überhaupt am zurückgestellten Boot-Image-Ziel
+weitergearbeitet wird, soll erst eine Wissensbasis entstehen ("wie baut man
+ein Betriebssystem von A-Z, wie funktioniert Linux, wie ist es aufgebaut") —
+künftiger Ort dafür: `docs/knowledge-base/`.
 
 ---
 
@@ -97,18 +107,19 @@ bei jedem Update wieder zum Stick greifen zu müssen. Details:
 - Eigener Kernel (Multiboot2, eigener Scheduler, Zero-Copy-Framebuffer von Grund auf) → auf unbestimmte Zeit verschoben, nicht in 3 Monaten machbar
 - "0% I/O-Overhead" Security → realistisches Ziel: minimaler, messbarer Overhead statt Null
 - Eigene Treiber-Pipelines → Standard-Linux-Treiber nutzen, die für die Hardware schon existieren
+- GUI/Interface-Schicht (`tarno-desktop`, `tarno-installer`, `tarno-ui-theme`, `tarnod-ui`) → komplett entfernt und zurückgestellt, siehe "Zurückgestellt — Desktop-/GUI-Erlebnis" oben
 
 ## Tools/Stack im Überblick
 | Bereich | Tool |
 |---|---|
-| Basis-OS | Alpine Linux oder Buildroot |
+| Basis-OS | Alpine Linux oder Buildroot (Debian-Migration als Zukunftsziel, siehe oben) |
 | Init | OpenRC / eigenes Minimal-Init |
 | Compositor (Gaming) | cage (Kiosk, Direct-Fullscreen) |
-| Compositor (Desktop) | eigener Compositor `tarno-desktop` (Rust/smithay) mit fusionierter Taskleiste, Dual-Mode neben `cage` — siehe [`docs/month-desktop.md`](docs/month-desktop.md) |
 | Core-Isolation | isolcpus, cset, sched_setaffinity |
 | Security-Monitoring | eBPF |
 | Daemon | Rust oder C++ (nativ, kein Electron) |
-| Festplatten-Installer | `tarno-disk-installer` (Rust) — sfdisk/mkfs.vfat/mkfs.ext4/rsync/extlinux, siehe [`docs/month4-full-os.md`](docs/month4-full-os.md) |
-| Updates + App-Marktplatz | ein gemeinsamer `opkg`-basierter Paketmanager statt zwei getrennter Systeme |
-| Terminal | `foot` (Wayland-natives Standardwerkzeug, kein Eigenbau) |
-| Netzwerk | `iwd` (WLAN), `bluez` (Bluetooth) |
+| Tarno AI | phasenweise, in `tarnod` integriert (`candle` für ein künftiges LLM-Backend) — Details siehe [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md) |
+| Festplatten-Installer | `tarno-disk-installer` (Rust) — sfdisk/mkfs.vfat/mkfs.ext4/rsync/extlinux, zurückgestellt, siehe [`docs/month4-full-os.md`](docs/month4-full-os.md) |
+| Updates + App-Marktplatz | ein gemeinsamer `opkg`-basierter Paketmanager statt zwei getrennter Systeme, zurückgestellt |
+| Terminal | `foot` (Wayland-natives Standardwerkzeug, kein Eigenbau), zurückgestellt |
+| Netzwerk | `iwd` (WLAN), `bluez` (Bluetooth), zurückgestellt |

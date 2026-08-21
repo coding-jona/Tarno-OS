@@ -1,11 +1,10 @@
 //! JSON-Request/Response-Protokoll für den `tarnod`-IPC-Socket.
 //!
 //! Framing: newline-delimited JSON (siehe `tarnod/src/ipc.rs`). Geteilt
-//! zwischen dem Daemon (`tarnod`), dem CLI-Client (`tarnoctl`, aktuell noch
-//! mit eigenen JSON-String-Literalen) und der GUI (`tarnod-ui`), damit
-//! Protokolländerungen nicht mehrfach nachgezogen werden müssen. Das
-//! Protokoll ist bewusst klein gehalten, siehe
-//! docs/month3-tarno-layer.md#ipc-design.
+//! zwischen dem Daemon (`tarnod`) und dem CLI-Client (`tarnoctl`, aktuell
+//! noch mit eigenen JSON-String-Literalen), damit Protokolländerungen
+//! nicht mehrfach nachgezogen werden müssen. Das Protokoll ist bewusst
+//! klein gehalten, siehe docs/month3-tarno-layer.md#ipc-design.
 
 use serde::{Deserialize, Serialize};
 
@@ -98,8 +97,8 @@ mod tests {
 
     #[test]
     fn request_round_trips_through_serialize_deserialize() {
-        // Wichtig fuer tarnod-ui: die GUI serialisiert Request selbst
-        // (statt wie tarnoctl rohe JSON-Strings zu bauen).
+        // Stellt sicher, dass ein zukünftiger Client Request über serde
+        // serialisieren kann (statt wie tarnoctl rohe JSON-Strings zu bauen).
         let req = Request::ResumeProcess { pid: 1234 };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();

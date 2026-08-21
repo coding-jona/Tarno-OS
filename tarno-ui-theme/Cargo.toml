@@ -1,9 +1,0 @@
-[package]
-name = "tarno-ui-theme"
-version = "0.1.0"
-edition = "2021"
-license = "AGPL-3.0-only"
-description = "Geteiltes egui-Theme ('Stealth-Tech', dunkel/teal) fuer alle Tarno-OS-GUIs (tarnod-ui, tarno-installer)"
-
-[dependencies]
-egui = "0.32"

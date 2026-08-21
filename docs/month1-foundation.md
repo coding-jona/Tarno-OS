@@ -71,25 +71,20 @@ sudo dd if=output/images/sdcard.img of=/dev/sdX bs=4M status=progress conv=fsync
 (`/dev/sdX` durch den tatsächlichen USB-Stick-Gerätepfad ersetzen — **nicht**
 eine bestehende Festplatte, `dd` überschreibt ohne Rückfrage.)
 
-**Auf den Stick schreiben — per GUI:** [`tarno-installer`](../tarno-installer/)
-macht denselben Vorgang weniger fehleranfällig: listet nur Wechseldatenträger
-(schließt das eigene Root-Gerät aus), zeigt Fortschritt/Geschwindigkeit/ETA,
-verlangt eine explizite Bestätigung mit vollem Geräte-Label vor dem
-Überschreiben. Siehe [`docs/architecture.md`](architecture.md#tarno-installer-natives-gui-läuft-nicht-auf-tarno-os-selbst).
-Läuft nativ auch auf Windows — siehe
-[`tarno-installer/README.md#windows-nutzung`](../tarno-installer/README.md#windows-nutzung),
-falls der Stick von einem Windows-Rechner aus erstellt wird.
-
 **Wichtig, zwei getrennte Rechner-Rollen:** `output/images/sdcard.img`
 selbst kann **nur** auf Linux (oder WSL2/einer Linux-VM) gebaut werden —
 Buildroot ist ein Linux-Build-System, es gibt keinen nativen
 Windows-Build-Pfad dafür. Das Schreiben dieses fertigen Images auf den
-Stick (der zweite, unabhängige Schritt) kann dagegen sowohl auf Linux als
-auch auf Windows passieren (`dd` bzw. `tarno-installer`). Ein reiner
-Windows-Nutzer baut das Image also entweder auf einer zweiten
+Stick ist der zweite, unabhängige Schritt und war früher zusätzlich per
+GUI-Installer (`tarno-installer`, inkl. eines nativen Windows-Builds)
+möglich; dieser wurde im Zuge der GUI-Entfernung (siehe ROADMAP.md,
+Abschnitt "Zurückgestellt") aus dem Repo entfernt. Aktuell gibt es dafür
+**kein In-Repo-Tool mehr für Windows-Nutzer** — nur der `dd`-Weg oben
+funktioniert, und der braucht ein Linux-System (bzw. WSL2/eine Linux-VM).
+Ein reiner Windows-Nutzer baut das Image also entweder auf einer zweiten
 Linux-Maschine/in WSL2, oder lädt ein von der CI/einem Linux-Rechner
-gebautes `sdcard.img` herunter, und schreibt es dann lokal mit
-`tarno-installer.exe` auf den Stick.
+gebautes `sdcard.img` herunter, und schreibt es dann per `dd` aus
+WSL2/einer Linux-VM auf den Stick.
 
 **Scope-Hinweis:** Wie beim restlichen Buildroot-Teil (siehe unten) sind
 `genimage.cfg`/`syslinux.cfg`/`post-image.sh` nach aktueller Buildroot-
