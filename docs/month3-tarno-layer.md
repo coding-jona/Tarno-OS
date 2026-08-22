@@ -36,9 +36,9 @@ eBPF-Programme können nur `bpf_send_signal()`/`bpf_send_signal_thread()` an den
 ## Tarno AI
 
 Tarno AI ist als Assistent direkt in `tarnod` integriert (kein separater
-Prozess) — in drei Phasen geplant. Phase 1 ist in dieser Session real
-gebaut und getestet; Phase 2 und 3 sind bewusst nur dokumentiert, nicht
-umgesetzt.
+Prozess) — in drei Phasen geplant, alle drei sind mittlerweile real gebaut
+und getestet: Phase 1 (heuristisches Backend), Phase 2 (Mistral-AI-API,
+erster Cut) und Phase 3 (additive Security-Event-Anbindung).
 
 ### Phase 1 (fertig): heuristisches Backend, kein LLM
 
@@ -207,16 +207,95 @@ werden statt einer manuellen Dateibearbeitung.
    und den entsprechenden `mode_note`-Text zeigen statt des Hinweises auf
    diese Anleitung.
 
-### Phase 3 (nicht umgesetzt, nur dokumentiert): Security-Intelligenz
+### Phase 3 (umgesetzt): Security-Intelligenz
 
 `security::ebpf_loader`s Event-Stream (`ExecEvent{pid, uid, comm,
-filename}`, siehe oben) würde zusätzlich in `SystemContext`/`AiState`
-eingespeist, damit `AiQuery`/`AiSuggestions` auch über jüngste
-Security-Events reden können ("was wurde zuletzt geblockt", "warum wurde
-Prozess X angehalten"). Das ist **additiv** zur bestehenden
-Tracepoint/Policy-Engine gedacht — Tarno AI würde Events nur lesend
-konsumieren und erklären, nicht die SIGSTOP-Entscheidung selbst treffen
-oder ersetzen.
+filename}`, siehe oben) speist zusätzlich in `SystemContext`/`AiState` ein,
+damit `AiQuery`/`AiStatus` auch über jüngste Security-Events reden können
+("was wurde zuletzt geblockt", "warum wurde Prozess X angehalten"). Wie
+geplant **additiv** zur bestehenden Tracepoint/Policy-Engine umgesetzt —
+Tarno AI konsumiert Events nur lesend und erklärt sie, trifft/ersetzt nicht
+die SIGSTOP-Entscheidung selbst (die bleibt unverändert in
+`security::ebpf_loader::run`, siehe Woche-11-Abschnitt oben).
+
+Neues Modul `tarnod/tarnod/src/security/events.rs`, Geschwister von
+`ebpf_loader.rs`:
+
+- **`SecurityEventLog`**: derselbe beschränkte FIFO-Ring wie `AiState`s
+  Suggestions-Queue (`ai/mod.rs`) — `Mutex<Vec<SecurityEventRecord>>`,
+  auf **50 Einträge** gedeckelt, älteste zuerst raus. Bewusst **nicht**
+  hinter `#[cfg(feature = "ebpf")]` gesetzt (anders als `ebpf_loader`
+  selbst): ohne das Feature pusht schlicht nie jemand hinein, der Log
+  bleibt immer leer, statt dass `ai::backend`/`main.rs` zwei verschiedene
+  `SystemContext`-Formen per `#[cfg]` bräuchten. `AppState` trägt ihn daher
+  unconditional als `security_events: security::events::SecurityEventLog`.
+- **`SecurityEventRecord{pid, uid, comm, filename, action, timestamp_secs}`**:
+  eigene, vom `ebpf`-Feature/`tarnod-guard-common` unabhängige Kopie der
+  relevanten `ExecEvent`-Felder (als `String` statt `[u8; N]`), plus
+  `action: SecurityAction` (`Allowed`/`Stopped`) — welche der beiden
+  Policy-Ausgänge das Event hatte.
+- **`security::ebpf_loader::run`** (das Cargo-Feature `ebpf` bleibt der
+  einzige Ort, der wirklich pusht): bekommt neben der `Policy` jetzt auch
+  `Arc<AppState>` übergeben (`main.rs`s Spawn-Stelle klont `state` dafür,
+  analog zu `ai::tuning::run`) und pusht **jedes** ausgewertete Event —
+  nicht nur die gestoppten — als `SecurityEventRecord` in
+  `state.security_events`, bevor die (unveränderte) Policy-Prüfung/
+  SIGSTOP-Logik weiterläuft. Bewusst alle Events statt nur Stopps: ein
+  Ring, der nur Stopps enthält, würde stillschweigend wichtige
+  Kontextinformation weglassen (z.B. "wie viele normale Execs liefen
+  dazwischen"); die 50er-Kappung ist der bewusste Kompromiss zwischen
+  Nützlichkeit und unbeschränktem Speicherwachstum — auf einem System mit
+  sehr vielen Execs kann ein älterer Stopp dadurch aus dem Ring fallen,
+  das ist eine akzeptierte, getestete Eigenschaft (kein Bug), kein
+  vollständiges Audit-Log.
+- **`SystemContext`** (`ai/backend.rs`) bekommt drei neue Felder:
+  `recent_security_stops` (Anzahl `Stopped`-Events im aktuellen Ring),
+  `last_stopped_comm`/`last_stopped_filename` (der jüngste gestoppte
+  Prozess, falls einer im Ring vorhanden ist). `SystemContext::gather`
+  bekommt dafür einen zweiten Parameter (`&SecurityEventLog`) und leitet
+  sie aus `SecurityEventLog::stop_count()`/`::last_stopped()` ab — beide
+  sind `0`/`None`, wenn das `ebpf`-Feature aus ist oder noch nichts
+  passiert ist; `SystemContext` selbst kann diese beiden Fälle nicht
+  unterscheiden (ehrlich so belassen, nicht künstlich aufgelöst).
+- **`ai/heuristic.rs`**: neue Fragenform `asks_blocked` (deutsch/englisch:
+  "geblockt"/"blockiert"/"blocked"/"angehalten"/"gestoppt"/"stopped"),
+  eigenständig von der bestehenden `asks_security` (generischer
+  Subsystem-Status) geprüft. Ohne Events (Feature aus **oder** einfach
+  noch nichts passiert — beide ununterscheidbar, siehe oben) antwortet
+  `HeuristicBackend` ehrlich mit "Nichts Auffälliges bisher …" statt etwas
+  zu erfinden; mit Events nennt sie Anzahl, `comm` und Pfad des zuletzt
+  gestoppten Prozesses plus einen Zeiger auf `tarnoctl resume <pid>`.
+- **`ai/mistral.rs`**: `system_prompt()` (der knappe, aus `SystemContext`
+  gebaute Kontext, den Mistral vor jeder Frage sieht) trägt jetzt zusätzlich
+  einen Satz mit derselben Security-Event-Zusammenfassung (Anzahl +
+  zuletzt gestoppter Prozess, oder "keine kürzlich gestoppten Prozesse") —
+  eine Mistral-beantwortete Frage zu "was wurde geblockt" ist damit
+  genauso geerdet wie die Heuristik-Antwort, statt zu halluzinieren.
+- **IPC/`tarnoctl`**: keine neue `Request`-Variante nötig — die drei neuen
+  Felder sind additiv in die bestehende `Request::AiStatus`-Response
+  aufgenommen (`recent_security_stops`, `last_stopped_comm`,
+  `last_stopped_filename`, neben `mistral_configured`/`mode_note` aus
+  Phase 2). `tarnoctl ai status` zeigt sie automatisch mit, da es die
+  Response-JSON unverändert durchreicht — kein CLI-Code-Änderung nötig.
+  Die Freitext-Fragenformen ("was wurde zuletzt geblockt", "warum wurde X
+  angehalten") laufen über den bereits bestehenden `tarnoctl ai
+  <frage...>`-Pfad.
+
+Testabdeckung: Unit-Tests für `SecurityEventLog` (leer beim Start,
+FIFO-Kappung bei 50, `stop_count`/`last_stopped` inkl. des Falls, dass ein
+alter Stopp durch die Kappung verdrängt wird), für die beiden neuen
+`HeuristicBackend`-Fragenformen (mit und ohne Events, deutsch und
+englisch), für `system_prompt()`s neue Zusammenfassung, sowie
+End-to-End-Tests auf `dispatch()`-Ebene (`AiStatus`/`AiQuery` gegen einen
+`AppState`, in den zuvor ein synthetisches `SecurityEventRecord` gepusht
+wurde) — durchgängig gegen **synthetische** Events, kein echter eBPF-Load/
+Attach (bleibt dieselbe, bereits an anderer Stelle in diesem Dokument
+benannte Sandbox-Grenze wie beim restlichen `ebpf`-Feature). `cargo build`/
+`cargo test` sind sowohl ohne als auch mit `--features ebpf` grün.
+
+Damit sind alle drei ursprünglich geplanten Phasen von Tarno AI
+umgesetzt — Phase 1 (Heuristik), Phase 2 (Mistral-API, erster Cut) und
+Phase 3 (Security-Event-Anbindung, additiv).
 
 ## Woche 12: Polish & Dokumentation
 
