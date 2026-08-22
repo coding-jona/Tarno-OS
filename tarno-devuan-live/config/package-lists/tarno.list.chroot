@@ -64,3 +64,23 @@ grub-efi-amd64
 # rights at all, root being permanently locked either way.
 user-setup
 sudo
+
+# core desktop apps - up to now this was labwc's right-click menu,
+# tarno-settings, and a bare terminal, nothing to actually browse
+# files, get online, or edit a document with.
+#   pcmanfm-qt - file manager (LXQt's, Qt-based to match tarno-settings)
+#   firefox-esr - web browser (nothing at all was installed before)
+#   geany - text editor with syntax highlighting, still lightweight
+#   fuzzel - app launcher (same wlroots-ecosystem author as foot),
+#     bound to Super+Space in rc.xml, reads /usr/share/applications/*
+#     .desktop files automatically - no extra config needed for that
+#   wl-clipboard, grim, slurp - clipboard and screenshot CLI tools;
+#     baseline utilities every other wlroots desktop ships, missing
+#     here entirely until now
+pcmanfm-qt
+firefox-esr
+geany
+fuzzel
+wl-clipboard
+grim
+slurp

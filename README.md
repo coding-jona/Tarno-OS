@@ -127,6 +127,17 @@ from a hung/crashed session. Added `swaybg` (filling with the theme's
 base `#202020`) to `etc/xdg/labwc/autostart`, so a working session
 actually looks like one.
 
+Core apps: a file manager (`pcmanfm-qt`), a web browser
+(`firefox-esr`), a text editor (`geany`), and an app launcher
+(`fuzzel`, bound to `Super+Space`, reads `/usr/share/applications/*.desktop`
+automatically - no separate config needed to list apps in it) - up to
+this point there was nothing to browse files, get online, or edit a
+document with at all, just labwc's menu, `tarno-settings`, and a bare
+terminal. Also added `wl-clipboard`/`grim`/`slurp` (clipboard and
+screenshot CLI tools) - baseline utilities every other wlroots desktop
+ships that were simply missing here. Themed `fuzzel.ini` matches the
+same palette as everything else.
+
 ## Login
 
 There isn't one - tty1 autologs in as `user` (agetty `--autologin`, see
