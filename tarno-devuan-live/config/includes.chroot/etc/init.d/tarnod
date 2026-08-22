@@ -2,6 +2,11 @@
 # binary comes from .github/workflows/build-devuan-image.yml /
 # scripts/build-devuan-live.sh, built and dropped at
 # config/includes.chroot/usr/bin/tarnod before lb build runs.
+#
+# Enabled via 0300-dhcp-network.chroot (`rc-update add tarnod default`)
+# - having the package-list/init-script/binary in place was never
+# enough on its own, same class of gap as agetty/dhcpcd/seatd needing
+# their own explicit rc-update calls.
 
 name="tarnod"
 description="Tarno OS root daemon"
@@ -10,6 +15,13 @@ command_background=true
 pidfile="/run/${RC_SVCNAME}.pid"
 
 depend() {
-	need net
-	after bootmisc
+	# `need net` was a hard dependency on a virtual "net" service that
+	# nothing in this image actually provides - dhcpcd's Debian
+	# packaging ships a plain LSB init.d script with no `provide net`,
+	# so OpenRC could never resolve it and tarnod would fail to start
+	# at all. `use dhcpcd` is a soft dependency on the concrete
+	# service instead: start after it if present, but don't block if
+	# it's missing or not running (tarnod's `status` command doesn't
+	# need the network - only `ai` does).
+	use dhcpcd
 }

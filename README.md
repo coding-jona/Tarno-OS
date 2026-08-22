@@ -42,9 +42,12 @@ not shipping that silently).
 
 The root daemon (this package, `main.go`) listens on a Unix socket
 (`/run/tarnod.sock`, JSON in/out) and starts on boot via the OpenRC
-service in `tarno-devuan-live/config/includes.chroot/etc/init.d/tarnod`.
-Both the CI workflow and `scripts/build-devuan-live.sh` build it and drop
-it into `config/includes.chroot/usr/bin/tarnod` before `lb build` runs.
+service in `tarno-devuan-live/config/includes.chroot/etc/init.d/tarnod`,
+enabled by `0450-tarnod-enable.chroot` (the init script alone was never
+enough - same gap as agetty/dhcpcd/seatd, confirmed missing on a real
+boot). Both the CI workflow and `scripts/build-devuan-live.sh` build it
+and drop it into `config/includes.chroot/usr/bin/tarnod` before
+`lb build` runs.
 
     go run . &
     go run ./cmd/tarnoctl status
@@ -73,8 +76,20 @@ instead of bouncing to login. `/etc/profile.d/tarno-desktop.sh` always
 logs what happened to `/tmp/tarno-desktop.log` (whether it even ran,
 what tty/WAYLAND_DISPLAY/DISPLAY it saw) plus `$XDG_RUNTIME_DIR/labwc.log`
 for labwc's own output - no more guessing blind from a fast-flashing
-console. Still not confirmed to actually render anything graphical on
-real hardware.
+console.
+
+Second real boot test (with that fix in) found `/tmp` itself not
+actually writable - this image's `init=/sbin/openrc-init` setup skips
+the usual sysvinit/OpenRC boot chain that normally fixes `/tmp`
+permissions (openrc's own `bootmisc`, not wired into this image's
+runlevels), so it kept bare `mkdir` permissions. Fixed by a small
+dedicated service, `etc/init.d/tarno-earlysetup` (enabled by
+`0150-tarno-earlysetup-enable.chroot`), that runs before agetty and
+just fixes `/tmp`/`/var/tmp` permissions. `XDG_RUNTIME_DIR` also moved
+from `/run/user/<uid>` (root:root 0755 - a plain user process can never
+mkdir there, confirmed) to `/tmp/runtime-<uid>`, the XDG basedir spec's
+own documented fallback for when nothing sets it up properly. Still not
+confirmed to actually render anything graphical on real hardware.
 
 ## Login
 
@@ -87,4 +102,10 @@ by hand only if you `chvt` to another console.
 
 ## Status
 
-Wifi isn't wired up, only wired DHCP. See `ROADMAP.md`.
+Wifi isn't wired up, only wired DHCP - and even that needed a fix:
+Debian/Devuan's default `/etc/network/interfaces` ships its own
+`iface ... inet dhcp` stanza, which made dhcpcd's own init script
+refuse to start at all (avoiding a conflict with two DHCP clients on
+the same interface). Overridden to loopback-only
+(`config/includes.chroot/etc/network/interfaces`) since dhcpcd, not
+ifupdown, manages every interface in this image. See `ROADMAP.md`.
