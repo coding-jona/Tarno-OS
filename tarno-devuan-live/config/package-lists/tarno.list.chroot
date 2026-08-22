@@ -22,14 +22,18 @@ syslinux-utils
 # desktop: labwc (minimal wlroots/openbox-alike compositor with a real
 # root-menu, see config/includes.chroot/etc/xdg/labwc/) + seatd (seat
 # management without systemd-logind) + foot (minimal wayland terminal,
-# also the menu's Terminal entry) + waybar (taskbar - window list via
-# its wlr/taskbar module, which needs no compositor-specific support
-# beyond wlr-foreign-toplevel-management, which labwc implements - plus
-# a clock and a Tarno Settings launcher button, config in
+# also the menu's Terminal entry) + swaybg (labwc, like Openbox, paints
+# no background of its own - without a wallpaper client the screen is
+# just black, indistinguishable from "did this even start", confirmed
+# on a real boot) + waybar (taskbar - window list via its wlr/taskbar
+# module, which needs no compositor-specific support beyond
+# wlr-foreign-toplevel-management, which labwc implements - plus a
+# clock and a Tarno Settings launcher button, config in
 # config/includes.chroot/etc/xdg/waybar/).
 labwc
 seatd
 foot
+swaybg
 waybar
 
 # settings panel (config/includes.chroot/usr/bin/tarno-settings)
@@ -37,6 +41,18 @@ python3
 python3-pyside6.qtcore
 python3-pyside6.qtgui
 python3-pyside6.qtwidgets
+
+# tarno-disk-install (config/includes.chroot/usr/bin/tarno-disk-install,
+# menu entry in etc/xdg/labwc/menu.xml) needs all of these to actually
+# do anything - partition/format/copy/bootloader. Previously not shipped
+# in the image at all, so the installer only ever existed as source you'd
+# have to build yourself; there was no way to install to disk from a
+# running live session despite the README claiming otherwise.
+parted
+dosfstools
+e2fsprogs
+rsync
+grub-efi-amd64
 
 # live-config's own user creation (/usr/lib/live/config/0030-user-setup)
 # silently no-ops unless the `user-setup` package is present - without it

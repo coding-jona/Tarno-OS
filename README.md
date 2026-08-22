@@ -25,7 +25,17 @@ hardware, write it to a USB stick with `tarno-install`:
     sudo ./tarno-install tarno-devuan-live/*.iso sdX
 
 or install it to an internal disk from a running live session with
-`tarno-disk-install` (see `cmd/tarno-disk-install`).
+`tarno-disk-install` - now actually shipped in the image (`sudo
+tarno-disk-install` lists internal disks, `sudo tarno-disk-install sda`
+installs; also reachable from the desktop, see "Desktop" below). It
+wasn't before: the binary was never built into the ISO, none of its
+dependencies (`parted`, `dosfstools`, `e2fsprogs`, `rsync`,
+`grub-efi-amd64`) were in the package list, so despite this same README
+paragraph, there was no way to actually install to disk from a live
+session - confirmed missing on a real boot. Partition/format/mount
+pipeline verified locally against a loopback device; the rsync +
+chroot + grub-install stage still needs a real boot to fully confirm
+(needs the live system's own root, not reproducible in a dev sandbox).
 
 ## Updates
 
@@ -53,6 +63,16 @@ and drop it into `config/includes.chroot/usr/bin/tarnod` before
     go run ./cmd/tarnoctl status
     MISTRAL_API_KEY=... go run . &     # enables `tarnoctl ai <question>`
 
+The socket is `chmod 0666` right after creation - tarnod runs as root,
+so without this it inherits the process umask (typically `0755`), and
+Unix-socket `connect()` needs *write* permission, meaning any non-root
+client (`tarnoctl`, `tarno-settings`, both run as the live user) got
+`EACCES`. Confirmed on a real boot ("tarnod unreachable: [Errno 13]
+Permission denied") and fixed locally (verified: a non-root user can
+now connect and get a real response). Fine for a single-user image with
+root permanently locked - world-writable is the point, not a leftover
+mistake.
+
 ## Desktop
 
 Minimal Wayland desktop: [labwc](https://labwc.github.io/) (an
@@ -65,8 +85,12 @@ implements - plus a clock and a launcher button for `tarno-settings`;
 config in `tarno-devuan-live/config/includes.chroot/etc/xdg/waybar/`) +
 `tarno-settings`, a small PySide6 panel
 (`tarno-devuan-live/config/includes.chroot/usr/bin/tarno-settings`) that
-talks to `tarnod` over its socket - a Status tab and an AI tab for now,
-i.e. whatever `tarnod` actually exposes today. Starts automatically on
+talks to `tarnod` over its socket - Status and AI tabs (whatever
+`tarnod` itself exposes today), plus an Install tab wrapping
+`tarno-disk-install` (also its own "Install to Disk" root-menu entry,
+`tarno-install-to-disk` - an interactive terminal wrapper, since the
+raw command needs a device name and rsync's progress needs a real tty,
+neither of which fits a Qt widget). Starts automatically on
 tty1 login (`/etc/profile.d/tarno-desktop.sh`). Theme is the old
 `tarno-ui-theme` palette (cyan `#0BC7FF` on Fluent-style dark gray),
 ported to an Openbox `themerc` and a Qt stylesheet - completely different
@@ -93,8 +117,15 @@ dedicated service, `etc/init.d/tarno-earlysetup` (enabled by
 just fixes `/tmp`/`/var/tmp` permissions. `XDG_RUNTIME_DIR` also moved
 from `/run/user/<uid>` (root:root 0755 - a plain user process can never
 mkdir there, confirmed) to `/tmp/runtime-<uid>`, the XDG basedir spec's
-own documented fallback for when nothing sets it up properly. Still not
-confirmed to actually render anything graphical on real hardware.
+own documented fallback for when nothing sets it up properly.
+
+Third real boot test (past both of the above): labwc actually started -
+a plain black screen, which turned out to be success, not failure.
+labwc, like Openbox on X11, paints no background of its own; without a
+wallpaper client the whole output is just black and indistinguishable
+from a hung/crashed session. Added `swaybg` (filling with the theme's
+base `#202020`) to `etc/xdg/labwc/autostart`, so a working session
+actually looks like one.
 
 ## Login
 
