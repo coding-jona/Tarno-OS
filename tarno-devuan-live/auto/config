@@ -34,7 +34,80 @@ set -e
 # ../../.github/workflows/build-devuan-image.yml, der nur die
 # Host-seitige Verifikation beim allerersten Bootstrap-Schritt betrifft,
 # nicht die späteren In-Chroot-apt-Operationen von `lb build`.
+# --mode debian: live-build kennt kein eigenes "devuan"-Mode (die Liste ist
+# hart auf debian/emdebian/progress/ubuntu/kubuntu begrenzt, siehe
+# functions/defaults.sh, Set_defaults(), Zeilen ~25-49 im tatsächlich
+# installierten Paket - dazu unten mehr). Ohne dieses Flag rät live-build
+# den Mode per `lsb_release -is` des BUILD-HOSTS, nicht des Ziel-Chroots.
+# Auf dem GitHub-Actions-Runner (`runs-on: ubuntu-latest`) liefert das
+# "Ubuntu" -> LB_MODE=ubuntu, und das kippt still eine ganze Reihe
+# unabhaengiger Defaults auf Ubuntu-Werte um - am gravierendsten
+# LB_LINUX_PACKAGES=linux + LB_LINUX_FLAVOURS=generic (fuer amd64), macht
+# zusammen das Ubuntu-Metapaket "linux-generic", das es in Devuans Archiv
+# schlicht nicht gibt (Devuan/Debian heisst das Kernel-Metapaket
+# "linux-image-amd64", das Standardverhalten im "*"-Fallback-Zweig von
+# functions/defaults.sh, nicht im ubuntu|kubuntu-Zweig). Das waere der
+# naechste Fehlschlag nach dem Security-Mirror-Fix unten gewesen - hier
+# also proaktiv mit `--mode debian` verhindert, denn Devuan ist ein
+# Debian-, kein Ubuntu-Abkoemmling (README.md, Abschnitt "Warum Devuan
+# statt Debian?").
+#
+# --security false + config/archives/devuan-security.list.{chroot,binary}:
+# Realer Fehlschlag in Actions-Run 32560959289
+# (https://github.com/coding-jona/Tarno-OS/actions/runs/32560959289):
+#
+#   Err:2 http://security.ubuntu.com/ubuntu excalibur-security Release
+#   404  Not Found
+#
+# Root Cause (verifiziert am tatsaechlich installierten Paket, nicht nur
+# per Doku-Vermutung: `apt-get install live-build` liefert auf einem
+# Ubuntu-Noble-System exakt Version 3.0~a57-1ubuntu49.1 - dieselbe Version,
+# die auch `ubuntu-latest`-GitHub-Runner installieren, siehe
+# https://launchpad.net/ubuntu/noble/amd64/live-build - hier lokal
+# installiert und /usr/share/live/build/functions/defaults.sh sowie
+# /usr/lib/live/build/lb_chroot_archives direkt gelesen): Der oben
+# beschriebene LB_MODE=ubuntu-Unfall liess live-build automatisch eine
+# eigene "Security-Archiv"-Zeile generieren (lb_chroot_archives,
+# ubuntu|kubuntu-Zweig: `deb ${LB_MIRROR_CHROOT_SECURITY}
+# ${DISTRIBUTION}-security ...`) - mit dem Ubuntu-Default-Mirror
+# security.ubuntu.com statt Devuans deb.devuan.org, obwohl das
+# Namensschema selbst ("<dist>-security") zufaellig zu Devuans echtem
+# Suite-Namen passt (bestaetigt per Recherche: Devuans eigene
+# empfohlene sources.list nennt exakt "excalibur-security" auf
+# deb.devuan.org/merged, siehe https://www.devuan.org/os/packages).
+#
+# Mit dem obigen `--mode debian`-Fix aendert sich das Namensschema aber:
+# live-build's "debian"-Zweig generiert stattdessen das AELTERE, seit ca.
+# 2019 obsolete Debian-Schema "<dist>/updates" (z.B. "excalibur/updates")
+# statt "<dist>-security" - das gibt es auf deb.devuan.org ebenfalls
+# nicht, waere also ein Fehlschlag mit anderem Pfad, aber demselben
+# Ergebnis. Keiner der beiden in dieser (von Ubuntu seit Jahren
+# eingefrorenen) live-build-Version eingebauten Mode-Zweige trifft
+# Devuans tatsaechliches, aktuelles Layout korrekt.
+#
+# Deshalb hier bewusst BEIDE eingebauten Mechanismen umgangen: die
+# automatische Security-Zeilen-Generierung komplett abgeschaltet
+# (--security false) und stattdessen die live-build-eigene,
+# Mode-unabhaengige "third-party archives"-Schnittstelle genutzt (siehe
+# config/archives/devuan-security.list.chroot und .list.binary in diesem
+# Verzeichnis) - die schreibt die von uns vorgegebene Zeile unveraendert
+# nach chroot/etc/apt/sources.list.d/, unabhaengig von LB_MODE/LB_SECURITY.
+#
+# --keyring-packages: live-build installiert per Default das Debian-eigene
+# `debian-archive-keyring` in den Chroot, um die dort per apt gezogenen
+# Pakete zu verifizieren (Default laut lb_config-Manual/live-build-Quelle,
+# functions/defaults.sh: LB_KEYRING_PACKAGES="${LB_KEYRING_PACKAGES:-debian-archive-keyring}").
+# Das ist für einen Devuan-Ziel-Chroot schlicht falsch - genau dieses
+# Verhalten ist als realer Bug dokumentiert ("live-build uses debian
+# repos", devuan-packages/live-build-Issue #13: live-build zieht
+# Pakete aus Debian- statt Devuan-Repos, weil es den falschen Keyring
+# installiert). Deshalb hier explizit `devuan-keyring` statt des
+# Debian-Defaults - unabhängig vom debootstrap-Paket-Fix in
+# ../../.github/workflows/build-devuan-image.yml, der nur die
+# Host-seitige Verifikation beim allerersten Bootstrap-Schritt betrifft,
+# nicht die späteren In-Chroot-apt-Operationen von `lb build`.
 lb config noauto \
+    --mode debian \
     --distribution excalibur \
     --architectures amd64 \
     --archive-areas main \
@@ -42,6 +115,7 @@ lb config noauto \
     --mirror-chroot http://deb.devuan.org/merged \
     --mirror-binary http://deb.devuan.org/merged \
     --keyring-packages devuan-keyring \
+    --security false \
     --binary-images iso-hybrid \
     --bootappend-live "boot=live components init=/sbin/openrc-init" \
     "${@}"

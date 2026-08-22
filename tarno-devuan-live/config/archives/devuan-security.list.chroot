@@ -1,0 +1,30 @@
+# Devuans Security-Suite - manuell statt über live-builds eingebaute
+# `--security true`-Automatik, siehe ausführliche Begründung in
+# ../../auto/config (Kommentar über dem `lb config`-Aufruf, Abschnitt
+# "--security false + config/archives/devuan-security.list.{chroot,binary}").
+#
+# Kurzfassung: live-build kennt keinen "devuan"-Mode; sowohl sein
+# "ubuntu"- als auch sein "debian"-Mode-Zweig generieren für die
+# Security-Zeile entweder den falschen Host (security.ubuntu.com) oder
+# das falsche, veraltete Namensschema ("<dist>/updates" statt
+# "<dist>-security"). Diese Datei ist live-builds eigener, Mode-
+# unabhängiger "third-party archives"-Mechanismus (siehe
+# /usr/lib/live/build/lb_chroot_archives im live-build-Paket, Abschnitt
+# "Check local sources.list") - sie wird nach Ersetzung der unten
+# erklärten Platzhalter unverändert nach
+# chroot/etc/apt/sources.list.d/devuan-security.list kopiert, während des
+# Chroot-Installationsschritts (`lb_chroot_archives`, vor der eigentlichen
+# Paketinstallation).
+#
+# @DISTRIBUTION@ -> LB_DISTRIBUTION (excalibur, siehe auto/config)
+# @ARCHIVE_AREAS@ -> LB_ARCHIVE_AREAS (main, siehe auto/config)
+#
+# Suite-Name und Mirror-Host exakt wie in Devuans eigener, offiziell
+# dokumentierter sources.list-Empfehlung (https://www.devuan.org/os/packages,
+# Stand Recherche August 2026): `deb http://deb.devuan.org/merged
+# excalibur-security main`. Signaturprüfung läuft über dasselbe
+# `devuan-keyring`-Paket, das auto/config bereits per
+# `--keyring-packages devuan-keyring` in den Chroot installiert (ein
+# Devuan-Archiv, ein Signierschlüssel für alle Suiten) - deshalb ist hier
+# keine separate .key.chroot-Datei nötig.
+deb http://deb.devuan.org/merged @DISTRIBUTION@-security @ARCHIVE_AREAS@

@@ -139,6 +139,79 @@ Entwicklungs-Sandbox (derselbe Netzwerk-Proxy blockiert `deb.devuan.org`
 weiterhin) noch anderswo. Die echte Verifikation steht mit dem nächsten
 `workflow_dispatch`-Lauf noch aus.
 
+**Update — der Devuan-debootstrap-Fix hat real gegriffen:** Der nächste
+`workflow_dispatch`-Lauf (Actions-Run
+[32560959289](https://github.com/coding-jona/Tarno-OS/actions/runs/32560959289))
+kam deutlich weiter als der erste — `debootstrap` lief diesmal komplett
+durch ("I: Base system installed successfully.", echte Pakete aus
+`deb.devuan.org/merged` inklusive `devuan-keyring`, `sysvinit-core`). Das
+ist der erste real bestätigte Beweis, dass der debootstrap-Fix
+funktioniert. Danach scheiterte der Lauf aber an einer neuen Stelle,
+`lb_chroot_archives` (Einrichten der apt-Quellen im Chroot für die
+Paketinstallation):
+
+```
+Ign:1 http://security.ubuntu.com/ubuntu excalibur-security InRelease
+Err:2 http://security.ubuntu.com/ubuntu excalibur-security Release
+  404  Not Found
+E: The repository 'http://security.ubuntu.com/ubuntu excalibur-security Release' does not have a Release file.
+```
+
+Root Cause (verifiziert nicht per Doku-Vermutung, sondern am tatsächlich
+installierten Paket: `apt-get install live-build` liefert auf Ubuntu
+Noble — exakt der Unterbau von `runs-on: ubuntu-latest` — Version
+`3.0~a57-1ubuntu49.1`, siehe
+[Launchpad](https://launchpad.net/ubuntu/noble/amd64/live-build); diese
+Version wurde hier lokal installiert und ihr echter Quellcode gelesen,
+`/usr/share/live/build/functions/defaults.sh` und
+`/usr/lib/live/build/lb_chroot_archives`): live-build kennt keinen
+eigenen "devuan"-Mode (nur `debian`, `emdebian`, `progress`, `ubuntu`,
+`kubuntu`). Ohne explizites `--mode` **rät** live-build den Mode über
+`lsb_release -is` des Build-**Hosts** — auf dem GitHub-Actions-Runner
+also "Ubuntu" → `LB_MODE=ubuntu`. Das kippt still eine ganze Reihe an
+sich unabhängiger Defaults auf Ubuntu-Werte, unter anderem den
+Security-Mirror (`http://security.ubuntu.com/ubuntu/` statt Devuans
+`deb.devuan.org`) — daher der 404, denn Ubuntus Archiv kennt Devuans
+Suite-Namen `excalibur-security` naturgemäß nicht. `deb.devuan.org/merged
+excalibur-updates` (in derselben Logzeile davor) lief dagegen sauber
+durch — kein Problem mit dem Mirror selbst, nur mit dieser einen
+zusätzlichen, automatisch generierten Zeile.
+
+Der naheliegende Gegen-Fix (`--mode debian` statt `ubuntu` erzwingen)
+wurde geprüft und wäre **nicht ausreichend gewesen**: live-builds
+"debian"-Zweig generiert die Security-Zeile im alten, seit ca. 2019
+obsoleten Debian-Schema `<dist>/updates` statt `<dist>-security` — das
+gibt es auf `deb.devuan.org` ebenfalls nicht (bestätigt per Recherche:
+Devuans eigene, aktuell dokumentierte sources.list nennt exakt
+`excalibur-security` auf `deb.devuan.org/merged`, siehe
+[devuan.org/os/packages](https://www.devuan.org/os/packages)). Keiner der
+beiden in dieser (von Ubuntu seit Jahren eingefrorenen) live-build-Version
+eingebauten Mode-Zweige trifft Devuans tatsächliches, aktuelles Layout
+korrekt — schlicht weil "Devuan" für dieses Tool nicht existiert.
+
+**Fix (umgesetzt in `auto/config` und `config/archives/`):**
+`--mode debian` erzwungen (behebt daneben auch einen zweiten, noch nicht
+aufgetretenen, aber am selben Code verifizierten Bug: unter
+`LB_MODE=ubuntu` hätte live-build später versucht, das
+Ubuntu-Kernel-Metapaket `linux-generic` zu installieren, das es in
+Devuans Archiv nicht gibt — Debian/Devuan heißt es `linux-image-amd64`),
+zusammen mit `--security false` (schaltet live-builds eigene, für Devuan
+falsche Security-Zeilen-Generierung ab) plus zwei neuen Dateien,
+[`config/archives/devuan-security.list.chroot`](config/archives/devuan-security.list.chroot)
+und `.list.binary`, die live-builds eigenen, Mode-unabhängigen
+"third-party archives"-Mechanismus nutzen, um exakt die von Devuan
+dokumentierte Zeile einzutragen: `deb http://deb.devuan.org/merged
+excalibur-security main`. Lokal mit dem echten, oben identifizierten
+live-build-Paket verifiziert: `lb config` läuft fehlerfrei durch und
+erzeugt in `config/chroot` genau `LB_MODE=debian`, `LB_SECURITY=false`,
+`LB_LINUX_PACKAGES=linux-image`, `LB_LINUX_FLAVOURS=amd64`; die
+Platzhalter-Ersetzung in den neuen `config/archives/`-Dateien wurde
+manuell nachvollzogen und ergibt exakt `deb
+http://deb.devuan.org/merged excalibur-security main`. Ein echter
+`lb build`-Netzwerklauf bleibt weiterhin nur in GitHub Actions möglich
+(derselbe Sandbox-Proxy-Block wie überall in diesem Track) — das ist der
+nächste noch ausstehende Verifikationsschritt.
+
 ## Was hier bewusst NICHT drin ist (Scope dieses ersten Cuts)
 
 - **Kein `tarnod`-Binary.** `config/includes.chroot/etc/init.d/tarnod`
