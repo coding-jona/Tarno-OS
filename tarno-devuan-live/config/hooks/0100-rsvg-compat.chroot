@@ -1,5 +1,26 @@
 #!/bin/sh
-# librsvg dropped the `rsvg` command name in 2012; this live-build's splash
-# conversion still calls it. Symlink it before the binary stage runs.
+# librsvg dropped `rsvg` for `rsvg-convert` in 2012 - and changed the CLI:
+# old `rsvg` took a trailing positional output file, rsvg-convert treats
+# all positional args as inputs and wants -o/--output instead. A plain
+# name symlink isn't enough (live-build calls
+# `rsvg --format png ... splash.svg splash.png`, which rsvg-convert reads
+# as two input files) - translate the call instead.
 set -e
-ln -sf /usr/bin/rsvg-convert /usr/bin/rsvg
+cat > /usr/bin/rsvg <<'EOF'
+#!/bin/sh
+set -e
+n=$#
+i=1
+rest=
+for a in "$@"; do
+	if [ "$i" -lt "$n" ]; then
+		rest="$rest $a"
+	else
+		out=$a
+	fi
+	i=$((i + 1))
+done
+# shellcheck disable=SC2086
+exec rsvg-convert $rest -o "$out"
+EOF
+chmod +x /usr/bin/rsvg
