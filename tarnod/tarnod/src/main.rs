@@ -276,4 +276,72 @@ mod tests {
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("\"suggestions\":[]"));
     }
+
+    // Tarno-AI-Phase-3 (siehe docs/month3-tarno-layer.md#tarno-ai): Tests
+    // gegen synthetische `SecurityEventRecord`s statt eines echten eBPF-
+    // Attach (in dieser Sandbox ohnehin nicht möglich) — deckt den
+    // vollständigen Weg SecurityEventLog -> SystemContext::gather ->
+    // dispatch() ab.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_ai_status_reports_no_stops_without_security_events() {
+        let state = state_with_vault(Vault::default());
+        let resp = dispatch(&state, Request::AiStatus).await;
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("\"recent_security_stops\":0"));
+        assert!(s.contains("\"last_stopped_comm\":null"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_ai_status_reflects_synthetic_security_stop() {
+        let state = state_with_vault(Vault::default());
+        state.security_events.push(security::events::SecurityEventRecord::new(
+            4242,
+            0,
+            "cryptominer",
+            "/tmp/cryptominer",
+            security::events::SecurityAction::Stopped,
+        ));
+        let resp = dispatch(&state, Request::AiStatus).await;
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("\"recent_security_stops\":1"));
+        assert!(s.contains("\"last_stopped_comm\":\"cryptominer\""));
+        assert!(s.contains("\"last_stopped_filename\":\"/tmp/cryptominer\""));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_ai_query_answers_what_was_blocked_from_synthetic_event() {
+        let state = state_with_vault(Vault::default());
+        state.security_events.push(security::events::SecurityEventRecord::new(
+            4242,
+            0,
+            "evil.sh",
+            "/tmp/evil.sh",
+            security::events::SecurityAction::Stopped,
+        ));
+        let resp = dispatch(
+            &state,
+            Request::AiQuery {
+                text: "was wurde zuletzt geblockt?".into(),
+            },
+        )
+        .await;
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("evil.sh"));
+        assert!(s.contains("/tmp/evil.sh"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_ai_query_answers_what_was_blocked_honestly_without_events() {
+        let state = state_with_vault(Vault::default());
+        let resp = dispatch(
+            &state,
+            Request::AiQuery {
+                text: "what was blocked recently?".into(),
+            },
+        )
+        .await;
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("Nichts Auffälliges bisher"));
+    }
 }

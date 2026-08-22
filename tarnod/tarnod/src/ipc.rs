@@ -95,6 +95,7 @@ mod tests {
                 dry_run: true,
             },
             ai: crate::ai::AiState::new(),
+            security_events: crate::security::events::SecurityEventLog::new(),
         })
     }
 

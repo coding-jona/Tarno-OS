@@ -62,10 +62,44 @@ fn answer_security(ctx: &SystemContext) -> String {
     }
 }
 
+/// Tarno-AI-Phase-3 (siehe docs/month3-tarno-layer.md#tarno-ai): beantwortet
+/// "was wurde zuletzt geblockt"/"what was blocked" bzw. "warum wurde X
+/// angehalten"/"why was X stopped" anhand von `SystemContext::recent_
+/// security_stops`/`last_stopped_*` (befüllt aus `security::events::
+/// SecurityEventLog`, additiv zur Tracepoint/Policy-Engine, siehe
+/// `security::ebpf_loader`). Ohne Events (Feature `ebpf` inaktiv, oder
+/// bisher nichts passiert) gibt es eine ehrliche "nichts Auffälliges"-
+/// Antwort statt einer erfundenen — beide Fälle sind aus `SystemContext`
+/// heraus nicht unterscheidbar (0 Stops bleibt 0 Stops), das wird hier
+/// bewusst nicht verschleiert.
+fn answer_security_events(ctx: &SystemContext) -> String {
+    if ctx.recent_security_stops == 0 {
+        if ctx.ebpf_active {
+            "Nichts Auffälliges bisher — im aktuellen Event-Fenster wurde kein Prozess von der \
+             Behavioral-Security gestoppt."
+                .to_string()
+        } else {
+            "Nichts Auffälliges bisher — Behavioral-Security (eBPF) ist in diesem Build nicht \
+             aktiv, es gibt daher keine Events zum Nachschauen."
+                .to_string()
+        }
+    } else {
+        let comm = ctx.last_stopped_comm.as_deref().unwrap_or("unbekannt");
+        let filename = ctx.last_stopped_filename.as_deref().unwrap_or("unbekannter Pfad");
+        format!(
+            "{} Prozess(e) wurden zuletzt von der Behavioral-Security gestoppt (SIGSTOP). \
+             Zuletzt betroffen: \"{comm}\" ({filename}) — die konfigurierte Deny-Liste hat \
+             gegriffen. Fortsetzen (nach Prüfung) mit `tarnoctl resume <pid>`.",
+            ctx.recent_security_stops
+        )
+    }
+}
+
 fn fallback(question: &str) -> String {
     format!(
         "Das kann ich (Phase 1, heuristisch, kein LLM) noch nicht beantworten: \"{question}\". \
-         Bekannte Fragen: Gaming-Mode-Status, RAM-Status, Security-Status."
+         Bekannte Fragen: Gaming-Mode-Status, RAM-Status, Security-Status, zuletzt geblockte \
+         Prozesse."
     )
 }
 
@@ -76,12 +110,23 @@ impl AiBackend for HeuristicBackend {
 
         let asks_gaming = q.contains("gaming");
         let asks_ram = q.contains("ram") || q.contains("memory") || q.contains("speicher");
+        // Spezifischer als asks_security (Phase 3): "was wurde geblockt"/
+        // "warum wurde X angehalten" fragen nach konkreten Events, nicht
+        // nach dem generellen Subsystem-Status.
+        let asks_blocked = q.contains("geblockt")
+            || q.contains("blockiert")
+            || q.contains("blocked")
+            || q.contains("angehalten")
+            || q.contains("gestoppt")
+            || q.contains("stopped");
         let asks_security = q.contains("security") || q.contains("sicherheit");
 
         if asks_gaming {
             answer_gaming_mode(ctx)
         } else if asks_ram {
             answer_memory(ctx)
+        } else if asks_blocked {
+            answer_security_events(ctx)
         } else if asks_security {
             answer_security(ctx)
         } else {
@@ -162,5 +207,50 @@ mod tests {
         c.mem_available_kb = None;
         let answer = backend.answer("ram status", &c).await;
         assert!(answer.contains("nicht lesbar"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn answers_what_was_blocked_honestly_when_no_events() {
+        let backend = HeuristicBackend;
+        let mut c = ctx(false);
+        c.ebpf_active = true;
+        let answer = backend.answer("was wurde zuletzt geblockt?", &c).await;
+        assert!(answer.contains("Nichts Auffälliges bisher"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn answers_what_was_blocked_without_ebpf_feature() {
+        let backend = HeuristicBackend;
+        let c = ctx(false); // ebpf_active: false (Default)
+        let answer = backend.answer("what was blocked recently?", &c).await;
+        assert!(answer.contains("Nichts Auffälliges bisher"));
+        assert!(answer.contains("nicht aktiv"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn answers_why_was_process_stopped_with_real_event_data() {
+        let backend = HeuristicBackend;
+        let mut c = ctx(false);
+        c.ebpf_active = true;
+        c.recent_security_stops = 1;
+        c.last_stopped_comm = Some("cryptominer".to_string());
+        c.last_stopped_filename = Some("/tmp/cryptominer".to_string());
+        let answer = backend.answer("warum wurde cryptominer angehalten?", &c).await;
+        assert!(answer.contains("cryptominer"));
+        assert!(answer.contains("/tmp/cryptominer"));
+        assert!(answer.contains("tarnoctl resume"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn answers_why_was_process_stopped_english() {
+        let backend = HeuristicBackend;
+        let mut c = ctx(false);
+        c.ebpf_active = true;
+        c.recent_security_stops = 2;
+        c.last_stopped_comm = Some("evil.sh".to_string());
+        c.last_stopped_filename = Some("/tmp/evil.sh".to_string());
+        let answer = backend.answer("why was evil.sh stopped?", &c).await;
+        assert!(answer.contains("2 Prozess(e)"));
+        assert!(answer.contains("evil.sh"));
     }
 }
