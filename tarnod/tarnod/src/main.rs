@@ -25,6 +25,13 @@ pub struct AppState {
     pub gaming: GamingController,
     pub config: Config,
     pub ai: AiState,
+    /// Tarno-AI-Phase-3 (siehe docs/month3-tarno-layer.md#tarno-ai):
+    /// beschränkter Log der jüngsten `ExecEvent`s, den
+    /// `security::ebpf_loader::run` (Feature `ebpf`) befüllt und den
+    /// `AiQuery`/`AiStatus` nur lesend konsumieren. Unabhängig vom `ebpf`-
+    /// Feature immer vorhanden — ohne das Feature bleibt er schlicht immer
+    /// leer, siehe `security::events`.
+    pub security_events: security::events::SecurityEventLog,
 }
 
 /// Verarbeitet eine einzelne Anfrage gegen den aktuellen Daemon-Zustand.
@@ -60,12 +67,12 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
             Err(e) => Response::err(e.to_string()),
         },
         Request::AiQuery { text } => {
-            let ctx = ai::backend::SystemContext::gather(&state.gaming);
+            let ctx = ai::backend::SystemContext::gather(&state.gaming, &state.security_events);
             let answer = state.ai.answer(&text, &ctx).await;
             Response::ok(serde_json::json!({ "answer": answer }))
         }
         Request::AiStatus => {
-            let ctx = ai::backend::SystemContext::gather(&state.gaming);
+            let ctx = ai::backend::SystemContext::gather(&state.gaming, &state.security_events);
             let mistral_configured = state.ai.mistral_configured();
             // Ohne konfigurierten Mistral-Key läuft Tarno AI im reinen
             // Heuristik-Modus — das soll für `tarnoctl ai status` sofort
@@ -91,6 +98,10 @@ pub async fn dispatch(state: &AppState, req: Request) -> Response {
                 "mem_available_kb": ctx.mem_available_kb,
                 "mistral_configured": mistral_configured,
                 "mode_note": mode_note,
+                // Tarno-AI-Phase-3: siehe docs/month3-tarno-layer.md#tarno-ai.
+                "recent_security_stops": ctx.recent_security_stops,
+                "last_stopped_comm": ctx.last_stopped_comm,
+                "last_stopped_filename": ctx.last_stopped_filename,
             }))
         }
         Request::AiSuggestions => {
@@ -123,6 +134,7 @@ fn main() -> anyhow::Result<()> {
         gaming,
         config,
         ai,
+        security_events: security::events::SecurityEventLog::new(),
     });
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -132,8 +144,9 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "ebpf")]
         {
             let policy = security::ebpf_loader::Policy::from_env();
+            let ebpf_state = Arc::clone(&state);
             tokio::spawn(async move {
-                if let Err(e) = security::ebpf_loader::run(policy).await {
+                if let Err(e) = security::ebpf_loader::run(policy, ebpf_state).await {
                     eprintln!("tarnod: eBPF-Security-Subsystem beendet mit Fehler: {e}");
                 }
             });
@@ -166,6 +179,7 @@ mod tests {
                 dry_run: true,
             },
             ai,
+            security_events: security::events::SecurityEventLog::new(),
         }
     }
 

@@ -30,7 +30,7 @@ pub async fn run(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(TUNING_INTERVAL);
     loop {
         interval.tick().await;
-        let ctx = SystemContext::gather(&state.gaming);
+        let ctx = SystemContext::gather(&state.gaming, &state.security_events);
         if let Some(suggestion) = evaluate(&ctx) {
             state.ai.push_suggestion(suggestion);
         }
@@ -62,10 +62,9 @@ mod tests {
     fn ctx(total_kb: u64, available_kb: u64, gaming_mode_active: bool) -> SystemContext {
         SystemContext {
             gaming_mode_active,
-            isolated_cpus: None,
-            ebpf_active: false,
             mem_total_kb: Some(total_kb),
             mem_available_kb: Some(available_kb),
+            ..Default::default()
         }
     }
 
@@ -90,11 +89,9 @@ mod tests {
     #[test]
     fn no_suggestion_without_meminfo() {
         let c = SystemContext {
-            gaming_mode_active: false,
-            isolated_cpus: None,
-            ebpf_active: false,
             mem_total_kb: None,
             mem_available_kb: None,
+            ..Default::default()
         };
         assert!(evaluate(&c).is_none());
     }

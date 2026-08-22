@@ -120,6 +120,12 @@ struct ChatResponse {
 /// ausführliches Prompt-Engineering) — nur so viel Live-Kontext, dass die
 /// Antwort geerdet ist, ohne bei jeder Anfrage unnötig viele Tokens zu
 /// verbrauchen (siehe offene Frage dazu in der Recherche-Doku).
+///
+/// Seit Tarno-AI-Phase-3 (siehe docs/month3-tarno-layer.md#tarno-ai) enthält
+/// der Kontext zusätzlich eine knappe Security-Event-Zusammenfassung, damit
+/// eine Frage wie "was wurde zuletzt geblockt" real geerdet beantwortet wird
+/// statt zu halluzinieren — Mistral bekommt nur diese Zusammenfassung, nicht
+/// den vollen Event-Ring (der bleibt intern in `SecurityEventLog`).
 fn system_prompt(ctx: &SystemContext) -> String {
     let gaming = if ctx.gaming_mode_active { "an" } else { "aus" };
     let isolated = ctx.isolated_cpus.as_deref().unwrap_or("keine");
@@ -131,13 +137,23 @@ fn system_prompt(ctx: &SystemContext) -> String {
         }
         _ => "unbekannt".to_string(),
     };
+    let security_events = if ctx.recent_security_stops == 0 {
+        "keine kürzlich gestoppten Prozesse".to_string()
+    } else {
+        format!(
+            "{} kürzlich gestoppte(r) Prozess(e), zuletzt: {} ({})",
+            ctx.recent_security_stops,
+            ctx.last_stopped_comm.as_deref().unwrap_or("unbekannt"),
+            ctx.last_stopped_filename.as_deref().unwrap_or("unbekannter Pfad"),
+        )
+    };
     format!(
         "Du bist Tarno AI, der eingebaute System-Assistent von Tarno OS \
          (ein Gaming-optimiertes Linux für Minecraft auf Debian-Basis). \
          Antworte kurz, konkret und auf Deutsch, außer die Frage ist auf \
          Englisch. Aktueller System-Kontext: Gaming-Mode ist {gaming}, \
          isolierte CPUs: {isolated}, Behavioral-Security (eBPF): {ebpf}, \
-         RAM: {mem}."
+         RAM: {mem}, Security-Events: {security_events}."
     )
 }
 
@@ -366,6 +382,7 @@ mod tests {
             ebpf_active: true,
             mem_total_kb: Some(1_000_000),
             mem_available_kb: Some(200_000),
+            ..Default::default()
         }
     }
 
@@ -400,6 +417,19 @@ mod tests {
         assert!(prompt.contains("an")); // gaming mode an
         assert!(prompt.contains("2-3")); // isolierte CPUs
         assert!(prompt.contains("aktiv")); // ebpf
+        assert!(prompt.contains("keine kürzlich gestoppten Prozesse")); // Phase 3, kein Stop in ctx()
+    }
+
+    #[test]
+    fn system_prompt_embeds_recent_security_stop() {
+        let mut c = ctx();
+        c.recent_security_stops = 2;
+        c.last_stopped_comm = Some("cryptominer".to_string());
+        c.last_stopped_filename = Some("/tmp/cryptominer".to_string());
+        let prompt = system_prompt(&c);
+        assert!(prompt.contains("2 kürzlich gestoppte(r) Prozess(e)"));
+        assert!(prompt.contains("cryptominer"));
+        assert!(prompt.contains("/tmp/cryptominer"));
     }
 
     #[test]

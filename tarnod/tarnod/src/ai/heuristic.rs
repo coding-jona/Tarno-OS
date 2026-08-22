@@ -102,9 +102,9 @@ mod tests {
             } else {
                 None
             },
-            ebpf_active: false,
             mem_total_kb: Some(1_000_000),
             mem_available_kb: Some(200_000),
+            ..Default::default()
         }
     }
 

@@ -6,12 +6,14 @@
 use async_trait::async_trait;
 
 use crate::gaming::GamingController;
+use crate::security::events::SecurityEventLog;
 
 /// Live-Zustand des Systems, wie ihn Tarno AI für eine Antwort/einen
 /// Vorschlag braucht. Alle Felder sind aus echten, bereits vorhandenen
 /// Quellen befüllt (`GamingController`, `/proc/meminfo`, das `ebpf`-Cargo-
-/// Feature) — nichts hier ist erfunden.
-#[derive(Debug, Clone, PartialEq)]
+/// Feature, seit Phase 3 zusätzlich `security::events::SecurityEventLog`)
+/// — nichts hier ist erfunden.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SystemContext {
     /// Governor auf "performance" gesetzt (siehe `gaming.rs::set_governor`).
     pub gaming_mode_active: bool,
@@ -25,13 +27,26 @@ pub struct SystemContext {
     pub mem_total_kb: Option<u64>,
     /// `MemAvailable` aus `/proc/meminfo`, in kB.
     pub mem_available_kb: Option<u64>,
+    /// Tarno-AI-Phase-3 (siehe docs/month3-tarno-layer.md#tarno-ai): Anzahl
+    /// der `SecurityAction::Stopped`-Events im aktuellen
+    /// `SecurityEventLog`-Ring (0, falls `ebpf`-Feature inaktiv oder noch
+    /// nichts passiert ist — kein Unterschied zwischen beiden Fällen ohne
+    /// weitere Info, ehrlich abgebildet als "0").
+    pub recent_security_stops: usize,
+    /// `comm` (Kernel-Task-Name) des jüngsten gestoppten Prozesses im
+    /// aktuellen Ring, falls vorhanden.
+    pub last_stopped_comm: Option<String>,
+    /// Binärpfad des jüngsten gestoppten Prozesses im aktuellen Ring
+    /// (der "Grund", gegen den die Policy getroffen hat), falls vorhanden.
+    pub last_stopped_filename: Option<String>,
 }
 
 impl SystemContext {
     /// Sammelt den aktuellen System-Zustand. Reine Lesezugriffe (sysfs,
-    /// procfs) — keine Schreibaktion, kann daher jederzeit gefahrlos vor
-    /// jeder `AiQuery`/`AiStatus`-Antwort neu aufgerufen werden.
-    pub fn gather(gaming: &GamingController) -> Self {
+    /// procfs, der In-Memory-`SecurityEventLog`) — keine Schreibaktion,
+    /// kann daher jederzeit gefahrlos vor jeder `AiQuery`/`AiStatus`-Antwort
+    /// neu aufgerufen werden.
+    pub fn gather(gaming: &GamingController, security_events: &SecurityEventLog) -> Self {
         let isolated_cpus = gaming
             .isolated_cpus()
             .ok()
@@ -40,12 +55,16 @@ impl SystemContext {
             .current_governor()
             .map(|g| g == "performance")
             .unwrap_or(false);
+        let last_stopped = security_events.last_stopped();
         Self {
             gaming_mode_active,
             isolated_cpus,
             ebpf_active: cfg!(feature = "ebpf"),
             mem_total_kb: super::read_meminfo_kb("MemTotal:"),
             mem_available_kb: super::read_meminfo_kb("MemAvailable:"),
+            recent_security_stops: security_events.stop_count(),
+            last_stopped_comm: last_stopped.as_ref().map(|e| e.comm.clone()),
+            last_stopped_filename: last_stopped.as_ref().map(|e| e.filename.clone()),
         }
     }
 }
