@@ -94,7 +94,50 @@ Laufen gebracht hat.
 [`.github/workflows/build-devuan-image.yml`](../.github/workflows/build-devuan-image.yml)
 manuell auslösen (Actions-Tab → "Build Tarno OS Devuan image (experimental)" →
 "Run workflow"). Das ist der einzige Ort, an dem diese Konfiguration
-bisher überhaupt laufen könnte — und das ist noch nicht passiert.
+bisher überhaupt laufen könnte.
+
+**Update — erster echter Lauf, echter Fehlschlag (ein konkretes Beispiel
+für das "ehrlich verifizieren"-Muster, das dieses Projekt schon an
+anderer Stelle praktiziert, siehe z. B.
+[`docs/month3-tarno-layer.md`](../docs/month3-tarno-layer.md), Abschnitte
+Phase 1/2/3, und den Buildroot-Kernel-Config-Fix in
+[`docs/architecture.md`](../docs/architecture.md)):** Der Workflow wurde
+inzwischen einmal real auf GitHub Actions ausgelöst (Actions-Run
+[32560292687](https://github.com/coding-jona/Tarno-OS/actions/runs/32560292687),
+volle Internet-Anbindung, kein Sandbox-Proxy) und ist tatsächlich
+losgelaufen — aber nach ~20 Sekunden mit einem echten, root-caused Fehler
+gescheitert:
+
+```
+P: Running debootstrap (download-only)...
+E: No such script: /usr/share/debootstrap/scripts/excalibur
+```
+
+Root Cause: Ubuntus (bzw. Debians) eigenes `debootstrap`-Paket kennt unter
+`/usr/share/debootstrap/scripts/` nur Debian/Ubuntu-Codenamen — Devuan-
+Suite-Namen wie `excalibur` fehlen dort komplett. Bestätigt über einen
+echten Debian-Bugreport
+([#1067240](https://bugs-devel.debian.org/cgi-bin/bugreport.cgi?bug=1067240),
+"debootstrap: Devuan install scripts in /usr/share/debootstrap/scripts/")
+und ein unabhängiges Praxis-Rezept
+([Gist](https://gist.github.com/CypherpunkSamurai/925f961b13a73a354636b56e2760d150)),
+das beide denselben Fix nennen: Devuans eigenes, gepatchtes
+`debootstrap`-Paket installieren (erkennbar an einer `+devuanN`-
+Versionsendung) statt sich auf Ubuntus/Debians Archiv zu verlassen — plus
+Devuans `devuan-keyring`-Paket für die echte GPG-Verifikation der
+Release-Datei. Der Fix (Download + `dpkg -i` der Devuan-eigenen Pakete
+vor dem `lb config`/`lb build`-Lauf, mit einer nachgelagerten
+`debootstrap --version`-Prüfung, die laut abbricht, falls der Tausch
+nicht gegriffen hat) ist in
+[`.github/workflows/build-devuan-image.yml`](../.github/workflows/build-devuan-image.yml)
+umgesetzt.
+
+**Ehrlich gesagt:** Dieser Fix ist auf echter externer Recherche
+gegründet (zwei unabhängige Quellen, s. o.), aber **noch durch keinen
+erfolgreichen `lb build`-Lauf bestätigt** — weder in dieser
+Entwicklungs-Sandbox (derselbe Netzwerk-Proxy blockiert `deb.devuan.org`
+weiterhin) noch anderswo. Die echte Verifikation steht mit dem nächsten
+`workflow_dispatch`-Lauf noch aus.
 
 ## Was hier bewusst NICHT drin ist (Scope dieses ersten Cuts)
 
