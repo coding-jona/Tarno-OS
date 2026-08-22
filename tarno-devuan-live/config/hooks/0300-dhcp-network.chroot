@@ -1,0 +1,5 @@
+#!/bin/sh
+# Enable dhcpcd at boot, same as the agetty/console hook - not on by
+# default just because the package is installed.
+set -e
+rc-update add dhcpcd default

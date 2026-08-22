@@ -1,0 +1,7 @@
+#!/bin/sh
+# openrc-init doesn't get a console login for free - the openrc package
+# ships an agetty template (/etc/init.d/agetty) but nothing symlinks or
+# enables it by default. Without this there's no login prompt on tty1.
+set -e
+ln -sf agetty /etc/init.d/agetty.tty1
+rc-update add agetty.tty1 default
