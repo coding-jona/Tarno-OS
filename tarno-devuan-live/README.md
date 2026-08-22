@@ -59,6 +59,7 @@ bestehenden Praxis im Repo (Buildroot ist auf `2024.02.10` gepinnt, siehe
 | `config/includes.chroot/etc/init.d/tarnod` | OpenRC-Service-Skript für `tarnod`, portiert aus dem Buildroot-Pfad |
 | `config/archives/devuan-security.list.{chroot,binary}` | Eigene Security-Archiv-Zeile (live-builds automatische Generierung ist für Devuan an keinem eingebauten Mode korrekt, siehe Update-Verlauf unten) |
 | `config/bootloaders/isolinux/` | Eigene ISOLINUX-Boot-Menü-Vorlage — Kopie von live-builds eingebauter Vorlage, aber mit auf das moderne `isolinux`/`syslinux-common`-Paketlayout korrigierten `isolinux.bin`/`vesamenu.c32`-Symlinks (siehe Update-Verlauf unten) |
+| `config/hooks/0100-rsvg-compat.chroot` | Chroot-Hook: Kompatibilitäts-Symlink `rsvg` → `rsvg-convert` (live-builds Splash-Konvertierung ruft den seit 2012 nicht mehr existierenden alten Kommandonamen auf, siehe Update-Verlauf unten) |
 
 `config/` folgt sonst den `live-build`-Standardkonventionen — weitere
 Unterverzeichnisse (`config/bootstrap`, `config/chroot` usw.) legt
@@ -328,6 +329,42 @@ bleibt dabei unangetastet erhalten (wie für eingecheckte `config/`-Inhalte
 erwartet); `file`/`ls -la` bestätigen, dass beide Symlinks jetzt auf die
 per `dpkg-deb -c` gegen die echten `isolinux`/`syslinux-common`-Pakete
 verifizierten realen Pfade zeigen.
+
+**Update — ISOLINUX-Fix bestätigt, ein weiterer Alt-Kommando-Fehlschlag
+direkt danach:** Der nächste `workflow_dispatch`-Lauf (Actions-Run
+[32563556170](https://github.com/coding-jona/Tarno-OS/actions/runs/32563556170))
+bestätigt den ISOLINUX-Fix eindeutig — keine `cp: cannot stat`-Fehler
+mehr, der Lauf kam noch weiter als zuvor. Neuer Abbruch, wieder in
+`lb_binary_syslinux`, beim Konvertieren des Boot-Splash-Bilds:
+
+```
+env: 'rsvg': No such file or directory
+```
+
+Root Cause (am tatsächlich installierten `live-build`-Paket verifiziert,
+`/usr/lib/live/build/lb_binary_syslinux` Zeilen ~94 und ~337): der
+Standard-Syslinux-Splash (`LB_SYSLINUX_THEME=live-build`, live-builds
+eigener Default) konvertiert `splash.svg` → `splash.png` per
+`Chroot chroot "rsvg --format png ..."` — ruft also `rsvg` **innerhalb
+des Chroots** auf. `rsvg` ist der alte, seit dem librsvg-2.26-Split (2012)
+nicht mehr existierende Kommandoname; aktuelle `librsvg2-bin`-Pakete
+(auch auf Devuan) liefern ausschließlich `rsvg-convert`. Der vorherige
+`Check_package`-Aufruf prüft dabei nur, ob das *Paket* `librsvg2-bin`
+installiert ist (`dpkg-query -s`, siehe
+`/usr/share/live/build/functions/packages.sh`, `Check_installed()`) —
+das Paket kommt also so oder so rein, nur unter dem neuen Binärnamen.
+
+**Fix:** neuer Chroot-Hook
+[`config/hooks/0100-rsvg-compat.chroot`](config/hooks/0100-rsvg-compat.chroot)
+(alte `config/hooks/*.chroot`-Konvention dieser live-build-Version, nicht
+die neuere `.hook.chroot`-Namensgebung — siehe
+`/usr/lib/live/build/lb_chroot_hooks` im tatsächlich installierten Paket),
+legt `/usr/bin/rsvg` als Symlink auf `/usr/bin/rsvg-convert` an. Läuft
+zeitlich vor der Paketinstallation (chroot-hooks-Phase vor binary-Phase),
+der Symlink zeigt also zunächst ins Leere — unproblematisch, da nur beim
+späteren tatsächlichen `rsvg`-Aufruf aufgelöst werden muss, und
+`librsvg2-bin` ist bis dahin über `Check_package`/`Install_package`
+längst nachinstalliert.
 
 ## Was hier bewusst NICHT drin ist (Scope dieses ersten Cuts)
 
