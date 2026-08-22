@@ -22,3 +22,16 @@
 # auf der Konsole — in dieser ersten Cut-Version bewusst nicht ergänzt,
 # um den Scope klein zu halten.
 openrc
+
+# isolinux: liefert /usr/lib/ISOLINUX/isolinux.bin - separates Debian-/
+# Devuan-Paket, nicht mehr Teil von "syslinux" selbst (das Splitting kam
+# mit syslinux 5, 2014). Dieses live-build (siehe auto/config, Kommentar
+# zu --mode debian) prüft in lb_binary_syslinux nur "syslinux" +
+# "syslinux-common" automatisch (Check_package), nicht "isolinux" - ein
+# reales, an dieser (seit ~2012 von Ubuntu eingefrorenen) live-build-
+# Version liegendes Versäumnis. Ohne dieses Paket bricht `lb build` beim
+# Kopieren der ISO-Bootloader-Dateien ab (siehe
+# config/bootloaders/isolinux/ in diesem Verzeichnis für die zugehörige
+# Pfad-Korrektur). Hier explizit ergänzt statt auf die (fehlende)
+# Auto-Erkennung zu vertrauen.
+isolinux
