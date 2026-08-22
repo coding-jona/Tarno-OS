@@ -12,9 +12,12 @@ GRUB/syslinux normally use to override init.
 Console login (agetty) and wired DHCP (dhcpcd) are enabled via chroot
 hooks - neither comes for free under openrc-init. Wifi isn't wired up.
 
-Status: builds an `.hybrid.iso` in CI. Not booted on real hardware yet.
-`tarnod` itself isn't packaged into the image yet — `config/includes.chroot/etc/init.d/tarnod`
-just wires up the OpenRC service for whenever it is.
+Status: builds an `.hybrid.iso` in CI, `tarnod` is packaged in. First
+real boot test (QEMU/KVM) failed on `ISOLINUX: Failed to load ldlinux.c32`
+- our `config/bootloaders/isolinux/` override only had symlinks for
+`isolinux.bin`/`vesamenu.c32`, missing the other required syslinux 6
+modules (`ldlinux.c32`, and `vesamenu.c32`'s own runtime deps
+`libcom32.c32`/`libutil.c32`). Fixed, not yet re-tested.
 
 Build/test locally: see the top-level README.md (`make devuan-iso`,
 `make devuan-run`).
