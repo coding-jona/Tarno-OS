@@ -1,0 +1,29 @@
+{
+    "layer": "top",
+    "position": "top",
+    "height": 30,
+    "spacing": 4,
+
+    "modules-left": ["custom/menu", "wlr/taskbar"],
+    "modules-right": ["clock"],
+
+    "custom/menu": {
+        "format": "Tarno",
+        "tooltip": false,
+        "on-click": "tarno-settings"
+    },
+
+    "wlr/taskbar": {
+        "format": "{name}",
+        "icon-size": 16,
+        "tooltip-format": "{title}",
+        "on-click": "activate",
+        "on-click-middle": "close",
+        "all-outputs": true
+    },
+
+    "clock": {
+        "format": "{:%H:%M   %d.%m.%Y}",
+        "tooltip-format": "<big>{:%Y %B}</big>\n<tt><small>{calendar}</small></tt>"
+    }
+}

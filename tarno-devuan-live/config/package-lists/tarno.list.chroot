@@ -25,11 +25,16 @@ syslinux-utils
 # also the menu's Terminal entry) + swaybg (labwc, like Openbox, paints
 # no background of its own - without a wallpaper client the screen is
 # just black, indistinguishable from "did this even start", confirmed
-# on a real boot).
+# on a real boot) + waybar (taskbar - window list via its wlr/taskbar
+# module, which needs no compositor-specific support beyond
+# wlr-foreign-toplevel-management, which labwc implements - plus a
+# clock and a Tarno Settings launcher button, config in
+# config/includes.chroot/etc/xdg/waybar/).
 labwc
 seatd
 foot
 swaybg
+waybar
 
 # settings panel (config/includes.chroot/usr/bin/tarno-settings)
 python3

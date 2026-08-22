@@ -1,0 +1,49 @@
+/* Same palette as tarno-settings / the labwc themerc - cyan #0bc7ff on
+   Fluent-style dark gray. */
+
+* {
+    font-family: sans-serif;
+    font-size: 13px;
+    min-height: 0;
+}
+
+window#waybar {
+    background-color: #202020;
+    color: #f3f3f3;
+}
+
+#custom-menu {
+    padding: 0 14px;
+    color: #0bc7ff;
+    font-weight: bold;
+}
+
+#custom-menu:hover {
+    background-color: #2c2c2c;
+}
+
+#taskbar {
+    padding: 0 4px;
+}
+
+#taskbar button {
+    padding: 0 10px;
+    color: #b3b3b3;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+}
+
+#taskbar button:hover {
+    background-color: #2c2c2c;
+}
+
+#taskbar button.active {
+    color: #f3f3f3;
+    border-bottom: 2px solid #0bc7ff;
+}
+
+#clock {
+    padding: 0 14px;
+    color: #b3b3b3;
+}

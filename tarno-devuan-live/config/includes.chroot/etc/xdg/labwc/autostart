@@ -8,3 +8,8 @@
 # nothing, so a working session is visibly a working session.
 # Right-click still opens the menu.
 swaybg -c '#202020' &
+
+# waybar is a layer-shell panel, not a regular window - it reserves its
+# own screen space via the wlr-layer-shell protocol, no labwc-side
+# config needed for that. Config: config/includes.chroot/etc/xdg/waybar/
+waybar &

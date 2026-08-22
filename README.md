@@ -78,6 +78,11 @@ mistake.
 Minimal Wayland desktop: [labwc](https://labwc.github.io/) (an
 Openbox-alike wlroots compositor with a real right-click root menu,
 config in `tarno-devuan-live/config/includes.chroot/etc/xdg/labwc/`) +
+[waybar](https://github.com/Alexays/Waybar) as a taskbar (window list via
+its `wlr/taskbar` module - needs nothing labwc-specific, just the
+`wlr-foreign-toplevel-management` protocol every wlroots compositor
+implements - plus a clock and a launcher button for `tarno-settings`;
+config in `tarno-devuan-live/config/includes.chroot/etc/xdg/waybar/`) +
 `tarno-settings`, a small PySide6 panel
 (`tarno-devuan-live/config/includes.chroot/usr/bin/tarno-settings`) that
 talks to `tarnod` over its socket - Status and AI tabs (whatever
