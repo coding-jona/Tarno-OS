@@ -1,6 +1,7 @@
 #!/sbin/openrc-run
-# tarnod isn't built/packaged into the image yet, this just wires up the
-# service for when it is.
+# binary comes from .github/workflows/build-devuan-image.yml /
+# scripts/build-devuan-live.sh, built and dropped at
+# config/includes.chroot/usr/bin/tarnod before lb build runs.
 
 name="tarnod"
 description="Tarno OS root daemon"

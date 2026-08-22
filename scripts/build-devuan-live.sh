@@ -4,6 +4,17 @@
 # names, so unlike the CI workflow this needs no debootstrap package swap.
 set -eu
 
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+
+# built before the re-exec below, as the invoking user - so it picks up
+# their normal go toolchain instead of root's (possibly missing) PATH
+if ! command -v go >/dev/null 2>&1; then
+	echo "no go toolchain found, install golang first" >&2
+	exit 1
+fi
+mkdir -p "${repo_root}/tarno-devuan-live/config/includes.chroot/usr/bin"
+( cd "${repo_root}" && GOOS=linux GOARCH=amd64 go build -o tarno-devuan-live/config/includes.chroot/usr/bin/tarnod . )
+
 if [ "$(id -u)" -ne 0 ]; then
 	if command -v sudo >/dev/null 2>&1; then
 		exec sudo "$0" "$@"

@@ -38,8 +38,19 @@ the live image's `sources.list` - the repo is unsigned until an
 `APT_REPO_GPG_KEY` secret exists (`[trusted=yes]` by default otherwise,
 not shipping that silently).
 
+## tarnod
+
+The root daemon (this package, `main.go`) listens on a Unix socket
+(`/run/tarnod.sock`, JSON in/out) and starts on boot via the OpenRC
+service in `tarno-devuan-live/config/includes.chroot/etc/init.d/tarnod`.
+Both the CI workflow and `scripts/build-devuan-live.sh` build it and drop
+it into `config/includes.chroot/usr/bin/tarnod` before `lb build` runs.
+
+    go run . &
+    go run ./cmd/tarnoctl status
+    MISTRAL_API_KEY=... go run . &     # enables `tarnoctl ai <question>`
+
 ## Status
 
-`tarnod` isn't packaged into the live image yet - the OpenRC service is
-wired up but has nothing to run. Wifi isn't wired up either, only wired
-DHCP. See `ROADMAP.md`.
+Wifi isn't wired up, only wired DHCP. No desktop/UI yet - shell only.
+See `ROADMAP.md`.

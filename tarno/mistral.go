@@ -1,6 +1,10 @@
 package tarno
 
-import mistral "github.com/gage-technologies/mistral-go"
+import (
+	"errors"
+
+	mistral "github.com/gage-technologies/mistral-go"
+)
 
 /*
  {
@@ -36,9 +40,25 @@ import mistral "github.com/gage-technologies/mistral-go"
 }
 */
 
-type MistralProvider struct{}
+const mistralModel = "mistral-small-latest"
 
-func NewMistralProvider(apikey string) {
-	mistral.NewMistralClientDefault(apikey)
+type MistralProvider struct {
+	client *mistral.MistralClient
+}
 
+func NewMistralProvider(apikey string) *MistralProvider {
+	return &MistralProvider{client: mistral.NewMistralClientDefault(apikey)}
+}
+
+func (p *MistralProvider) Query(text string) (string, error) {
+	resp, err := p.client.Chat(mistralModel, []mistral.ChatMessage{
+		{Role: "user", Content: text},
+	}, nil)
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Choices) == 0 {
+		return "", errors.New("mistral: empty response")
+	}
+	return resp.Choices[0].Message.Content, nil
 }
