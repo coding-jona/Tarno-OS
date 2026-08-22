@@ -11,3 +11,10 @@ isolinux
 # reach the internet at all. wifi (wpa_supplicant + firmware) isn't
 # wired up yet.
 dhcpcd5
+
+# isohybrid moved into its own package too (same 2014 syslinux split as
+# isolinux above). lb_binary_iso's own check for it only looks for the
+# `syslinux` package (Check_package chroot/usr/bin/isohybrid syslinux),
+# which doesn't ship isohybrid anymore either - same class of stale
+# check, so pull it in by hand like isolinux.
+syslinux-utils
