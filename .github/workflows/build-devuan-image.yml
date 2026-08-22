@@ -1,0 +1,95 @@
+name: Build Tarno OS Devuan image (experimental)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build-devuan-image:
+    name: live-build (tarno-devuan-live, Devuan excalibur)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install live-build host deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y live-build squashfs-tools xorriso
+
+      # ubuntu's debootstrap doesn't ship devuan suite scripts (excalibur
+      # etc), pull devuan's own package instead
+      - name: install devuan's debootstrap + keyring
+        run: |
+          set -eu
+
+          fetch_pinned_or_latest () {
+            pkg_dir="$1"
+            pinned_file="$2"
+            out="$3"
+
+            url="http://deb.devuan.org/devuan/pool/main/d/${pkg_dir}/${pinned_file}"
+            if curl -fsSL -o "${out}" "${url}"; then
+              return 0
+            fi
+
+            echo "pinned ${pinned_file} is gone, falling back to latest in pool listing" >&2
+            listing_url="http://deb.devuan.org/devuan/pool/main/d/${pkg_dir}/"
+            latest_file="$(curl -fsSL "${listing_url}" \
+              | grep -oE "${pkg_dir}_[^\"']+_(all|amd64)\.deb" \
+              | sort -V | tail -n1)"
+            [ -n "${latest_file}" ] || { echo "no ${pkg_dir} .deb found" >&2; exit 1; }
+            curl -fsSL -o "${out}" "${listing_url}${latest_file}"
+          }
+
+          fetch_pinned_or_latest debootstrap debootstrap_1.0.134devuan2_all.deb /tmp/devuan-debootstrap.deb
+          fetch_pinned_or_latest devuan-keyring devuan-keyring_2025.08.09_all.deb /tmp/devuan-keyring.deb
+
+          sudo dpkg -i /tmp/devuan-debootstrap.deb /tmp/devuan-keyring.deb || true
+          sudo apt-get install -f -y
+
+      - name: verify debootstrap is devuan's
+        run: |
+          set -eu
+          version="$(debootstrap --version)"
+          echo "${version}"
+          case "${version}" in
+            *devuan*) ;;
+            *) echo "not devuan's debootstrap, lb build would fail" >&2; exit 1 ;;
+          esac
+
+      - name: lb config
+        working-directory: tarno-devuan-live
+        run: sudo lb config
+
+      # actions' default shell is bash -e without pipefail, so tee's exit
+      # code (not lb build's) would decide success - set it explicitly
+      - name: lb build
+        working-directory: tarno-devuan-live
+        run: |
+          set -o pipefail
+          sudo lb build 2>&1 | tee build.log
+
+      - name: check result
+        working-directory: tarno-devuan-live
+        run: |
+          image="$(find . -maxdepth 1 -name '*.iso' | head -n1)"
+          [ -n "${image}" ] || { echo "no .iso produced" >&2; exit 1; }
+          file "${image}"
+          sha256sum "${image}" | tee "${image}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarno-os-devuan-iso
+          path: |
+            tarno-devuan-live/*.iso
+            tarno-devuan-live/*.iso.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devuan-live-build-log
+          path: tarno-devuan-live/build.log
+          if-no-files-found: ignore

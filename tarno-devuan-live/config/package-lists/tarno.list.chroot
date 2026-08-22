@@ -1,0 +1,7 @@
+# openrc-init is selected via the init= kernel param in auto/config;
+# devuan's default init (sysvinit) stays untouched.
+openrc
+
+# isolinux.bin moved into its own package when syslinux split in 2014;
+# this live-build's package check doesn't know that, so pull it in by hand.
+isolinux

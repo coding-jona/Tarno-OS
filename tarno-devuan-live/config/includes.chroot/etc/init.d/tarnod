@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+# tarnod isn't built/packaged into the image yet, this just wires up the
+# service for when it is.
+
+name="tarnod"
+description="Tarno OS root daemon"
+command="/usr/bin/tarnod"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+	need net
+	after bootmisc
+}

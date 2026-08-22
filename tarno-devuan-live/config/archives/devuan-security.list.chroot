@@ -1,0 +1,4 @@
+# live-build has no devuan mode, so --security false in auto/config turns
+# off its (wrong-for-devuan) auto-generated security line, and this file
+# provides the real one via live-build's third-party-archives mechanism.
+deb http://deb.devuan.org/merged @DISTRIBUTION@-security @ARCHIVE_AREAS@
