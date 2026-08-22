@@ -180,9 +180,26 @@ jobs:
       # Log-Datei (anders als Buildroots build-time.log) - deshalb hier
       # per `tee` selbst mitschreiben, damit ein Fehlschlag als
       # Artifact nachvollziehbar bleibt.
+      #
+      # `set -o pipefail`: GitHub Actions' Default-Shell fuer `run:` ist
+      # `bash -e {0}` OHNE `pipefail` (verifiziert am echten Job-Log dieses
+      # Workflows, Actions-Run 32562474234 - jeder Schritt meldet dort
+      # "shell: /usr/bin/bash -e {0}"). Ohne `pipefail` ist der Exit-Code
+      # einer Pipe der des LETZTEN Kommandos, hier also `tee` - das
+      # scheitert praktisch nie. Genau das ist in besagtem Run real
+      # passiert: `lb build` brach mitten im Chroot-Schritt ab (fehlendes
+      # Contents-amd64.gz, siehe Fix in tarno-devuan-live/auto/config), der
+      # Schritt hier meldete trotzdem "success", und nur der nachfolgende
+      # "Ergebnis-Image pruefen"-Schritt hat den Fehlschlag ueberhaupt noch
+      # bemerkt (kein .iso gefunden). Mit `pipefail` schlaegt dieser
+      # Schritt direkt und korrekt fehl, sobald `lb build` selbst
+      # fehlschlaegt - der Log bleibt trotzdem vollstaendig, `tee` laeuft
+      # ja weiterhin mit.
       - name: lb build (Devuan excalibur, debootstrap + Pakete + ISO)
         working-directory: tarno-devuan-live
-        run: sudo lb build 2>&1 | tee build.log
+        run: |
+          set -o pipefail
+          sudo lb build 2>&1 | tee build.log
 
       - name: Ergebnis-Image pruefen
         working-directory: tarno-devuan-live

@@ -34,6 +34,7 @@ set -e
 # ../../.github/workflows/build-devuan-image.yml, der nur die
 # Host-seitige Verifikation beim allerersten Bootstrap-Schritt betrifft,
 # nicht die späteren In-Chroot-apt-Operationen von `lb build`.
+#
 # --mode debian: live-build kennt kein eigenes "devuan"-Mode (die Liste ist
 # hart auf debian/emdebian/progress/ubuntu/kubuntu begrenzt, siehe
 # functions/defaults.sh, Set_defaults(), Zeilen ~25-49 im tatsächlich
@@ -93,19 +94,48 @@ set -e
 # Verzeichnis) - die schreibt die von uns vorgegebene Zeile unveraendert
 # nach chroot/etc/apt/sources.list.d/, unabhaengig von LB_MODE/LB_SECURITY.
 #
-# --keyring-packages: live-build installiert per Default das Debian-eigene
-# `debian-archive-keyring` in den Chroot, um die dort per apt gezogenen
-# Pakete zu verifizieren (Default laut lb_config-Manual/live-build-Quelle,
-# functions/defaults.sh: LB_KEYRING_PACKAGES="${LB_KEYRING_PACKAGES:-debian-archive-keyring}").
-# Das ist für einen Devuan-Ziel-Chroot schlicht falsch - genau dieses
-# Verhalten ist als realer Bug dokumentiert ("live-build uses debian
-# repos", devuan-packages/live-build-Issue #13: live-build zieht
-# Pakete aus Debian- statt Devuan-Repos, weil es den falschen Keyring
-# installiert). Deshalb hier explizit `devuan-keyring` statt des
-# Debian-Defaults - unabhängig vom debootstrap-Paket-Fix in
-# ../../.github/workflows/build-devuan-image.yml, der nur die
-# Host-seitige Verifikation beim allerersten Bootstrap-Schritt betrifft,
-# nicht die späteren In-Chroot-apt-Operationen von `lb build`.
+# --firmware-chroot false / --firmware-binary false: zweiter, direkt vom
+# `--mode debian`-Fix ausgeloester Nebeneffekt, real aufgetreten in
+# Actions-Run 32562474234
+# (https://github.com/coding-jona/Tarno-OS/actions/runs/32562474234) -
+# `lb build` selbst meldete "success" (siehe Anmerkung zu `set -o
+# pipefail` in ../../.github/workflows/build-devuan-image.yml), brach
+# aber tatsaechlich mitten im Chroot-Schritt ab:
+#
+#   lb_chroot_linux-image
+#   --2026-08-22 08:33:13--  http://deb.devuan.org/merged/dists/excalibur/Contents-amd64.gz
+#   HTTP request sent, awaiting response... 404 Not Found
+#   gzip: stdin: unexpected end of file
+#
+# Root Cause (wieder am tatsaechlich installierten Paket verifiziert,
+# /usr/share/live/build/functions/defaults.sh Zeilen ~1230-1241 und
+# /usr/lib/live/build/lb_chroot_linux-image Zeilen ~57-63): LB_FIRMWARE_CHROOT
+# defaultet im ubuntu-Zweig auf "false", in JEDEM anderen Mode (also auch
+# im hier erzwungenen "debian") auf "true". Mit `--mode debian` oben
+# aktiviert das also automatisch live-builds Firmware-Erkennung, die dafuer
+# ein "Contents-amd64.gz"-Indexdatei von der Mirror-Wurzel herunterlaedt,
+# um darin nach "lib/firmware"-Dateipfaden zu suchen. Diese Datei liegt auf
+# deb.devuan.org unter diesem (alten, flachen) Pfad nicht (mehr) vor - ob
+# grundsaetzlich nicht oder nur an anderer Stelle (z.B. unter
+# main/Contents-amd64.gz), war aus dieser Sandbox heraus nicht verifizierbar
+# (deb.devuan.org per Proxy geblockt, s.o.).
+#
+# Bewusst kein Versuch, den echten Contents-Pfad zu erraten oder
+# nachzubauen: Firmware-Pakete liegen bei Devuan wie bei Debian ueblicherweise
+# in den Komponenten "non-free-firmware"/"non-free", und dieser Build nutzt
+# ausschliesslich `--archive-areas main` (bewusste Entscheidung, siehe
+# README.md, "Was hier bewusst NICHT drin ist") - selbst ein erfolgreicher
+# Contents-Abruf wuerde die Firmware-Paketliste hier also ohnehin auf (fast)
+# nichts filtern (lb_chroot_linux-image filtert contrib/non-free-Treffer
+# heraus, wenn diese Archiv-Bereiche nicht aktiv sind). Firmware-Erkennung
+# hier also einfach konsistent zur bestehenden "main only"-Entscheidung
+# abgeschaltet, statt eine kaputte Mode-Nebenwirkung zu reparieren, die für
+# unsere Konfiguration ohnehin nichts beigetragen hätte.
+# --firmware-binary betrifft laut lb_config-Doku nur den
+# debian-installer-Pfad (den dieser Build nicht nutzt, kein
+# `--debian-installer`-Flag gesetzt) - hier trotzdem explizit mitgesetzt,
+# aus Konsistenz und um denselben Fehlermodus präventiv auszuschließen,
+# falls ein späterer Cut doch einmal debian-installer aktiviert.
 lb config noauto \
     --mode debian \
     --distribution excalibur \
@@ -116,6 +146,8 @@ lb config noauto \
     --mirror-binary http://deb.devuan.org/merged \
     --keyring-packages devuan-keyring \
     --security false \
+    --firmware-chroot false \
+    --firmware-binary false \
     --binary-images iso-hybrid \
     --bootappend-live "boot=live components init=/sbin/openrc-init" \
     "${@}"
