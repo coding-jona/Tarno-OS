@@ -64,9 +64,14 @@ tty1 login (`/etc/profile.d/tarno-desktop.sh`). Theme is the old
 ported to an Openbox `themerc` and a Qt stylesheet - completely different
 layout from the old deleted `tarno-desktop`/`tarnod-ui`, same colors.
 
-Built from documented labwc/Openbox config knowledge, not yet booted on
-real hardware or in `make devuan-run` - CI only proves the packages
-resolve and `lb build` succeeds, it doesn't render anything graphical.
+First real boot test found labwc crashing the login session instantly
+(no systemd/elogind means nothing set `XDG_RUNTIME_DIR`, and that's
+labwc's very first startup check - see git history for the fix). Login
+now drops into labwc without exec'ing it, so any *other* crash (e.g. no
+usable DRM/KMS device on a given machine/VM) lands you back at a shell
+instead of bouncing to login, with `$XDG_RUNTIME_DIR/labwc.log` to
+check. Still not confirmed to actually render anything graphical on
+real hardware.
 
 ## Login
 
