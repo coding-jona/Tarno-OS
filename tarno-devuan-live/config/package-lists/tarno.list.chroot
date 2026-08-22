@@ -22,10 +22,14 @@ syslinux-utils
 # desktop: labwc (minimal wlroots/openbox-alike compositor with a real
 # root-menu, see config/includes.chroot/etc/xdg/labwc/) + seatd (seat
 # management without systemd-logind) + foot (minimal wayland terminal,
-# also the menu's Terminal entry).
+# also the menu's Terminal entry) + swaybg (labwc, like Openbox, paints
+# no background of its own - without a wallpaper client the screen is
+# just black, indistinguishable from "did this even start", confirmed
+# on a real boot).
 labwc
 seatd
 foot
+swaybg
 
 # settings panel (config/includes.chroot/usr/bin/tarno-settings)
 python3

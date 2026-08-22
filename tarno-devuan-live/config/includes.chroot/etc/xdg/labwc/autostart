@@ -1,2 +1,10 @@
 #!/bin/sh
-# nothing to autostart yet - right-click the desktop for the menu
+# labwc, like Openbox on X11, doesn't paint a desktop background itself
+# - without a wallpaper client the whole screen is just black, which on
+# a real boot is indistinguishable from "did this actually start at
+# all?" (confirmed: that's exactly what a plain black screen after
+# login looked like). swaybg is the minimal wlr-layer-shell wallpaper
+# tool for this - fill with the theme's base dark-gray instead of
+# nothing, so a working session is visibly a working session.
+# Right-click still opens the menu.
+swaybg -c '#202020' &

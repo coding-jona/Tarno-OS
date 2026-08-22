@@ -88,8 +88,15 @@ dedicated service, `etc/init.d/tarno-earlysetup` (enabled by
 just fixes `/tmp`/`/var/tmp` permissions. `XDG_RUNTIME_DIR` also moved
 from `/run/user/<uid>` (root:root 0755 - a plain user process can never
 mkdir there, confirmed) to `/tmp/runtime-<uid>`, the XDG basedir spec's
-own documented fallback for when nothing sets it up properly. Still not
-confirmed to actually render anything graphical on real hardware.
+own documented fallback for when nothing sets it up properly.
+
+Third real boot test (past both of the above): labwc actually started -
+a plain black screen, which turned out to be success, not failure.
+labwc, like Openbox on X11, paints no background of its own; without a
+wallpaper client the whole output is just black and indistinguishable
+from a hung/crashed session. Added `swaybg` (filling with the theme's
+base `#202020`) to `etc/xdg/labwc/autostart`, so a working session
+actually looks like one.
 
 ## Login
 
