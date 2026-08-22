@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Tarno OS settings panel - talks to tarnod over its unix socket."""
+import json
+import socket
+import sys
+
+from PySide6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPlainTextEdit,
+    QPushButton,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+SOCKET_PATH = "/run/tarnod.sock"
+
+BG_APP = "#202020"
+BG_PANEL = "#2c2c2c"
+BG_WIDGET = "#333333"
+BG_WIDGET_HOVER = "#3d3d3d"
+BORDER = "rgba(255, 255, 255, 0.08)"
+TEXT_PRIMARY = "#f3f3f3"
+TEXT_MUTED = "#b3b3b3"
+ACCENT = "#0bc7ff"
+ACCENT_HOVER = "#33d1ff"
+DANGER = "#ff6a5f"
+
+STYLESHEET = f"""
+QMainWindow, QWidget {{
+    background: {BG_APP};
+    color: {TEXT_PRIMARY};
+    font-size: 13px;
+}}
+QTabWidget::pane {{
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    background: {BG_PANEL};
+}}
+QTabBar::tab {{
+    background: transparent;
+    color: {TEXT_MUTED};
+    padding: 8px 16px;
+}}
+QTabBar::tab:selected {{
+    color: {TEXT_PRIMARY};
+    border-bottom: 2px solid {ACCENT};
+}}
+QPushButton {{
+    background: {BG_WIDGET};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    padding: 6px 14px;
+}}
+QPushButton:hover {{
+    background: {BG_WIDGET_HOVER};
+    border-color: {ACCENT_HOVER};
+}}
+QPushButton:pressed {{
+    background: {BG_APP};
+}}
+QLineEdit, QPlainTextEdit {{
+    background: {BG_WIDGET};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    padding: 6px;
+    color: {TEXT_PRIMARY};
+}}
+QLabel[role="muted"] {{
+    color: {TEXT_MUTED};
+}}
+QLabel[role="danger"] {{
+    color: {DANGER};
+}}
+"""
+
+
+def call(cmd, text=""):
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(SOCKET_PATH)
+            s.sendall(json.dumps({"cmd": cmd, "text": text}).encode())
+            s.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        return json.loads(b"".join(chunks))
+    except (OSError, json.JSONDecodeError) as e:
+        return {"ok": False, "error": f"tarnod unreachable: {e}"}
+
+
+def restyle(label):
+    label.style().unpolish(label)
+    label.style().polish(label)
+
+
+class StatusTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.label = QLabel("checking...")
+        self.label.setProperty("role", "muted")
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self.refresh)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.label)
+        layout.addWidget(refresh)
+        layout.addStretch()
+        self.refresh()
+
+    def refresh(self):
+        resp = call("status")
+        if resp.get("ok"):
+            self.label.setText(f"● {resp['data']}")
+            self.label.setProperty("role", "")
+        else:
+            self.label.setText(f"● {resp.get('error', 'unknown error')}")
+            self.label.setProperty("role", "danger")
+        restyle(self.label)
+
+
+class AiTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Ask tarnod something...")
+        self.input.returnPressed.connect(self.ask)
+        ask = QPushButton("Ask")
+        ask.clicked.connect(self.ask)
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.input)
+        layout.addWidget(ask)
+        layout.addWidget(self.output)
+
+    def ask(self):
+        question = self.input.text().strip()
+        if not question:
+            return
+        resp = call("ai", question)
+        if resp.get("ok"):
+            self.output.setPlainText(resp["data"])
+        else:
+            self.output.setPlainText("error: " + resp.get("error", "unknown error"))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Tarno Settings")
+        self.resize(480, 360)
+
+        tabs = QTabWidget()
+        tabs.addTab(StatusTab(), "Status")
+        tabs.addTab(AiTab(), "AI")
+        self.setCentralWidget(tabs)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyleSheet(STYLESHEET)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

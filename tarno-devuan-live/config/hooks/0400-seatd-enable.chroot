@@ -1,0 +1,6 @@
+#!/bin/sh
+# seatd needs to actually be running for labwc/wlroots to get device
+# access without systemd-logind - same "package installed but service not
+# enabled" gap as agetty/dhcpcd.
+set -e
+rc-update add seatd default

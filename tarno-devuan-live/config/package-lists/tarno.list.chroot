@@ -18,3 +18,17 @@ dhcpcd5
 # which doesn't ship isohybrid anymore either - same class of stale
 # check, so pull it in by hand like isolinux.
 syslinux-utils
+
+# desktop: labwc (minimal wlroots/openbox-alike compositor with a real
+# root-menu, see config/includes.chroot/etc/xdg/labwc/) + seatd (seat
+# management without systemd-logind) + foot (minimal wayland terminal,
+# also the menu's Terminal entry).
+labwc
+seatd
+foot
+
+# settings panel (config/includes.chroot/usr/bin/tarno-settings)
+python3
+python3-pyside6.qtcore
+python3-pyside6.qtgui
+python3-pyside6.qtwidgets
