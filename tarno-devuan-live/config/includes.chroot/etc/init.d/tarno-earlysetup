@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+# openrc-init here (via the init=/sbin/openrc-init kernel param) skips
+# the usual sysvinit/initscripts boot chain that normally fixes up /tmp
+# permissions on every Debian/Devuan boot (that's normally openrc's own
+# `bootmisc` service, or initscripts' checkroot.sh on plain sysvinit -
+# neither is wired into this image's runlevels). Without it /tmp keeps
+# whatever bare `mkdir` permissions (0755 root:root) it happened to end
+# up with, so any non-root process trying to write there - which is
+# exactly what tarno-desktop.sh does - gets "Permission denied".
+# Confirmed on a real boot.
+description="Tarno OS early boot fixups (fix /tmp perms before anything writes there)"
+
+depend() {
+	before agetty.tty1
+	keyword -prefix
+}
+
+start() {
+	ebegin "Fixing /tmp, /var/tmp permissions"
+	mkdir -p /tmp /var/tmp
+	chmod 1777 /tmp /var/tmp
+	eend $?
+}

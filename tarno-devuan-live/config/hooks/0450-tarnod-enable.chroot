@@ -1,0 +1,10 @@
+#!/bin/sh
+# Enable tarnod at boot (see etc/init.d/tarnod) - having the
+# package-list/init-script/binary in place was never enough on its own,
+# same class of gap as agetty/dhcpcd/seatd needing their own explicit
+# rc-update calls. Confirmed missing on a real boot: the service was
+# never in any runlevel, so tarnod never actually started, despite
+# everything else being wired up correctly.
+set -e
+chmod +x /etc/init.d/tarnod
+rc-update add tarnod default

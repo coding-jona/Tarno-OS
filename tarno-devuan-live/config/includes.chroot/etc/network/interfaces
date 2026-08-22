@@ -1,0 +1,15 @@
+# Loopback only - dhcpcd (not ifupdown) manages every other interface in
+# this image (see 0300-dhcp-network.chroot). Debian/Devuan's default
+# interfaces file - whatever live-build/debootstrap leaves in place -
+# ships an `iface ... inet dhcp` stanza of its own, and dhcpcd's init
+# script (/etc/init.d/dhcpcd, sanity() check) deliberately REFUSES to
+# start at all if it finds one here, to avoid two DHCP clients fighting
+# over the same interface:
+#
+#   grep -q "^[[:space:]]*iface[[:space:]]*.*[[:space:]]*inet[[:space:]]*dhcp" \
+#       /etc/network/interfaces && exit 6   # "Not running dhcpcd because ..."
+#
+# Confirmed on a real boot: dhcpcd failed to start for exactly this
+# reason. Keeping this file down to just lo removes the conflict.
+auto lo
+iface lo inet loopback

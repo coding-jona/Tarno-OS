@@ -1,0 +1,10 @@
+#!/bin/sh
+# Enable the /tmp-permissions fixup service (see
+# etc/init.d/tarno-earlysetup) - not on by default just because the
+# file is in the image, same class of gap as agetty/dhcpcd/seatd.
+# Early in the hook numbering since everything else in this image
+# (console login, the desktop autostart it triggers) ends up writing to
+# /tmp and needs this to have already run.
+set -e
+chmod +x /etc/init.d/tarno-earlysetup
+rc-update add tarno-earlysetup default

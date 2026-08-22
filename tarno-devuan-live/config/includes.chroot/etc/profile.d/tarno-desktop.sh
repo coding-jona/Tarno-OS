@@ -36,7 +36,17 @@ if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ] && [ "$on_console" = 1
 	# with its output logged - so any *other* crash (e.g. no usable
 	# DRM/KMS device) drops back to a shell with a log pointer instead
 	# of silently bouncing back to login again.
-	: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+	# /run/user/<uid> is the "proper" XDG location, but /run itself is
+	# (correctly) root:root 0755 - a non-root process can never mkdir
+	# under it without a privileged helper (that's what pam_systemd
+	# does on a systemd box). Confirmed on a real boot: "Permission
+	# denied" trying exactly that. This image has no such helper, so
+	# fall back to a per-user directory under /tmp instead - the XDG
+	# basedir spec's own documented fallback when no real session
+	# manager sets XDG_RUNTIME_DIR up. Requires
+	# tarno-earlysetup (etc/init.d/tarno-earlysetup) to have already
+	# fixed /tmp's permissions, which it does before this ever runs.
+	: "${XDG_RUNTIME_DIR:=/tmp/runtime-$(id -u)}"
 	mkdir -p "$XDG_RUNTIME_DIR"
 	chmod 700 "$XDG_RUNTIME_DIR"
 	export XDG_RUNTIME_DIR
