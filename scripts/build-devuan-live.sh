@@ -21,7 +21,7 @@ if ! command -v apt-get >/dev/null 2>&1; then
 fi
 
 apt-get update
-apt-get install -y live-build squashfs-tools xorriso
+apt-get install -y live-build squashfs-tools xorriso syslinux-utils
 
 cd "$(dirname "$0")/../tarno-devuan-live"
 lb clean

@@ -14,7 +14,7 @@ jobs:
       - name: install live-build host deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y live-build squashfs-tools xorriso
+          sudo apt-get install -y live-build squashfs-tools xorriso syslinux-utils
 
       # ubuntu's debootstrap doesn't ship devuan suite scripts (excalibur
       # etc), pull devuan's own package instead
