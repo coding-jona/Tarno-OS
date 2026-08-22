@@ -68,6 +68,12 @@ Built from documented labwc/Openbox config knowledge, not yet booted on
 real hardware or in `make devuan-run` - CI only proves the packages
 resolve and `lb build` succeeds, it doesn't render anything graphical.
 
+## Login
+
+`user` / `live` - live-config's own default (`user-setup` + `sudo`
+packages make this actually happen, see `tarno-devuan-live/README.md`).
+root is always locked. `user` has passwordless `sudo`.
+
 ## Status
 
 Wifi isn't wired up, only wired DHCP. See `ROADMAP.md`.

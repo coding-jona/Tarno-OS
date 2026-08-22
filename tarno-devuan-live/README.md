@@ -12,12 +12,14 @@ GRUB/syslinux normally use to override init.
 Console login (agetty) and wired DHCP (dhcpcd) are enabled via chroot
 hooks - neither comes for free under openrc-init. Wifi isn't wired up.
 
-Status: builds an `.hybrid.iso` in CI, `tarnod` is packaged in. First
-real boot test (QEMU/KVM) failed on `ISOLINUX: Failed to load ldlinux.c32`
-- our `config/bootloaders/isolinux/` override only had symlinks for
-`isolinux.bin`/`vesamenu.c32`, missing the other required syslinux 6
-modules (`ldlinux.c32`, and `vesamenu.c32`'s own runtime deps
-`libcom32.c32`/`libutil.c32`). Fixed, not yet re-tested.
+Status: builds an `.hybrid.iso` in CI, `tarnod` is packaged in, ISOLINUX
+boots (see git history for the module-symlink fix). Login: `user` / `live`
+- `user-setup` + `sudo` are required for live-config to actually create
+the account and give it admin rights
+(`/usr/lib/live/config/0030-user-setup`, `0040-sudo` - both silently
+no-op if their package isn't installed, which is what happened before
+this was added). root is permanently locked by live-config itself,
+regardless.
 
 Build/test locally: see the top-level README.md (`make devuan-iso`,
 `make devuan-run`).
