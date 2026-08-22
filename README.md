@@ -69,15 +69,21 @@ First real boot test found labwc crashing the login session instantly
 labwc's very first startup check - see git history for the fix). Login
 now drops into labwc without exec'ing it, so any *other* crash (e.g. no
 usable DRM/KMS device on a given machine/VM) lands you back at a shell
-instead of bouncing to login, with `$XDG_RUNTIME_DIR/labwc.log` to
-check. Still not confirmed to actually render anything graphical on
+instead of bouncing to login. `/etc/profile.d/tarno-desktop.sh` always
+logs what happened to `/tmp/tarno-desktop.log` (whether it even ran,
+what tty/WAYLAND_DISPLAY/DISPLAY it saw) plus `$XDG_RUNTIME_DIR/labwc.log`
+for labwc's own output - no more guessing blind from a fast-flashing
+console. Still not confirmed to actually render anything graphical on
 real hardware.
 
 ## Login
 
-`user` / `live` - live-config's own default (`user-setup` + `sudo`
-packages make this actually happen, see `tarno-devuan-live/README.md`).
-root is always locked. `user` has passwordless `sudo`.
+There isn't one - tty1 autologs in as `user` (agetty `--autologin`, see
+`tarno-devuan-live/config/hooks/0200-agetty-console.chroot`), same as
+every mainstream live image. `user-setup` + `sudo` still create the
+account and give it passwordless `sudo` (see
+`tarno-devuan-live/README.md`); root is always locked. Log in as `user`
+by hand only if you `chvt` to another console.
 
 ## Status
 
