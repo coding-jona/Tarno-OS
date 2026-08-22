@@ -55,8 +55,10 @@ bestehenden Praxis im Repo (Buildroot ist auf `2024.02.10` gepinnt, siehe
 | Pfad | Zweck |
 |---|---|
 | `auto/config` | `live-build`-Wrapper-Skript (`lb config`-Aufruf mit allen Flags) — Standard-live-build-Konvention |
-| `config/package-lists/tarno.list.chroot` | Zusätzliche Pakete: aktuell nur `openrc` |
+| `config/package-lists/tarno.list.chroot` | Zusätzliche Pakete: `openrc`, `isolinux` |
 | `config/includes.chroot/etc/init.d/tarnod` | OpenRC-Service-Skript für `tarnod`, portiert aus dem Buildroot-Pfad |
+| `config/archives/devuan-security.list.{chroot,binary}` | Eigene Security-Archiv-Zeile (live-builds automatische Generierung ist für Devuan an keinem eingebauten Mode korrekt, siehe Update-Verlauf unten) |
+| `config/bootloaders/isolinux/` | Eigene ISOLINUX-Boot-Menü-Vorlage — Kopie von live-builds eingebauter Vorlage, aber mit auf das moderne `isolinux`/`syslinux-common`-Paketlayout korrigierten `isolinux.bin`/`vesamenu.c32`-Symlinks (siehe Update-Verlauf unten) |
 
 `config/` folgt sonst den `live-build`-Standardkonventionen — weitere
 Unterverzeichnisse (`config/bootstrap`, `config/chroot` usw.) legt
@@ -265,6 +267,67 @@ hier ohnehin nichts beigetragen. Zusätzlich `set -o pipefail` vor dem
 ergänzt, damit ein künftiger Abbruch mitten in `lb build` den Workflow-
 Schritt auch tatsächlich als fehlgeschlagen markiert, statt sich auf den
 nachgelagerten ISO-Check verlassen zu müssen.
+
+**Update — `pipefail`-Fix bewährt sich sofort, weitester Lauf bisher,
+neuer Fehler beim ISOLINUX-Bootloader:** Der nächste
+`workflow_dispatch`-Lauf (Actions-Run
+[32562958758](https://github.com/coding-jona/Tarno-OS/actions/runs/32562958758))
+bestätigt zwei Dinge auf einmal: der `pipefail`-Fix greift (der
+`lb build`-Schritt meldete diesmal korrekt "failure" statt fälschlich
+"success"), und der Lauf kam deutlich weiter als je zuvor — komplette
+Chroot-Paketinstallation inklusive Kernel (`lb_binary_linux-image`),
+`memtest86+`, alle isolinux/syslinux-Pakete erfolgreich installiert. Der
+Abbruch kam diesmal in `lb_binary_syslinux`, beim Zusammenbau der
+ISO-Bootdateien:
+
+```
+cp: cannot stat '/root/isolinux/isolinux.bin': No such file or directory
+cp: cannot stat '/root/isolinux/vesamenu.c32': No such file or directory
+```
+
+Root Cause (wieder am tatsächlich installierten `live-build`-Paket
+verifiziert, `/usr/lib/live/build/lb_binary_syslinux` sowie die
+Paketinhalte der von Ubuntu Noble bezogenen `isolinux`/
+`syslinux-common`-Pakete derselben Upstream-Version wie im Chroot-Log
+sichtbar, `3:6.04~git20190206.bf6db5b4+dfsg1-...`): live-builds
+eingebaute ISOLINUX-Vorlage
+(`/usr/share/live/build/bootloaders/isolinux/`) enthält zwei Symlinks,
+`isolinux.bin -> /usr/lib/syslinux/isolinux.bin` und `vesamenu.c32 ->
+/usr/lib/syslinux/vesamenu.c32`, die beim Kopieren in den Chroot mit
+`cp -aL` aufgelöst werden müssen. Diese Pfade stammen aus der Zeit VOR
+dem großen syslinux-5-Split (2014): seitdem liefert **ein separates
+Paket namens `isolinux`** `isolinux.bin` unter `/usr/lib/ISOLINUX/`
+(nicht mehr Teil von `syslinux` selbst), und `syslinux-common` liefert
+`vesamenu.c32` unter `/usr/lib/syslinux/modules/bios/` (BIOS/EFI-Split),
+nicht mehr flach unter `/usr/lib/syslinux/`. Diese (von Ubuntu seit
+~2012 eingefrorene) live-build-Version kennt beide Umzüge nicht — und
+prüft in `lb_binary_syslinux`s `Check_package`-Aufrufen zudem nur auf
+`syslinux`/`syslinux-common`, nie auf `isolinux` selbst, weshalb dieses
+Paket bislang gar nicht erst installiert wurde.
+
+**Fix:** Zwei Teile, beide nötig:
+1. `isolinux` zu
+   [`config/package-lists/tarno.list.chroot`](config/package-lists/tarno.list.chroot)
+   hinzugefügt (live-build erkennt die fehlende Abhängigkeit nicht
+   automatisch, s. o.).
+2. Eigene ISOLINUX-Vorlage unter
+   [`config/bootloaders/isolinux/`](config/bootloaders/isolinux/) —
+   live-build unterstützt genau dafür einen offiziellen lokalen
+   Override-Mechanismus (`lb_binary_syslinux`: "Prefer archives from the
+   config tree" / "Internal local copy", greift automatisch, sobald
+   `config/bootloaders/<bootloader>/` existiert). Identische Kopie der
+   eingebauten Vorlage, nur die zwei Symlinks auf die tatsächlichen,
+   modernen Paketpfade korrigiert (`isolinux.bin` →
+   `/usr/lib/ISOLINUX/isolinux.bin`, `vesamenu.c32` →
+   `/usr/lib/syslinux/modules/bios/vesamenu.c32`). Kein Fork von
+   live-build nötig, keine Änderung an dessen eigenen Skripten — eine
+   von live-build selbst vorgesehene Erweiterungsstelle.
+
+Verifiziert: `sudo lb config` lokal erneut ausgeführt, `config/bootloaders/isolinux/`
+bleibt dabei unangetastet erhalten (wie für eingecheckte `config/`-Inhalte
+erwartet); `file`/`ls -la` bestätigen, dass beide Symlinks jetzt auf die
+per `dpkg-deb -c` gegen die echten `isolinux`/`syslinux-common`-Pakete
+verifizierten realen Pfade zeigen.
 
 ## Was hier bewusst NICHT drin ist (Scope dieses ersten Cuts)
 
