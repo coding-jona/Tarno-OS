@@ -14,10 +14,11 @@ jobs:
         with:
           go-version: "1.25"
 
-      - name: build tarnod
+      - name: build tarnod, tarno-disk-install
         run: |
           mkdir -p tarno-devuan-live/config/includes.chroot/usr/bin
           GOOS=linux GOARCH=amd64 go build -o tarno-devuan-live/config/includes.chroot/usr/bin/tarnod .
+          GOOS=linux GOARCH=amd64 go build -o tarno-devuan-live/config/includes.chroot/usr/bin/tarno-disk-install ./cmd/tarno-disk-install
 
       - name: install live-build host deps
         run: |

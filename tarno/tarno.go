@@ -33,6 +33,16 @@ func (d *TarnoD) Run(ctx context.Context) error {
 	}
 	defer func() { _ = l.Close() }()
 
+	// tarnod runs as root; without this the socket inherits the
+	// process umask (typically 0755) and Unix-socket connect() needs
+	// *write* permission, so tarno-settings/tarnoctl running as the
+	// live user get EACCES - confirmed on a real boot ("tarnod
+	// unreachable: [Errno 13] Permission denied"). Single-user image,
+	// root permanently locked - world-writable is the whole point.
+	if err := os.Chmod(SocketPath, 0o666); err != nil {
+		return err
+	}
+
 	go func() {
 		<-ctx.Done()
 		_ = l.Close()

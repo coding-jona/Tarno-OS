@@ -8,6 +8,10 @@
 			<action name="Execute" command="foot"/>
 		</item>
 		<separator/>
+		<item label="Install to Disk">
+			<action name="Execute" command="foot -e tarno-install-to-disk"/>
+		</item>
+		<separator/>
 		<item label="Exit">
 			<action name="Exit"/>
 		</item>
