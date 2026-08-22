@@ -121,17 +121,37 @@ func output(name string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// biosBoot reports whether this process is running under legacy
+// BIOS, not UEFI - i.e. exactly the case grub-install --target=x86_64-efi
+// can never make bootable, no matter how correctly it runs. Confirmed
+// on a real install: BIOS-mode VM, EFI-only bootloader, "hangs at boot
+// from disk" - a GPT disk with only an ESP is invisible to BIOS
+// firmware, which has nothing to do with grub-install actually working.
+func biosBoot() bool {
+	_, err := os.Stat("/sys/firmware/efi")
+	return err != nil
+}
+
 func install(devName string) error {
 	devPath := "/dev/" + devName
-	espPath := partPath(devName, "1")
-	rootPath := partPath(devName, "2")
+	espPath := partPath(devName, "2")
+	rootPath := partPath(devName, "3")
 
 	fmt.Println("partitioning", devPath)
+	// GPT + BIOS booting needs a dedicated ~1MiB BIOS boot partition
+	// (the `bios_grub` flag) for grub-install --target=i386-pc to
+	// embed its core image into - there's no traditional MBR gap to
+	// (ab)use like there is with an msdos partition table. Always
+	// creating both this and the ESP means the same install works
+	// whichever firmware the machine actually has, rather than baking
+	// in an assumption.
 	if err := run("parted", "--script", devPath,
 		"mklabel", "gpt",
-		"mkpart", "ESP", "fat32", "1MiB", "513MiB",
-		"set", "1", "esp", "on",
-		"mkpart", "root", "ext4", "513MiB", "100%",
+		"mkpart", "bios_grub", "1MiB", "2MiB",
+		"set", "1", "bios_grub", "on",
+		"mkpart", "ESP", "fat32", "2MiB", "514MiB",
+		"set", "2", "esp", "on",
+		"mkpart", "root", "ext4", "514MiB", "100%",
 	); err != nil {
 		return err
 	}
@@ -207,12 +227,21 @@ func install(devName string) error {
 		return err
 	}
 
-	fmt.Println("installing bootloader")
-	if err := run("chroot", target, "grub-install",
-		"--target=x86_64-efi", "--efi-directory=/boot/efi",
-		"--bootloader-id=Tarno", "--recheck", devPath,
-	); err != nil {
-		return err
+	if biosBoot() {
+		fmt.Println("installing bootloader (BIOS/legacy)")
+		if err := run("chroot", target, "grub-install",
+			"--target=i386-pc", "--recheck", devPath,
+		); err != nil {
+			return err
+		}
+	} else {
+		fmt.Println("installing bootloader (UEFI)")
+		if err := run("chroot", target, "grub-install",
+			"--target=x86_64-efi", "--efi-directory=/boot/efi",
+			"--bootloader-id=Tarno", "--recheck", devPath,
+		); err != nil {
+			return err
+		}
 	}
 
 	f, err := os.OpenFile(filepath.Join(target, "etc", "default", "grub"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)

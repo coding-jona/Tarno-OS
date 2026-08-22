@@ -48,11 +48,20 @@ python3-pyside6.qtwidgets
 # in the image at all, so the installer only ever existed as source you'd
 # have to build yourself; there was no way to install to disk from a
 # running live session despite the README claiming otherwise.
+#
+# grub-pc-bin ships the i386-pc target modules for BIOS/legacy
+# grub-install (confirmed needed: a real install hung at "boot from
+# disk" because only the EFI target was ever installed, on a BIOS-mode
+# VM - see cmd/tarno-disk-install's biosBoot()). Deliberately
+# grub-pc-bin, not grub-pc - the latter's postinst asks (via debconf)
+# which disk to install to, which has no good answer inside a live
+# image's own build chroot.
 parted
 dosfstools
 e2fsprogs
 rsync
 grub-efi-amd64
+grub-pc-bin
 
 # live-config's own user creation (/usr/lib/live/config/0030-user-setup)
 # silently no-ops unless the `user-setup` package is present - without it
@@ -64,3 +73,23 @@ grub-efi-amd64
 # rights at all, root being permanently locked either way.
 user-setup
 sudo
+
+# core desktop apps - up to now this was labwc's right-click menu,
+# tarno-settings, and a bare terminal, nothing to actually browse
+# files, get online, or edit a document with.
+#   pcmanfm-qt - file manager (LXQt's, Qt-based to match tarno-settings)
+#   firefox-esr - web browser (nothing at all was installed before)
+#   geany - text editor with syntax highlighting, still lightweight
+#   fuzzel - app launcher (same wlroots-ecosystem author as foot),
+#     bound to Super+Space in rc.xml, reads /usr/share/applications/*
+#     .desktop files automatically - no extra config needed for that
+#   wl-clipboard, grim, slurp - clipboard and screenshot CLI tools;
+#     baseline utilities every other wlroots desktop ships, missing
+#     here entirely until now
+pcmanfm-qt
+firefox-esr
+geany
+fuzzel
+wl-clipboard
+grim
+slurp

@@ -7,6 +7,15 @@
 		<item label="Terminal">
 			<action name="Execute" command="foot"/>
 		</item>
+		<item label="Files">
+			<action name="Execute" command="pcmanfm-qt"/>
+		</item>
+		<item label="Web Browser">
+			<action name="Execute" command="firefox-esr"/>
+		</item>
+		<item label="Text Editor">
+			<action name="Execute" command="geany"/>
+		</item>
 		<separator/>
 		<item label="Install to Disk">
 			<action name="Execute" command="foot -e tarno-install-to-disk"/>

@@ -30,12 +30,25 @@ tarno-disk-install` lists internal disks, `sudo tarno-disk-install sda`
 installs; also reachable from the desktop, see "Desktop" below). It
 wasn't before: the binary was never built into the ISO, none of its
 dependencies (`parted`, `dosfstools`, `e2fsprogs`, `rsync`,
-`grub-efi-amd64`) were in the package list, so despite this same README
-paragraph, there was no way to actually install to disk from a live
-session - confirmed missing on a real boot. Partition/format/mount
-pipeline verified locally against a loopback device; the rsync +
-chroot + grub-install stage still needs a real boot to fully confirm
-(needs the live system's own root, not reproducible in a dev sandbox).
+`grub-efi-amd64`, `grub-pc-bin`) were in the package list, so despite
+this same README paragraph, there was no way to actually install to
+disk from a live session - confirmed missing on a real boot.
+
+First real install hung at "boot from disk" - the installer only ever
+put down an EFI bootloader, invisible to BIOS/legacy firmware (which is
+what every VM/machine in this whole session has actually been using -
+same reason the live ISO needs ISOLINUX at all). Fixed: the partition
+table now always includes a `bios_grub` partition alongside the ESP
+(GPT+BIOS booting needs one to embed into, there's no MBR-style gap to
+reuse), and the installer detects the current firmware
+(`/sys/firmware/efi` present or not) and runs the matching
+`grub-install --target=i386-pc` or `--target=x86_64-efi` accordingly -
+so the same install works on whichever firmware is actually booting it.
+Verified locally: the full partition table (including the `bios_grub`
+flag) and a real `grub-install --target=i386-pc` against it both
+succeed against a loopback device. The rsync + chroot + full boot cycle
+still needs a real machine to fully confirm end to end (needs the live
+system's own root, not reproducible in a dev sandbox).
 
 ## Updates
 
@@ -137,6 +150,17 @@ Python interpreter itself. Fixed with `app.setDesktopFileName
 `/usr/share/applications/tarno-settings.desktop` (`Name=Tarno
 Settings`) so waybar's `wlr/taskbar` resolves it to a real name instead
 of the raw app_id.
+
+Core apps: a file manager (`pcmanfm-qt`), a web browser
+(`firefox-esr`), a text editor (`geany`), and an app launcher
+(`fuzzel`, bound to `Super+Space`, reads `/usr/share/applications/*.desktop`
+automatically - no separate config needed to list apps in it) - up to
+this point there was nothing to browse files, get online, or edit a
+document with at all, just labwc's menu, `tarno-settings`, and a bare
+terminal. Also added `wl-clipboard`/`grim`/`slurp` (clipboard and
+screenshot CLI tools) - baseline utilities every other wlroots desktop
+ships that were simply missing here. Themed `fuzzel.ini` matches the
+same palette as everything else.
 
 ## Login
 
