@@ -2,6 +2,7 @@
 """Tarno OS settings panel - talks to tarnod over its unix socket."""
 import json
 import socket
+import subprocess
 import sys
 
 from PySide6.QtWidgets import (
@@ -152,6 +153,55 @@ class AiTab(QWidget):
             self.output.setPlainText("error: " + resp.get("error", "unknown error"))
 
 
+class InstallTab(QWidget):
+    """Wraps tarno-disk-install - the one thing tarnod itself can't do,
+    since it needs a real terminal for rsync progress and the type-the-
+    device-name confirmation prompt (see tarno-install-to-disk)."""
+
+    def __init__(self):
+        super().__init__()
+        warn = QLabel(
+            "Installs this running live system to an internal disk. "
+            "Erases the target disk entirely."
+        )
+        warn.setProperty("role", "muted")
+        warn.setWordWrap(True)
+
+        self.disks = QPlainTextEdit()
+        self.disks.setReadOnly(True)
+        refresh = QPushButton("Refresh disk list")
+        refresh.clicked.connect(self.refresh)
+        install = QPushButton("Install to Disk...")
+        install.clicked.connect(self.launch)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(warn)
+        layout.addWidget(self.disks)
+        layout.addWidget(refresh)
+        layout.addWidget(install)
+        self.refresh()
+
+    def refresh(self):
+        try:
+            proc = subprocess.run(
+                ["sudo", "tarno-disk-install"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            text = (proc.stdout + proc.stderr).strip()
+            self.disks.setPlainText(text or "no internal disks found")
+        except (OSError, subprocess.SubprocessError) as e:
+            self.disks.setPlainText(f"error: {e}")
+
+    def launch(self):
+        # Runs in its own terminal, not inline here - rsync's progress
+        # output and the safety confirmation prompt both need a real
+        # tty, not a Qt widget.
+        subprocess.Popen(["foot", "-e", "tarno-install-to-disk"])
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -161,6 +211,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(StatusTab(), "Status")
         tabs.addTab(AiTab(), "AI")
+        tabs.addTab(InstallTab(), "Install")
         self.setCentralWidget(tabs)
 
 

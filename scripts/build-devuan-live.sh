@@ -14,6 +14,7 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 mkdir -p "${repo_root}/tarno-devuan-live/config/includes.chroot/usr/bin"
 ( cd "${repo_root}" && GOOS=linux GOARCH=amd64 go build -o tarno-devuan-live/config/includes.chroot/usr/bin/tarnod . )
+( cd "${repo_root}" && GOOS=linux GOARCH=amd64 go build -o tarno-devuan-live/config/includes.chroot/usr/bin/tarno-disk-install ./cmd/tarno-disk-install )
 
 if [ "$(id -u)" -ne 0 ]; then
 	if command -v sudo >/dev/null 2>&1; then

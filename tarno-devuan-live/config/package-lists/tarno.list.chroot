@@ -33,6 +33,18 @@ python3-pyside6.qtcore
 python3-pyside6.qtgui
 python3-pyside6.qtwidgets
 
+# tarno-disk-install (config/includes.chroot/usr/bin/tarno-disk-install,
+# menu entry in etc/xdg/labwc/menu.xml) needs all of these to actually
+# do anything - partition/format/copy/bootloader. Previously not shipped
+# in the image at all, so the installer only ever existed as source you'd
+# have to build yourself; there was no way to install to disk from a
+# running live session despite the README claiming otherwise.
+parted
+dosfstools
+e2fsprogs
+rsync
+grub-efi-amd64
+
 # live-config's own user creation (/usr/lib/live/config/0030-user-setup)
 # silently no-ops unless the `user-setup` package is present - without it
 # the live "user" account never gets created at all, root stays locked

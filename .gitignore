@@ -1,4 +1,5 @@
 .vscode
 tarno/mistral_client.py
 tarno-devuan-live/config/includes.chroot/usr/bin/tarnod
+tarno-devuan-live/config/includes.chroot/usr/bin/tarno-disk-install
 __pycache__/

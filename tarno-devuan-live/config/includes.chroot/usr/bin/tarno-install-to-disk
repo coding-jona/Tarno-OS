@@ -1,0 +1,28 @@
+#!/bin/sh
+# Interactive wrapper around tarno-disk-install for the desktop menu.
+# The raw command needs a device name up front (or lists disks and
+# exits with none) - this lists them and asks, so the menu item is
+# actually usable without already knowing the CLI. Runs in a terminal
+# (see etc/xdg/labwc/menu.xml) and stays open at the end so success/
+# failure output is actually readable, not just a closing window.
+set -eu
+
+echo "Tarno OS - Install to Disk"
+echo "erases the target disk and installs this running live system there."
+echo
+
+sudo tarno-disk-install
+
+echo
+printf 'device to install to (e.g. sda), empty to cancel: '
+read -r dev
+
+if [ -z "${dev}" ]; then
+	echo "cancelled"
+else
+	sudo tarno-disk-install "${dev}" || true
+fi
+
+echo
+printf 'press enter to close '
+read -r _
