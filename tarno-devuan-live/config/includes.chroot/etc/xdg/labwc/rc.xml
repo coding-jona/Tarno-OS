@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<labwc_config>
+	<theme>
+		<name>Tarno</name>
+	</theme>
+	<keyboard>
+		<keybind key="W-Return">
+			<action name="Execute" command="foot"/>
+		</keybind>
+		<keybind key="A-F4">
+			<action name="Close"/>
+		</keybind>
+	</keyboard>
+	<mouse>
+		<context name="Root">
+			<mousebind button="Right" action="Press" direction="Down">
+				<action name="ShowMenu" menu="root-menu"/>
+			</mousebind>
+		</context>
+	</mouse>
+</labwc_config>

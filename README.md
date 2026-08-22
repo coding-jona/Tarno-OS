@@ -50,7 +50,24 @@ it into `config/includes.chroot/usr/bin/tarnod` before `lb build` runs.
     go run ./cmd/tarnoctl status
     MISTRAL_API_KEY=... go run . &     # enables `tarnoctl ai <question>`
 
+## Desktop
+
+Minimal Wayland desktop: [labwc](https://labwc.github.io/) (an
+Openbox-alike wlroots compositor with a real right-click root menu,
+config in `tarno-devuan-live/config/includes.chroot/etc/xdg/labwc/`) +
+`tarno-settings`, a small PySide6 panel
+(`tarno-devuan-live/config/includes.chroot/usr/bin/tarno-settings`) that
+talks to `tarnod` over its socket - a Status tab and an AI tab for now,
+i.e. whatever `tarnod` actually exposes today. Starts automatically on
+tty1 login (`/etc/profile.d/tarno-desktop.sh`). Theme is the old
+`tarno-ui-theme` palette (cyan `#0BC7FF` on Fluent-style dark gray),
+ported to an Openbox `themerc` and a Qt stylesheet - completely different
+layout from the old deleted `tarno-desktop`/`tarnod-ui`, same colors.
+
+Built from documented labwc/Openbox config knowledge, not yet booted on
+real hardware or in `make devuan-run` - CI only proves the packages
+resolve and `lb build` succeeds, it doesn't render anything graphical.
+
 ## Status
 
-Wifi isn't wired up, only wired DHCP. No desktop/UI yet - shell only.
-See `ROADMAP.md`.
+Wifi isn't wired up, only wired DHCP. See `ROADMAP.md`.
