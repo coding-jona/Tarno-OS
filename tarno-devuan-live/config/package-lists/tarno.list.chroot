@@ -1,0 +1,24 @@
+# Tarno OS — Devuan-Live-Paketliste (erster Cut, Basis-Boot-Fähigkeit,
+# kein Feature-Parität-Anspruch mit dem Buildroot-Pfad in
+# tarno-br2-external/). Siehe README.md dieses Verzeichnisses.
+#
+# live-build installiert diese Pakete zusätzlich zum Standard-Live-System,
+# das `lb build` ohnehin automatisch zusammenstellt (debootstrap-Basis +
+# live-boot/live-config fürs Live-Medium selbst — die gehören NICHT hier
+# rein, die zieht live-build automatisch).
+#
+# openrc: stellt laut mehreren unabhängigen Devuan-/OpenRC-How-Tos
+# (siehe docs/knowledge-base/04-tarno-os-debian-migration-notes.md,
+# Abschnitt "Init") sowohl die klassischen OpenRC-Service-Skripte
+# (/etc/init.d/*, rc-service, rc-update) als auch /sbin/openrc-init selbst
+# bereit — kein separates Paket dafür nötig. Devuans Standard-Init bleibt
+# sysvinit (unverändert, kein Konflikt); openrc-init wird erst über den
+# Kernel-Boot-Parameter `init=/sbin/openrc-init` in auto/config aktiv
+# ausgewählt (siehe dortiger Kommentar).
+#
+# Bekannte Lücke, noch nicht behoben (siehe README.md "Nächste Schritte"):
+# ohne zusätzliche agetty-Runlevel-Links (rc-update add agetty.tty1
+# default usw.) gibt es unter reinem OpenRC-Init ggf. keinen Login-Prompt
+# auf der Konsole — in dieser ersten Cut-Version bewusst nicht ergänzt,
+# um den Scope klein zu halten.
+openrc

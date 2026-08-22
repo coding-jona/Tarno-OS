@@ -37,7 +37,7 @@ Nur was das M6700 (Ivy Bridge, AHCI, PS/2, Intel-GPU, Ethernet) tatsächlich bra
 | eBPF (für Monat 3) | `CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y`, optional `CONFIG_BPF_LSM=y` |
 | Explizit AUS | `CONFIG_SOUND` (falls nicht gebraucht), alle nicht-M6700-Treiber (WLAN-Chipsätze anderer Hersteller, andere Storage-Controller, Bluetooth falls ungenutzt), `CONFIG_USB_*` nur PS/2-relevante behalten falls USB-Tastatur/Maus genutzt wird |
 
-Fragment wird via `BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y` + `BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES` eingebunden (siehe `configs/tarno_m6700_defconfig`).
+Eingebunden über `BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y` mit zwei Teilen: `BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE` zeigt auf `board/tarno-m6700/linux.config` (die vollständige Basis-Kernel-Config), `BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES` auf `linux.config.fragment` obendrauf für die M6700-spezifischen Ergänzungen (siehe `configs/tarno_m6700_defconfig`). Ein Fragment allein reicht nicht als Konfigurationsquelle — das war ursprünglich falsch verdrahtet (nur Fragment, keine Basis-Config) und ließ den allerersten echten Build sofort mit "No kernel configuration file specified" fehlschlagen.
 
 ### Telemetrie/unnötige Daemons deaktivieren
 - Keine `BR2_PACKAGE_*` für: `chrony`-NTP-Auto-Update-Checker (nur falls gebraucht, sonst raus), `dbus` nur falls ein Paket es zwingend braucht, keine Log-Rotation-Daemons über das Minimum hinaus.
@@ -71,25 +71,20 @@ sudo dd if=output/images/sdcard.img of=/dev/sdX bs=4M status=progress conv=fsync
 (`/dev/sdX` durch den tatsächlichen USB-Stick-Gerätepfad ersetzen — **nicht**
 eine bestehende Festplatte, `dd` überschreibt ohne Rückfrage.)
 
-**Auf den Stick schreiben — per GUI:** [`tarno-installer`](../tarno-installer/)
-macht denselben Vorgang weniger fehleranfällig: listet nur Wechseldatenträger
-(schließt das eigene Root-Gerät aus), zeigt Fortschritt/Geschwindigkeit/ETA,
-verlangt eine explizite Bestätigung mit vollem Geräte-Label vor dem
-Überschreiben. Siehe [`docs/architecture.md`](architecture.md#tarno-installer-natives-gui-läuft-nicht-auf-tarno-os-selbst).
-Läuft nativ auch auf Windows — siehe
-[`tarno-installer/README.md#windows-nutzung`](../tarno-installer/README.md#windows-nutzung),
-falls der Stick von einem Windows-Rechner aus erstellt wird.
-
 **Wichtig, zwei getrennte Rechner-Rollen:** `output/images/sdcard.img`
 selbst kann **nur** auf Linux (oder WSL2/einer Linux-VM) gebaut werden —
 Buildroot ist ein Linux-Build-System, es gibt keinen nativen
 Windows-Build-Pfad dafür. Das Schreiben dieses fertigen Images auf den
-Stick (der zweite, unabhängige Schritt) kann dagegen sowohl auf Linux als
-auch auf Windows passieren (`dd` bzw. `tarno-installer`). Ein reiner
-Windows-Nutzer baut das Image also entweder auf einer zweiten
+Stick ist der zweite, unabhängige Schritt und war früher zusätzlich per
+GUI-Installer (`tarno-installer`, inkl. eines nativen Windows-Builds)
+möglich; dieser wurde im Zuge der GUI-Entfernung (siehe ROADMAP.md,
+Abschnitt "Zurückgestellt") aus dem Repo entfernt. Aktuell gibt es dafür
+**kein In-Repo-Tool mehr für Windows-Nutzer** — nur der `dd`-Weg oben
+funktioniert, und der braucht ein Linux-System (bzw. WSL2/eine Linux-VM).
+Ein reiner Windows-Nutzer baut das Image also entweder auf einer zweiten
 Linux-Maschine/in WSL2, oder lädt ein von der CI/einem Linux-Rechner
-gebautes `sdcard.img` herunter, und schreibt es dann lokal mit
-`tarno-installer.exe` auf den Stick.
+gebautes `sdcard.img` herunter, und schreibt es dann per `dd` aus
+WSL2/einer Linux-VM auf den Stick.
 
 **Scope-Hinweis:** Wie beim restlichen Buildroot-Teil (siehe unten) sind
 `genimage.cfg`/`syslinux.cfg`/`post-image.sh` nach aktueller Buildroot-
@@ -113,7 +108,8 @@ schreiben, am M6700 tatsächlich booten, Ergebnis hier nachtragen.
 ### Compositor: `cage`
 - `cage` ist ein Kiosk-Wayland-Compositor, der genau eine Anwendung fullscreen startet — passt exakt zu "Direct-Fullscreen ohne Desktop-Overhead".
 - Buildroot-Package `BR2_PACKAGE_CAGE` (sofern in der gewählten Buildroot-Version vorhanden; sonst als eigenes Package im `tarno-br2-external`-Tree ergänzen, analog zum `tarnod`-Package-Pattern).
-- Start: `cage -- /opt/jdk/bin/java -jar minecraft-launcher.jar` (bzw. über `scripts/jvm-launch.sh`, siehe [`month2-gaming-tuning.md`](month2-gaming-tuning.md)).
+- Start: `WLR_NO_HARDWARE_CURSORS=1 cage -- /opt/jdk/bin/java -jar minecraft-launcher.jar` (bzw. über `scripts/jvm-launch.sh`, siehe [`month2-gaming-tuning.md`](month2-gaming-tuning.md)).
+- **`WLR_NO_HARDWARE_CURSORS=1` vorsorglich gesetzt**, auch ohne aktuellen Multi-Monitor-Betrieb: bekannter wlroots-Bug, bei dem der Mauszeiger beim Wechsel zwischen mehreren Outputs (unterschiedliche Auflösung/Skalierung/Refresh-Rate) an der Hardware-Cursor-Plane hängen bleibt/stockt — live bestätigt auf einem KDE/KWin-System (dort behoben über `KWIN_CURSOR_FORCE_SOFTWARE=1`, den KWin-eigenen Namen für denselben Software-Cursor-Workaround). `WLR_NO_HARDWARE_CURSORS` ist die generische wlroots-Variable für exakt dasselbe Prinzip (erzwingt Software- statt Hardware-Cursor-Rendering) und gilt für jeden wlroots-basierten Compositor, also auch `cage`. Kostet minimal CPU (Cursor wird pro Frame mit-compositiert statt per Hardware-Plane verschoben) — auf einem einzelnen Fullscreen-Output ohnehin kaum messbar, deshalb schon jetzt Standard statt erst bei Bedarf nachzurüsten.
 
 **Meilenstein-Abnahmekriterium:** `java -version` liefert die erwartete Version, Minecraft startet in `cage` fullscreen, Baseline-FPS wird mit `scripts/benchmark.sh` (siehe Monat 2) protokolliert.
 

@@ -1,0 +1,31 @@
+#!/sbin/openrc-run
+# Tarno OS Root-Daemon — Devuan-Track-Variante.
+#
+# Portiert 1:1 aus tarno-br2-external/board/tarno-m6700/rootfs-overlay/etc/init.d/tarnod
+# (Buildroot-Pfad, aktuell der einzige lauffähige Build-Weg). OpenRC-
+# Service-Skripte sind portabel zwischen Distributionen — hier nur der
+# Pfad zur Datei geändert (landet über live-build-`includes.chroot`-
+# Konvention direkt an derselben FHS-Stelle /etc/init.d/tarnod im
+# fertigen Image, statt über einen Buildroot-Rootfs-Overlay).
+#
+# WICHTIG, expliziter Scope-Hinweis: /usr/bin/tarnod (das eigentliche
+# Binary) ist NICHT Teil dieses ersten Cuts. Dieses Skript referenziert
+# den Pfad, an dem das Binary liegen MÜSSTE, wenn es paketiert wäre — es
+# wird hier weder gebaut noch eingebettet noch fingiert. Das Paketieren
+# von tarnod in ein Devuan-Image (per echtem `cargo build`-Schritt +
+# config/includes.chroot/usr/bin/tarnod, oder als eigenes .deb) ist
+# eigene, spätere Arbeit — siehe die zwei Optionen in
+# docs/knowledge-base/04-tarno-os-debian-migration-notes.md, Abschnitt
+# "tarnod.mk", und README.md dieses Verzeichnisses, Abschnitt
+# "Nächste Schritte".
+
+name="tarnod"
+description="Tarno OS root daemon (IPC, API-key vault, gaming-mode, eBPF security)"
+command="/usr/bin/tarnod"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+	need net
+	after bootmisc
+}

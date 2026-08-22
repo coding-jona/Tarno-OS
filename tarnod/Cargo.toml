@@ -1,12 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["tarnod", "tarnoctl", "tarnod-protocol", "tarnod-ui"]
-# tarnod-ui bewusst NICHT in default-members: braucht X11/Wayland/GL-
-# Bibliotheken (winit/glutin), die der Buildroot-Cross-Build des tarnod-
-# Packages (tarno-br2-external/package/tarnod/tarnod.mk) nicht automatisch
-# mitziehen soll. `cargo build --workspace`/`cargo test --workspace` (z.B.
-# in CI/lokaler Entwicklung) bauen weiterhin alles, inklusive tarnod-ui.
-default-members = ["tarnod", "tarnoctl", "tarnod-protocol"]
+members = ["tarnod", "tarnoctl", "tarnod-protocol"]
+# Platz reserviert für eine künftige tarnod-ai-Crate (siehe ROADMAP.md,
+# Monat 3 — Tarno-Layer).
 
 [workspace.package]
 version = "0.1.0"
@@ -20,3 +16,9 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "signal",
 libc = "0.2"
 anyhow = "1"
 tarnod-protocol = { path = "tarnod-protocol" }
+# Tarno-AI-Phase-2 (Mistral-API-Backend, siehe docs/month3-tarno-layer.md
+# #tarno-ai): rustls statt OpenSSL, damit kein System-OpenSSL/C++-Toolchain-
+# Bezug in den Build kommt (dieselbe Begründung wie an anderer Stelle im
+# Projekt gegen C++-Toolchain-Abhängigkeiten, siehe docs/).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-trait = "0.1"

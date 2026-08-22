@@ -7,9 +7,11 @@ name: Build Tarno OS image
 # Push (ein voller Buildroot-Build lädt mehrere GB herunter und dauert
 # potenziell Stunden) — nur manuell oder bei einem Versions-Tag.
 #
-# Ergebnis: sdcard.img als Workflow-Artifact zum Download. Dieses Image ist
-# das, was tarno-installer (siehe ci.yml) tatsächlich auf einen USB-Stick
-# schreibt — der Installer selbst enthält keinen Teil des Betriebssystems.
+# Ergebnis: sdcard.img als Workflow-Artifact zum Download. Aktuell schreibt
+# man dieses Image per `dd` auf einen USB-Stick (siehe
+# docs/month1-foundation.md) — ein dedizierter Installer existiert im Repo
+# derzeit nicht mehr (der bisherige GUI-Installer `tarno-installer` wurde
+# entfernt, siehe ROADMAP.md, Abschnitt "Zurückgestellt").
 
 on:
   workflow_dispatch: {}

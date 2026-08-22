@@ -4,8 +4,19 @@
 //! `process_ctl::stop`. Die Policy-Entscheidung + SIGSTOP passieren
 //! bewusst hier (Userspace), nicht im eBPF-Programm — Begründung:
 //! docs/month3-tarno-layer.md#warum-sigstop-aus-userspace.
+//!
+//! Tarno-AI-Phase-3 (siehe docs/month3-tarno-layer.md#tarno-ai): jedes
+//! ausgewertete Event wird zusätzlich — rein lesend/protokollierend, ohne
+//! Einfluss auf die Policy-Entscheidung oben — in `state.security_events`
+//! (`security::events::SecurityEventLog`) gepusht, damit Tarno AI darüber
+//! reden kann ("was wurde zuletzt geblockt").
+
+use std::sync::Arc;
 
 use tarnod_guard::Guard;
+
+use super::events::{SecurityAction, SecurityEventRecord};
+use crate::AppState;
 
 /// Einfache Allow/Deny-Policy: ein Binärpfad gilt als verdächtig, wenn er
 /// eine der konfigurierten Deny-Substrings enthält. Bewusst simpel gehalten
@@ -40,8 +51,11 @@ impl Policy {
 
 /// Lädt das eBPF-Programm, attached es und verarbeitet Events, bis ein
 /// Fehler auftritt (z.B. Programm wurde extern detached). Läuft als
-/// eigener Tokio-Task neben dem IPC-Server (siehe main.rs).
-pub async fn run(policy: Policy) -> anyhow::Result<()> {
+/// eigener Tokio-Task neben dem IPC-Server (siehe main.rs). `state` wird
+/// nur für den additiven Tarno-AI-Phase-3-Event-Log gebraucht
+/// (`state.security_events`) — die Policy-Entscheidung selbst hängt
+/// weiterhin ausschließlich an `policy`.
+pub async fn run(policy: Policy, state: Arc<AppState>) -> anyhow::Result<()> {
     let mut guard = Guard::load()?;
     eprintln!(
         "tarnod: eBPF-Behavioral-Security aktiv (deny-list: {:?})",
@@ -52,7 +66,23 @@ pub async fn run(policy: Policy) -> anyhow::Result<()> {
     loop {
         let ev = events.next().await?;
         let filename = ev.filename_str();
-        if policy.is_denied(filename) {
+        let denied = policy.is_denied(filename);
+
+        // Tarno-AI-Phase-3: additiv protokollieren, unabhängig davon, ob die
+        // Policy den Prozess durchlässt oder stoppt — siehe Moduldoc oben.
+        state.security_events.push(SecurityEventRecord::new(
+            ev.pid,
+            ev.uid,
+            ev.comm_str(),
+            filename,
+            if denied {
+                SecurityAction::Stopped
+            } else {
+                SecurityAction::Allowed
+            },
+        ));
+
+        if denied {
             eprintln!(
                 "tarnod: verdächtiger Prozess erkannt: pid={} uid={} comm={} filename={}",
                 ev.pid,

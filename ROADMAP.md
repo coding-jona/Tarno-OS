@@ -1,10 +1,22 @@
 # Tarno OS – Realistische 3-Monats-Roadmap
 
-**Prämisse:** Kein eigener Kernel. Stattdessen ein extrem gestripptes Linux (Buildroot oder Alpine als Basis) mit eigenem `tarnod`-Daemon und minimaler Shell. Erreicht ~90% der Ziele aus dem Manifest in umsetzbarer Zeit, weil JVM, Treiber, Dateisystem und Scheduler schon funktionieren und du dich auf Tuning statt Kernel-Entwicklung konzentrierst.
+**Prämisse:** Tarno OS ist heute **shell-only** — kein GUI-Layer im Repo (der
+frühere GUI/Interface-Kram wurde bewusst entfernt, siehe "Zurückgestellt"
+unten). Kein eigener Kernel. Basis ist aktuell ein extrem gestripptes Linux
+via Buildroot-Cross-Compile mit eigenem `tarnod`-Daemon und minimaler Shell;
+langfristig soll diese Basis durch ein **Devuan**-Fundament (Debian-Ableitung
+ohne den systemd-Default-Konflikt vanilla Debians, siehe "Zukunft —
+Devuan-Basis" unten) ersetzt werden — ein erster, experimenteller
+Konfigurations-Skeleton existiert bereits (`tarno-devuan-live/`), die
+Vollmigration bleibt aber ein Kurswechsel, der noch nicht umgesetzt ist.
+Erreicht ~90% der Ziele aus
+dem Manifest in umsetzbarer Zeit, weil JVM, Treiber, Dateisystem und
+Scheduler schon funktionieren und du dich auf Tuning statt Kernel-Entwicklung
+konzentrierst.
 
 **Zielhardware:** Dell Precision M6700 (Ivy Bridge, AHCI, PS/2) — läuft problemlos mit Standard-Linux-Kernel + Treibern, kein Custom-Boot nötig.
 
-> Dieses Dokument ist die Übersicht. Die technische Ausarbeitung mit konkreten Befehlen, Paketnamen, Kernel-Configs und Abnahmekriterien steht in [`docs/architecture.md`](docs/architecture.md), [`docs/month1-foundation.md`](docs/month1-foundation.md), [`docs/month2-gaming-tuning.md`](docs/month2-gaming-tuning.md), [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md), [`docs/month-desktop.md`](docs/month-desktop.md) (Desktop-Modus) und [`docs/month4-full-os.md`](docs/month4-full-os.md) (Festplatten-Installer, Updates/App-Marktplatz, Terminal, Netzwerk — alle über den ursprünglichen 3-Monats-Rahmen hinaus ergänzt). Lauffähiger Code liegt in [`tarnod/`](tarnod/) (Daemon+CLI+GUI), [`tarno-guard-ebpf/`](tarno-guard-ebpf/) (eBPF-Security), [`scripts/`](scripts/) (Gaming-Mode-Tuning), [`tarno-br2-external/`](tarno-br2-external/) (Buildroot-Integration), [`tarno-installer/`](tarno-installer/) (USB-Installer-GUI), [`tarno-desktop/`](tarno-desktop/) (eigener Compositor + Taskleiste) und [`tarno-disk-installer/`](tarno-disk-installer/) (Installation von USB auf die interne Platte).
+> Dieses Dokument ist die Übersicht. Die technische Ausarbeitung mit konkreten Befehlen, Paketnamen, Kernel-Configs und Abnahmekriterien steht in [`docs/architecture.md`](docs/architecture.md), [`docs/month1-foundation.md`](docs/month1-foundation.md), [`docs/month2-gaming-tuning.md`](docs/month2-gaming-tuning.md), [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md) und [`docs/month4-full-os.md`](docs/month4-full-os.md) (zurückgestellter Detailplan: Festplatten-Installer, Updates/App-Marktplatz, Terminal, Netzwerk). Lauffähiger Code liegt in [`tarnod/`](tarnod/) (Daemon+CLI), [`tarno-guard-ebpf/`](tarno-guard-ebpf/) (eBPF-Security), [`scripts/`](scripts/) (Gaming-Mode-Tuning) und [`tarno-br2-external/`](tarno-br2-external/) (Buildroot-Integration).
 
 ---
 
@@ -41,7 +53,7 @@
 
 ---
 
-## Monat 3 — Tarno-Layer (Daemon, Security, AI)
+## Monat 3 — Tarno-Layer (Daemon, Security, Tarno AI)
 
 **Woche 9-10: tarnod als Userspace-Service**
 - `tarnod` als privilegierter Root-Service (kein Kernel-Modul) in C++/Rust oder .NET Native AOT
@@ -53,43 +65,110 @@
 - Bei verdächtigem Prozess: SIGSTOP via eBPF-Trigger + Userspace-Handler auslösen
 - Das gibt dir 80% des "Behavioral Kernel Shield" ohne Kernel-Entwicklung
 
-**Woche 12: Polish & Dokumentation**
+**Woche 12: Tarno AI + Polish**
+
+Tarno AI ist ein Assistent, direkt in `tarnod` integriert (kein separater
+Prozess, kein separates Crate) — Shell-Chat-Interface über `tarnoctl`,
+proaktives Tuning, eine Intelligenzschicht über der eBPF-Security. Geplant
+in drei Phasen, **alle drei sind mittlerweile umgesetzt** (Phase 2 als
+erster, bewusst vereinfachter Cut):
+
+- **Phase 1 (fertig, echter Code, kein LLM):** Modul `tarnod/tarnod/src/ai/`
+  mit einem heuristischen `AiBackend` (`ai/heuristic.rs`) — mustererkennt
+  bekannte Fragen ("ist gaming mode an", "was frisst RAM", "security
+  status") und beantwortet sie templated anhand von echtem, live gelesenem
+  System-Zustand (`gaming.rs`, `/proc/meminfo`, `ebpf`-Feature-Flag). Dazu
+  ein proaktiver Tuning-Task (`ai/tuning.rs`, alle 30s), der bei
+  auffälligem RAM-/Gaming-Mode-Zustand einen Vorschlag in eine Queue
+  pusht. Erreichbar über `tarnoctl ai <status|suggestions|<frage...>>`
+  bzw. die neuen `AiQuery`/`AiStatus`/`AiSuggestions`-IPC-Requests. Mit
+  Unit-Tests abgedeckt.
+- **Phase 2 (erster Cut umgesetzt, echter Code):** austauschbares Backend
+  (`ai/mistral.rs`), das **Mistral-AI-Cloud-Modelle über deren REST-API**
+  anspricht (Bearer-Auth gegen `api.mistral.ai/v1/chat/completions`,
+  Modell `mistral-small-latest`) — kein lokales LLM. API-Key landet in der
+  bestehenden `Vault` (`MISTRAL_API_KEY`), kein neuer Speichermechanismus;
+  ohne konfigurierten Key läuft Tarno AI automatisch im Phase-1-
+  Heuristik-Modus weiter (`AiState::from_vault`, kein Absturz). Fällt bei
+  Netzwerk-/API-Fehlern transparent auf `HeuristicBackend` zurück
+  (`ai/fallback.rs`). **Ehrlich benannte Einschränkungen ggü. der
+  Python-Referenz-Implementierung** (`coding-jona/tarno`), auf der dieser
+  Cut basiert: feste Default-Rate-Limit statt Per-Modell-RPS-Tabelle, kein
+  Streaming, kein Tool-/Function-Calling, kein Modell-Reasoning-Tuning —
+  ein erster, funktionsfähiger Cut, keine volle Parität. Setup (manuell,
+  kein First-Boot-Wizard vorhanden):
+  [`docs/month3-tarno-layer.md#mistral-api-key-einrichten`](docs/month3-tarno-layer.md#mistral-api-key-einrichten).
+  Volle Recherche (Kurskorrektur gegenüber der ursprünglich geplanten
+  lokalen-`candle`-Lösung, Modelle/Kosten, Rust-Crate-Optionen):
+  [`docs/knowledge-base/05-mistral-ai-api-integration.md`](docs/knowledge-base/05-mistral-ai-api-integration.md).
+- **Phase 3 (umgesetzt, echter Code):** `security::ebpf_loader`s
+  Event-Stream (`ExecEvent{pid, uid, comm, filename}`) speist zusätzlich in
+  einen neuen, beschränkten Ring (`security/events.rs`, 50 Einträge FIFO,
+  Teil von `AppState`, unabhängig vom `ebpf`-Feature kompiliert) und darüber
+  in `SystemContext` ein — die Assistenz kann jetzt über jüngste
+  Security-Events reden ("was wurde zuletzt geblockt", "warum wurde Prozess
+  X angehalten"), sowohl über `HeuristicBackend` (neue Fragenform,
+  ehrliche "nichts Auffälliges"-Antwort ohne Events) als auch über den
+  `MistralBackend`-System-Prompt (geerdet statt halluziniert). Wie geplant
+  strikt additiv zur bestehenden Tracepoint/Policy-Engine — Tarno AI liest
+  nur, die SIGSTOP-Entscheidung in `ebpf_loader::run` bleibt unverändert.
+
+Detaillierte Begründung, Architektur und Testabdeckung:
+[`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md#tarno-ai).
+
 - FPS/Frametime-Live-Profiling-Overlay (z.B. via `mangohud` angepasst oder eigenes leichtgewichtiges Overlay)
 - Aufräumen, Doku, Reproduzierbarkeit (Build-Script, damit du das System neu bauen kannst)
 - Realistischer Abschlussbericht: was wurde erreicht vs. Manifest
 
 ---
 
-## Monat 4 — Vollständiges Betriebssystem-Erlebnis (über den ursprünglichen 3-Monats-Rahmen hinaus)
+## Zurückgestellt — Desktop-/GUI-Erlebnis
 
-Der USB-Stick war ursprünglich als reines Boot-Medium gedacht (Live-Betrieb,
-kein Installationsschritt). Jetzt kommt eine echte Installation auf die
-interne Platte dazu — und alles, was ein System danach braucht, um nicht
-bei jedem Update wieder zum Stick greifen zu müssen. Details:
+Der frühere GUI/Interface-Kram (`tarno-desktop`, `tarno-installer`,
+`tarno-ui-theme`, `tarnod-ui`) wurde komplett aus dem Repo entfernt
+(Git-Historie bleibt als Sicherheitsnetz erhalten). Grund: "Man kann nicht
+direkt mit Interfaces anfangen, wenn man ein OS baut" — bevor eine GUI-Schicht
+wieder aufgebaut wird, soll erst der darunterliegende Daemon/Security/AI-Kern
+(`tarnod`, Monat 3) tragfähig sein.
+
+Die alten Monat-4-Pläne (Festplatten-Installer, System-Updates +
+App-Marktplatz, Terminal, Netzwerk) hingen an dieser jetzt entfernten GUI und
+sind **on hold, ohne Zeitplan** — nicht gestrichen, nur zurückgestellt, bis
+eine GUI-Schicht neu aufgebaut wird. Details/historischer Planungsstand:
 [`docs/month4-full-os.md`](docs/month4-full-os.md).
 
-**Festplatten-Installer** (`tarno-disk-installer`)
-- Läuft AUF Tarno OS selbst (live vom Stick gebootet), nicht auf dem
-  Erstellungsrechner — anders als `tarno-installer`, das nur den Stick
-  beschreibt. Partitioniert die interne Platte, formatiert, kopiert das
-  laufende System dorthin, installiert den Bootloader. Danach bootet der
-  Laptop ohne Stick.
+---
 
-**System-Updates + App-Marktplatz — ein gemeinsamer Paketmanager**
-- Keine zwei getrennten Systeme: derselbe Paketmanager (`opkg`-basiert,
-  Buildroot bringt das schon mit) bedient sowohl System-Updates
-  (Kernel/Kernpakete) als auch den App-Marktplatz (Nutzer-Apps) aus
-  einem Repository — ein Update-Mechanismus statt zwei.
+## Zukunft — Devuan-Basis
 
-**Terminal**
-- `foot` (Wayland-natives, sehr schlankes Terminal) als Buildroot-Paket
-  statt eines selbstgeschriebenen Terminal-Emulators — passt zur
-  "wiederverwenden statt neu erfinden"-Linie, wo ein ausgereiftes
-  Standardwerkzeug existiert.
+Langfristige Entscheidung: die Basis von Tarno OS soll perspektivisch von
+Buildroot-Cross-Compile auf ein Debian-*familiäres* Fundament (`debootstrap`
++ `live-build`) wechseln — bessere Paketverfügbarkeit, ausgereiftere
+Werkzeugkette, weniger Cross-Compile-Eigenheiten. **Kurskorrektur ggü. der
+ursprünglichen Formulierung dieses Abschnitts ("Debian-Basis"):** Recherche
+(`docs/knowledge-base/`) deckte auf, dass vanilla Debians `init`-Metapaket
+standardmäßig zu `systemd-sysv` auflöst — ein echter Konflikt mit Tarno OS'
+Kein-systemd-Prämisse. Das konkrete Ziel ist deshalb jetzt **Devuan**
+(nicht vanilla Debian): eine reale, aktiv gepflegte Debian-Ableitung mit
+identischem `apt`/`dpkg`/`live-build`-Ökosystem, aber ohne dieses Problem —
+`openrc` ist dort per Boot-Parameter (`init=/sbin/openrc-init`) aktivierbar.
+Details/Quellen:
+[`docs/knowledge-base/04-tarno-os-debian-migration-notes.md`](docs/knowledge-base/04-tarno-os-debian-migration-notes.md#init-openrc-bleibt-eine-gültige-option--aber-nicht-auf-vanilla-debian).
 
-**Netzwerk (WLAN, Bluetooth)**
-- `iwd` (schlanker als NetworkManager+wpa_supplicant) für WLAN, `bluez`
-  für Bluetooth, Steuerung über ein neues Panel in `tarnod-ui`.
+**Kein Zeitplan, Buildroot bleibt der einzige aktuell funktionierende,
+ausgelieferte Build-Weg** (`tarno-br2-external/`,
+`.github/workflows/build-os-image.yml`). Was inzwischen real (aber
+ungetestet) existiert: ein erster `live-build`-Konfigurations-Skeleton unter
+[`tarno-devuan-live/`](tarno-devuan-live/) plus dazugehöriger CI-Workflow
+[`.github/workflows/build-devuan-image.yml`](.github/workflows/build-devuan-image.yml)
+(nur `workflow_dispatch`, noch nie ausgeführt — derselbe Sandbox-Proxy, der
+zuvor Buildroots Mirrors blockierte, blockiert auch Devuans). Das ist ein
+kleiner, klar experimenteller Parallel-Track, keine Vollmigration — die
+bleibt weiterhin offen und ungeplant.
+
+Die Wissensbasis, die dieser Migration vorausgehen soll ("wie baut man ein
+Betriebssystem von A-Z, wie funktioniert Linux, wie ist es aufgebaut"),
+liegt unter `docs/knowledge-base/`.
 
 ---
 
@@ -97,18 +176,19 @@ bei jedem Update wieder zum Stick greifen zu müssen. Details:
 - Eigener Kernel (Multiboot2, eigener Scheduler, Zero-Copy-Framebuffer von Grund auf) → auf unbestimmte Zeit verschoben, nicht in 3 Monaten machbar
 - "0% I/O-Overhead" Security → realistisches Ziel: minimaler, messbarer Overhead statt Null
 - Eigene Treiber-Pipelines → Standard-Linux-Treiber nutzen, die für die Hardware schon existieren
+- GUI/Interface-Schicht (`tarno-desktop`, `tarno-installer`, `tarno-ui-theme`, `tarnod-ui`) → komplett entfernt und zurückgestellt, siehe "Zurückgestellt — Desktop-/GUI-Erlebnis" oben
 
 ## Tools/Stack im Überblick
 | Bereich | Tool |
 |---|---|
-| Basis-OS | Alpine Linux oder Buildroot |
+| Basis-OS | Alpine Linux oder Buildroot (Devuan-Migration als Zukunftsziel, erster experimenteller Skeleton in `tarno-devuan-live/`, siehe oben) |
 | Init | OpenRC / eigenes Minimal-Init |
 | Compositor (Gaming) | cage (Kiosk, Direct-Fullscreen) |
-| Compositor (Desktop) | eigener Compositor `tarno-desktop` (Rust/smithay) mit fusionierter Taskleiste, Dual-Mode neben `cage` — siehe [`docs/month-desktop.md`](docs/month-desktop.md) |
 | Core-Isolation | isolcpus, cset, sched_setaffinity |
 | Security-Monitoring | eBPF |
 | Daemon | Rust oder C++ (nativ, kein Electron) |
-| Festplatten-Installer | `tarno-disk-installer` (Rust) — sfdisk/mkfs.vfat/mkfs.ext4/rsync/extlinux, siehe [`docs/month4-full-os.md`](docs/month4-full-os.md) |
-| Updates + App-Marktplatz | ein gemeinsamer `opkg`-basierter Paketmanager statt zwei getrennter Systeme |
-| Terminal | `foot` (Wayland-natives Standardwerkzeug, kein Eigenbau) |
-| Netzwerk | `iwd` (WLAN), `bluez` (Bluetooth) |
+| Tarno AI | phasenweise, in `tarnod` integriert — Phase 1 (Heuristik), Phase 2 (Mistral-AI-Cloud-API mit Heuristik-Fallback, erster Cut) und Phase 3 (additive Security-Event-Anbindung) umgesetzt, siehe [`docs/knowledge-base/05-mistral-ai-api-integration.md`](docs/knowledge-base/05-mistral-ai-api-integration.md) — Details siehe [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md) |
+| Festplatten-Installer | `tarno-disk-installer` (Rust) — sfdisk/mkfs.vfat/mkfs.ext4/rsync/extlinux, zurückgestellt, siehe [`docs/month4-full-os.md`](docs/month4-full-os.md) |
+| Updates + App-Marktplatz | ein gemeinsamer `opkg`-basierter Paketmanager statt zwei getrennter Systeme, zurückgestellt |
+| Terminal | `foot` (Wayland-natives Standardwerkzeug, kein Eigenbau), zurückgestellt |
+| Netzwerk | `iwd` (WLAN), `bluez` (Bluetooth), zurückgestellt |
