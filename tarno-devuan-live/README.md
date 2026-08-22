@@ -212,6 +212,60 @@ http://deb.devuan.org/merged excalibur-security main`. Ein echter
 (derselbe Sandbox-Proxy-Block wie überall in diesem Track) — das ist der
 nächste noch ausstehende Verifikationsschritt.
 
+**Update — Security-Fix bestätigt, ein Whack-a-Mole-Nebeneffekt
+gefunden:** Der nächste `workflow_dispatch`-Lauf (Actions-Run
+[32562474234](https://github.com/coding-jona/Tarno-OS/actions/runs/32562474234))
+bestätigt den Security-Fix oben eindeutig — im Log sind jetzt echte,
+erfolgreiche Zeilen zu sehen:
+
+```
+Get:9 http://deb.devuan.org/merged excalibur-security/main amd64 Packages [251 kB]
+Get:1 http://deb.devuan.org/merged excalibur-security/main amd64 bsdutils amd64 1:2.41.5-0+deb13u1devuan1 [111 kB]
+```
+
+Pakete wurden also real aus `excalibur-security` installiert — keine
+404 mehr. Der Build brach aber an neuer Stelle ab, `lb_chroot_linux-image`:
+
+```
+[2026-08-22 08:33:13] lb_chroot_linux-image
+--2026-08-22 08:33:13--  http://deb.devuan.org/merged/dists/excalibur/Contents-amd64.gz
+HTTP request sent, awaiting response... 404 Not Found
+gzip: stdin: unexpected end of file
+```
+
+Root Cause (wieder am tatsächlich installierten `live-build`-Paket
+verifiziert): der `--mode debian`-Fix aus der vorigen Runde hatte einen
+zweiten, bis dahin nicht sichtbaren Nebeneffekt. `LB_FIRMWARE_CHROOT`
+(steuert, ob live-build automatisch nach Firmware-Paketen sucht)
+defaultet laut `functions/defaults.sh` im `ubuntu`-Zweig auf `false`, in
+jedem anderen Modus (also auch im hier erzwungenen `debian`) auf `true`.
+Aktiviert, lädt `lb_chroot_linux-image` eine `Contents-<arch>.gz`-Datei
+von der Mirror-Wurzel, um darin nach `lib/firmware`-Pfaden zu suchen —
+diese Datei liegt unter dem von dieser (alten) live-build-Version
+erwarteten Pfad auf `deb.devuan.org` nicht vor.
+
+Zusätzlich aufgefallen (kein Aufreger, aber real): der Schritt
+`lb build` im Workflow meldete trotz dieses Abbruchs **"success"** —
+`sudo lb build 2>&1 | tee build.log` läuft ohne `pipefail` unter
+GitHub Actions' Standard-Shell (`bash -e {0}`, verifiziert am echten
+Job-Log), der Exit-Code der Pipe ist also der von `tee` (fast nie
+fehlerhaft), nicht der von `lb build`. Nur der nachfolgende
+"Ergebnis-Image prüfen"-Schritt hat den Fehlschlag über das fehlende
+`.iso` überhaupt bemerkt.
+
+**Fix:** `--firmware-chroot false` / `--firmware-binary false` in
+`auto/config` — bewusst keine Suche nach dem "richtigen"
+Contents-Dateipfad, weil Firmware-Pakete bei Devuan (wie bei Debian)
+ohnehin in `non-free-firmware`/`non-free` liegen und dieser Build
+bewusst nur `--archive-areas main` nutzt (siehe Abschnitt "Was hier
+bewusst NICHT drin ist" unten) — ein erfolgreicher Contents-Abruf hätte
+hier ohnehin nichts beigetragen. Zusätzlich `set -o pipefail` vor dem
+`lb build`-Aufruf in
+[`build-devuan-image.yml`](../.github/workflows/build-devuan-image.yml)
+ergänzt, damit ein künftiger Abbruch mitten in `lb build` den Workflow-
+Schritt auch tatsächlich als fehlgeschlagen markiert, statt sich auf den
+nachgelagerten ISO-Check verlassen zu müssen.
+
 ## Was hier bewusst NICHT drin ist (Scope dieses ersten Cuts)
 
 - **Kein `tarnod`-Binary.** `config/includes.chroot/etc/init.d/tarnod`
