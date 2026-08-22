@@ -127,6 +127,17 @@ from a hung/crashed session. Added `swaybg` (filling with the theme's
 base `#202020`) to `etc/xdg/labwc/autostart`, so a working session
 actually looks like one.
 
+Fourth real boot test: waybar's taskbar showed every `tarno-settings`
+window as "Python (v3.13)". `tarno-settings` runs as `python3
+/usr/bin/tarno-settings` (the shebang invokes the interpreter, not a
+compiled binary of that name), so without an explicit app_id, Qt's
+wayland platform plugin fell back to identifying the window as the
+Python interpreter itself. Fixed with `app.setDesktopFileName
+("tarno-settings")` plus a matching
+`/usr/share/applications/tarno-settings.desktop` (`Name=Tarno
+Settings`) so waybar's `wlr/taskbar` resolves it to a real name instead
+of the raw app_id.
+
 ## Login
 
 There isn't one - tty1 autologs in as `user` (agetty `--autologin`, see

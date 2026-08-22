@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Tarno Settings
+Comment=Status, AI, and disk install for Tarno OS
+Exec=tarno-settings
+Terminal=false
+Categories=Settings;System;

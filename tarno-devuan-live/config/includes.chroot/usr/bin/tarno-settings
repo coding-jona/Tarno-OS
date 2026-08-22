@@ -217,6 +217,14 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    # Without this, Qt's wayland platform plugin falls back to
+    # something derived from argv[0] for the xdg_toplevel app_id - and
+    # since this runs as `python3 /usr/bin/tarno-settings` (the shebang
+    # invokes the interpreter, not a compiled binary named
+    # tarno-settings), that fallback is the Python interpreter itself.
+    # Confirmed on a real boot: waybar's taskbar showed "Python (v3.13)"
+    # instead of anything Tarno-related.
+    app.setDesktopFileName("tarno-settings")
     app.setStyleSheet(STYLESHEET)
     win = MainWindow()
     win.show()
