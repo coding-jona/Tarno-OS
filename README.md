@@ -27,6 +27,17 @@ hardware, write it to a USB stick with `tarno-install`:
 or install it to an internal disk from a running live session with
 `tarno-disk-install` (see `cmd/tarno-disk-install`).
 
+## Updates
+
+Tarno OS ships its own tools as a normal apt repo instead of a custom
+updater - `scripts/build-deb.sh` builds `tarno-tools.deb`
+(tarno-install + tarno-disk-install), `scripts/build-apt-repo.sh` turns
+a folder of `.deb`s into a flat apt repo, `.github/workflows/apt-repo.yml`
+publishes it to GitHub Pages on every push to `devel`. Not yet wired into
+the live image's `sources.list` - the repo is unsigned until an
+`APT_REPO_GPG_KEY` secret exists (`[trusted=yes]` by default otherwise,
+not shipping that silently).
+
 ## Status
 
 `tarnod` isn't packaged into the live image yet - the OpenRC service is
