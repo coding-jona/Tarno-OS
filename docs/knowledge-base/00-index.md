@@ -8,16 +8,38 @@ Prinzip: erst verstehen/recherchieren, dann (später, separat) bauen.
 Kein Code in `tarnod/`, `tarno-br2-external/` oder sonst irgendwo im Repo
 wurde für diese Dateien geändert. Reine Referenz-/Recherche-Doku.
 
-## Strang A — Debian-Basis (Dateien 1-4)
+## Strang A — Devuan-Basis (Dateien 1-4)
 
 Wie baut man ein Linux-basiertes Betriebssystem von Grund auf, und was
 würde es konkret bedeuten, Tarno OS' Basis von Buildroot-Cross-Compile auf
-ein **Debian**-Fundament umzustellen?
+ein Debian-*familiäres* Fundament umzustellen?
+
+**Kurskorrektur, gleich hier vorneweg:** Diese Recherche begann mit
+vanilla **Debian** als Ziel. Weitere Recherche deckte einen echten
+Konflikt auf: Debians `init`-Meta-Paket löst über seine
+Dependency-Alternativen standardmäßig zu `systemd-sysv` auf, sofern man
+das nicht fragil per Paket-Reihenfolge/APT-Pinning übersteuert — das
+widerspricht Tarno OS' Kernprämisse "kein systemd → OpenRC" (siehe
+README.md, ROADMAP.md, `docs/architecture.md`,
+`docs/month1-foundation.md`). Auflösung: **Devuan** statt vanilla Debian
+— eine reale, aktiv gepflegte Debian-Ableitung mit identischem
+`apt`/`dpkg`/`live-build`-Ökosystem, aber ohne das systemd-Default-Pull-
+Problem, mit `openrc` als offiziell unterstützter Init-Alternative
+(Boot-Parameter `init=/sbin/openrc-init`). Details/Quellen:
+[`02-debian-base-system-building.md`](02-debian-base-system-building.md)
+(Abschnitt "Das systemd-Default-Problem auf vanilla Debian") und
+[`04-tarno-os-debian-migration-notes.md`](04-tarno-os-debian-migration-notes.md)
+(Abschnitt "Init"). Der erste echte (wenn auch ungetestete) Code dazu
+liegt in [`../../tarno-devuan-live/`](../../tarno-devuan-live/), siehe
+dessen README.
 
 Kontext: [`ROADMAP.md`](../../ROADMAP.md), Abschnitt "Zukunft —
-Debian-Basis". Dort steht die Entscheidung (Debian statt Buildroot,
-langfristig) und die Prämisse, dass diese Wissensbasis **vor** einer
-möglichen Migration entstehen soll — nicht danach, nicht parallel dazu.
+Devuan-Basis". Dort steht die Entscheidung (Debian-familiäre Basis statt
+Buildroot, langfristig, konkret: Devuan) und die Prämisse, dass diese
+Wissensbasis **vor** einer möglichen Vollmigration entstehen soll — nicht
+danach, nicht parallel dazu. (Der erste `tarno-devuan-live/`-Skeleton
+ist eine bewusste Ausnahme davon: ein kleiner, klar als experimentell
+markierter Parallel-Track, keine Vollmigration.)
 
 ## Strang B — Tarno-AI-Phase-2 (Datei 5)
 

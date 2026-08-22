@@ -1,0 +1,35 @@
+#!/bin/sh
+# Tarno OS — live-build-Wrapper für den Devuan-Track (siehe README.md in
+# diesem Verzeichnis für Status/Scope).
+#
+# Standard-live-build-Konvention (Debian Live Manual, Kapitel "Managing a
+# configuration", https://live-team.pages.debian.net/live-manual/html/live-manual/managing-a-configuration.en.html):
+# `auto/config` speichert den vollständigen `lb config`-Aufruf statt Flags
+# von Hand einzutippen. `lb build` ruft dieses Skript automatisch (mit dem
+# `noauto`-Flag, das eine erneute Rekursion verhindert) erneut auf, ein
+# manueller `lb config`-Aufruf im selben Verzeichnis tut es auch — beide
+# Wege führen zum selben deterministischen `config/`-Zustand. Das
+# abschließende `"${@}"` reicht zusätzliche, beim Aufruf übergebene Flags
+# durch (ebenfalls Standard-Konvention).
+#
+# UNGETESTET in dieser Sandbox — der Netzwerk-Proxy hier blockiert
+# deb.devuan.org (Devuans Paket-Mirror), genau wie er vorher schon
+# Buildroots Mirrors blockiert hat. Kein `lb config`/`lb build`-Lauf hat
+# dieses Skript je real ausgeführt. Siehe README.md, Abschnitt
+# "Status/Scope", und docs/month1-foundation.md, Abschnitt "Scope-Hinweis
+# für diese Sandbox" für das Buildroot-Äquivalent dieser Einschränkung.
+
+set -e
+
+lb config noauto \
+    --distribution excalibur \
+    --architectures amd64 \
+    --archive-areas main \
+    --mirror-bootstrap http://deb.devuan.org/merged \
+    --mirror-chroot http://deb.devuan.org/merged \
+    --mirror-binary http://deb.devuan.org/merged \
+    --binary-images iso-hybrid \
+    --bootappend-live "boot=live components init=/sbin/openrc-init" \
+    "${@}"
+
+exit 0

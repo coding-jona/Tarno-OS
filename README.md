@@ -5,9 +5,12 @@ ist `tarnod`, ein Root-Daemon, der drei Dinge vereint — Gaming-Tuning
 (CPU-Governor/Isolation), eBPF-basierte Behavioral-Security und **Tarno AI**
 (im Aufbau — ein Assistent, der über denselben Daemon läuft, siehe
 [`docs/month3-tarno-layer.md`](docs/month3-tarno-layer.md)). Eine
-Debian-Basis (statt des heutigen Buildroot-Cross-Compiles) ist das
-langfristige, zurückgestellte Ziel — siehe `ROADMAP.md`, Abschnitt
-"Zukunft — Debian-Basis".
+Devuan-Basis (statt des heutigen Buildroot-Cross-Compiles) ist das
+langfristige, zurückgestellte Ziel — Devuan statt vanilla Debian, weil
+Debians `init`-Metapaket standardmäßig zu `systemd-sysv` auflöst (Konflikt
+mit Tarno OS' Kein-systemd-Prämisse), siehe `ROADMAP.md`, Abschnitt
+"Zukunft — Devuan-Basis". Ein erster, experimenteller (aber ungetesteter)
+Konfigurations-Skeleton dafür liegt bereits in [`tarno-devuan-live/`](tarno-devuan-live/).
 
 - **Plan/Übersicht:** [`ROADMAP.md`](ROADMAP.md)
 - **Technische Details je Monat + Architektur:** [`docs/`](docs/)
@@ -19,9 +22,10 @@ langfristige, zurückgestellte Ziel — siehe `ROADMAP.md`, Abschnitt
 | [`tarnod/`](tarnod/) | Root-Daemon (`tarnod`), CLI-Client (`tarnoctl`) — Rust-Workspace |
 | [`tarno-guard-ebpf/`](tarno-guard-ebpf/) | eBPF-Behavioral-Security (Tracepoint auf `execve`, RingBuf-Events, Userspace-Loader) |
 | [`scripts/`](scripts/) | Gaming-Mode-Tuning (CPU-Governor, THP, JVM-Start-Wrapper, FPS-Benchmark) |
-| [`tarno-br2-external/`](tarno-br2-external/) | Buildroot-`BR2_EXTERNAL`-Tree (Kernel-Config, `tarnod`-Package, Board-Support M6700, USB-Boot-Image) |
+| [`tarno-br2-external/`](tarno-br2-external/) | Buildroot-`BR2_EXTERNAL`-Tree (Kernel-Config, `tarnod`-Package, Board-Support M6700, USB-Boot-Image) — einziger aktuell funktionierender/ausgelieferter Build-Weg |
+| [`tarno-devuan-live/`](tarno-devuan-live/) | `live-build`-Konfigurations-Skeleton Richtung "Zukunft — Devuan-Basis" — echte, aber ungetestete Konfiguration, experimenteller Parallel-Track, kein Ersatz für `tarno-br2-external/` |
 | [`docs/`](docs/) | Architektur + detaillierte Monatspläne mit Befehlen/Configs/Abnahmekriterien |
-| [`docs/knowledge-base/`](docs/knowledge-base/) | Recherche zu Linux-/Debian-Systembau für das zurückgestellte Debian-Basis-Ziel — reine Referenz, nichts davon ist umgesetzt |
+| [`docs/knowledge-base/`](docs/knowledge-base/) | Recherche zu Linux-/Debian-Systembau für das zurückgestellte Devuan-Basis-Ziel — größtenteils reine Referenz; der Init-Abschnitt hat inzwischen einen ersten Code-Niederschlag in `tarno-devuan-live/` |
 
 ## Schnellstart (Entwicklung, ohne Buildroot)
 

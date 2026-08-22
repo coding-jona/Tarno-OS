@@ -4,9 +4,12 @@
 frühere GUI/Interface-Kram wurde bewusst entfernt, siehe "Zurückgestellt"
 unten). Kein eigener Kernel. Basis ist aktuell ein extrem gestripptes Linux
 via Buildroot-Cross-Compile mit eigenem `tarnod`-Daemon und minimaler Shell;
-langfristig soll diese Basis durch ein **Debian**-Fundament ersetzt werden
-(siehe "Zukunft — Debian-Basis" unten) — das ist ein Kurswechsel, der aktuell
-nur dokumentiert, aber noch nicht umgesetzt ist. Erreicht ~90% der Ziele aus
+langfristig soll diese Basis durch ein **Devuan**-Fundament (Debian-Ableitung
+ohne den systemd-Default-Konflikt vanilla Debians, siehe "Zukunft —
+Devuan-Basis" unten) ersetzt werden — ein erster, experimenteller
+Konfigurations-Skeleton existiert bereits (`tarno-devuan-live/`), die
+Vollmigration bleibt aber ein Kurswechsel, der noch nicht umgesetzt ist.
+Erreicht ~90% der Ziele aus
 dem Manifest in umsetzbarer Zeit, weil JVM, Treiber, Dateisystem und
 Scheduler schon funktionieren und du dich auf Tuning statt Kernel-Entwicklung
 konzentrierst.
@@ -136,19 +139,36 @@ eine GUI-Schicht neu aufgebaut wird. Details/historischer Planungsstand:
 
 ---
 
-## Zukunft — Debian-Basis
+## Zukunft — Devuan-Basis
 
 Langfristige Entscheidung: die Basis von Tarno OS soll perspektivisch von
-Buildroot-Cross-Compile auf ein **Debian**-Fundament (z. B. `debootstrap` +
-`live-build`) wechseln — bessere Paketverfügbarkeit, ausgereiftere
-Werkzeugkette, weniger Cross-Compile-Eigenheiten. **Explizit: keine
-Code-Änderung jetzt.** Buildroot bleibt der einzige aktuell funktionierende
-Build-Weg (`tarno-br2-external/`, `.github/workflows/build-os-image.yml`).
+Buildroot-Cross-Compile auf ein Debian-*familiäres* Fundament (`debootstrap`
++ `live-build`) wechseln — bessere Paketverfügbarkeit, ausgereiftere
+Werkzeugkette, weniger Cross-Compile-Eigenheiten. **Kurskorrektur ggü. der
+ursprünglichen Formulierung dieses Abschnitts ("Debian-Basis"):** Recherche
+(`docs/knowledge-base/`) deckte auf, dass vanilla Debians `init`-Metapaket
+standardmäßig zu `systemd-sysv` auflöst — ein echter Konflikt mit Tarno OS'
+Kein-systemd-Prämisse. Das konkrete Ziel ist deshalb jetzt **Devuan**
+(nicht vanilla Debian): eine reale, aktiv gepflegte Debian-Ableitung mit
+identischem `apt`/`dpkg`/`live-build`-Ökosystem, aber ohne dieses Problem —
+`openrc` ist dort per Boot-Parameter (`init=/sbin/openrc-init`) aktivierbar.
+Details/Quellen:
+[`docs/knowledge-base/04-tarno-os-debian-migration-notes.md`](docs/knowledge-base/04-tarno-os-debian-migration-notes.md#init-openrc-bleibt-eine-gültige-option--aber-nicht-auf-vanilla-debian).
 
-Bevor an dieser Migration oder überhaupt am zurückgestellten Boot-Image-Ziel
-weitergearbeitet wird, soll erst eine Wissensbasis entstehen ("wie baut man
-ein Betriebssystem von A-Z, wie funktioniert Linux, wie ist es aufgebaut") —
-künftiger Ort dafür: `docs/knowledge-base/`.
+**Kein Zeitplan, Buildroot bleibt der einzige aktuell funktionierende,
+ausgelieferte Build-Weg** (`tarno-br2-external/`,
+`.github/workflows/build-os-image.yml`). Was inzwischen real (aber
+ungetestet) existiert: ein erster `live-build`-Konfigurations-Skeleton unter
+[`tarno-devuan-live/`](tarno-devuan-live/) plus dazugehöriger CI-Workflow
+[`.github/workflows/build-devuan-image.yml`](.github/workflows/build-devuan-image.yml)
+(nur `workflow_dispatch`, noch nie ausgeführt — derselbe Sandbox-Proxy, der
+zuvor Buildroots Mirrors blockierte, blockiert auch Devuans). Das ist ein
+kleiner, klar experimenteller Parallel-Track, keine Vollmigration — die
+bleibt weiterhin offen und ungeplant.
+
+Die Wissensbasis, die dieser Migration vorausgehen soll ("wie baut man ein
+Betriebssystem von A-Z, wie funktioniert Linux, wie ist es aufgebaut"),
+liegt unter `docs/knowledge-base/`.
 
 ---
 
@@ -161,7 +181,7 @@ künftiger Ort dafür: `docs/knowledge-base/`.
 ## Tools/Stack im Überblick
 | Bereich | Tool |
 |---|---|
-| Basis-OS | Alpine Linux oder Buildroot (Debian-Migration als Zukunftsziel, siehe oben) |
+| Basis-OS | Alpine Linux oder Buildroot (Devuan-Migration als Zukunftsziel, erster experimenteller Skeleton in `tarno-devuan-live/`, siehe oben) |
 | Init | OpenRC / eigenes Minimal-Init |
 | Compositor (Gaming) | cage (Kiosk, Direct-Fullscreen) |
 | Core-Isolation | isolcpus, cset, sched_setaffinity |

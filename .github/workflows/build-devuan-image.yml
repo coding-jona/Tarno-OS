@@ -1,0 +1,92 @@
+name: Build Tarno OS Devuan image (experimental)
+
+# Baut das experimentelle Devuan-Live-Image (siehe tarno-devuan-live/) mit
+# einem echten `live-build`-Lauf gegen Devuans Paket-Mirrors — genau wie
+# beim Buildroot-Pendant (build-os-image.yml) ist das ein Schritt, der
+# bisher in KEINER Sandbox lief (siehe tarno-devuan-live/README.md,
+# Abschnitt "Warum das hier niemand gebaut hat"). Läuft NICHT bei jedem
+# Push (ein `live-build`-Lauf lädt ein komplettes Basissystem + Pakete aus
+# dem Netz und kann lange dauern) — nur manuell auslösbar.
+#
+# WICHTIG: tarno-br2-external/ bleibt der einzige aktuell
+# funktionierende/ausgelieferte Build-Weg für Tarno OS. Dieser Workflow
+# ist Teil eines parallelen, experimentellen Tracks (ROADMAP.md, Abschnitt
+# "Zukunft — Devuan-Basis") — ein erfolgreicher Lauf hier würde zum ersten
+# Mal überhaupt zeigen, ob tarno-devuan-live/ tatsächlich ein bootfähiges
+# Image erzeugt.
+#
+# Ergebnis (bei Erfolg): das fertige `.hybrid.iso`-Image als
+# Workflow-Artifact zum Download, analog zu sdcard.img beim Buildroot-Weg.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build-devuan-image:
+    name: live-build (tarno-devuan-live, Devuan excalibur)
+    runs-on: ubuntu-latest
+    # live-build lädt ein komplettes Basissystem + Pakete aus dem Netz -
+    # deutlich weniger als ein voller Buildroot-Cross-Build, aber immer
+    # noch potenziell lang genug (Netzwerk-Varianz), um etwas Puffer
+    # gegenüber der Hosted-Runner-Obergrenze (360 Minuten) zu lassen.
+    timeout-minutes: 120
+    steps:
+      - name: Tarno-OS-Repo auschecken
+        uses: actions/checkout@v4
+
+      # Standard-Host-Abhängigkeiten für einen live-build-Lauf mit
+      # iso-hybrid-Ausgabe (Debian Live Manual, Kapitel "Installing
+      # live-build" + "iso-hybrid"-Ausgabeformat): live-build selbst,
+      # debootstrap fürs Basissystem, squashfs-tools fürs komprimierte
+      # Root-Dateisystem, xorriso fürs ISO-Hybrid-Image.
+      - name: live-build-Host-Abhängigkeiten installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            live-build debootstrap squashfs-tools xorriso
+
+      # lb config/lb build brauchen root fuer chroot-Operationen
+      # (mount/umount im Basissystem, Geraeteknoten, debootstrap als root)
+      # - Standard-live-build-Anforderung, kein Tarno-OS-Spezifikum.
+      - name: lb config
+        working-directory: tarno-devuan-live
+        run: sudo lb config
+
+      # `lb build` selbst erzeugt standardmaessig keine persistente
+      # Log-Datei (anders als Buildroots build-time.log) - deshalb hier
+      # per `tee` selbst mitschreiben, damit ein Fehlschlag als
+      # Artifact nachvollziehbar bleibt.
+      - name: lb build (Devuan excalibur, debootstrap + Pakete + ISO)
+        working-directory: tarno-devuan-live
+        run: sudo lb build 2>&1 | tee build.log
+
+      - name: Ergebnis-Image pruefen
+        working-directory: tarno-devuan-live
+        run: |
+          ls -la .
+          image="$(find . -maxdepth 1 -name '*.iso' | head -n1)"
+          if [ -z "${image}" ]; then
+            echo "kein .iso-Ergebnis gefunden - lb build ist vermutlich fehlgeschlagen" >&2
+            exit 1
+          fi
+          file "${image}"
+          sha256sum "${image}" | tee "${image}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarno-os-devuan-iso
+          path: |
+            tarno-devuan-live/*.iso
+            tarno-devuan-live/*.iso.sha256
+          if-no-files-found: error
+          # ISO-Images sind mehrere hundert MB - nicht ewig aufheben,
+          # gleiche Retention wie beim Buildroot-Artifact.
+          retention-days: 14
+
+      - name: Build-Log als Artifact (auch bei Fehlschlag)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devuan-live-build-log
+          path: tarno-devuan-live/build.log
+          if-no-files-found: ignore

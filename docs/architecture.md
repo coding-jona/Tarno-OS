@@ -75,6 +75,12 @@ Dieses Dokument beschreibt die technische Gesamtarchitektur der in [`ROADMAP.md`
 - `BR2_EXTERNAL`-Tree mit eigenem Package `tarnod` (cargo-package-Infra) und Board-Definition `tarno-m6700` (Kernel-Config-Fragment, Rootfs-Overlay).
 - Das eBPF-Objekt wird **vorkompiliert** eingebettet (nicht im Buildroot-Cross-Build erzeugt), um Host-BPF-Toolchain-Bootstrapping im Cross-Build zu vermeiden. Details: [`month1-foundation.md`](month1-foundation.md#woche-1-2-basis-system).
 
+### Devuan-Live-Track (`tarno-devuan-live/`, experimentell)
+- Paralleler, `live-build`-basierter Build-Weg Richtung ROADMAP.md-Ziel "Zukunft — Devuan-Basis" — Buildroot (oben) bleibt der einzige aktuell *funktionierende/ausgelieferte* Weg, dieser Track ist echte, aber ungetestete Konfiguration.
+- Devuan statt vanilla Debian, weil Debians `init`-Metapaket standardmäßig zu `systemd-sysv` auflöst (Konflikt mit der Kein-systemd-Prämisse); Devuan löst standardmäßig zu `sysvinit-core` auf und bietet `openrc` als Boot-Parameter-Alternative (`init=/sbin/openrc-init`) an. Details: [`knowledge-base/04-tarno-os-debian-migration-notes.md`](knowledge-base/04-tarno-os-debian-migration-notes.md#init-openrc-bleibt-eine-gültige-option--aber-nicht-auf-vanilla-debian).
+- `auto/config` (`lb config`-Wrapper, gepinnt auf `--distribution excalibur`), ein minimales `config/package-lists/tarno.list.chroot` (`openrc`) und der 1:1 aus dem Buildroot-Pfad portierte OpenRC-Service unter `config/includes.chroot/etc/init.d/tarnod` — kein `tarnod`-Binary, kein eigener Kernel-Build, keine Feature-Parität mit Buildroot in diesem ersten Cut.
+- CI-Gegenstück: [`.github/workflows/build-devuan-image.yml`](../.github/workflows/build-devuan-image.yml) (`workflow_dispatch`-only, wie beim Buildroot-Workflow). Details/Scope: [`../tarno-devuan-live/README.md`](../tarno-devuan-live/README.md).
+
 ## Sicherheitsmodell (Userspace-Isolation statt Kernel-Vault)
 
 Kein eigener Kernel-Vault nötig, weil:

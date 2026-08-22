@@ -1,12 +1,18 @@
-# Tarno OS → Debian: Migrationsnotizen (Brücke)
+# Tarno OS → Devuan: Migrationsnotizen (Brücke)
 
 Siehe [`00-index.md`](00-index.md) für Zweck/Status. **Explizit
 nochmal, weil dies das Dokument mit dem größten Missverständnis-Risiko
-ist: keine Zeile Code wurde für dieses Dokument geändert.** Es ist reine
-Vorbereitung für einen späteren Zeitpunkt, an dem die in
-[`ROADMAP.md`](../../ROADMAP.md) ("Zukunft — Debian-Basis") beschriebene
-Migration tatsächlich angegangen wird. Buildroot bleibt bis dahin der
-einzige funktionierende Build-Weg.
+ist: der überwiegende Teil dieses Dokuments (Kernel, Boot-Layout,
+tarnod-Paketierung) blieb reine Planungsnotiz, keine Code-Änderung.**
+Ausnahme: der Init-Abschnitt unten hat inzwischen einen ersten, echten
+(aber ungetesteten) Code-Niederschlag in
+[`../../tarno-devuan-live/`](../../tarno-devuan-live/) — siehe dessen
+README für Status/Scope. Der Rest bleibt Vorbereitung für einen späteren
+Zeitpunkt, an dem die in [`ROADMAP.md`](../../ROADMAP.md) ("Zukunft —
+Devuan-Basis", vormals "Debian-Basis" — siehe Init-Abschnitt unten, warum
+sich das Ziel korrigiert hat) beschriebene Vollmigration tatsächlich
+angegangen wird. Buildroot bleibt bis dahin der einzige funktionierende,
+ausgelieferte Build-Weg.
 
 Ziel dieses Dokuments: für jedes bestehende Buildroot-Artefakt in
 `tarno-br2-external/` konkret benennen, was davon auf eine künftige
@@ -88,15 +94,52 @@ teilweise: ein debootstrap-chroot läuft nativ auf derselben Architektur
 möglich — ob das die vorkompilierte Variante ablöst, ist eine spätere
 Abwägung, kein Automatismus.
 
-## Init: OpenRC bleibt eine gültige Option
+## Init: OpenRC bleibt eine gültige Option — aber nicht auf vanilla Debian
 
-Wie in [`01-linux-os-architecture.md`](01-linux-os-architecture.md)
-beschrieben: Debian nutzt standardmäßig systemd, aber OpenRC ist
-offiziell paketiert. Der heutige `S60tarnod`-OpenRC-Service
-(`board/tarno-m6700/rootfs-overlay/etc/init.d/S60tarnod`) müsste bei
-einer Migration nicht neu konzipiert werden — nur der Paketierungsweg
-ändert sich (Datei landet im debootstrap-chroot statt im Buildroot-
-Rootfs-Overlay).
+**Kurskorrektur.** Die ursprüngliche Fassung dieses Abschnitts behauptete
+sinngemäß "OpenRC ist offiziell auf Debian paketiert, keine Neukonzeption
+nötig" — das ist eine Vereinfachung, die sich bei genauerer Recherche als
+zu optimistisch herausstellte. Wie in
+[`01-linux-os-architecture.md`](01-linux-os-architecture.md) beschrieben,
+nutzt Debian standardmäßig systemd, und `apt install openrc` installiert
+zwar das OpenRC-Paket — löst aber **nicht** das eigentliche Problem: das
+`init`-Metapaket selbst löst seine Dependency-Alternativen
+(`systemd-sysv | sysvinit-core | ...`) standardmäßig zur ersten
+Alternative auf, also `systemd-sysv`, sowohl bei `debootstrap` als auch
+bei `live-build`. Um das zu übersteuern, bräuchte man fragiles
+APT-Pinning oder eine sorgfältig kontrollierte Installationsreihenfolge —
+unverifiziert in dieser Sandbox und in der Praxis leicht durch einen
+späteren `apt`-Lauf wieder umkippbar. Details/Mechanismus:
+[`02-debian-base-system-building.md`](02-debian-base-system-building.md#das-systemd-default-problem-auf-vanilla-debian),
+Quelle:
+<https://www.notinventedhere.org/articles/linux/debootstrapping-debian-jessie-without-systemd.html>.
+
+**Tatsächliche Auflösung: Devuan statt vanilla Debian.** Devuan ist eine
+reale, aktiv gepflegte Debian-Ableitung — identisches
+`apt`/`dpkg`/`live-build`-Ökosystem (nur Mirror `deb.devuan.org` statt
+`deb.debian.org`), deren `init`-Metapaket standardmäßig zu
+`sysvinit-core` auflöst, nicht zu `systemd-sysv`. Devuan bietet zusätzlich
+`openrc` als vollwertige, offiziell unterstützte Init-Alternative an,
+aktivierbar über den Kernel-Boot-Parameter `init=/sbin/openrc-init` —
+konzeptionell identisch zu dem Boot-Parameter-Muster, das
+`tarno-br2-external/board/tarno-m6700/syslinux.cfg` bereits heute nutzt
+(`root=/dev/sda2` als Kernel-Cmdline-Parameter über den Bootloader). Der
+heutige `tarnod`-OpenRC-Service
+(`tarno-br2-external/board/tarno-m6700/rootfs-overlay/etc/init.d/tarnod`,
+Service-Name `tarnod` — nicht `S60tarnod`, wie eine ältere Fassung dieses
+Dokuments fälschlich annahm; OpenRC nutzt symlink-basierte Runlevel statt
+`SNN`-Präfixe im Dateinamen selbst) musste dafür tatsächlich **nicht neu
+konzipiert werden** — die ursprüngliche Kernaussage stimmt im Ergebnis,
+nur der Weg dorthin (Devuan statt vanilla Debian) ist ein anderer als
+ursprünglich angenommen. Das Service-Skript ist 1:1 nach
+[`../../tarno-devuan-live/config/includes.chroot/etc/init.d/tarnod`](../../tarno-devuan-live/config/includes.chroot/etc/init.d/tarnod)
+portiert (echter, aber ungetesteter Code — siehe
+[`../../tarno-devuan-live/README.md`](../../tarno-devuan-live/README.md)).
+
+Quellen:
+- <https://www.devuan.org/os/init-freedom>
+- <https://laskarnix.org/devuan-migrate-from-sysv-to-openrc-init/>
+- <https://dev1galaxy.org/viewtopic.php?id=7853>
 
 ## Zusammenfassung: Übertragbarkeits-Tabelle
 
@@ -106,7 +149,7 @@ Rootfs-Overlay).
 | `genimage.cfg` / `syslinux.cfg` (Boot-Layout-Konzept) | mittel — Konzept ähnlich, Mechanik (`live-build`) anders |
 | `post-image.sh` (Buildroot-Hook-Mechanik) | niedrig — Buildroot-spezifisch, entfällt |
 | `tarnod.mk` (fachliche Anforderung: Rust-Binaries + eBPF-Objekt einbetten) | hoch als Anforderung, niedrig als Mechanik (Cargo-Package-Infra vs. `.deb`/chroot-Build) |
-| OpenRC als Init | hoch — offiziell auf Debian paketiert, keine Neukonzeption nötig |
+| OpenRC als Init | hoch als Service-Skript (1:1 nach `tarno-devuan-live/` portiert), aber **nicht auf vanilla Debian** — vanilla Debians `init`-Metapaket löst standardmäßig zu `systemd-sysv` auf; Auflösung: Ziel-Distribution auf Devuan geändert (`init=/sbin/openrc-init`-Boot-Parameter), siehe Abschnitt "Init" oben |
 
 ## Quellen
 
@@ -116,4 +159,5 @@ und [`03-bootloader-init-kernel-basics.md`](03-bootloader-init-kernel-basics.md)
 für die zugrundeliegenden Primärquellen. Repo-interne Referenzen:
 [`docs/architecture.md`](../architecture.md),
 [`docs/month1-foundation.md`](../month1-foundation.md),
-`tarno-br2-external/`.
+`tarno-br2-external/`, [`../../tarno-devuan-live/`](../../tarno-devuan-live/)
+(erster echter, ungetesteter Code-Niederschlag des Init-Abschnitts oben).
