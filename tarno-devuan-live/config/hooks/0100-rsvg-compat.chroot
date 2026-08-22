@@ -1,0 +1,41 @@
+#!/bin/sh
+# Kompatibilitäts-Symlink: rsvg -> rsvg-convert.
+#
+# live-build-Chroot-Hook (Konvention dieser live-build-Version,
+# 3.0~a57-1ubuntu49.1: config/hooks/*.chroot, läuft während der
+# "chroot hooks"-Phase innerhalb des Chroots, siehe
+# /usr/lib/live/build/lb_chroot_hooks im tatsächlich installierten
+# Paket). Nicht die neuere .hook.chroot-Namenskonvention (live-build 4.x+
+# - diese hier installierte Version kennt nur die alte).
+#
+# Grund (verifiziert am tatsächlich installierten live-build-Paket,
+# /usr/lib/live/build/lb_binary_syslinux, Zeilen ~94 und ~337): der
+# Standard-Syslinux-Splash ("LB_SYSLINUX_THEME=live-build", live-builds
+# eigener Default) konvertiert splash.svg -> splash.png per
+# `Chroot chroot "rsvg --format png --height 480 --width 640 splash.svg
+# splash.png"` - ruft also das Kommando `rsvg` **innerhalb des Chroots**
+# auf. Reale Fehlermeldung in Actions-Run 32563556170
+# (https://github.com/coding-jona/Tarno-OS/actions/runs/32563556170):
+#
+#   env: 'rsvg': No such file or directory
+#
+# `rsvg` ist der alte, seit dem librsvg-2.26-Split (2012) nicht mehr
+# existierende Kommandoname - aktuelle `librsvg2-bin`-Pakete (auch auf
+# Devuan/Debian) liefern ausschließlich `rsvg-convert`. Der vorangehende
+# `Check_package chroot/usr/bin/rsvg librsvg2-bin`-Aufruf in
+# lb_binary_syslinux prüft dabei ohnehin nur, ob das *Paket*
+# `librsvg2-bin` per `dpkg-query -s` installiert ist (der `FILE`-Parameter
+# wird in dieser live-build-Version nicht ausgewertet, siehe
+# /usr/share/live/build/functions/packages.sh, Check_installed()) - das
+# Paket wird also so oder so installiert, nur eben unter dem neuen
+# Binärnamen.
+#
+# Dieser Hook läuft zeitlich VOR der Paketinstallation (chroot-hooks-Phase
+# kommt vor der binary-Phase, in der Check_package/Install_package erst
+# librsvg2-bin nachzieht) - der Symlink zeigt also zunächst ins Leere.
+# Das ist unproblematisch: ein Symlink muss beim Anlegen nicht auflösen,
+# nur beim späteren tatsächlichen Zugriff (hier: wenn lb_binary_syslinux
+# `rsvg` aufruft, ist librsvg2-bin über Check_package/Install_package
+# längst nachinstalliert).
+set -e
+ln -sf /usr/bin/rsvg-convert /usr/bin/rsvg
