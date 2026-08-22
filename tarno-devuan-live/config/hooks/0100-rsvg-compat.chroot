@@ -1,0 +1,5 @@
+#!/bin/sh
+# librsvg dropped the `rsvg` command name in 2012; this live-build's splash
+# conversion still calls it. Symlink it before the binary stage runs.
+set -e
+ln -sf /usr/bin/rsvg-convert /usr/bin/rsvg

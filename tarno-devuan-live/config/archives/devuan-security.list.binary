@@ -1,0 +1,4 @@
+# .binary twin of devuan-security.list.chroot - without this the image's
+# own /etc/apt/sources.list.d/ ships without the security suite even
+# though the chroot build step used it correctly.
+deb http://deb.devuan.org/merged @DISTRIBUTION@-security @ARCHIVE_AREAS@

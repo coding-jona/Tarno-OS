@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+# live-build has no devuan mode; without --mode it guesses one from the
+# build host's lsb_release, which drags in a pile of wrong Ubuntu/Debian
+# defaults (kernel package name, security mirror, firmware detection).
+# Force debian mode and override the parts it still gets wrong for devuan
+# by hand: --security false + config/archives/devuan-security.list.* set
+# the real deb.devuan.org security line ourselves, --firmware-*-false
+# skips a Contents-amd64.gz fetch that 404s on deb.devuan.org.
+lb config noauto \
+	--mode debian \
+	--distribution excalibur \
+	--architectures amd64 \
+	--archive-areas main \
+	--mirror-bootstrap http://deb.devuan.org/merged \
+	--mirror-chroot http://deb.devuan.org/merged \
+	--mirror-binary http://deb.devuan.org/merged \
+	--keyring-packages devuan-keyring \
+	--security false \
+	--firmware-chroot false \
+	--firmware-binary false \
+	--binary-images iso-hybrid \
+	--bootappend-live "boot=live components init=/sbin/openrc-init" \
+	"${@}"
+
+exit 0
