@@ -1,0 +1,10 @@
+# Gleiche Datei/Begründung wie devuan-security.list.chroot in diesem
+# Verzeichnis - dort ausführlicher Kommentar. Dieser ".binary"-Zwilling
+# wird von live-build für den zweiten Durchlauf verwendet (die
+# sources.list, die am Ende TATSÄCHLICH im fertigen Live-Image landet,
+# siehe /usr/lib/live/build/lb_chroot_archives, Abschnitt "Check local
+# sources.list" im binary-Teil der Datei) - ohne diese zweite Datei bliebe
+# das ausgelieferte Image ohne Security-Suite in seiner eigenen
+# /etc/apt/sources.list.d/, obwohl der Chroot-Build-Schritt selbst sie
+# korrekt genutzt hätte.
+deb http://deb.devuan.org/merged @DISTRIBUTION@-security @ARCHIVE_AREAS@
