@@ -13,9 +13,10 @@ Console login (agetty) and wired DHCP (dhcpcd) are enabled via chroot
 hooks - neither comes for free under openrc-init. Wifi isn't wired up.
 
 Status: builds an `.hybrid.iso` in CI, `tarnod` is packaged in, ISOLINUX
-boots (see git history for the module-symlink fix). Login: `user` / `live`
-- `user-setup` + `sudo` are required for live-config to actually create
-the account and give it admin rights
+boots (see git history for the module-symlink fix). tty1 autologs in as
+`user` (`0200-agetty-console.chroot`, agetty `--autologin`) - no
+username/password to type at all. `user-setup` + `sudo` are still what
+actually creates that account and gives it admin rights
 (`/usr/lib/live/config/0030-user-setup`, `0040-sudo` - both silently
 no-op if their package isn't installed, which is what happened before
 this was added). root is permanently locked by live-config itself,

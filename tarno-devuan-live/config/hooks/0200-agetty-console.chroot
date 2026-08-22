@@ -5,3 +5,15 @@
 set -e
 ln -sf agetty /etc/init.d/agetty.tty1
 rc-update add agetty.tty1 default
+
+# Autologin as the live user - every mainstream live image (Debian,
+# Ubuntu, Kali, ...) does this, there's no password worth typing on a
+# live/demo system, and it removes an entire class of "did I type the
+# wrong thing" reports for free. openrc's agetty init reads
+# `agetty_options` from /etc/conf.d/<service-name> and passes it
+# straight through to agetty (see init.d/agetty.in upstream:
+# command_args_foreground="${agetty_options} ...") - agetty's own
+# `--autologin user` still runs `/bin/login -f user` underneath, so PAM
+# session setup and /etc/profile(.d/*) still run exactly as with a
+# manual login, just without the prompt.
+echo 'agetty_options="--autologin user"' > /etc/conf.d/agetty.tty1
