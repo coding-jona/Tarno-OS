@@ -1,2 +1,5 @@
 #!/bin/sh
-# nothing to autostart yet - right-click the desktop for the menu
+# waybar is a layer-shell panel, not a regular window - it reserves its
+# own screen space via the wlr-layer-shell protocol, no labwc-side
+# config needed for that. Config: config/includes.chroot/etc/xdg/waybar/
+waybar &

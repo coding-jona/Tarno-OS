@@ -22,10 +22,15 @@ syslinux-utils
 # desktop: labwc (minimal wlroots/openbox-alike compositor with a real
 # root-menu, see config/includes.chroot/etc/xdg/labwc/) + seatd (seat
 # management without systemd-logind) + foot (minimal wayland terminal,
-# also the menu's Terminal entry).
+# also the menu's Terminal entry) + waybar (taskbar - window list via
+# its wlr/taskbar module, which needs no compositor-specific support
+# beyond wlr-foreign-toplevel-management, which labwc implements - plus
+# a clock and a Tarno Settings launcher button, config in
+# config/includes.chroot/etc/xdg/waybar/).
 labwc
 seatd
 foot
+waybar
 
 # settings panel (config/includes.chroot/usr/bin/tarno-settings)
 python3
