@@ -21,6 +21,19 @@
 
 set -e
 
+# --keyring-packages: live-build installiert per Default das Debian-eigene
+# `debian-archive-keyring` in den Chroot, um die dort per apt gezogenen
+# Pakete zu verifizieren (Default laut lb_config-Manual/live-build-Quelle,
+# functions/defaults.sh: LB_KEYRING_PACKAGES="${LB_KEYRING_PACKAGES:-debian-archive-keyring}").
+# Das ist für einen Devuan-Ziel-Chroot schlicht falsch - genau dieses
+# Verhalten ist als realer Bug dokumentiert ("live-build uses debian
+# repos", devuan-packages/live-build-Issue #13: live-build zieht
+# Pakete aus Debian- statt Devuan-Repos, weil es den falschen Keyring
+# installiert). Deshalb hier explizit `devuan-keyring` statt des
+# Debian-Defaults - unabhängig vom debootstrap-Paket-Fix in
+# ../../.github/workflows/build-devuan-image.yml, der nur die
+# Host-seitige Verifikation beim allerersten Bootstrap-Schritt betrifft,
+# nicht die späteren In-Chroot-apt-Operationen von `lb build`.
 lb config noauto \
     --distribution excalibur \
     --architectures amd64 \
@@ -28,6 +41,7 @@ lb config noauto \
     --mirror-bootstrap http://deb.devuan.org/merged \
     --mirror-chroot http://deb.devuan.org/merged \
     --mirror-binary http://deb.devuan.org/merged \
+    --keyring-packages devuan-keyring \
     --binary-images iso-hybrid \
     --bootappend-live "boot=live components init=/sbin/openrc-init" \
     "${@}"

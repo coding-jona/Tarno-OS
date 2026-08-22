@@ -37,13 +37,137 @@ jobs:
       # Standard-Host-Abhängigkeiten für einen live-build-Lauf mit
       # iso-hybrid-Ausgabe (Debian Live Manual, Kapitel "Installing
       # live-build" + "iso-hybrid"-Ausgabeformat): live-build selbst,
-      # debootstrap fürs Basissystem, squashfs-tools fürs komprimierte
-      # Root-Dateisystem, xorriso fürs ISO-Hybrid-Image.
+      # squashfs-tools fürs komprimierte Root-Dateisystem, xorriso fürs
+      # ISO-Hybrid-Image. `debootstrap` bewusst NICHT hier aus Ubuntus
+      # Archiv installieren, sondern erst im nächsten Schritt aus Devuans
+      # eigenem Paket (siehe Kommentar dort) - sonst würde `apt-get
+      # install debootstrap` unnötig erst Ubuntus Variante ziehen, nur
+      # um sie danach wieder zu überschreiben.
       - name: live-build-Host-Abhängigkeiten installieren
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            live-build debootstrap squashfs-tools xorriso
+            live-build squashfs-tools xorriso
+
+      # Realer Lauf dieses Workflows (Actions-Run 32560292687,
+      # https://github.com/coding-jona/Tarno-OS/actions/runs/32560292687)
+      # ist genau hier fehlgeschlagen, ~20s in den Job hinein:
+      #
+      #   E: No such script: /usr/share/debootstrap/scripts/excalibur
+      #
+      # Root Cause (bestätigt über zwei unabhängige Quellen, kein Rätselraten):
+      # Ubuntus/Debians eigenes `debootstrap`-Paket kennt nur Debian/Ubuntu-
+      # Codenamen unter /usr/share/debootstrap/scripts/ - Devuan-Suite-Namen
+      # wie `excalibur` (oder ältere wie `chimaera`) fehlen dort komplett,
+      # ebenso der Verweis auf Devuans eigenes Schlüsselbund-Paket. Siehe
+      # den echten Debian-Bugreport "debootstrap: Devuan install scripts in
+      # /usr/share/debootstrap/scripts/"
+      # (https://bugs-devel.debian.org/cgi-bin/bugreport.cgi?bug=1067240)
+      # sowie ein unabhängig bestätigtes Praxis-Rezept
+      # (https://gist.github.com/CypherpunkSamurai/925f961b13a73a354636b56e2760d150),
+      # das exakt denselben Fix beschreibt: Devuans eigenes, gepatchtes
+      # `debootstrap`-Paket installieren (erkennbar an einer
+      # `+devuanN`-Versionsendung, z. B. `1.0.123+devuan3`) statt sich auf
+      # das Ubuntu/Debian-Archiv zu verlassen.
+      #
+      # Zusätzlich real recherchiert (Devuan-Bugtracker #837, "debootstrap:
+      # Requires explicit --merged-usr for excalibur/ceres", geschlossen
+      # durch Aufnahme von debootstrap 1.0.134devuan1 in unstable): erst ab
+      # dieser Version kennt das `excalibur`-Skript UsrMerge (Devuans
+      # Standard seit Excalibur) automatisch als Default - ein Grund mehr,
+      # eine konkrete, hinreichend aktuelle Version zu pinnen statt
+      # irgendeine alte Devuan-debootstrap-Version zu nehmen.
+      #
+      # Ebenfalls nötig: Devuans `devuan-keyring`-Paket, damit debootstrap
+      # die Release-Signatur von deb.devuan.org echt per GPG prüfen kann
+      # (kein `--no-check-gpg`-Workaround, siehe README.md).
+      #
+      # Versions-Ehrlichkeit: Der Netzwerk-Proxy der Entwicklungs-Sandbox
+      # blockiert deb.devuan.org (dieselbe Einschränkung wie überall sonst
+      # in diesem Projekt, siehe tarno-devuan-live/README.md, Abschnitt
+      # "Warum das hier niemand gebaut hat") - die unten gepinnten
+      # Dateinamen stammen aus Web-Recherche (Devuan-Bugtracker-Historie +
+      # Paket-Metadaten), nicht aus einem selbst abgerufenen, aktuellen
+      # Verzeichnis-Listing. Deshalb zusätzlich ein Fallback: falls die
+      # gepinnte Version inzwischen aus dem Pool gefallen ist (Devuan hält
+      # i. d. R. nur die jeweils aktuelle Version vor), wird das echte
+      # Verzeichnis-Listing zur Laufzeit (hier, mit echtem Internetzugang,
+      # anders als in der Sandbox) geparst und die tatsächlich aktuelle
+      # Datei nachgeladen - mit klarer Warnung im Log, damit ein
+      # Versions-Drift sichtbar bleibt statt still zu passieren.
+      - name: Devuans eigenes debootstrap + devuan-keyring installieren (statt Ubuntus)
+        run: |
+          set -eu
+
+          fetch_pinned_or_latest () {
+            pkg_dir="$1"    # z. B. debootstrap
+            pinned_file="$2" # gepinnter Dateiname, siehe oben
+            out="$3"
+
+            url="http://deb.devuan.org/devuan/pool/main/d/${pkg_dir}/${pinned_file}"
+            echo "Versuche gepinnte Version: ${url}"
+            if curl -fsSL -o "${out}" "${url}"; then
+              echo "OK: gepinnte Version geladen (${pinned_file})"
+              return 0
+            fi
+
+            echo "WARNUNG: gepinnte Version ${pinned_file} nicht abrufbar -" \
+                 "vermutlich aus dem Pool gefallen (Versions-Drift seit" \
+                 "Recherche-Stand dieses Workflows). Fallback: echtes" \
+                 "Verzeichnis-Listing parsen." >&2
+            listing_url="http://deb.devuan.org/devuan/pool/main/d/${pkg_dir}/"
+            listing="$(curl -fsSL "${listing_url}")"
+            latest_file="$(printf '%s\n' "${listing}" \
+              | grep -oE "${pkg_dir}_[^\"']+_(all|amd64)\.deb" \
+              | sort -V | tail -n1)"
+            if [ -z "${latest_file}" ]; then
+              echo "FEHLER: konnte auch per Fallback keine ${pkg_dir}-.deb-Datei" \
+                   "im echten Verzeichnis-Listing finden - Abbruch." >&2
+              exit 1
+            fi
+            echo "Fallback gefunden: ${latest_file} (weicht vom gepinnten" \
+                 "Recherche-Stand ab - README.md/PR-Beschreibung entsprechend" \
+                 "aktualisieren)."
+            curl -fsSL -o "${out}" "${listing_url}${latest_file}"
+          }
+
+          fetch_pinned_or_latest debootstrap debootstrap_1.0.134devuan2_all.deb /tmp/devuan-debootstrap.deb
+          fetch_pinned_or_latest devuan-keyring devuan-keyring_2025.08.09_all.deb /tmp/devuan-keyring.deb
+
+          # dpkg -i statt apt-get install: apt-get vergleicht Versionsnummern
+          # und könnte den Wechsel von einer (numerisch höheren) Ubuntu-
+          # Debootstrap-Version als "Downgrade" verweigern. dpkg -i kennt
+          # dieses Konzept nicht und installiert einfach die angegebene
+          # Datei; `apt-get install -f` danach löst fehlende Abhängigkeiten
+          # auf (Standard-Muster fürs Installieren lokaler .deb-Dateien).
+          sudo dpkg -i /tmp/devuan-debootstrap.deb /tmp/devuan-keyring.deb || true
+          sudo apt-get install -f -y
+
+      # Verifiziert, dass der obige Paket-Tausch tatsächlich gegriffen hat.
+      # Ohne diese Prüfung würde ein stiller Fallback auf Ubuntus
+      # debootstrap (z. B. weil dpkg -i aus irgendeinem Grund fehlschlägt)
+      # erst 20s später beim eigentlichen `lb build` als kryptischer
+      # "No such script"-Fehler auffallen (siehe Actions-Run 32560292687
+      # oben) - hier stattdessen sofort und mit klarer Fehlermeldung
+      # abbrechen.
+      - name: debootstrap-Version verifizieren (muss Devuan-Patch sein)
+        run: |
+          set -eu
+          version="$(debootstrap --version)"
+          echo "Installierte debootstrap-Version: ${version}"
+          case "${version}" in
+            *devuan*)
+              echo "OK: Devuan-gepatchtes debootstrap aktiv."
+              ;;
+            *)
+              echo "FEHLER: debootstrap-Version enthält kein '+devuanN'/" \
+                   "'devuanN'-Suffix - der Paket-Tausch hat nicht gegriffen," \
+                   "es läuft vermutlich noch Ubuntus debootstrap. lb build" \
+                   "würde mit 'No such script: .../excalibur' fehlschlagen" \
+                   "(siehe Kommentar im vorigen Schritt). Abbruch." >&2
+              exit 1
+              ;;
+          esac
 
       # lb config/lb build brauchen root fuer chroot-Operationen
       # (mount/umount im Basissystem, Geraeteknoten, debootstrap als root)
