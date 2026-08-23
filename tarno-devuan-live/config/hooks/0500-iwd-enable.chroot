@@ -1,0 +1,14 @@
+#!/bin/sh
+# Enable iwd at boot, same as agetty/dhcpcd/seatd - not on by default
+# just because the package is installed. iwd's own init script depends
+# on dbus, and OpenRC auto-starts `need`-declared dependencies even when
+# they're not themselves added to a runlevel (confirmed: dbus is already
+# running on a real boot in this image without any dbus-enable hook of
+# our own, pulled in the same way by another service's dependency) - so
+# nothing extra is needed here for that.
+#
+# dhcpcd (see 0300-dhcp-network.chroot) already probes every interface
+# it finds, wireless included, so once iwd associates wlan0 there's
+# nothing further to wire up for it to get an address.
+set -e
+rc-update add iwd default

@@ -1,0 +1,10 @@
+{
+  "policies": {
+    "Preferences": {
+      "toolkit.cosmeticAnimations.enabled": { "Value": false, "Status": "default" },
+      "general.smoothScroll": { "Value": false, "Status": "default" },
+      "browser.tabs.animate": { "Value": false, "Status": "default" },
+      "browser.fullscreen.animate": { "Value": false, "Status": "default" }
+    }
+  }
+}

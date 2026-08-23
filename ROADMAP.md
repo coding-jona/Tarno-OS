@@ -1,7 +1,7 @@
 # ROADMAP
 
-* ui in python3 - started, tarno-settings (PySide6) + labwc, see README.md "Desktop"
-* golang server für mistral API
+* ui in python3 - tarno-settings + tarno-store (PySide6) + labwc + waybar, see README.md "Desktop"
+* golang server für mistral API (tarnod) - Fahrplan zum echten System-Assistenten: [`docs/tarno-ai-roadmap.md`](docs/tarno-ai-roadmap.md)
 * devuan openrc basis
 * apt-repo für updates (tarno-tools.deb, s. scripts/build-deb.sh) - noch unsigniert, GPG-Key fehlt
-* taskleiste - noch nicht gebaut. aktuell nur labwc (Rechtsklick-Menü) + tarno-settings, kein Panel/Taskbar mit laufenden Fenstern, Uhr o.ä.
+* taskleiste - gebaut (waybar: Fenster-Liste, Uhr, Tarno-Startmenü-Button), siehe README.md "Desktop"

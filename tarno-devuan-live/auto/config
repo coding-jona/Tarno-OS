@@ -8,11 +8,18 @@ set -e
 # by hand: --security false + config/archives/devuan-security.list.* set
 # the real deb.devuan.org security line ourselves, --firmware-*-false
 # skips a Contents-amd64.gz fetch that 404s on deb.devuan.org.
+#
+# archive-areas needs non-free-firmware (Devuan mirrors Debian's post-
+# bookworm component split) for real WiFi to work at all - the actual
+# chip firmware for iwlwifi/realtek/atheros/broadcom lives there, not in
+# main. contrib added alongside it as a safety net (some firmware-
+# adjacent packages live there depending on licensing details). See
+# tarno.list.chroot for the actual package names.
 lb config noauto \
 	--mode debian \
 	--distribution excalibur \
 	--architectures amd64 \
-	--archive-areas main \
+	--archive-areas "main contrib non-free-firmware" \
 	--mirror-bootstrap http://deb.devuan.org/merged \
 	--mirror-chroot http://deb.devuan.org/merged \
 	--mirror-binary http://deb.devuan.org/merged \
