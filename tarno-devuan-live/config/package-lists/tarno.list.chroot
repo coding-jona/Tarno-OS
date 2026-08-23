@@ -98,15 +98,18 @@ rsync
 grub-efi-amd64
 grub-pc-bin
 
-# live-config's own user creation (/usr/lib/live/config/0030-user-setup)
-# silently no-ops unless the `user-setup` package is present - without it
-# the live "user" account never gets created at all, root stays locked
-# (live-config always ships root with a `*` password), so there was no
-# way to log in. Default once this fires: user/live (hardcoded crypt hash
-# in that script, not empty). sudo is needed too, same gate
-# (/usr/lib/live/config/0040-sudo) - without it "user" has no admin
-# rights at all, root being permanently locked either way.
-user-setup
+# The `user` account itself is now created at build time
+# (hooks/0175-user-account.chroot), not by live-config's own
+# 0030-user-setup runtime component - so the `user-setup` package that
+# component needs is no longer pulled in at all; it would just sit
+# there unused (its component self-skips once the account already
+# exists, same as ours creating it early). `sudo` is still needed
+# though, for the actual `sudo` binary every `sudo -n ...` call in this
+# image shells out to, and for live-config's own 0040-sudo component
+# (which - independent of user-setup - adds `user` to the `sudo` group
+# if the `sudo` package is present; harmless/redundant now that
+# etc/sudoers.d/tarno-user grants NOPASSWD directly by username rather
+# than through that group, but no reason to fight it).
 sudo
 
 # core desktop apps - up to now this was labwc's right-click menu,

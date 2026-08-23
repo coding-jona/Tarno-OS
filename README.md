@@ -442,6 +442,45 @@ idempotent on a second run). Not run against a real `seatd`/`labwc`
 pair - no such stack in this sandbox to exercise the actual socket
 connection end to end.
 
+Tenth: the Eighth and Ninth fixes above both worked by winning a race
+every boot - actively reverting whatever a third-party live-boot/
+live-config component had just done. Asked to stop patching around
+that and remove what's actually getting in the way instead, so both
+got fixed at the root:
+
+- The `/etc/network/interfaces` reset isn't `live-config` at all - it's
+  `live-boot`'s own `9990-netbase.sh`, which runs from the initramfs
+  (before `openrc-init`/anything in this image ever starts) and
+  *unconditionally* overwrites the file, confirmed against its actual
+  source. It has a documented escape hatch for exactly this: `if
+  [ "${STATICIP}" = "frommedia" ] && [ -e "${IFFILE}" ]; then ...
+  return; fi` - leave an already-existing file alone. Now set via
+  `STATICIP=frommedia` in `auto/config`'s `--bootappend-live`, so
+  live-boot never touches the file in the first place.
+- The empty-groups bug came from `live-config`'s `0030-user-setup`
+  always starting `user` from zero supplementary groups. Its own
+  `Config()` already skips itself entirely if the account it wants to
+  create already exists (`grep -q "^${LIVE_USERNAME}:" /etc/passwd`) -
+  so new hook `0175-user-account.chroot` creates `user` at *build*
+  time instead, with the right groups (`video`, `audio`, `cdrom`,
+  `dialout`, `plugdev`) from the start, no cmdline flag or
+  component-disabling needed, just winning the race by already being
+  done before live-config ever checks.
+
+`tarno-earlysetup`'s two reverts from the Eighth/Ninth fixes stay in
+place regardless, as zero-cost safety nets in case either escape hatch
+ever behaves differently on some Devuan version - but neither should
+have anything left to do. Verified locally: `live-boot`'s and
+`live-config`'s actual packaged source (`9990-netbase.sh`,
+`0030-user-setup`) read directly to confirm both guards exist and
+behave as described; the `0175-user-account.chroot` logic (`adduser`
++ `usermod -aG` + `passwd -l`) run in isolation against a real
+throwaway account - correct groups, correct locked-password state
+(`!` in `/etc/shadow`), idempotent on a second run. Not run through an
+actual `lb build` + boot - no OpenRC/live-boot host in this sandbox to
+confirm `STATICIP=frommedia` and the build-time account both behave
+identically on Devuan's exact packaged versions.
+
 ## WiFi
 
 [iwd](https://iwd.wiki.kernel.org/) instead of wpa_supplicant + a
@@ -472,10 +511,11 @@ available here), so real on-device confirmation is still needed.
 
 There isn't one - tty1 autologs in as `user` (agetty `--autologin`, see
 `tarno-devuan-live/config/hooks/0200-agetty-console.chroot`), same as
-every mainstream live image. `user-setup` + `sudo` create the account
-and add it to the `sudo` group (see `tarno-devuan-live/README.md`);
-root is always locked. Log in as `user` by hand only if you `chvt` to
-another console.
+every mainstream live image. The account itself is created at *build*
+time by `0175-user-account.chroot` (`adduser` + a fixed group list,
+locked password - see the Tenth real boot test above for why this
+moved off `user-setup`'s own runtime account creation); root is always
+locked. Log in as `user` by hand only if you `chvt` to another console.
 
 Passwordless sudo specifically comes from `etc/sudoers.d/tarno-user`
 (`user ALL=(ALL) NOPASSWD: ALL`, chmod'd to the `0440` sudo insists on
