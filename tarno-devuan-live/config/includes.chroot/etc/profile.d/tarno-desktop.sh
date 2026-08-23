@@ -22,6 +22,17 @@
 # don't gate a basic fixup on anything that could itself fail first.
 xdg-user-dirs-update 2>/dev/null || true
 
+# tarno-store's Flathub tab needs the flathub remote configured before
+# `flatpak search`/`install` can do anything - and --user remotes are
+# per-account, so this can't be done once at build time the way the apt
+# sources list is. --if-not-exists makes it idempotent (cheap no-op on
+# every login after the first), same "don't gate a basic fixup on
+# anything else, just run it" reasoning as xdg-user-dirs-update above.
+if command -v flatpak >/dev/null 2>&1; then
+	flatpak remote-add --user --if-not-exists flathub \
+		https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+fi
+
 # Only tty1-6 (any local virtual console) get a getty in this image
 # (see 0200-agetty-console.chroot) - matching that instead of the exact
 # string "/dev/tty1" so a boot-order/console-naming quirk can't just
