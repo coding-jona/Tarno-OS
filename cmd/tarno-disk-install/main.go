@@ -227,6 +227,32 @@ func install(devName string) error {
 		return err
 	}
 
+	// Wires the disk-installed system up to Tarno OS' own apt repo
+	// (scripts/build-os-deb.sh -> tarno-os.deb, published by
+	// .github/workflows/apt-repo.yml) so it can actually receive OS
+	// updates via `apt upgrade` - the live/USB session this installer
+	// runs from never needed this (ephemeral, nothing persists across
+	// a reboot), but the disk-installed system it produces does.
+	//
+	// [trusted=yes]: the repo has no signing key yet (APT_REPO_GPG_KEY
+	// doesn't exist as a secret) - deliberate, user-confirmed interim
+	// tradeoff so the update channel actually works today rather than
+	// staying blocked indefinitely on a manual step. Transport is
+	// already TLS via GitHub Pages; trusted=yes only waives apt's
+	// additional package-signature check on top of that. Swap for the
+	// commented-out signed line below the moment the secret exists.
+	aptSourcesDir := filepath.Join(target, "etc", "apt", "sources.list.d")
+	if err := os.MkdirAll(aptSourcesDir, 0o755); err != nil {
+		return err
+	}
+	aptSource := "# deb https://coding-jona.github.io/Tarno-OS/ tarno main\n" +
+		"deb [trusted=yes] https://coding-jona.github.io/Tarno-OS/ tarno main\n"
+	if err := os.WriteFile(
+		filepath.Join(aptSourcesDir, "tarno-os.list"), []byte(aptSource), 0o644,
+	); err != nil {
+		return err
+	}
+
 	if biosBoot() {
 		fmt.Println("installing bootloader (BIOS/legacy)")
 		if err := run("chroot", target, "grub-install",
@@ -248,7 +274,27 @@ func install(devName string) error {
 	if err != nil {
 		return err
 	}
-	_, werr := f.WriteString("GRUB_CMDLINE_LINUX_DEFAULT=\"init=/sbin/openrc-init\"\n")
+	// GRUB_GFXPAYLOAD_LINUX=keep is the actual fix for "whole system
+	// stuck at the wrong resolution after install" - without it, GRUB
+	// negotiates its own graphics mode with the firmware for its menu,
+	// then resets to a plain VESA/VGA text mode before handing off to
+	// the kernel, which on BIOS/legacy firmware (this repo's own
+	// biosBoot(), same as the ESP+bios_grub partitioning above) usually
+	// means a low default like 800x600 - and that low mode is what the
+	// console AND everything drawn on top of it afterwards (including
+	// labwc/Wayland, which inherits whatever mode is already active)
+	// gets stuck with. `keep` hands off GRUB's own negotiated mode
+	// unchanged instead of resetting it; GRUB_GFXMODE=auto is what lets
+	// GRUB negotiate its best (i.e. actual native) mode in the first
+	// place rather than defaulting conservatively itself. Appended
+	// (shell-sourced last-assignment-wins, same reasoning as
+	// GRUB_CMDLINE_LINUX_DEFAULT below) rather than trying to edit
+	// Devuan's own stock line in place.
+	_, werr := f.WriteString(
+		"GRUB_GFXMODE=auto\n" +
+			"GRUB_GFXPAYLOAD_LINUX=keep\n" +
+			"GRUB_CMDLINE_LINUX_DEFAULT=\"init=/sbin/openrc-init\"\n",
+	)
 	cerr := f.Close()
 	if werr != nil {
 		return werr

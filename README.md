@@ -53,13 +53,52 @@ system's own root, not reproducible in a dev sandbox).
 ## Updates
 
 Tarno OS ships its own tools as a normal apt repo instead of a custom
-updater - `scripts/build-deb.sh` builds `tarno-tools.deb`
-(tarno-install + tarno-disk-install), `scripts/build-apt-repo.sh` turns
-a folder of `.deb`s into a flat apt repo, `.github/workflows/apt-repo.yml`
-publishes it to GitHub Pages on every push to `devel`. Not yet wired into
-the live image's `sources.list` - the repo is unsigned until an
-`APT_REPO_GPG_KEY` secret exists (`[trusted=yes]` by default otherwise,
-not shipping that silently).
+updater - `scripts/build-deb.sh` builds `tarno-tools.deb` (tarno-install
++ tarno-disk-install, the install-media tools), `scripts/build-apt-repo.sh`
+turns a folder of `.deb`s into a flat apt repo, `.github/workflows/apt-repo.yml`
+publishes it to GitHub Pages on every push to `devel`.
+
+Until now that repo only ever carried those two install-media tools -
+nothing of the OS itself, so an already-installed Tarno OS system had
+no update path at all beyond "reinstall from a new ISO". Fixed:
+`scripts/build-os-deb.sh` builds `tarno-os.deb` - literally the whole
+OS layer (tarnod, the labwc/waybar desktop, tarno-settings/
+tarno-store/tarno-assistant, and all their OpenRC service wiring),
+built from the exact same `tarno-devuan-live/config/includes.chroot/`
+tree the live ISO ships, so there's one source of truth instead of two
+things to keep in sync by hand. Its `postinst` re-runs the same hook
+scripts (`tarno-devuan-live/config/hooks/*.chroot`) the ISO build
+itself runs - they're already idempotent shell (`rc-update`, `chmod`,
+`ln -sf`, `sed -i`), nothing chroot-specific, so they work identically
+against a real installed system. Everything under `/etc` it ships is a
+`conffile`, so a local edit survives an upgrade instead of getting
+silently clobbered.
+
+Deliberately *not* wired into the live/USB image's own `sources.list` -
+a live session never persists across a reboot, so it has no use for an
+update channel. `tarno-disk-install` writes
+`/etc/apt/sources.list.d/tarno-os.list` into the disk-installed system
+it produces instead, since that's the system that actually benefits.
+The repo is still unsigned - no `APT_REPO_GPG_KEY` secret exists yet -
+so this ships as `deb [trusted=yes] ...` for now (a commented-out
+signed line sits right above it in the same file, ready to swap in the
+moment the secret exists) - a deliberate, user-confirmed interim
+tradeoff to make the channel actually work today (transport is already
+TLS via GitHub Pages either way) rather than leaving it blocked
+indefinitely on a manual step, not something done silently.
+
+Verified locally: `build-deb.sh` + `build-os-deb.sh` +
+`build-apt-repo.sh` run together, producing a real two-package repo
+(`dpkg-scanpackages` correctly indexes both). `tarno-os.deb`'s contents
+inspected with `dpkg-deb -c`/`-e` - correct file tree, ownership,
+permissions, `conffiles`, and a working `postinst` (all 6 hook copies
+present in the right order, valid shell syntax). The
+`tarno-disk-install` apt-source write tested in isolation - correct
+path, content, and `0644` permissions, and the resulting one-line
+`sources.list` entry parses cleanly with a real `apt-get`. Not run
+through an actual `dpkg -i`/`apt install` - no OpenRC/Devuan host in
+this sandbox to exercise `rc-update` and friends for real, so the
+postinst hasn't been confirmed end to end yet.
 
 ## tarnod
 
