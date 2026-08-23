@@ -69,12 +69,33 @@ service in `tarno-devuan-live/config/includes.chroot/etc/init.d/tarnod`,
 enabled by `0450-tarnod-enable.chroot` (the init script alone was never
 enough - same gap as agetty/dhcpcd/seatd, confirmed missing on a real
 boot). Both the CI workflow and `scripts/build-devuan-live.sh` build it
-and drop it into `config/includes.chroot/usr/bin/tarnod` before
+(along with `tarnoctl` - previously only ever existed as source you'd
+have to build yourself, same class of gap `tarno-disk-install` used to
+have) and drop them into `config/includes.chroot/usr/bin/` before
 `lb build` runs.
 
     go run . &
     go run ./cmd/tarnoctl status
-    MISTRAL_API_KEY=... go run . &     # enables `tarnoctl ai <question>`
+    MISTRAL_API_KEY=... go run . &          # env var still works...
+    go run ./cmd/tarnoctl set-api-key sk-...  # ...or set it live, no restart
+    go run ./cmd/tarnoctl ai-status
+    go run ./cmd/tarnoctl ai "some question"
+
+The API key can be set two ways now: the `MISTRAL_API_KEY` env var (as
+before), or persisted at `/etc/tarnod/mistral_api_key` (`0600`,
+root-owned) via the new `set_api_key` socket command - which is what
+`tarno-settings`' AI tab and `tarnoctl set-api-key` actually use. tarnod
+checks the env var first, falls back to that file on startup, and
+`set_api_key` swaps the live provider in immediately (a `sync.RWMutex`
+around it) - no restart needed after saving a key from the GUI. Modeled
+on (not copied from - it's Python/Windows, this is Go/Linux) how
+[`coding-jona/tarno`](https://github.com/coding-jona/tarno) resolves
+API keys through a `SecretsVault` instead of reading them raw in
+provider code; see `docs/tarno-ai-roadmap.md` for the full comparison
+and what's still ahead. Verified locally: a real `tarnod` + `tarnoctl`
+round trip (`ai-status` → `not configured`, `set-api-key`, `ai-status`
+→ `configured`, and again after a full process restart with no env var
+set, confirming the file actually persists it).
 
 The socket is `chmod 0666` right after creation - tarnod runs as root,
 so without this it inherits the process umask (typically `0755`), and
@@ -209,6 +230,21 @@ color tokens shared between both apps. Verified locally: headless run
 correctly distinguishes installed vs. not (checked against real
 `dpkg-query` state), search filtering works.
 
+`tarno-assistant` (`config/includes.chroot/usr/bin/tarno-assistant`,
+root menu entry "Tarno", `Super+T`) - a real chat window for Tarno OS'
+namesake feature instead of the single-line ask/answer box buried in a
+settings tab, closer to what Cortana used to be for Windows (minus
+voice, deliberately not part of this yet). Talks to the same `tarnod`
+socket `tarno-settings`' AI tab does (`ai`/`ai_status`) - API keys are
+still only ever configured in Settings, never typed into the chat
+itself, matching the same rule the project this is modeled on
+([`coding-jona/tarno`](https://github.com/coding-jona/tarno), see
+`docs/tarno-ai-roadmap.md`) follows for its own chat surface. Shows a
+clear "not configured, go set a key" message and disables the input
+instead of silently failing when no key is set yet. Verified locally:
+headless run (`QT_QPA_PLATFORM=offscreen`) against a real `tarnod`
+instance, both states (no key set -> disabled input + guidance message;
+key set via a real `set_api_key` call -> "ready", input enabled).
 No animations anywhere on purpose - they cost real frame time for zero
 functional benefit, especially on the kind of aging hardware this has
 actually been tested on. `labwc` has no animation system to begin with

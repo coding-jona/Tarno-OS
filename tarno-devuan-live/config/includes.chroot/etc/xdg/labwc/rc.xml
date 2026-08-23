@@ -17,6 +17,15 @@
 		<keybind key="W-space">
 			<action name="Execute" command="fuzzel"/>
 		</keybind>
+		<!-- Super+T ("Tarno") for the assistant - same idea as Windows'
+		     own Cortana/Copilot keybind, a dedicated shortcut instead of
+		     making it one more fuzzel search away. Doesn't collide with
+		     any of <default/>'s own built-in binds (Alt+Tab, Super+A/D,
+		     Super+arrows - see the <mouse> comment below for how that
+		     was confirmed for this file's other overrides). -->
+		<keybind key="W-t">
+			<action name="Execute" command="tarno-assistant"/>
+		</keybind>
 		<keybind key="A-F4">
 			<action name="Close"/>
 		</keybind>

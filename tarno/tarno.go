@@ -3,24 +3,94 @@ package tarno
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 )
 
 const MistralBaseURL = "https://api.mistral.ai/v1"
 
 const SocketPath = "/run/tarnod.sock"
 
+// ConfigDir/APIKeyPath: a persistent home for the Mistral API key beyond
+// the MISTRAL_API_KEY env var, so it can be set from tarno-settings'
+// AI tab instead of only at tarnod's own OpenRC-service startup (nothing
+// in the shipped image ever set that env var, so the AI tab was
+// unreachable out of the box despite existing).
+//
+// The reference project this whole assistant is modeled on
+// (coding-jona/tarno) deliberately never writes API keys into its config
+// file - it resolves them through a SecretsVault (OS keyring primary,
+// an encrypted-file fallback tier) instead, precisely so a key isn't
+// sitting in plaintext config. This image has no desktop keyring daemon
+// (no gnome-keyring/kwallet - it's a minimal Wayland/OpenRC image, not a
+// full desktop stack), so there's no keyring tier to hook into yet. A
+// root-owned, 0600 file is the closest practical equivalent to their own
+// documented fallback tier: tarnod already runs as root, and the file is
+// unreadable to the unprivileged "user" account tarno-settings runs as -
+// strictly better isolated than the MISTRAL_API_KEY env var it replaces
+// (an env var is visible to any process sharing the same uid, or to root
+// via /proc/<pid>/environ regardless). See docs/tarno-ai-roadmap.md for
+// the rest of the plan this is Phase 1 of.
+const ConfigDir = "/etc/tarnod"
+
+var APIKeyPath = filepath.Join(ConfigDir, "mistral_api_key")
+
+var errEmptyAPIKey = errors.New("api key is empty")
+
 type TarnoD struct {
+	mu       sync.RWMutex
 	provider Provider
 }
 
 func New() *TarnoD {
 	d := &TarnoD{}
-	if key := os.Getenv("MISTRAL_API_KEY"); key != "" {
+	key := os.Getenv("MISTRAL_API_KEY")
+	if key == "" {
+		key = readAPIKeyFile()
+	}
+	if key != "" {
 		d.provider = NewMistralProvider(key)
 	}
 	return d
+}
+
+func readAPIKeyFile() string {
+	data, err := os.ReadFile(APIKeyPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// setAPIKey persists key to APIKeyPath and swaps the live provider in,
+// with no tarnod restart needed - tarno-settings can call this directly
+// over the socket the moment a key is entered.
+func (d *TarnoD) setAPIKey(key string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return errEmptyAPIKey
+	}
+	if err := os.MkdirAll(ConfigDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(APIKeyPath, []byte(key), 0o600); err != nil {
+		return err
+	}
+
+	d.mu.Lock()
+	d.provider = NewMistralProvider(key)
+	d.mu.Unlock()
+	return nil
+}
+
+func (d *TarnoD) currentProvider() Provider {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.provider
 }
 
 // Run listens on SocketPath until ctx is cancelled.
@@ -76,14 +146,27 @@ func (d *TarnoD) dispatch(req Request) Response {
 		return Response{Ok: true, Data: "tarnod running"}
 
 	case "ai":
-		if d.provider == nil {
-			return Response{Ok: false, Error: "mistral not configured (set MISTRAL_API_KEY)"}
+		provider := d.currentProvider()
+		if provider == nil {
+			return Response{Ok: false, Error: "mistral not configured - set an API key in Tarno Settings' AI tab"}
 		}
-		answer, err := d.provider.Query(req.Text)
+		answer, err := provider.Query(req.Text)
 		if err != nil {
 			return Response{Ok: false, Error: err.Error()}
 		}
 		return Response{Ok: true, Data: answer}
+
+	case "ai_status":
+		if d.currentProvider() == nil {
+			return Response{Ok: true, Data: "not configured"}
+		}
+		return Response{Ok: true, Data: "configured"}
+
+	case "set_api_key":
+		if err := d.setAPIKey(req.Text); err != nil {
+			return Response{Ok: false, Error: err.Error()}
+		}
+		return Response{Ok: true, Data: "api key saved"}
 
 	default:
 		return Response{Ok: false, Error: "unknown command: " + req.Cmd}

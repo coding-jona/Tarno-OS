@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Tarno - the OS's built-in assistant, a real chat window instead of a
+single ask/answer box buried in a settings tab (think Cortana's role in
+Windows, minus voice for now - see docs/tarno-ai-roadmap.md for the
+full plan this is Phase 2 of).
+
+API keys are configured in Tarno Settings' AI tab, never typed in here -
+same rule the reference project this is modeled on
+(coding-jona/tarno) follows for its own chat surface.
+"""
+import json
+import socket
+import sys
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
+
+SOCKET_PATH = "/run/tarnod.sock"
+
+# Same tokens as tarno-settings/tarno-store - every Tarno app should
+# look like part of the same OS.
+BG_APP = "#191919"
+BG_PANEL = "#232323"
+BG_CARD = "#262626"
+BORDER = "rgba(255, 255, 255, 0.07)"
+BORDER_STRONG = "rgba(255, 255, 255, 0.14)"
+TEXT_PRIMARY = "#f3f3f3"
+TEXT_MUTED = "#9a9a9a"
+ACCENT = "#0bc7ff"
+ACCENT_HOVER = "#33d1ff"
+USER_BUBBLE_TEXT = "#062229"
+
+FONT_STACK = '"Inter", "Noto Sans", "Segoe UI", -apple-system, sans-serif'
+
+STYLESHEET = f"""
+* {{
+    font-family: {FONT_STACK};
+}}
+QMainWindow, QWidget {{
+    background: {BG_APP};
+    color: {TEXT_PRIMARY};
+    font-size: 13px;
+}}
+#header {{
+    background: {BG_PANEL};
+    border-bottom: 1px solid {BORDER};
+}}
+#headerTitle {{
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: 0.2px;
+}}
+#headerSubtitle {{
+    color: {TEXT_MUTED};
+    font-size: 12px;
+}}
+QScrollArea {{
+    border: none;
+}}
+#bubbleTarno {{
+    background: {BG_CARD};
+    border: 1px solid {BORDER};
+    border-radius: 14px;
+    max-width: 340px;
+}}
+#bubbleUser {{
+    background: {ACCENT};
+    border-radius: 14px;
+    max-width: 340px;
+}}
+#bubbleTarno QLabel {{
+    color: {TEXT_PRIMARY};
+}}
+#bubbleUser QLabel {{
+    color: {USER_BUBBLE_TEXT};
+    font-weight: 600;
+}}
+#inputBar {{
+    background: {BG_PANEL};
+    border-top: 1px solid {BORDER};
+}}
+QLineEdit {{
+    background: {BG_CARD};
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 10px;
+    padding: 9px 14px;
+    font-size: 13px;
+    selection-background-color: {ACCENT};
+}}
+QLineEdit:focus {{
+    border-color: {ACCENT};
+}}
+QLineEdit:disabled {{
+    color: {TEXT_MUTED};
+}}
+QPushButton {{
+    background: {BG_CARD};
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 10px;
+    padding: 9px 18px;
+    font-weight: 600;
+}}
+QPushButton:hover {{
+    background: {BG_PANEL};
+    border-color: {ACCENT_HOVER};
+    color: {ACCENT_HOVER};
+}}
+QPushButton:pressed {{
+    background: {BG_APP};
+}}
+QPushButton:disabled {{
+    color: {TEXT_MUTED};
+    border-color: {BORDER};
+}}
+QScrollBar:vertical {{
+    background: transparent;
+    width: 10px;
+}}
+QScrollBar::handle:vertical {{
+    background: {BORDER_STRONG};
+    border-radius: 5px;
+    min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {ACCENT_HOVER};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0;
+}}
+"""
+
+
+def call(cmd, text=""):
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(SOCKET_PATH)
+            s.sendall(json.dumps({"cmd": cmd, "text": text}).encode())
+            s.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        return json.loads(b"".join(chunks))
+    except (OSError, json.JSONDecodeError) as e:
+        return {"ok": False, "error": f"tarnod unreachable: {e}"}
+
+
+class MessageBubble(QFrame):
+    def __init__(self, text, is_user):
+        super().__init__()
+        self.setObjectName("bubbleUser" if is_user else "bubbleTarno")
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.addWidget(label)
+
+
+class ChatArea(QScrollArea):
+    def __init__(self):
+        super().__init__()
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        container = QWidget()
+        self.message_layout = QVBoxLayout(container)
+        self.message_layout.setContentsMargins(16, 16, 16, 16)
+        self.message_layout.setSpacing(8)
+        self.message_layout.addStretch(1)
+        self.setWidget(container)
+
+    def add_message(self, text, is_user):
+        bubble = MessageBubble(text, is_user)
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        if is_user:
+            row_layout.addStretch(1)
+            row_layout.addWidget(bubble)
+        else:
+            row_layout.addWidget(bubble)
+            row_layout.addStretch(1)
+        self.message_layout.insertWidget(self.message_layout.count() - 1, row)
+        QTimer.singleShot(0, self._scroll_to_bottom)
+
+    def _scroll_to_bottom(self):
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Tarno")
+        self.resize(460, 620)
+
+        header = QFrame()
+        header.setObjectName("header")
+        title = QLabel("Tarno")
+        title.setObjectName("headerTitle")
+        self.subtitle = QLabel("checking...")
+        self.subtitle.setObjectName("headerSubtitle")
+        header_text = QVBoxLayout()
+        header_text.setSpacing(2)
+        header_text.addWidget(title)
+        header_text.addWidget(self.subtitle)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(20, 14, 20, 14)
+        header_layout.addLayout(header_text)
+
+        self.chat = ChatArea()
+
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Ask Tarno anything...")
+        self.input.returnPressed.connect(self.send)
+        send_btn = QPushButton("Send")
+        send_btn.clicked.connect(self.send)
+        input_row = QHBoxLayout()
+        input_row.addWidget(self.input, 1)
+        input_row.addWidget(send_btn)
+
+        input_bar = QFrame()
+        input_bar.setObjectName("inputBar")
+        input_bar_layout = QVBoxLayout(input_bar)
+        input_bar_layout.setContentsMargins(16, 12, 16, 16)
+        input_bar_layout.addLayout(input_row)
+
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(header)
+        central_layout.addWidget(self.chat, 1)
+        central_layout.addWidget(input_bar)
+        self.setCentralWidget(central)
+
+        self.refresh_status()
+
+    def refresh_status(self):
+        resp = call("ai_status")
+        if resp.get("ok") and resp.get("data") == "configured":
+            self.subtitle.setText("ready")
+            self.input.setEnabled(True)
+        elif resp.get("ok"):
+            self.subtitle.setText("not configured")
+            self.input.setEnabled(False)
+            self.chat.add_message(
+                "I don't have an API key yet - open Tarno Settings' "
+                "AI tab to set one up, then come back here.",
+                is_user=False,
+            )
+        else:
+            self.subtitle.setText(resp.get("error", "tarnod unreachable"))
+            self.input.setEnabled(False)
+
+    def send(self):
+        question = self.input.text().strip()
+        if not question:
+            return
+        self.input.clear()
+        self.chat.add_message(question, is_user=True)
+        self.input.setEnabled(False)
+        resp = call("ai", question)
+        self.input.setEnabled(True)
+        self.input.setFocus()
+        if resp.get("ok"):
+            self.chat.add_message(resp["data"], is_user=False)
+        else:
+            self.chat.add_message(
+                "error: " + resp.get("error", "unknown error"), is_user=False
+            )
+
+
+def main():
+    app = QApplication(sys.argv)
+    # Same app_id fix as tarno-settings/tarno-store - without it Qt's
+    # wayland platform plugin falls back to argv[0]-derived naming, and
+    # since this runs as `python3 /usr/bin/tarno-assistant`, waybar's
+    # taskbar would show "Python (vX.Y)" instead of "Tarno".
+    app.setDesktopFileName("tarno-assistant")
+    QIcon.setThemeName("Papirus")
+    app.setStyleSheet(STYLESHEET)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
