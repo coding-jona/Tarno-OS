@@ -105,3 +105,19 @@ xarchiver
 # ~/Desktop, ~/Downloads etc. never existed - nothing in this image was
 # creating them (see etc/profile.d/tarno-desktop.sh).
 xdg-user-dirs
+
+# papirus-icon-theme is one of several OR-alternatives in pcmanfm-qt's
+# own Recommends (papirus | breeze | faenza | oxygen) - apt's resolver
+# could just as easily pick any of the others. Both pcmanfm-qt's
+# settings.conf and tarno-store explicitly reference "Papirus" by
+# name, so pull it in for real instead of leaving that to chance.
+papirus-icon-theme
+
+# app installer method: synaptic is a real, complete graphical apt
+# frontend (search/browse/install/remove across every package in
+# sources.list, not just a curated list) - menu entry in
+# etc/xdg/labwc/menu.xml. Complements tarno-store (config/includes.
+# chroot/usr/bin/tarno-store), a small curated catalog of ~20 apps
+# across the categories a usable desktop needs, installed/removed with
+# a couple of clicks via plain apt-get underneath.
+synaptic
