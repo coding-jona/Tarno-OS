@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Tarno Store
+Comment=Browse and install curated apps
+Exec=tarno-store
+Terminal=false
+Categories=System;PackageManager;

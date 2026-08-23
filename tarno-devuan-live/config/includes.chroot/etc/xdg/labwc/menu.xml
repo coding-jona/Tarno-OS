@@ -17,6 +17,13 @@
 			<action name="Execute" command="geany"/>
 		</item>
 		<separator/>
+		<item label="Tarno Store">
+			<action name="Execute" command="tarno-store"/>
+		</item>
+		<item label="Synaptic Package Manager">
+			<action name="Execute" command="sudo -E synaptic"/>
+		</item>
+		<separator/>
 		<item label="Install to Disk">
 			<action name="Execute" command="foot -e tarno-install-to-disk"/>
 		</item>

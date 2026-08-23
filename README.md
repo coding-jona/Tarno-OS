@@ -162,20 +162,23 @@ screenshot CLI tools) - baseline utilities every other wlroots desktop
 ships that were simply missing here. Themed `fuzzel.ini` matches the
 same palette as everything else.
 
-Fifth real boot test: windows couldn't be moved, resized, maximized,
-minimized, or closed at all. Root cause: `rc.xml` only ever bound the
-`Root` mouse context (the right-click menu) - labwc only falls back to
-its own built-in mousebinds/keybinds when there's *no* `<mouse>`/
-`<keyboard>` block at all; once one exists, whatever it doesn't cover
-is simply unbound, no silent merge with the defaults. Fixed with
-labwc's own documented `<default/>` element (loads its real built-in
-bindings - title-drag-to-move, double-click-to-maximize, border-resize,
-button contexts, Alt+Tab window switching, Super+A maximize, Super+D
-show desktop, Super+drag for apps that draw their own decorations and
-have no labwc titlebar at all) placed before our own overrides, which
-now apply on top of it instead of replacing everything. Verified
-locally: `labwc -d` against the new config logs "Loaded 34 merged
-mousebinds" and "Replaced 2 keybinds" with zero parse errors.
+`tarno-store` (`config/includes.chroot/usr/bin/tarno-store`, root menu
++ `/usr/share/applications/tarno-store.desktop`) - a small curated
+catalog of ~20 real, well-known apps across categories a usable desktop
+needs (Internet, Office, Graphics, Media, Development, System,
+Utilities), install/remove with one click via plain `apt-get`
+underneath (`QProcess`, streamed output, `DEBIAN_FRONTEND=noninteractive`,
+`sudo -n` so it fails fast instead of hanging if that were ever not
+passwordless). Not a package-repository browser - `synaptic` (also on
+the root menu, `sudo -E synaptic` to keep the Wayland session env
+across the privilege jump) is the real thing for that, searching all of
+`sources.list`. Same design language as `tarno-settings` - card-style
+rows, `Papirus` icons (added explicitly, not left to chance among
+pcmanfm-qt's own OR'd icon-theme Recommends), a proper header, refined
+color tokens shared between both apps. Verified locally: headless run
+(`QT_QPA_PLATFORM=offscreen`) renders all 20 rows, `is_installed()`
+correctly distinguishes installed vs. not (checked against real
+`dpkg-query` state), search filtering works.
 
 ## Login
 
