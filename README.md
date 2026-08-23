@@ -162,6 +162,24 @@ screenshot CLI tools) - baseline utilities every other wlroots desktop
 ships that were simply missing here. Themed `fuzzel.ini` matches the
 same palette as everything else.
 
+`tarno-store` (`config/includes.chroot/usr/bin/tarno-store`, root menu
++ `/usr/share/applications/tarno-store.desktop`) - a small curated
+catalog of ~20 real, well-known apps across categories a usable desktop
+needs (Internet, Office, Graphics, Media, Development, System,
+Utilities), install/remove with one click via plain `apt-get`
+underneath (`QProcess`, streamed output, `DEBIAN_FRONTEND=noninteractive`,
+`sudo -n` so it fails fast instead of hanging if that were ever not
+passwordless). Not a package-repository browser - `synaptic` (also on
+the root menu, `sudo -E synaptic` to keep the Wayland session env
+across the privilege jump) is the real thing for that, searching all of
+`sources.list`. Same design language as `tarno-settings` - card-style
+rows, `Papirus` icons (added explicitly, not left to chance among
+pcmanfm-qt's own OR'd icon-theme Recommends), a proper header, refined
+color tokens shared between both apps. Verified locally: headless run
+(`QT_QPA_PLATFORM=offscreen`) renders all 20 rows, `is_installed()`
+correctly distinguishes installed vs. not (checked against real
+`dpkg-query` state), search filtering works.
+
 ## Login
 
 There isn't one - tty1 autologs in as `user` (agetty `--autologin`, see
