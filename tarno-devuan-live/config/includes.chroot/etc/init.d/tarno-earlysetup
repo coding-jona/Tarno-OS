@@ -8,10 +8,24 @@
 # up with, so any non-root process trying to write there - which is
 # exactly what tarno-desktop.sh does - gets "Permission denied".
 # Confirmed on a real boot.
-description="Tarno OS early boot fixups (fix /tmp perms before anything writes there)"
+#
+# Also restores /etc/network/interfaces to loopback-only every boot.
+# The file baked into the image (config/includes.chroot/etc/network/
+# interfaces) IS correct on disk - confirmed by diffing the actual git
+# source against a real boot - but live-config's own runtime network
+# component regenerates it fresh on every boot (a stock `allow-hotplug
+# eth0` / `iface eth0 inet dhcp` "just works out of the box" default),
+# running before openrc-init/this service ever gets a chance, so
+# there's no ordering trick that beats it - it has to be actively
+# reverted instead. Confirmed on a real boot: `cat
+# /etc/network/interfaces` showed exactly that stock content, and
+# `dhcpcd` refused to start because of it ("... defines some
+# interfaces that will use a DHCP client"), same failure class as the
+# original bug this was meant to have already fixed at build time.
+description="Tarno OS early boot fixups (fix /tmp perms + /etc/network/interfaces before anything else runs)"
 
 depend() {
-	before agetty.tty1
+	before agetty.tty1 dhcpcd
 	keyword -prefix
 }
 
@@ -19,5 +33,12 @@ start() {
 	ebegin "Fixing /tmp, /var/tmp permissions"
 	mkdir -p /tmp /var/tmp
 	chmod 1777 /tmp /var/tmp
+	eend $?
+
+	ebegin "Resetting /etc/network/interfaces to loopback-only"
+	cat >/etc/network/interfaces <<-'EOF'
+	auto lo
+	iface lo inet loopback
+	EOF
 	eend $?
 }
