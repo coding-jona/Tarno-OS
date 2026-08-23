@@ -25,6 +25,11 @@ jobs:
         env:
           OUT: dist
 
+      - name: build tarno-os.deb
+        run: ./scripts/build-os-deb.sh
+        env:
+          OUT: dist
+
       - name: build apt repo
         run: ./scripts/build-apt-repo.sh dist public
         env:
