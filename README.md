@@ -119,16 +119,17 @@ implements - plus a clock and a launcher button for `tarno-settings`;
 config in `tarno-devuan-live/config/includes.chroot/etc/xdg/waybar/`) +
 `tarno-settings`, a small PySide6 panel
 (`tarno-devuan-live/config/includes.chroot/usr/bin/tarno-settings`) that
-talks to `tarnod` over its socket - Status and AI tabs (whatever
-`tarnod` itself exposes today), a Network tab (wired status + WiFi
-scan/connect/known-networks via `iwctl`, see "WiFi" below), a System
-tab (hostname/kernel/uptime/memory/disk, read-only), a Power tab
-(reboot/shut down), plus an Install tab wrapping
+talks to `tarnod` over its socket - a Status tab, a Network tab (wired
+status + WiFi scan/connect/known-networks via `iwctl`, see "WiFi"
+below), a System tab (hostname/kernel/uptime/memory/disk, read-only),
+an AI tab (Mistral API key setup + a quick ask/answer box to
+sanity-check it, see "tarnod" above), an Install tab wrapping
 `tarno-disk-install` (also its own "Install to Disk" root-menu entry,
 `tarno-install-to-disk` - an interactive terminal wrapper, since the
 raw command needs a device name and rsync's progress needs a real tty,
-neither of which fits a Qt widget). Starts automatically on
-tty1 login (`/etc/profile.d/tarno-desktop.sh`). Theme is the old
+neither of which fits a Qt widget), and a Power tab (reboot/shut
+down). Starts automatically on tty1 login
+(`/etc/profile.d/tarno-desktop.sh`). Theme is the old
 `tarno-ui-theme` palette (cyan `#0BC7FF` on Fluent-style dark gray),
 ported to an Openbox `themerc` and a Qt stylesheet - completely different
 layout from the old deleted `tarno-desktop`/`tarnod-ui`, same colors.
@@ -245,6 +246,7 @@ instead of silently failing when no key is set yet. Verified locally:
 headless run (`QT_QPA_PLATFORM=offscreen`) against a real `tarnod`
 instance, both states (no key set -> disabled input + guidance message;
 key set via a real `set_api_key` call -> "ready", input enabled).
+
 No animations anywhere on purpose - they cost real frame time for zero
 functional benefit, especially on the kind of aging hardware this has
 actually been tested on. `labwc` has no animation system to begin with
