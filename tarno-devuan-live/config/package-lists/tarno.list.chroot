@@ -8,9 +8,38 @@ isolinux
 
 # dhcpcd probes every interface it finds and doesn't need to know real
 # interface names ahead of time - needed for tarnod's mistral calls to
-# reach the internet at all. wifi (wpa_supplicant + firmware) isn't
-# wired up yet.
+# reach the internet at all. Handles wifi the same way once iwd (below)
+# has associated an interface - nothing extra to wire up for that.
 dhcpcd5
+
+# WiFi: iwd (iNet wireless daemon) instead of wpa_supplicant + a
+# separate GUI/CLI tool - it's a single self-contained daemon with its
+# own simple `iwctl` client, no supplicant.conf to hand-edit, and it
+# doesn't fight dhcpcd for IP configuration (iwd only does L2
+# association, dhcpcd still does DHCP for every interface it finds,
+# wireless included - see 0500-iwd-enable.chroot). tarno-settings'
+# Network tab drives it via iwctl.
+#
+# The actual chip firmware (not code, just binary blobs) for real WiFi
+# hardware lives in the non-free-firmware archive area (enabled in
+# auto/config) - broad coverage on purpose since this has to work on
+# whatever laptop it's actually tested on, not just one chipset:
+#   firmware-iwlwifi    - Intel (by far the most common in laptops)
+#   firmware-realtek    - Realtek (common in cheaper/newer hardware)
+#   firmware-atheros    - Qualcomm Atheros (ath10k/ath11k need this;
+#                         ath9k is fully open and doesn't, but including
+#                         it costs nothing and covers the mixed case)
+#   firmware-brcm80211  - Broadcom (common in older Macbooks and some
+#                         Chromebook-derived hardware)
+#   firmware-misc-nonfree - grab-bag for everything else non-free that
+#                           doesn't fit the above (some older/oddball
+#                           wifi and bluetooth combo chips)
+iwd
+firmware-iwlwifi
+firmware-realtek
+firmware-atheros
+firmware-brcm80211
+firmware-misc-nonfree
 
 # isohybrid moved into its own package too (same 2014 syslinux split as
 # isolinux above). lb_binary_iso's own check for it only looks for the
