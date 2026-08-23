@@ -12,6 +12,16 @@
 		"$(date '+%F %T')" "$(tty 2>&1)" "$WAYLAND_DISPLAY" "$DISPLAY"
 } >>/tmp/tarno-desktop.log 2>&1
 
+# ~/Desktop, ~/Downloads etc. don't exist on a fresh live account -
+# nothing ever created them (no systemd/GTK/KDE session doing the usual
+# XDG-autostart dance, and labwc's own autostart is a plain script we
+# write ourselves, not an XDG-autostart-.desktop processor). pcmanfm-qt's
+# sidebar bookmarks point at them anyway, so browsing there hit "No such
+# file or directory". Idempotent, cheap, runs on every login regardless
+# of tty/graphical session state - same reasoning as tarno-earlysetup:
+# don't gate a basic fixup on anything that could itself fail first.
+xdg-user-dirs-update 2>/dev/null || true
+
 # Only tty1-6 (any local virtual console) get a getty in this image
 # (see 0200-agetty-console.chroot) - matching that instead of the exact
 # string "/dev/tty1" so a boot-order/console-naming quirk can't just
