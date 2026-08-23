@@ -74,22 +74,31 @@ against a real installed system. Everything under `/etc` it ships is a
 `conffile`, so a local edit survives an upgrade instead of getting
 silently clobbered.
 
-Still not wired into the live image's own `sources.list`, and the repo
-is still unsigned until an `APT_REPO_GPG_KEY` secret exists
-(`[trusted=yes]` by default otherwise, not shipping that silently) -
-both need to land before an installed system can actually
-`apt upgrade` painlessly, but the package itself is real and builds
-today.
+Deliberately *not* wired into the live/USB image's own `sources.list` -
+a live session never persists across a reboot, so it has no use for an
+update channel. `tarno-disk-install` writes
+`/etc/apt/sources.list.d/tarno-os.list` into the disk-installed system
+it produces instead, since that's the system that actually benefits.
+The repo is still unsigned - no `APT_REPO_GPG_KEY` secret exists yet -
+so this ships as `deb [trusted=yes] ...` for now (a commented-out
+signed line sits right above it in the same file, ready to swap in the
+moment the secret exists) - a deliberate, user-confirmed interim
+tradeoff to make the channel actually work today (transport is already
+TLS via GitHub Pages either way) rather than leaving it blocked
+indefinitely on a manual step, not something done silently.
 
 Verified locally: `build-deb.sh` + `build-os-deb.sh` +
 `build-apt-repo.sh` run together, producing a real two-package repo
 (`dpkg-scanpackages` correctly indexes both). `tarno-os.deb`'s contents
 inspected with `dpkg-deb -c`/`-e` - correct file tree, ownership,
 permissions, `conffiles`, and a working `postinst` (all 6 hook copies
-present in the right order, valid shell syntax). Not run through an
-actual `dpkg -i`/`apt install` - no OpenRC/Devuan host in this sandbox
-to exercise `rc-update` and friends for real, so the postinst hasn't
-been confirmed end to end yet.
+present in the right order, valid shell syntax). The
+`tarno-disk-install` apt-source write tested in isolation - correct
+path, content, and `0644` permissions, and the resulting one-line
+`sources.list` entry parses cleanly with a real `apt-get`. Not run
+through an actual `dpkg -i`/`apt install` - no OpenRC/Devuan host in
+this sandbox to exercise `rc-update` and friends for real, so the
+postinst hasn't been confirmed end to end yet.
 
 ## tarnod
 

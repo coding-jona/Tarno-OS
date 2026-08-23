@@ -227,6 +227,32 @@ func install(devName string) error {
 		return err
 	}
 
+	// Wires the disk-installed system up to Tarno OS' own apt repo
+	// (scripts/build-os-deb.sh -> tarno-os.deb, published by
+	// .github/workflows/apt-repo.yml) so it can actually receive OS
+	// updates via `apt upgrade` - the live/USB session this installer
+	// runs from never needed this (ephemeral, nothing persists across
+	// a reboot), but the disk-installed system it produces does.
+	//
+	// [trusted=yes]: the repo has no signing key yet (APT_REPO_GPG_KEY
+	// doesn't exist as a secret) - deliberate, user-confirmed interim
+	// tradeoff so the update channel actually works today rather than
+	// staying blocked indefinitely on a manual step. Transport is
+	// already TLS via GitHub Pages; trusted=yes only waives apt's
+	// additional package-signature check on top of that. Swap for the
+	// commented-out signed line below the moment the secret exists.
+	aptSourcesDir := filepath.Join(target, "etc", "apt", "sources.list.d")
+	if err := os.MkdirAll(aptSourcesDir, 0o755); err != nil {
+		return err
+	}
+	aptSource := "# deb https://coding-jona.github.io/Tarno-OS/ tarno main\n" +
+		"deb [trusted=yes] https://coding-jona.github.io/Tarno-OS/ tarno main\n"
+	if err := os.WriteFile(
+		filepath.Join(aptSourcesDir, "tarno-os.list"), []byte(aptSource), 0o644,
+	); err != nil {
+		return err
+	}
+
 	if biosBoot() {
 		fmt.Println("installing bootloader (BIOS/legacy)")
 		if err := run("chroot", target, "grub-install",
