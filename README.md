@@ -440,10 +440,23 @@ available here), so real on-device confirmation is still needed.
 
 There isn't one - tty1 autologs in as `user` (agetty `--autologin`, see
 `tarno-devuan-live/config/hooks/0200-agetty-console.chroot`), same as
-every mainstream live image. `user-setup` + `sudo` still create the
-account and give it passwordless `sudo` (see
-`tarno-devuan-live/README.md`); root is always locked. Log in as `user`
-by hand only if you `chvt` to another console.
+every mainstream live image. `user-setup` + `sudo` create the account
+and add it to the `sudo` group (see `tarno-devuan-live/README.md`);
+root is always locked. Log in as `user` by hand only if you `chvt` to
+another console.
+
+Passwordless sudo specifically comes from `etc/sudoers.d/tarno-user`
+(`user ALL=(ALL) NOPASSWD: ALL`, chmod'd to the `0440` sudo insists on
+by `0250-sudoers-perms.chroot` - git can't represent that exact mode on
+its own). This README claimed passwordless sudo existed since early in
+this project, but nothing ever actually configured it - `sudo` group
+membership alone still requires typing your own password. Every place
+in this image that shells out with `sudo -n` (non-interactive, so it
+fails outright instead of hanging on a password prompt nobody can
+answer) was silently failing as a result: `tarno-store`'s Install/
+Remove buttons, `tarno-settings`' Power tab (reboot/shut down) and its
+Install tab. Confirmed on a real boot (reported as "the Install button
+doesn't work" and "can't shut down or restart").
 
 ## Status
 
