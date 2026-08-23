@@ -162,6 +162,32 @@ screenshot CLI tools) - baseline utilities every other wlroots desktop
 ships that were simply missing here. Themed `fuzzel.ini` matches the
 same palette as everything else.
 
+The waybar "Tarno" button now opens `fuzzel` (a real start menu -
+search-as-you-type over every installed app) instead of launching
+`tarno-settings` directly; `tarno-settings` is still one search away,
+or from the root menu.
+
+`pcmanfm-qt` hit real bugs: "Operation not supported" / "No such file
+or directory" doing basic file operations. Root-caused against its own
+stock config and dependency list
+(`/usr/share/pcmanfm-qt/lxqt/settings.conf`,
+`apt-cache show pcmanfm-qt`): it defaults to a terminal and archiver
+(`qterminal`, `lxqt-archiver`) that aren't in its own Depends/
+Recommends and were never installed here, and defaults to
+`UseTrash=true`, which is a known failure class on a live system's
+overlay/union root (this image boots via live-boot's overlay over a
+read-only squashfs) - GIO's trash implementation can throw exactly
+"Operation not supported" there. Fixed via
+`etc/skel/.config/pcmanfm-qt/lxqt/settings.conf` (copied into the live
+user's home from `/etc/skel` at account creation, not a change to the
+package's own file): `Terminal=foot`, `Archiver=xarchiver` (added),
+`UseTrash=false` (permanent delete instead, same as most live distros'
+file managers default to for this exact reason). Also added
+`xdg-user-dirs` + a call to `xdg-user-dirs-update` in
+`tarno-desktop.sh` - `~/Desktop`, `~/Downloads` etc. never existed
+(nothing in this image was creating them), and pcmanfm-qt's sidebar
+bookmarks point at them regardless.
+
 ## Login
 
 There isn't one - tty1 autologs in as `user` (agetty `--autologin`, see

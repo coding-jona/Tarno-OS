@@ -10,7 +10,7 @@
     "custom/menu": {
         "format": "Tarno",
         "tooltip": false,
-        "on-click": "tarno-settings"
+        "on-click": "fuzzel"
     },
 
     "wlr/taskbar": {

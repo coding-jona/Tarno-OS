@@ -93,3 +93,15 @@ fuzzel
 wl-clipboard
 grim
 slurp
+
+# pcmanfm-qt's own stock defaults reference a terminal and archiver we
+# don't have (qterminal, lxqt-archiver - neither is in its own Depends/
+# Recommends), confirmed real on a boot ("Operation not supported" /
+# "No such file or directory" doing basic file operations - see
+# etc/skel/.config/pcmanfm-qt/lxqt/settings.conf for the rest of that
+# fix). xarchiver is the actual archive manager now referenced there.
+xarchiver
+
+# ~/Desktop, ~/Downloads etc. never existed - nothing in this image was
+# creating them (see etc/profile.d/tarno-desktop.sh).
+xdg-user-dirs
