@@ -50,6 +50,59 @@ succeed against a loopback device. The rsync + chroot + full boot cycle
 still needs a real machine to fully confirm end to end (needs the live
 system's own root, not reproducible in a dev sandbox).
 
+## Automated boot test
+
+`.github/workflows/build-devuan-image.yml` has a second job,
+`qemu-smoke-test`, that runs after every build: boots the produced ISO
+in QEMU and fails the workflow if it doesn't reach a real working
+desktop. This exists because a recurring line in this same README used
+to be "a VM test never hit this" - several real bugs (dhcpcd vs.
+live-boot's network reset, seatd/video-group crashing labwc back to a
+shell) only ever surfaced on someone's actual laptop, not because VMs
+can't reproduce them, but because nothing was actually driving a VM
+boot to completion and inspecting the result.
+
+`scripts/qemu-smoke-test.py` is what does that: a real virtual GPU
+(`-vga std`, `-display none` just means QEMU doesn't pop a window on
+the CI runner - the guest still gets a real graphics device to drive
+via DRM/KMS, same as real hardware) plus a second, independent serial
+console (`ttyS0`, autologin, see `0200-agetty-console.chroot`) the
+script drives directly - reachable regardless of whatever labwc/seatd
+are doing on the "real" tty1/monitor console, so a crash there is
+something this script can observe and report instead of a silent
+black `-display none` screen. It asserts the same things this project
+has always manually checked by hand on real hardware: `/tmp/
+tarno-desktop.log` has no `Permission denied` and no `labwc exited`,
+`rc-status default` shows `seatd`/`dhcpcd`/`tarno-earlysetup`/`tarnod`
+all `started`, `user` is actually in the `video` group,
+`/etc/network/interfaces` is still loopback-only, and `labwc`/`waybar`
+are both still running processes at the end of boot - not just "did
+QEMU exit 0".
+
+Best-effort KVM acceleration (`-accel kvm:tcg`, GitHub-hosted runners
+have had `/dev/kvm` since ~2023, just not group-writable by default -
+the workflow fixes that the same way the Android-emulator CI action
+ecosystem does), falling back to plain software emulation (slower,
+still functionally correct - these are boot/config bugs, not
+performance-dependent ones) if that doesn't pan out.
+
+Verified locally: the actual command-parsing mechanics
+(`run_cmd`/`wait_for_shell` in `qemu-smoke-test.py`) run against a
+real pty (`pexpect.spawn("/bin/bash", ...)`, not a mock) - caught and
+fixed two real bugs this way before they could produce a silently
+wrong CI result: bash's bracketed-paste-mode escape codes breaking the
+naive first-line-strip output parsing, and `rc-status default`'s
+actual output format (a leading `*` bullet before each service name)
+not matching the original regex. The `rc-status`/`tarno-desktop.log`/
+`pgrep` assertions themselves checked against realistic sample text
+built from this project's own prior real-hardware findings. **Not**
+run end-to-end against the real ISO - this sandbox has no `/dev/kvm`,
+no `qemu-system-x86_64` installed, and its network policy blocks
+`deb.devuan.org` (same class of restriction as `flathub.org`/
+`codeberg.org` elsewhere in this README), so an actual `lb build` +
+QEMU boot isn't possible here. The next CI run of this workflow is the
+first real end-to-end test.
+
 ## Updates
 
 Tarno OS ships its own tools as a normal apt repo instead of a custom
