@@ -354,6 +354,29 @@ from the preferred one - the actual bug class - and a multi-output
 case) - correctly extracts and would force the right mode in both.
 Not run against real hardware yet.
 
+Eighth real boot test: `dhcpcd` refused to start again ("... defines
+some interfaces that will use a DHCP client"), the exact failure class
+already fixed once by overriding `etc/network/interfaces` to loopback-
+only. `cat /etc/network/interfaces` on the actual booted system showed
+the stock `allow-hotplug eth0` / `iface eth0 inet dhcp` content -
+confirmed the file baked into the image is still correct (`git show`
+against the actual built commit matches the loopback-only source
+exactly), so something at *boot time* was overwriting it before
+`dhcpcd` ever got to check. live-config's own runtime network
+component does exactly this - regenerates a stock DHCP-ready
+`interfaces` file on every boot as a "just works" default - and runs
+before `openrc-init`/any of this image's own services even start, so
+no ordering trick within this image's own runlevels can beat it; it
+has to be actively reverted instead. Fixed by having
+`tarno-earlysetup` (already the earliest thing this image runs, see
+above) force-write it back to loopback-only every boot, right after
+fixing `/tmp`'s permissions - same "don't fight the timing, just win
+the last word" approach. Verified locally: the exact heredoc logic
+in isolation, and that its output does *not* match `dhcpcd`'s own
+documented sanity-check pattern (confirmed against the literal grep
+expression from `/etc/init.d/dhcpcd`, so `dhcpcd` would actually start
+against this content).
+
 ## WiFi
 
 [iwd](https://iwd.wiki.kernel.org/) instead of wpa_supplicant + a
