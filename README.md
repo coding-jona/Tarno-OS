@@ -410,6 +410,38 @@ documented sanity-check pattern (confirmed against the literal grep
 expression from `/etc/init.d/dhcpcd`, so `dhcpcd` would actually start
 against this content).
 
+Ninth: real hardware repeatedly landed at a plain shell prompt instead
+of the desktop, no crash message visible - the actual symptom being
+"the OS just drops me into a shell". Root-caused by reading the real
+`live-config`, `user-setup`, and `seatd` packages rather than
+guessing: `live-config`'s own `0030-user-setup` component explicitly
+overrides `user-setup`'s default group list with an *empty* string
+(`debconf-set-selections passwd/user-default-groups`) unless a
+`live-config.user-default-groups=` kernel cmdline parameter says
+otherwise, which nothing in this image sets - so the live `user`
+account ends up in zero supplementary groups, not even
+`user-setup`'s own (already `video`-less) built-in default. Devuan's
+packaged `/etc/init.d/seatd` runs `seatd -g video` (`/etc/default/
+seatd`), which makes the seatd socket owned by the `video` group -
+without membership, `labwc`'s `libseat` backend can't connect to it
+at all, `labwc` exits immediately, and since `tarno-desktop.sh`
+deliberately doesn't `exec labwc` (so a crash is visible instead of
+silently bouncing back to login), that exit drops straight back into
+the interactive login shell - exactly the reported symptom. A
+kernel-cmdline fix wouldn't reach a disk-installed system either
+(`tarno-disk-install`'s `GRUB_CMDLINE_LINUX_DEFAULT` has no
+`boot=live`, so `live-config` - and any group list it'd assign -
+never runs again there); fixed instead with `usermod -aG video user`
+in `tarno-earlysetup`, every boot, same "don't fight the timing, just
+win the last word" approach as the two fixups above - this way both
+the live USB and anything already installed to disk self-heal on
+their next boot. Verified locally: the `usermod -aG video` logic
+tested in isolation against a real throwaway user account (starts in
+no supplementary groups, ends in exactly `video` after one run,
+idempotent on a second run). Not run against a real `seatd`/`labwc`
+pair - no such stack in this sandbox to exercise the actual socket
+connection end to end.
+
 ## WiFi
 
 [iwd](https://iwd.wiki.kernel.org/) instead of wpa_supplicant + a
