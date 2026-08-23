@@ -4,6 +4,13 @@
 		<name>Tarno</name>
 	</theme>
 	<keyboard>
+		<!-- Same story as <mouse> below: <default/> loads labwc's own
+		     built-in keybinds (Alt+Tab window switching, Super+A
+		     maximize, Super+D show desktop, Super+arrows to snap to
+		     screen edges) - our own binds after it override just the
+		     specific keys we want different (W-Return: foot instead
+		     of the default's lab-sensible-terminal). -->
+		<default/>
 		<keybind key="W-Return">
 			<action name="Execute" command="foot"/>
 		</keybind>
@@ -15,6 +22,19 @@
 		</keybind>
 	</keyboard>
 	<mouse>
+		<!-- Reported: windows couldn't be moved, resized, maximized,
+		     minimized, or closed at all. Root cause: this file only
+		     ever bound the Root context (below) - labwc only falls
+		     back to its own built-in mousebinds when there's no
+		     <mouse> block at all; once one exists, every context it
+		     doesn't cover is simply unbound, no silent merge with the
+		     defaults. <default/> loads labwc's actual built-in
+		     mousebinds (title-drag-to-move, double-click-to-maximize,
+		     border-resize, Maximize/Iconify/Close button contexts,
+		     and Super+drag for apps that draw their own decorations
+		     and have no labwc titlebar to grab at all) - our own Root
+		     override below still applies on top of it. -->
+		<default/>
 		<context name="Root">
 			<mousebind button="Right" action="Press" direction="Down">
 				<action name="ShowMenu" menu="root-menu"/>
