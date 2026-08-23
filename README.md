@@ -162,6 +162,21 @@ screenshot CLI tools) - baseline utilities every other wlroots desktop
 ships that were simply missing here. Themed `fuzzel.ini` matches the
 same palette as everything else.
 
+Fifth real boot test: windows couldn't be moved, resized, maximized,
+minimized, or closed at all. Root cause: `rc.xml` only ever bound the
+`Root` mouse context (the right-click menu) - labwc only falls back to
+its own built-in mousebinds/keybinds when there's *no* `<mouse>`/
+`<keyboard>` block at all; once one exists, whatever it doesn't cover
+is simply unbound, no silent merge with the defaults. Fixed with
+labwc's own documented `<default/>` element (loads its real built-in
+bindings - title-drag-to-move, double-click-to-maximize, border-resize,
+button contexts, Alt+Tab window switching, Super+A maximize, Super+D
+show desktop, Super+drag for apps that draw their own decorations and
+have no labwc titlebar at all) placed before our own overrides, which
+now apply on top of it instead of replacing everything. Verified
+locally: `labwc -d` against the new config logs "Loaded 34 merged
+mousebinds" and "Replaced 2 keybinds" with zero parse errors.
+
 ## Login
 
 There isn't one - tty1 autologs in as `user` (agetty `--autologin`, see
