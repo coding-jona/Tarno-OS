@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Tarno
+Comment=Ask Tarno anything - the OS's built-in assistant
+Exec=tarno-assistant
+Terminal=false
+Categories=Utility;

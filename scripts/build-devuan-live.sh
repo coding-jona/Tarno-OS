@@ -15,6 +15,12 @@ fi
 mkdir -p "${repo_root}/tarno-devuan-live/config/includes.chroot/usr/bin"
 ( cd "${repo_root}" && GOOS=linux GOARCH=amd64 go build -o tarno-devuan-live/config/includes.chroot/usr/bin/tarnod . )
 ( cd "${repo_root}" && GOOS=linux GOARCH=amd64 go build -o tarno-devuan-live/config/includes.chroot/usr/bin/tarno-disk-install ./cmd/tarno-disk-install )
+# tarnoctl was never actually built into the image before this - it
+# only ever existed as source you'd have to build yourself, same class
+# of gap as tarno-disk-install used to be. Useful on its own from a
+# terminal (tarnoctl status/ai-status/set-api-key), and tarno-settings/
+# tarno-assistant already talk to the same socket it does.
+( cd "${repo_root}" && GOOS=linux GOARCH=amd64 go build -o tarno-devuan-live/config/includes.chroot/usr/bin/tarnoctl ./cmd/tarnoctl )
 
 if [ "$(id -u)" -ne 0 ]; then
 	if command -v sudo >/dev/null 2>&1; then

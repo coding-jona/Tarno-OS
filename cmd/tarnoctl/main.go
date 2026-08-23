@@ -31,6 +31,8 @@ func send(req tarno.Request) (tarno.Response, error) {
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: tarnoctl status")
 	fmt.Fprintln(os.Stderr, "       tarnoctl ai <question>")
+	fmt.Fprintln(os.Stderr, "       tarnoctl ai-status")
+	fmt.Fprintln(os.Stderr, "       tarnoctl set-api-key <key>")
 }
 
 func main() {
@@ -49,6 +51,14 @@ func main() {
 			os.Exit(1)
 		}
 		req = tarno.Request{Cmd: "ai", Text: strings.Join(os.Args[2:], " ")}
+	case "ai-status":
+		req = tarno.Request{Cmd: "ai_status"}
+	case "set-api-key":
+		if len(os.Args) < 3 {
+			usage()
+			os.Exit(1)
+		}
+		req = tarno.Request{Cmd: "set_api_key", Text: os.Args[2]}
 	default:
 		usage()
 		os.Exit(1)

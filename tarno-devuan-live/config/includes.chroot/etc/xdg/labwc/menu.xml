@@ -1,6 +1,9 @@
 <?xml version="1.0"?>
 <openbox_menu>
 	<menu id="root-menu" label="Tarno OS">
+		<item label="Tarno">
+			<action name="Execute" command="tarno-assistant"/>
+		</item>
 		<item label="Tarno Settings">
 			<action name="Execute" command="tarno-settings"/>
 		</item>
