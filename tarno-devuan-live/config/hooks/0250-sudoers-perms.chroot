@@ -1,0 +1,12 @@
+#!/bin/sh
+# sudo refuses to read a sudoers.d file unless it's exactly 0440,
+# root-owned - it silently ignores (or, depending on version, hard
+# errors on) anything more permissive. Git can only represent the
+# executable bit, not an arbitrary mode like 0440, so
+# etc/sudoers.d/tarno-user ships at whatever git gives it and gets
+# fixed up here instead - same "can't express the real mode in git,
+# fix it at build time" reasoning as the +x chmods in the other hooks
+# in this directory.
+set -e
+chmod 0440 /etc/sudoers.d/tarno-user
+chown root:root /etc/sudoers.d/tarno-user

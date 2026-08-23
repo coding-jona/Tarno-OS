@@ -1,0 +1,19 @@
+# Passwordless sudo for the live "user" account - README has claimed
+# this exists ("user-setup + sudo still create the account and give it
+# passwordless sudo") since early in this project, but nothing ever
+# actually configured it: user-setup only creates the account and adds
+# it to the sudo group, and stock /etc/sudoers (`%sudo ALL=(ALL:ALL)
+# ALL`) still requires that group's members to type their own password.
+# Confirmed as the real root cause of several reported-broken features
+# that all shell out with `sudo -n` (non-interactive - fails outright
+# instead of hanging on a password prompt that can never be answered):
+# tarno-store's Install/Remove buttons, tarno-settings' Power tab
+# (reboot/shut down), its Install tab listing internal disks. Same
+# reasoning as the rest of this single-user live image (see tarnod's
+# world-writable socket) - there's no meaningful password to type on a
+# live/demo system with root already permanently locked either way.
+#
+# chmod'd to 0440 by a hook (see hooks/*-sudoers-perms.chroot) - sudo
+# refuses to read a sudoers.d file with any other permissions, and git
+# can't represent that exact mode on its own (only the executable bit).
+user ALL=(ALL) NOPASSWD: ALL
