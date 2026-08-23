@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """Tarno OS settings panel - talks to tarnod over its unix socket."""
 import json
+import re
 import socket
 import subprocess
 import sys
 
+from PySide6.QtCore import Qt, QProcess
 from PySide6.QtWidgets import (
     QApplication,
+    QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QTabWidget,
@@ -31,7 +38,9 @@ TEXT_PRIMARY = "#f3f3f3"
 TEXT_MUTED = "#9a9a9a"
 ACCENT = "#0bc7ff"
 ACCENT_HOVER = "#33d1ff"
+ACCENT_DIM = "rgba(11, 199, 255, 0.15)"
 DANGER = "#ff6a5f"
+DANGER_DIM = "rgba(255, 106, 95, 0.12)"
 
 FONT_STACK = '"Inter", "Noto Sans", "Segoe UI", -apple-system, sans-serif'
 
@@ -54,7 +63,7 @@ QTabBar::tab {{
     background: transparent;
     color: {TEXT_MUTED};
     font-weight: 600;
-    padding: 9px 18px;
+    padding: 9px 16px;
     margin-right: 2px;
 }}
 QTabBar::tab:selected {{
@@ -79,6 +88,19 @@ QPushButton:hover {{
 QPushButton:pressed {{
     background: {BG_APP};
 }}
+QPushButton:disabled {{
+    color: {TEXT_MUTED};
+    border-color: {BORDER};
+}}
+QPushButton[role="danger"] {{
+    color: {DANGER};
+    background: {DANGER_DIM};
+    border-color: transparent;
+}}
+QPushButton[role="danger"]:hover {{
+    background: {DANGER_DIM};
+    border-color: {DANGER};
+}}
 QLineEdit, QPlainTextEdit {{
     background: {BG_WIDGET};
     border: 1px solid {BORDER_STRONG};
@@ -90,11 +112,33 @@ QLineEdit, QPlainTextEdit {{
 QLineEdit:focus, QPlainTextEdit:focus {{
     border-color: {ACCENT};
 }}
+QListWidget {{
+    background: {BG_WIDGET};
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 8px;
+    padding: 4px;
+}}
+QListWidget::item {{
+    padding: 6px 8px;
+    border-radius: 6px;
+}}
+QListWidget::item:hover {{
+    background: {BG_WIDGET_HOVER};
+}}
+QListWidget::item:selected {{
+    background: {ACCENT_DIM};
+    color: {ACCENT};
+}}
 QLabel[role="muted"] {{
     color: {TEXT_MUTED};
 }}
 QLabel[role="danger"] {{
     color: {DANGER};
+}}
+QLabel[role="heading"] {{
+    font-weight: 700;
+    font-size: 13px;
+    margin-top: 4px;
 }}
 QScrollBar:vertical {{
     background: transparent;
@@ -131,9 +175,9 @@ def call(cmd, text=""):
         return {"ok": False, "error": f"tarnod unreachable: {e}"}
 
 
-def restyle(label):
-    label.style().unpolish(label)
-    label.style().polish(label)
+def restyle(widget):
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
 
 
 class StatusTab(QWidget):
@@ -237,16 +281,429 @@ class InstallTab(QWidget):
         subprocess.Popen(["foot", "-e", "tarno-install-to-disk"])
 
 
+# --- Network tab helpers -----------------------------------------------
+#
+# All of this shells out to `ip` and iwd's `iwctl` and regex-parses their
+# human-readable table output, the same "not a stable API, but the only
+# one that exists without pulling in a D-Bus binding dependency" choice
+# already made for apt in tarno-store. Deliberately tolerant of exact
+# column widths/box-drawing characters changing between iwd versions -
+# match on content (a `wlan\d+`/`wlp...` token, 2+-space column gaps),
+# not on exact formatting.
+#
+# Not run against a real iwd/wifi adapter in this sandbox (no wireless
+# hardware here) - root-caused/verified as far as static parsing logic
+# goes, not end to end on real hardware yet.
+
+
+def find_wifi_device():
+    try:
+        proc = subprocess.run(
+            ["iwctl", "device", "list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for token in proc.stdout.split():
+        name = token.strip("|-")
+        if re.fullmatch(r"wl\w+", name):
+            return name
+    return None
+
+
+def clean_table_lines(output, skip_prefixes=()):
+    lines = []
+    for raw in output.splitlines():
+        stripped = raw.strip()
+        if not stripped or set(stripped) <= {"-"}:
+            continue
+        if any(stripped.lower().startswith(p) for p in skip_prefixes):
+            continue
+        lines.append(stripped)
+    return lines
+
+
+def extract_ssid(line):
+    text = line.lstrip(">").strip()
+    m = re.match(r"^(.*?)\s{2,}", text)
+    if m:
+        return m.group(1).strip()
+    parts = text.split()
+    return parts[0] if parts else text
+
+
+def list_networks(device):
+    try:
+        proc = subprocess.run(
+            ["iwctl", "station", device, "get-networks"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return [], str(e)
+    lines = clean_table_lines(
+        proc.stdout, skip_prefixes=("network name", "available networks")
+    )
+    return lines, None
+
+
+def list_known_networks():
+    try:
+        proc = subprocess.run(
+            ["iwctl", "known-networks", "list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return clean_table_lines(proc.stdout, skip_prefixes=("name",))
+
+
+def station_show(device):
+    try:
+        proc = subprocess.run(
+            ["iwctl", "station", device, "show"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout.strip()
+
+
+def wired_status():
+    try:
+        proc = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    lines = []
+    for raw in proc.stdout.splitlines():
+        parts = raw.split()
+        # `ip -o addr show` output: "<idx>: <iface> inet <ip>/<mask> ..."
+        if len(parts) >= 4 and parts[2] == "inet" and not parts[1].startswith("wl"):
+            lines.append(f"{parts[1]}: {parts[3]}")
+    return "\n".join(lines) if lines else "not connected"
+
+
+class NetworkTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.wifi_device = None
+        self.scan_proc = None
+        self.connect_proc = None
+
+        wired_heading = QLabel("Wired")
+        wired_heading.setProperty("role", "heading")
+        self.wired_label = QLabel("checking...")
+        self.wired_label.setProperty("role", "muted")
+        self.wired_label.setWordWrap(True)
+
+        wifi_heading = QLabel("WiFi")
+        wifi_heading.setProperty("role", "heading")
+        self.wifi_status = QLabel("checking...")
+        self.wifi_status.setProperty("role", "muted")
+        self.wifi_status.setWordWrap(True)
+
+        scan_btn = QPushButton("Scan")
+        scan_btn.clicked.connect(self.scan)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh_all)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(scan_btn)
+        btn_row.addWidget(refresh_btn)
+        btn_row.addStretch()
+
+        self.networks = QListWidget()
+        self.networks.itemActivated.connect(self.on_network_activated)
+
+        known_heading = QLabel("Known networks")
+        known_heading.setProperty("role", "heading")
+        self.known = QListWidget()
+        self.known.setMaximumHeight(90)
+        forget_btn = QPushButton("Forget selected")
+        forget_btn.setProperty("role", "danger")
+        forget_btn.clicked.connect(self.forget_selected)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumHeight(70)
+        self.log.setPlaceholderText("Scan/connect output shows up here.")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(wired_heading)
+        layout.addWidget(self.wired_label)
+        layout.addWidget(wifi_heading)
+        layout.addWidget(self.wifi_status)
+        layout.addLayout(btn_row)
+        layout.addWidget(QLabel("Available networks (double-click to connect):"))
+        layout.addWidget(self.networks, 1)
+        layout.addWidget(known_heading)
+        layout.addWidget(self.known)
+        layout.addWidget(forget_btn)
+        layout.addWidget(self.log)
+
+        self.refresh_all()
+
+    def scan(self):
+        if not self.wifi_device:
+            self.detect_device()
+        if not self.wifi_device:
+            self.log.appendPlainText("no WiFi device found")
+            return
+        self.log.appendPlainText(f"$ iwctl station {self.wifi_device} scan")
+        self.scan_proc = QProcess(self)
+        self.scan_proc.setProgram("iwctl")
+        self.scan_proc.setArguments(["station", self.wifi_device, "scan"])
+        self.scan_proc.finished.connect(lambda code, _status: self.on_scan_finished(code))
+        self.scan_proc.start()
+
+    def on_scan_finished(self, code):
+        self.log.appendPlainText(f"(scan exit {code})")
+        self.refresh_networks()
+
+    def on_network_activated(self, item):
+        if not (item.flags() & Qt.ItemFlag.ItemIsSelectable):
+            return
+        ssid = extract_ssid(item.text())
+        secured = "open" not in item.text().lower()
+        passphrase = ""
+        if secured:
+            text, ok = QInputDialog.getText(
+                self,
+                "WiFi password",
+                f'Password for "{ssid}":',
+                QLineEdit.EchoMode.Password,
+            )
+            if not ok:
+                return
+            passphrase = text
+        self.connect_to(ssid, passphrase)
+
+    def connect_to(self, ssid, passphrase):
+        if not self.wifi_device:
+            return
+        args = []
+        if passphrase:
+            args += ["--passphrase", passphrase]
+        args += ["station", self.wifi_device, "connect", ssid]
+        self.log.appendPlainText(f"connecting to {ssid}...")
+        self.connect_proc = QProcess(self)
+        self.connect_proc.setProgram("iwctl")
+        self.connect_proc.setArguments(args)
+        self.connect_proc.readyReadStandardOutput.connect(self._read_connect_stdout)
+        self.connect_proc.readyReadStandardError.connect(self._read_connect_stderr)
+        self.connect_proc.finished.connect(
+            lambda code, _status: self.on_connect_finished(ssid, code)
+        )
+        self.connect_proc.start()
+
+    def _read_connect_stdout(self):
+        data = bytes(self.connect_proc.readAllStandardOutput()).decode(errors="replace")
+        if data.strip():
+            self.log.appendPlainText(data.rstrip())
+
+    def _read_connect_stderr(self):
+        data = bytes(self.connect_proc.readAllStandardError()).decode(errors="replace")
+        if data.strip():
+            self.log.appendPlainText(data.rstrip())
+
+    def on_connect_finished(self, ssid, code):
+        self.log.appendPlainText(f"connect {ssid} (exit {code})")
+        self.refresh_all()
+
+    def detect_device(self):
+        self.wifi_device = find_wifi_device()
+
+    def refresh_networks(self):
+        self.networks.clear()
+        if not self.wifi_device:
+            self.wifi_status.setText("no WiFi device found")
+            return
+        status = station_show(self.wifi_device)
+        self.wifi_status.setText(status or f"device: {self.wifi_device}")
+        lines, err = list_networks(self.wifi_device)
+        if err:
+            self.log.appendPlainText(f"get-networks error: {err}")
+            return
+        if not lines:
+            item = QListWidgetItem("no networks found - try Scan")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.networks.addItem(item)
+            return
+        for line in lines:
+            self.networks.addItem(QListWidgetItem(line))
+
+    def refresh_known(self):
+        self.known.clear()
+        for line in list_known_networks():
+            self.known.addItem(QListWidgetItem(line))
+
+    def refresh_all(self):
+        self.wired_label.setText(wired_status())
+        self.detect_device()
+        self.refresh_networks()
+        self.refresh_known()
+
+    def forget_selected(self):
+        item = self.known.currentItem()
+        if not item:
+            return
+        ssid = extract_ssid(item.text())
+        subprocess.run(
+            ["iwctl", "known-networks", ssid, "forget"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.refresh_known()
+
+
+# --- System tab ----------------------------------------------------------
+
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def system_info():
+    parts = []
+    parts.append(f"Hostname: {read_text('/etc/hostname').strip() or 'unknown'}")
+
+    kernel = subprocess.run(
+        ["uname", "-sr"], capture_output=True, text=True, timeout=5, check=False
+    ).stdout.strip()
+    parts.append(f"Kernel: {kernel or 'unknown'}")
+
+    uptime_fields = read_text("/proc/uptime").split()
+    if uptime_fields:
+        try:
+            total_seconds = int(float(uptime_fields[0]))
+            hours, rem = divmod(total_seconds, 3600)
+            minutes, seconds = divmod(rem, 60)
+            parts.append(f"Uptime: {hours}h {minutes}m {seconds}s")
+        except ValueError:
+            pass
+
+    mem = {}
+    for line in read_text("/proc/meminfo").splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            mem[key.strip()] = value.strip()
+    try:
+        total_kb = int(mem.get("MemTotal", "").split()[0])
+        avail_kb = int(mem.get("MemAvailable", "").split()[0])
+        parts.append(
+            f"Memory: {(total_kb - avail_kb) // 1024} MiB used / {total_kb // 1024} MiB total"
+        )
+    except (ValueError, IndexError):
+        pass
+
+    df = subprocess.run(
+        ["df", "-h", "/"], capture_output=True, text=True, timeout=5, check=False
+    ).stdout.strip().splitlines()
+    if len(df) >= 2:
+        parts.append(f"Disk (/): {df[1]}")
+
+    return "\n".join(parts)
+
+
+class SystemTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.info = QPlainTextEdit()
+        self.info.setReadOnly(True)
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self.refresh)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.info)
+        layout.addWidget(refresh)
+        self.refresh()
+
+    def refresh(self):
+        self.info.setPlainText(system_info())
+
+
+# --- Power tab -------------------------------------------------------------
+
+
+class PowerTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        warn = QLabel(
+            "Shuts down or restarts this machine immediately - save your "
+            "work first. Uses passwordless sudo (see README's Login "
+            "section), same as everything else in this image that needs "
+            "root."
+        )
+        warn.setProperty("role", "muted")
+        warn.setWordWrap(True)
+
+        reboot_btn = QPushButton("Reboot")
+        reboot_btn.clicked.connect(
+            lambda: self.confirm_and_run("reboot", ["sudo", "-n", "reboot"])
+        )
+        shutdown_btn = QPushButton("Shut down")
+        shutdown_btn.setProperty("role", "danger")
+        shutdown_btn.clicked.connect(
+            lambda: self.confirm_and_run("shut down", ["sudo", "-n", "poweroff"])
+        )
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(reboot_btn)
+        btn_row.addWidget(shutdown_btn)
+        btn_row.addStretch()
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(warn)
+        layout.addLayout(btn_row)
+        layout.addStretch()
+
+    def confirm_and_run(self, label, cmd):
+        box = QMessageBox(self)
+        box.setWindowTitle("Tarno Settings")
+        box.setText(f"Really {label} now?")
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            subprocess.Popen(cmd)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Tarno Settings")
-        self.resize(480, 360)
+        self.resize(560, 480)
 
         tabs = QTabWidget()
         tabs.addTab(StatusTab(), "Status")
+        tabs.addTab(NetworkTab(), "Network")
+        tabs.addTab(SystemTab(), "System")
         tabs.addTab(AiTab(), "AI")
         tabs.addTab(InstallTab(), "Install")
+        tabs.addTab(PowerTab(), "Power")
         self.setCentralWidget(tabs)
 
 

@@ -99,7 +99,10 @@ config in `tarno-devuan-live/config/includes.chroot/etc/xdg/waybar/`) +
 `tarno-settings`, a small PySide6 panel
 (`tarno-devuan-live/config/includes.chroot/usr/bin/tarno-settings`) that
 talks to `tarnod` over its socket - Status and AI tabs (whatever
-`tarnod` itself exposes today), plus an Install tab wrapping
+`tarnod` itself exposes today), a Network tab (wired status + WiFi
+scan/connect/known-networks via `iwctl`, see "WiFi" below), a System
+tab (hostname/kernel/uptime/memory/disk, read-only), a Power tab
+(reboot/shut down), plus an Install tab wrapping
 `tarno-disk-install` (also its own "Install to Disk" root-menu entry,
 `tarno-install-to-disk` - an interactive terminal wrapper, since the
 raw command needs a device name and rsync's progress needs a real tty,
@@ -206,6 +209,36 @@ color tokens shared between both apps. Verified locally: headless run
 correctly distinguishes installed vs. not (checked against real
 `dpkg-query` state), search filtering works.
 
+No animations anywhere on purpose - they cost real frame time for zero
+functional benefit, especially on the kind of aging hardware this has
+actually been tested on. `labwc` has no animation system to begin with
+(deliberately effect-free, unlike KWin/Mutter) and neither does
+`fuzzel`, so there was nothing to turn off there. `gtk-enable-animations=false`
+(`/etc/skel/.config/gtk-3.0/settings.ini` and the `gtk-4.0` twin, same
+`/etc/skel` override mechanism as pcmanfm-qt's `settings.conf`) covers
+every GTK3/4 app's menu/tooltip/tab fades - Geany, GTK dialogs, and
+`waybar` itself (it's a GTK app under the hood, same setting reaches
+its own tooltip fade-in). Firefox's chrome/content animations
+(`toolkit.cosmeticAnimations.enabled`, `general.smoothScroll`,
+`browser.tabs.animate`, `browser.fullscreen.animate`) are set via a
+distribution policy file (`/usr/lib/firefox-esr/distribution/policies.json`,
+Mozilla's own binary-relative lookup path, not distro-specific) as
+non-locked defaults - the user can still flip them back in
+`about:config` if they want, but a fresh install starts snappy. Qt apps
+(`tarno-settings`, `tarno-store`) never used any animation API to begin
+with, nothing to disable.
+
+`docs/tarno-ai-roadmap.md` lays out where "Tarno" (the AI, not just the
+`tarnod` binary) is actually headed - a real system assistant, not just
+a Q&A tab - based on a from-scratch architectural survey of
+[`coding-jona/tarno`](https://github.com/coding-jona/tarno) (the
+namesake project this whole OS is meant to eventually host a version
+of): what pattern maps directly onto `tarnod`'s Go/Unix-socket setup,
+what's a genuinely separate future phase (tool-use with a real
+permission layer, long-term memory), and what's explicitly deferred
+(voice, the "Tarno Mesh" multi-device/account system - both by the
+user's own choice, not forgotten).
+
 Sixth real boot test (real hardware this time, not a VM - a QEMU boot
 had never hit this): black screen, then dropped into a shell in a
 rapid respawn loop, `tarno-desktop.sh`'s own log showing
@@ -224,6 +257,32 @@ console/tty wiring under QEMU. Fixed by commenting out just that one
 (`0200-agetty-console.chroot`) - `tty2`-`tty6` are left alone, they're
 the documented way to get a manual login on another console.
 
+## WiFi
+
+[iwd](https://iwd.wiki.kernel.org/) instead of wpa_supplicant + a
+separate tool - one self-contained daemon with its own `iwctl` client,
+no `wpa_supplicant.conf` to hand-edit, and it only does L2 association
+(dhcpcd still handles DHCP for every interface it finds, wireless
+included - same "probes everything" behavior that already covered
+wired). Enabled via `0500-iwd-enable.chroot`. Actual chip firmware
+(iwlwifi/realtek/atheros/brcm80211, plus a `firmware-misc-nonfree`
+catch-all) comes from the `non-free-firmware` archive area, newly
+enabled in `auto/config` (Devuan mirrors Debian's post-bookworm
+component split - it wasn't enabled before, so none of this firmware
+was ever reachable regardless of the package list).
+
+`tarno-settings`' Network tab drives `iwctl` directly: scan, a
+double-click-to-connect list (prompts for a password on secured
+networks), known-networks with a forget button, and the live wired/
+WiFi status. Parses `iwctl`'s human-readable table output the same way
+`tarno-store` shells out to `apt-get` - not a stable API, but the only
+one that exists without pulling in a D-Bus binding dependency for one
+feature. Verified locally as far as the sandbox allows: the parsing
+helpers against real sample `iwctl` output, `system_info()`/
+`wired_status()` against this sandbox's own `/proc`, `/sys`, `ip` -
+**not** run against a real iwd instance or real WiFi hardware (none
+available here), so real on-device confirmation is still needed.
+
 ## Login
 
 There isn't one - tty1 autologs in as `user` (agetty `--autologin`, see
@@ -235,10 +294,10 @@ by hand only if you `chvt` to another console.
 
 ## Status
 
-Wifi isn't wired up, only wired DHCP - and even that needed a fix:
-Debian/Devuan's default `/etc/network/interfaces` ships its own
-`iface ... inet dhcp` stanza, which made dhcpcd's own init script
-refuse to start at all (avoiding a conflict with two DHCP clients on
-the same interface). Overridden to loopback-only
-(`config/includes.chroot/etc/network/interfaces`) since dhcpcd, not
-ifupdown, manages every interface in this image. See `ROADMAP.md`.
+Wired DHCP needed a fix before it worked at all: Debian/Devuan's
+default `/etc/network/interfaces` ships its own `iface ... inet dhcp`
+stanza, which made dhcpcd's own init script refuse to start at all
+(avoiding a conflict with two DHCP clients on the same interface).
+Overridden to loopback-only (`config/includes.chroot/etc/network/interfaces`)
+since dhcpcd, not ifupdown, manages every interface in this image.
+WiFi is wired up now too, see "WiFi" above. See `ROADMAP.md`.
