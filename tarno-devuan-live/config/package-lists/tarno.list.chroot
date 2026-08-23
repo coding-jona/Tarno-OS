@@ -58,12 +58,18 @@ syslinux-utils
 # module, which needs no compositor-specific support beyond
 # wlr-foreign-toplevel-management, which labwc implements - plus a
 # clock and a Tarno Settings launcher button, config in
-# config/includes.chroot/etc/xdg/waybar/).
+# config/includes.chroot/etc/xdg/waybar/) + wlr-randr (labwc has no
+# way to force a specific output mode itself - its own manual points
+# at wlr-randr/kanshi for that - needed by
+# etc/xdg/labwc/autostart's preferred-mode fix, see its comment for
+# the real bug this addresses: a real boot rendered the whole desktop
+# squashed into a square aspect ratio).
 labwc
 seatd
 foot
 swaybg
 waybar
+wlr-randr
 
 # settings panel (config/includes.chroot/usr/bin/tarno-settings)
 python3

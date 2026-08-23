@@ -334,6 +334,26 @@ console/tty wiring under QEMU. Fixed by commenting out just that one
 (`0200-agetty-console.chroot`) - `tty2`-`tty6` are left alone, they're
 the documented way to get a manual login on another console.
 
+Seventh real boot test: the whole desktop rendered squashed into a
+square aspect ratio, on both the live session and a disk-installed
+system - not something any config in this image was ever setting
+(confirmed: nothing here specifies a resolution/mode anywhere), and
+labwc itself has no way to force a specific output mode on its own -
+its own manual explicitly says so, pointing at `wlr-randr`/`kanshi`
+instead. Whatever labwc's own auto-enable picked on this hardware
+wasn't the panel's actual preferred mode. Fixed by reading the mode
+`wlr-randr` itself reports as `(preferred)` straight from the
+connector and forcing exactly that at the top of
+`etc/xdg/labwc/autostart`, before anything else starts - fixes this on
+whatever hardware it runs on without hardcoding a resolution number
+that would be wrong on different hardware, and is a no-op if the
+preferred mode was already active. New `wlr-randr` package dependency.
+Verified locally: the parsing logic against realistic sample
+`wlr-randr` output (including a case where the active mode differs
+from the preferred one - the actual bug class - and a multi-output
+case) - correctly extracts and would force the right mode in both.
+Not run against real hardware yet.
+
 ## WiFi
 
 [iwd](https://iwd.wiki.kernel.org/) instead of wpa_supplicant + a
