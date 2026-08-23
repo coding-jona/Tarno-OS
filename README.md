@@ -270,6 +270,39 @@ color tokens shared between both apps. Verified locally: headless run
 correctly distinguishes installed vs. not (checked against real
 `dpkg-query` state), search filtering works.
 
+Second tab, "Flathub" - the curated list is deliberately small (~20
+apps), so this is the actual "browse everything" complement: a search
+box wired to the real `flatpak search --user
+--columns=name,description,application <query>` (tab-separated fields,
+confirmed against `flatpak`'s own C source - `flatpak-table-printer.c`
+- since the exact format isn't documented anywhere and depends on
+whether stdout is a TTY), triggered on Enter/button click rather than
+live-filtered as you type since each search is a real subprocess call,
+not a filter over data already in memory. Results render as the same
+card-row look as the curated tab, Install/Remove driving `flatpak
+install/uninstall --user -y --noninteractive` instead of `apt-get`.
+`--user` (not `--system`) deliberately avoids needing polkit/root -
+this image has no desktop polkit agent, same reasoning as `tarnod`'s
+world-writable socket and the NOPASSWD sudoers drop-in. The `flathub`
+remote itself is added with `--if-not-exists` from
+`tarno-desktop.sh` on every login (per-account, so it can't be done
+once at build time the way the apt sources list is) - and since
+`flatpak`'s own `/etc/profile.d/flatpak.sh` (shipped by the `flatpak`
+package itself) adds `--user`-installed apps' `.desktop` files to
+`XDG_DATA_DIRS` automatically, `fuzzel` picks them up with zero extra
+plumbing, same as every other app on this image.
+
+Verified locally: the tab-separated parsing logic against sample
+`flatpak search`/`flatpak list` output built from the real column
+formats in `flatpak`'s own source, headless run instantiates both
+tabs without crashing, `flatpak`'s own `/etc/profile.d/flatpak.sh`
+inspected directly (installed `flatpak` locally to check) to confirm
+the `XDG_DATA_DIRS` wiring. **Not verified**: an actual `flatpak
+search`/`install` against the real Flathub remote - this sandbox's
+network egress proxy blocks `flathub.org` outright (`403` on
+`CONNECT`), so nothing here has run against Flathub's real catalog.
+Real on-device confirmation is still needed.
+
 `tarno-assistant` (`config/includes.chroot/usr/bin/tarno-assistant`,
 root menu entry "Tarno", `Super+T`) - a real chat window for Tarno OS'
 namesake feature instead of the single-line ask/answer box buried in a

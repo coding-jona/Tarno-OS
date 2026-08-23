@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Tarno Store - curated app catalog for Tarno OS.
+"""Tarno Store - curated apt catalog + Flathub search for Tarno OS.
 
 Not a real package repository browser (that's synaptic, on the root
-menu) - a small, hand-picked list of real apps across the categories a
-usable desktop needs, installed/removed with a couple of clicks. Same
-palette as tarno-settings, so every Tarno app looks alike.
+menu) - the Curated tab is a small, hand-picked list of real apps
+across the categories a usable desktop needs, installed/removed with a
+couple of clicks via plain apt-get. The Flathub tab is the actual
+"browse everything" complement for anything not in the curated list or
+not packaged in Devuan's own repos at all - searches live against
+Flathub's full catalog (thousands of apps) via `flatpak search`, not a
+hardcoded list. Same palette throughout, so every Tarno app looks
+alike.
 """
 import shutil
 import subprocess
@@ -24,6 +29,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -58,6 +64,27 @@ QMainWindow, QWidget {{
 #header {{
     background: {BG_PANEL};
     border-bottom: 1px solid {BORDER};
+}}
+QTabWidget::pane {{
+    border: none;
+    top: -1px;
+}}
+QTabBar {{
+    background: {BG_PANEL};
+}}
+QTabBar::tab {{
+    background: transparent;
+    color: {TEXT_MUTED};
+    font-weight: 600;
+    padding: 10px 20px;
+    margin-right: 2px;
+}}
+QTabBar::tab:selected {{
+    color: {TEXT_PRIMARY};
+    border-bottom: 2px solid {ACCENT};
+}}
+QTabBar::tab:hover:!selected {{
+    color: {TEXT_PRIMARY};
 }}
 #headerTitle {{
     font-size: 19px;
@@ -310,25 +337,121 @@ class AppRow(QFrame):
         self.refresh_button()
 
 
-class MainWindow(QMainWindow):
+def flatpak_installed_ids():
+    """Return the set of currently --user-installed Flatpak application IDs."""
+    result = subprocess.run(
+        ["flatpak", "list", "--user", "--app", "--columns=application"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+class FlathubRow(QFrame):
+    """One Flathub search result - same card look as AppRow, but backed by
+    `flatpak install/uninstall --user` instead of apt-get, and its
+    installed-state is passed in from the search that found it rather than
+    checked fresh on every repaint (a `flatpak list` per row would mean one
+    subprocess per result just to draw the list)."""
+
+    def __init__(self, name, app_id, description, installed, log):
+        super().__init__()
+        self.setObjectName("appCard")
+        self.app_id = app_id
+        self.log = log
+        self.process = None
+        self.installed = installed
+
+        icon_label = QLabel()
+        icon_label.setObjectName("appIcon")
+        icon_label.setFixedSize(44, 44)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_label.setPixmap(app_icon(FALLBACK_ICON).pixmap(QSize(28, 28)))
+
+        title = QLabel(name)
+        title.setObjectName("appName")
+        chip = QLabel("FLATHUB")
+        chip.setObjectName("categoryChip")
+        desc = QLabel(description or app_id)
+        desc.setObjectName("appDescription")
+        desc.setWordWrap(True)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        head.addWidget(title)
+        head.addWidget(chip)
+        head.addStretch()
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(3)
+        text_col.addLayout(head)
+        text_col.addWidget(desc)
+
+        self.button = QPushButton()
+        self.button.setFixedWidth(92)
+        self.button.clicked.connect(self.toggle)
+        self.refresh_button()
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(14)
+        layout.addWidget(icon_label)
+        layout.addLayout(text_col, 1)
+        layout.addWidget(self.button)
+
+    def refresh_button(self):
+        if self.installed:
+            self.button.setText("Remove")
+            self.button.setProperty("role", "danger")
+        else:
+            self.button.setText("Install")
+            self.button.setProperty("role", "")
+        self.button.style().unpolish(self.button)
+        self.button.style().polish(self.button)
+
+    def toggle(self):
+        action = "uninstall" if self.installed else "install"
+        self.button.setEnabled(False)
+        self.button.setText("...")
+
+        args = [action, "--user", "-y", "--noninteractive"]
+        if action == "install":
+            args.append("flathub")
+        args.append(self.app_id)
+        self.log.appendPlainText(f"$ flatpak {' '.join(args)}")
+
+        self.process = QProcess(self)
+        self.process.setProgram("flatpak")
+        self.process.setArguments(args)
+        self.process.readyReadStandardOutput.connect(self._read_stdout)
+        self.process.readyReadStandardError.connect(self._read_stderr)
+        self.process.finished.connect(self._finished)
+        self.process.start()
+
+    def _read_stdout(self):
+        data = bytes(self.process.readAllStandardOutput()).decode(errors="replace")
+        self.log.appendPlainText(data.rstrip())
+
+    def _read_stderr(self):
+        data = bytes(self.process.readAllStandardError()).decode(errors="replace")
+        self.log.appendPlainText(data.rstrip())
+
+    def _finished(self, exit_code, _status):
+        self.log.appendPlainText(f"(exit {exit_code})")
+        self.button.setEnabled(True)
+        if exit_code == 0:
+            self.installed = not self.installed
+        self.refresh_button()
+
+
+class CuratedTab(QWidget):
+    """The hand-picked apt catalog - same UI this whole app used to be
+    before the Flathub tab existed, just repotted into one tab instead of
+    the whole window."""
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Tarno Store")
-        self.resize(680, 560)
-
-        header = QFrame()
-        header.setObjectName("header")
-        title = QLabel("Tarno Store")
-        title.setObjectName("headerTitle")
-        subtitle = QLabel(f"{len(CATALOG)} curated apps - installs straight from apt")
-        subtitle.setObjectName("headerSubtitle")
-        header_text = QVBoxLayout()
-        header_text.setSpacing(2)
-        header_text.addWidget(title)
-        header_text.addWidget(subtitle)
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(20, 16, 20, 16)
-        header_layout.addLayout(header_text)
 
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search apps...")
@@ -357,26 +480,157 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.log)
         splitter.setSizes([420, 110])
 
-        body = QWidget()
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(20, 16, 20, 16)
-        body_layout.setSpacing(12)
-        body_layout.addWidget(self.search)
-        body_layout.addWidget(splitter)
-
-        central = QWidget()
-        central_layout = QVBoxLayout(central)
-        central_layout.setContentsMargins(0, 0, 0, 0)
-        central_layout.setSpacing(0)
-        central_layout.addWidget(header)
-        central_layout.addWidget(body)
-        self.setCentralWidget(central)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+        layout.addWidget(self.search)
+        layout.addWidget(splitter)
 
     def filter_rows(self, text):
         text = text.strip().lower()
         for item, name, category, description in self.rows:
             haystack = f"{name} {category} {description}".lower()
             item.setHidden(text not in haystack)
+
+
+class FlathubTab(QWidget):
+    """Live search against Flathub's full catalog via `flatpak search`.
+
+    Unlike the Curated tab this isn't a fixed list - every search shells
+    out to flatpak itself, so results are always Flathub's actual current
+    catalog (many thousands of apps), not something baked into this repo.
+    Triggered on Enter/button click rather than live-filtered as you type,
+    since each search is a real subprocess call, not a filter over data
+    already in memory.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.search_process = None
+        self.installed_ids = set()
+
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText('Search Flathub (e.g. "blender", "spotify")...')
+        self.search_box.returnPressed.connect(self.run_search)
+
+        self.search_button = QPushButton("Search")
+        self.search_button.setFixedWidth(92)
+        self.search_button.clicked.connect(self.run_search)
+
+        search_row = QHBoxLayout()
+        search_row.setSpacing(10)
+        search_row.addWidget(self.search_box, 1)
+        search_row.addWidget(self.search_button)
+
+        self.list = QListWidget()
+        self.list.setSpacing(8)
+        self.list.setFrameShape(QFrame.Shape.NoFrame)
+
+        self.status = QLabel("Search Flathub above to browse thousands of apps.")
+        self.status.setObjectName("appDescription")
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("Install/remove output shows up here.")
+
+        splitter = QSplitter()
+        splitter.setOrientation(Qt.Orientation.Vertical)
+        splitter.addWidget(self.list)
+        splitter.addWidget(self.log)
+        splitter.setSizes([420, 110])
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+        layout.addLayout(search_row)
+        layout.addWidget(self.status)
+        layout.addWidget(splitter)
+
+    def run_search(self):
+        query = self.search_box.text().strip()
+        if not query or self.search_process is not None:
+            return
+
+        self.list.clear()
+        self.status.setText(f'Searching Flathub for "{query}"...')
+        self.search_button.setEnabled(False)
+
+        self.installed_ids = flatpak_installed_ids()
+
+        self.search_process = QProcess(self)
+        self.search_process.setProgram("flatpak")
+        self.search_process.setArguments(
+            ["search", "--user", "--columns=name,description,application", query]
+        )
+        self.search_process.finished.connect(self._search_finished)
+        self.search_process.start()
+
+    def _search_finished(self, _exit_code, _status):
+        stdout = bytes(self.search_process.readAllStandardOutput()).decode(errors="replace")
+        stderr = bytes(self.search_process.readAllStandardError()).decode(errors="replace")
+        self.search_process = None
+        self.search_button.setEnabled(True)
+
+        rows = []
+        for line in stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) < 3:
+                continue
+            name, description, app_id = fields[0], fields[1], fields[2]
+            rows.append((name, description, app_id))
+
+        if not rows:
+            self.status.setText("No matches found on Flathub.")
+            if stderr.strip():
+                self.log.appendPlainText(stderr.strip())
+            return
+
+        self.status.setText(f"{len(rows)} result(s) from Flathub")
+        for name, description, app_id in rows:
+            item = QListWidgetItem(self.list)
+            row = FlathubRow(name, app_id, description, app_id in self.installed_ids, self.log)
+            item.setSizeHint(row.sizeHint())
+            self.list.addItem(item)
+            self.list.setItemWidget(item, row)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Tarno Store")
+        self.resize(680, 620)
+
+        header = QFrame()
+        header.setObjectName("header")
+        title = QLabel("Tarno Store")
+        title.setObjectName("headerTitle")
+        subtitle = QLabel(f"{len(CATALOG)} curated apps, plus all of Flathub")
+        subtitle.setObjectName("headerSubtitle")
+        header_text = QVBoxLayout()
+        header_text.setSpacing(2)
+        header_text.addWidget(title)
+        header_text.addWidget(subtitle)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(20, 16, 20, 16)
+        header_layout.addLayout(header_text)
+
+        tabs = QTabWidget()
+        tabs.addTab(CuratedTab(), "Curated")
+        if shutil.which("flatpak") is not None:
+            tabs.addTab(FlathubTab(), "Flathub")
+        else:
+            missing = QLabel("flatpak isn't installed - the Flathub tab needs it.")
+            missing.setObjectName("appDescription")
+            missing.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            tabs.addTab(missing, "Flathub")
+
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(header)
+        central_layout.addWidget(tabs)
+        self.setCentralWidget(central)
 
 
 def main():

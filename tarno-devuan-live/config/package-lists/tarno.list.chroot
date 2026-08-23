@@ -156,3 +156,13 @@ papirus-icon-theme
 # across the categories a usable desktop needs, installed/removed with
 # a couple of clicks via plain apt-get underneath.
 synaptic
+
+# tarno-store's Flathub tab shells out to `flatpak search`/`install`/
+# `uninstall --user` directly - this is the actual `flatpak` CLI/
+# runtime itself, not just a library. The flathub remote is added at
+# login instead of at build time (see etc/profile.d/tarno-desktop.sh)
+# since --user remotes are per-account, not global. --user (not
+# --system) deliberately avoids needing polkit/root for installs -
+# this image has no desktop polkit agent, same single-user reasoning
+# as tarnod's world-writable socket and the NOPASSWD sudoers drop-in.
+flatpak
