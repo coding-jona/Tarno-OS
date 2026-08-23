@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""Tarno Store - curated app catalog for Tarno OS.
+
+Not a real package repository browser (that's synaptic, on the root
+menu) - a small, hand-picked list of real apps across the categories a
+usable desktop needs, installed/removed with a couple of clicks. Same
+palette as tarno-settings, so every Tarno app looks alike.
+"""
+import shutil
+import subprocess
+import sys
+
+from PySide6.QtCore import QProcess, QSize, Qt
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
+
+BG_APP = "#191919"
+BG_PANEL = "#232323"
+BG_CARD = "#262626"
+BG_CARD_HOVER = "#2c2c2c"
+BG_WIDGET = "#333333"
+BG_WIDGET_HOVER = "#3d3d3d"
+BORDER = "rgba(255, 255, 255, 0.07)"
+BORDER_STRONG = "rgba(255, 255, 255, 0.14)"
+TEXT_PRIMARY = "#f3f3f3"
+TEXT_MUTED = "#9a9a9a"
+ACCENT = "#0bc7ff"
+ACCENT_HOVER = "#33d1ff"
+ACCENT_DIM = "rgba(11, 199, 255, 0.15)"
+DANGER = "#ff6a5f"
+DANGER_DIM = "rgba(255, 106, 95, 0.12)"
+
+FONT_STACK = '"Inter", "Noto Sans", "Segoe UI", -apple-system, sans-serif'
+
+STYLESHEET = f"""
+* {{
+    font-family: {FONT_STACK};
+}}
+QMainWindow, QWidget {{
+    background: {BG_APP};
+    color: {TEXT_PRIMARY};
+    font-size: 13px;
+}}
+#header {{
+    background: {BG_PANEL};
+    border-bottom: 1px solid {BORDER};
+}}
+#headerTitle {{
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+}}
+#headerSubtitle {{
+    color: {TEXT_MUTED};
+    font-size: 12px;
+}}
+QListWidget {{
+    background: transparent;
+    border: none;
+}}
+QListWidget::item {{
+    background: transparent;
+    border: none;
+    padding: 0;
+}}
+#appCard {{
+    background: {BG_CARD};
+    border: 1px solid {BORDER};
+    border-radius: 12px;
+}}
+#appCard:hover {{
+    background: {BG_CARD_HOVER};
+    border: 1px solid {BORDER_STRONG};
+}}
+#appIcon {{
+    background: {BG_WIDGET};
+    border-radius: 10px;
+}}
+#appName {{
+    font-size: 14px;
+    font-weight: 600;
+}}
+#appDescription {{
+    color: {TEXT_MUTED};
+    font-size: 12px;
+}}
+#categoryChip {{
+    background: {ACCENT_DIM};
+    color: {ACCENT};
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    border-radius: 8px;
+    padding: 2px 9px;
+}}
+QPushButton {{
+    background: {BG_WIDGET};
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 8px;
+    padding: 7px 18px;
+    font-weight: 600;
+}}
+QPushButton:hover {{
+    background: {BG_WIDGET_HOVER};
+    border-color: {ACCENT_HOVER};
+    color: {ACCENT_HOVER};
+}}
+QPushButton:pressed {{
+    background: {BG_APP};
+}}
+QPushButton:disabled {{
+    color: {TEXT_MUTED};
+    border-color: {BORDER};
+}}
+QPushButton[role="danger"] {{
+    color: {DANGER};
+    background: {DANGER_DIM};
+    border-color: transparent;
+}}
+QPushButton[role="danger"]:hover {{
+    background: {DANGER_DIM};
+    border-color: {DANGER};
+}}
+QLineEdit {{
+    background: {BG_WIDGET};
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 10px;
+    padding: 9px 14px;
+    font-size: 13px;
+    selection-background-color: {ACCENT};
+}}
+QLineEdit:focus {{
+    border-color: {ACCENT};
+}}
+QPlainTextEdit {{
+    background: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+    padding: 8px;
+    color: {TEXT_MUTED};
+    font-family: "JetBrains Mono", "Cascadia Code", monospace;
+    font-size: 11px;
+}}
+QScrollBar:vertical {{
+    background: transparent;
+    width: 10px;
+    margin: 0;
+}}
+QScrollBar::handle:vertical {{
+    background: {BORDER_STRONG};
+    border-radius: 5px;
+    min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {ACCENT_HOVER};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0;
+}}
+QSplitter::handle {{
+    background: transparent;
+}}
+"""
+
+# name, apt package, category, one-line description, icon-theme name
+# hint (usually == package, called out otherwise) - real, well-known
+# packages, nothing from a third-party repo (this only ever runs plain
+# `apt-get install/remove` against what's already in sources.list).
+CATALOG = [
+    ("Thunderbird", "thunderbird", "Internet", "E-Mail client", "thunderbird"),
+    ("qBittorrent", "qbittorrent", "Internet", "BitTorrent client", "qbittorrent"),
+    ("HexChat", "hexchat", "Internet", "IRC client", "hexchat"),
+    ("Remmina", "remmina", "Internet", "Remote desktop client (RDP/VNC/SSH)", "remmina"),
+    ("LibreOffice", "libreoffice", "Office", "Full office suite", "libreoffice-startcenter"),
+    ("Evince", "evince", "Office", "PDF and document viewer", "evince"),
+    ("GIMP", "gimp", "Graphics", "Image editor", "gimp"),
+    ("Inkscape", "inkscape", "Graphics", "Vector graphics editor", "inkscape"),
+    ("imv", "imv", "Graphics", "Minimal Wayland-native image viewer", "imv"),
+    ("VLC", "vlc", "Media", "Plays almost any audio/video format", "vlc"),
+    ("mpv", "mpv", "Media", "Minimal, high-quality video player", "mpv"),
+    ("Audacity", "audacity", "Media", "Audio editor", "audacity"),
+    ("Neovim", "neovim", "Development", "Modern vim-based text editor", "nvim"),
+    ("Git", "git", "Development", "Version control", "git"),
+    ("htop", "htop", "System", "Interactive process viewer", "utilities-system-monitor"),
+    ("neofetch", "neofetch", "System", "System info at a glance", "utilities-terminal"),
+    ("GParted", "gparted", "System", "Partition editor", "gparted"),
+    ("Filelight", "filelight", "System", "Disk usage analyzer", "filelight"),
+    ("Galculator", "galculator", "Utilities", "Calculator", "accessories-calculator"),
+    ("Flameshot", "flameshot", "Utilities", "Screenshot tool with annotations", "flameshot"),
+]
+
+FALLBACK_ICON = "application-x-executable"
+
+
+def is_installed(package):
+    return (
+        subprocess.run(
+            ["dpkg-query", "-W", "-f=${Status}", package],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        == "install ok installed"
+    )
+
+
+def app_icon(icon_name):
+    icon = QIcon.fromTheme(icon_name)
+    if icon.isNull():
+        icon = QIcon.fromTheme(FALLBACK_ICON)
+    return icon
+
+
+class AppRow(QFrame):
+    def __init__(self, name, package, category, description, icon_name, log):
+        super().__init__()
+        self.setObjectName("appCard")
+        self.package = package
+        self.log = log
+        self.process = None
+
+        icon_label = QLabel()
+        icon_label.setObjectName("appIcon")
+        icon_label.setFixedSize(44, 44)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_label.setPixmap(app_icon(icon_name).pixmap(QSize(28, 28)))
+
+        title = QLabel(name)
+        title.setObjectName("appName")
+        chip = QLabel(category.upper())
+        chip.setObjectName("categoryChip")
+        desc = QLabel(description)
+        desc.setObjectName("appDescription")
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        head.addWidget(title)
+        head.addWidget(chip)
+        head.addStretch()
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(3)
+        text_col.addLayout(head)
+        text_col.addWidget(desc)
+
+        self.button = QPushButton()
+        self.button.setFixedWidth(92)
+        self.button.clicked.connect(self.toggle)
+        self.refresh_button()
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(14)
+        layout.addWidget(icon_label)
+        layout.addLayout(text_col, 1)
+        layout.addWidget(self.button)
+
+    def refresh_button(self):
+        if is_installed(self.package):
+            self.button.setText("Remove")
+            self.button.setProperty("role", "danger")
+        else:
+            self.button.setText("Install")
+            self.button.setProperty("role", "")
+        self.button.style().unpolish(self.button)
+        self.button.style().polish(self.button)
+
+    def toggle(self):
+        action = "remove" if is_installed(self.package) else "install"
+        self.button.setEnabled(False)
+        self.button.setText("...")
+        self.log.appendPlainText(f"$ apt-get {action} -y {self.package}")
+
+        self.process = QProcess(self)
+        env = self.process.processEnvironment()
+        env.insert("DEBIAN_FRONTEND", "noninteractive")
+        self.process.setProcessEnvironment(env)
+        self.process.setProgram("sudo")
+        self.process.setArguments(["-n", "apt-get", action, "-y", self.package])
+        self.process.readyReadStandardOutput.connect(self._read_stdout)
+        self.process.readyReadStandardError.connect(self._read_stderr)
+        self.process.finished.connect(self._finished)
+        self.process.start()
+
+    def _read_stdout(self):
+        data = bytes(self.process.readAllStandardOutput()).decode(errors="replace")
+        self.log.appendPlainText(data.rstrip())
+
+    def _read_stderr(self):
+        data = bytes(self.process.readAllStandardError()).decode(errors="replace")
+        self.log.appendPlainText(data.rstrip())
+
+    def _finished(self, exit_code, _status):
+        self.log.appendPlainText(f"(exit {exit_code})")
+        self.button.setEnabled(True)
+        self.refresh_button()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Tarno Store")
+        self.resize(680, 560)
+
+        header = QFrame()
+        header.setObjectName("header")
+        title = QLabel("Tarno Store")
+        title.setObjectName("headerTitle")
+        subtitle = QLabel(f"{len(CATALOG)} curated apps - installs straight from apt")
+        subtitle.setObjectName("headerSubtitle")
+        header_text = QVBoxLayout()
+        header_text.setSpacing(2)
+        header_text.addWidget(title)
+        header_text.addWidget(subtitle)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(20, 16, 20, 16)
+        header_layout.addLayout(header_text)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search apps...")
+        self.search.textChanged.connect(self.filter_rows)
+
+        self.list = QListWidget()
+        self.list.setSpacing(8)
+        self.list.setFrameShape(QFrame.Shape.NoFrame)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("Install/remove output shows up here.")
+
+        self.rows = []
+        for name, package, category, description, icon_name in CATALOG:
+            item = QListWidgetItem(self.list)
+            row = AppRow(name, package, category, description, icon_name, self.log)
+            item.setSizeHint(row.sizeHint())
+            self.list.addItem(item)
+            self.list.setItemWidget(item, row)
+            self.rows.append((item, name, category, description))
+
+        splitter = QSplitter()
+        splitter.setOrientation(Qt.Orientation.Vertical)
+        splitter.addWidget(self.list)
+        splitter.addWidget(self.log)
+        splitter.setSizes([420, 110])
+
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(20, 16, 20, 16)
+        body_layout.setSpacing(12)
+        body_layout.addWidget(self.search)
+        body_layout.addWidget(splitter)
+
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(header)
+        central_layout.addWidget(body)
+        self.setCentralWidget(central)
+
+    def filter_rows(self, text):
+        text = text.strip().lower()
+        for item, name, category, description in self.rows:
+            haystack = f"{name} {category} {description}".lower()
+            item.setHidden(text not in haystack)
+
+
+def main():
+    if shutil.which("apt-get") is None:
+        print("apt-get not found - Tarno Store needs a Debian/Devuan base", file=sys.stderr)
+        sys.exit(1)
+
+    app = QApplication(sys.argv)
+    app.setDesktopFileName("tarno-store")
+    QIcon.setThemeName("Papirus")
+    app.setStyleSheet(STYLESHEET)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

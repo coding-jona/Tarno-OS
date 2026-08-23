@@ -19,18 +19,26 @@ from PySide6.QtWidgets import (
 
 SOCKET_PATH = "/run/tarnod.sock"
 
-BG_APP = "#202020"
-BG_PANEL = "#2c2c2c"
+# Same tokens as tarno-store - every Tarno app should look like part of
+# the same OS, not a pile of separately-styled Qt scripts.
+BG_APP = "#191919"
+BG_PANEL = "#232323"
 BG_WIDGET = "#333333"
 BG_WIDGET_HOVER = "#3d3d3d"
-BORDER = "rgba(255, 255, 255, 0.08)"
+BORDER = "rgba(255, 255, 255, 0.07)"
+BORDER_STRONG = "rgba(255, 255, 255, 0.14)"
 TEXT_PRIMARY = "#f3f3f3"
-TEXT_MUTED = "#b3b3b3"
+TEXT_MUTED = "#9a9a9a"
 ACCENT = "#0bc7ff"
 ACCENT_HOVER = "#33d1ff"
 DANGER = "#ff6a5f"
 
+FONT_STACK = '"Inter", "Noto Sans", "Segoe UI", -apple-system, sans-serif'
+
 STYLESHEET = f"""
+* {{
+    font-family: {FONT_STACK};
+}}
 QMainWindow, QWidget {{
     background: {BG_APP};
     color: {TEXT_PRIMARY};
@@ -38,43 +46,70 @@ QMainWindow, QWidget {{
 }}
 QTabWidget::pane {{
     border: 1px solid {BORDER};
-    border-radius: 8px;
+    border-radius: 10px;
     background: {BG_PANEL};
+    top: -1px;
 }}
 QTabBar::tab {{
     background: transparent;
     color: {TEXT_MUTED};
-    padding: 8px 16px;
+    font-weight: 600;
+    padding: 9px 18px;
+    margin-right: 2px;
 }}
 QTabBar::tab:selected {{
     color: {TEXT_PRIMARY};
     border-bottom: 2px solid {ACCENT};
 }}
+QTabBar::tab:hover:!selected {{
+    color: {TEXT_PRIMARY};
+}}
 QPushButton {{
     background: {BG_WIDGET};
-    border: 1px solid {BORDER};
-    border-radius: 4px;
-    padding: 6px 14px;
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 8px;
+    padding: 7px 16px;
+    font-weight: 600;
 }}
 QPushButton:hover {{
     background: {BG_WIDGET_HOVER};
     border-color: {ACCENT_HOVER};
+    color: {ACCENT_HOVER};
 }}
 QPushButton:pressed {{
     background: {BG_APP};
 }}
 QLineEdit, QPlainTextEdit {{
     background: {BG_WIDGET};
-    border: 1px solid {BORDER};
-    border-radius: 4px;
-    padding: 6px;
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 8px;
+    padding: 8px 10px;
     color: {TEXT_PRIMARY};
+    selection-background-color: {ACCENT};
+}}
+QLineEdit:focus, QPlainTextEdit:focus {{
+    border-color: {ACCENT};
 }}
 QLabel[role="muted"] {{
     color: {TEXT_MUTED};
 }}
 QLabel[role="danger"] {{
     color: {DANGER};
+}}
+QScrollBar:vertical {{
+    background: transparent;
+    width: 10px;
+}}
+QScrollBar::handle:vertical {{
+    background: {BORDER_STRONG};
+    border-radius: 5px;
+    min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {ACCENT_HOVER};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0;
 }}
 """
 
