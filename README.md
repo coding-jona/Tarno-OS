@@ -206,6 +206,24 @@ color tokens shared between both apps. Verified locally: headless run
 correctly distinguishes installed vs. not (checked against real
 `dpkg-query` state), search filtering works.
 
+Sixth real boot test (real hardware this time, not a VM - a QEMU boot
+had never hit this): black screen, then dropped into a shell in a
+rapid respawn loop, `tarno-desktop.sh`'s own log showing
+`tty=/dev/console` on every line instead of `/dev/tty1` - so its
+`tty[1-6]` check never matched and labwc never even got a chance to
+start.
+Root-caused via `cat /etc/inittab` and `cat /proc/1/cmdline` on the
+actual machine: Devuan's stock `/etc/inittab` still ships its own
+`1:2345:respawn:/sbin/getty --noclear 38400 tty1` entry, and
+`openrc-init` (confirmed as PID 1) is inittab-compatible and honors
+it - completely independent of, and fighting over the same VT with,
+the `agetty.tty1` OpenRC service this image adds for autologin. A VM
+test apparently never surfaced the race, presumably just different
+console/tty wiring under QEMU. Fixed by commenting out just that one
+`tty1` inittab line in the same hook that adds `agetty.tty1`
+(`0200-agetty-console.chroot`) - `tty2`-`tty6` are left alone, they're
+the documented way to get a manual login on another console.
+
 ## Login
 
 There isn't one - tty1 autologs in as `user` (agetty `--autologin`, see

@@ -17,3 +17,19 @@ rc-update add agetty.tty1 default
 # session setup and /etc/profile(.d/*) still run exactly as with a
 # manual login, just without the prompt.
 echo 'agetty_options="--autologin user"' > /etc/conf.d/agetty.tty1
+
+# Devuan's own /etc/inittab (still read by openrc-init - it's an
+# inittab-compatible PID 1, confirmed via /proc/1/cmdline on a real
+# boot) ships its own tty1 getty respawn entry
+# ("1:2345:respawn:/sbin/getty --noclear 38400 tty1"), completely
+# independent of the agetty.tty1 OpenRC service just enabled above -
+# both fight over the same VT. Confirmed on real hardware: a rapid
+# respawn loop, `tty` reporting /dev/console instead of /dev/tty1 (so
+# tarno-desktop.sh's tty[1-6] check never matches and labwc never even
+# gets a chance to start) - a plain black screen, no autologin, no
+# desktop. A VM boot test never hit this, presumably just different
+# console/tty wiring under QEMU. Only tty1 conflicts with anything we
+# provide - comment out just that one line, tty2-6 stay untouched as
+# the documented way to get a manual login on another console (see
+# README's "Login" section).
+sed -i '/respawn.*getty.*tty1$/ s/^/#/' /etc/inittab
