@@ -274,7 +274,27 @@ func install(devName string) error {
 	if err != nil {
 		return err
 	}
-	_, werr := f.WriteString("GRUB_CMDLINE_LINUX_DEFAULT=\"init=/sbin/openrc-init\"\n")
+	// GRUB_GFXPAYLOAD_LINUX=keep is the actual fix for "whole system
+	// stuck at the wrong resolution after install" - without it, GRUB
+	// negotiates its own graphics mode with the firmware for its menu,
+	// then resets to a plain VESA/VGA text mode before handing off to
+	// the kernel, which on BIOS/legacy firmware (this repo's own
+	// biosBoot(), same as the ESP+bios_grub partitioning above) usually
+	// means a low default like 800x600 - and that low mode is what the
+	// console AND everything drawn on top of it afterwards (including
+	// labwc/Wayland, which inherits whatever mode is already active)
+	// gets stuck with. `keep` hands off GRUB's own negotiated mode
+	// unchanged instead of resetting it; GRUB_GFXMODE=auto is what lets
+	// GRUB negotiate its best (i.e. actual native) mode in the first
+	// place rather than defaulting conservatively itself. Appended
+	// (shell-sourced last-assignment-wins, same reasoning as
+	// GRUB_CMDLINE_LINUX_DEFAULT below) rather than trying to edit
+	// Devuan's own stock line in place.
+	_, werr := f.WriteString(
+		"GRUB_GFXMODE=auto\n" +
+			"GRUB_GFXPAYLOAD_LINUX=keep\n" +
+			"GRUB_CMDLINE_LINUX_DEFAULT=\"init=/sbin/openrc-init\"\n",
+	)
 	cerr := f.Close()
 	if werr != nil {
 		return werr
