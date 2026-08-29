@@ -41,6 +41,17 @@ pub fn cpu_count() -> usize {
     CPU_COUNT.load(Ordering::Relaxed)
 }
 
+/// This CPU's dense index. Reads `gs:0` (`PerCpu::self_ptr`), so it is only
+/// valid after this CPU has run `install_percpu` (BSP: `smp::init`; AP:
+/// `ap_entry`).
+pub fn this_cpu() -> u32 {
+    unsafe {
+        let pc: *const PerCpu;
+        core::arch::asm!("mov {}, gs:0", out(reg) pc, options(nostack, preserves_flags));
+        (*pc).cpu_index
+    }
+}
+
 pub fn online() -> usize {
     CPUS_ONLINE.load(Ordering::Relaxed)
 }
@@ -94,12 +105,12 @@ unsafe extern "C" fn ap_entry(_info: &MpInfo) -> ! {
     idt::init(); // shared IDT, just `lidt`
     let lapic_id = apic::enable_this_cpu();
     install_percpu(index, lapic_id);
+    apic::start_periodic_timer();
 
     kprintln!("THOS: AP {} online     lapic {}", index, lapic_id);
     CPUS_ONLINE.fetch_add(1, Ordering::Release);
 
-    // No scheduler yet: park with interrupts off until 1g.
-    loop {
-        x86_64::instructions::hlt();
-    }
+    // Enter the scheduler as this CPU's idle thread; the timer preempts us
+    // into real work whenever the ready queue is non-empty.
+    crate::sched::cpu_enter();
 }

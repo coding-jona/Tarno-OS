@@ -93,6 +93,16 @@ pub fn enable_this_cpu() -> u32 {
     read(REG_ID) >> 24
 }
 
+/// Arm *this* CPU's APIC timer periodic at [`TIMER_HZ`] using the calibration
+/// the BSP already measured. Safe on any CPU once [`init_bsp`] has run.
+pub fn start_periodic_timer() {
+    let per_ms = COUNTS_PER_MS.load(Ordering::Relaxed);
+    let initial = (per_ms as u32).saturating_mul(1000 / TIMER_HZ).max(1);
+    write(REG_TIMER_DIV, TIMER_DIV_16);
+    write(REG_LVT_TIMER, TIMER_VECTOR as u32 | LVT_TIMER_PERIODIC);
+    write(REG_TIMER_INITCNT, initial);
+}
+
 /// Bring up the BSP APIC and arm its PIT-calibrated ~100 Hz periodic timer.
 ///
 /// # Safety
@@ -101,13 +111,8 @@ pub unsafe fn init_bsp(local_apic_addr: u64) {
     set_base(local_apic_addr);
     BSP_APIC_ID.store(enable_this_cpu() as u8, Ordering::Relaxed);
 
-    let per_ms = calibrate_against_pit();
-    COUNTS_PER_MS.store(per_ms, Ordering::Relaxed);
-
-    let initial = (per_ms as u32).saturating_mul(1000 / TIMER_HZ).max(1);
-    write(REG_TIMER_DIV, TIMER_DIV_16);
-    write(REG_LVT_TIMER, TIMER_VECTOR as u32 | LVT_TIMER_PERIODIC);
-    write(REG_TIMER_INITCNT, initial);
+    COUNTS_PER_MS.store(calibrate_against_pit(), Ordering::Relaxed);
+    start_periodic_timer();
 }
 
 pub fn counts_per_ms() -> u64 {

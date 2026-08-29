@@ -56,6 +56,7 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
 extern "x86-interrupt" fn apic_timer(_frame: InterruptStackFrame) {
     apic::on_timer_tick();
     apic::eoi();
+    crate::sched::on_tick();
 }
 
 extern "x86-interrupt" fn apic_spurious(_frame: InterruptStackFrame) {

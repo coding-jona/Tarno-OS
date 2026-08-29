@@ -11,10 +11,12 @@
 //! PIT-calibrated ~100 Hz periodic timer; interrupts fire.
 //!
 //! Milestone 1f: Limine starts the APs; each does its own GDT/TSS, shared
-//! IDT, Local APIC, GS base, then parks. All CPUs report online.
+//! IDT, Local APIC, GS base, then enters the scheduler as its idle thread.
+//! Milestone 1g: preemptive kernel-thread scheduler on all CPUs, the single
+//! wait primitive (`WaitQueue` / `Event`), and the generic handle table.
 //!
-//! Still ahead in Phase 1 (see docs/thos/roadmap.md): `syscall` entry,
-//! scheduler, the one wait/sync primitive, object manager.
+//! Phase 1 done. Next (Phase 2): VFS, AHCI, the POSIX personality, and the
+//! `syscall` fast path.
 
 #![no_std]
 #![no_main]
@@ -28,11 +30,16 @@ mod apic;
 mod gdt;
 mod idt;
 mod mm;
+mod object;
+mod sched;
 mod serial;
 mod smp;
+mod wait;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use limine::framebuffer::Framebuffer;
 use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest, RsdpRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
@@ -104,6 +111,8 @@ extern "C" fn kmain() -> ! {
 
     let mp = MP_REQUEST.response().expect("Limine MP request unanswered");
     smp::init(mp);
+
+    scheduler_milestone();
 
     kprintln!("THOS: halting.");
     exit_qemu(ExitCode::Success);
@@ -206,6 +215,72 @@ fn acpi_apic_bringup() {
         "THOS: APIC timer ok    {} ticks @ ~{} Hz",
         apic::ticks(),
         apic::timer_hz()
+    );
+}
+
+// --- Milestone 1: scheduler + wait primitive + handle table ---
+
+static WORK_DONE: AtomicU64 = AtomicU64::new(0);
+static WAITER_WOKE: AtomicBool = AtomicBool::new(false);
+static DEMO_EVENT: wait::Event = wait::Event::new();
+
+const N_WORKERS: usize = 6;
+const WORK_PER_WORKER: u64 = 50;
+
+extern "C" fn worker(_id: usize) -> ! {
+    for _ in 0..WORK_PER_WORKER {
+        WORK_DONE.fetch_add(1, Ordering::Relaxed);
+        sched::yield_now();
+    }
+    sched::exit()
+}
+
+extern "C" fn waiter(_: usize) -> ! {
+    DEMO_EVENT.wait();
+    WAITER_WOKE.store(true, Ordering::Release);
+    sched::exit()
+}
+
+extern "C" fn setter(_: usize) -> ! {
+    for _ in 0..20 {
+        sched::yield_now();
+    }
+    DEMO_EVENT.signal();
+    sched::exit()
+}
+
+/// Milestone 1: stand up the scheduler, run kernel threads across every CPU,
+/// block/wake one on the single wait primitive, and round-trip an object handle.
+fn scheduler_milestone() {
+    sched::init_bsp();
+
+    // Object + handle table round-trip.
+    let ev: Arc<wait::Event> = Arc::new(wait::Event::new());
+    let h = object::insert(ev.clone());
+    assert!(object::get::<wait::Event>(h).is_some(), "handle lookup failed");
+
+    for i in 0..N_WORKERS {
+        sched::spawn("worker", worker, i);
+    }
+    sched::spawn("waiter", waiter, 0);
+    sched::spawn("setter", setter, 0);
+
+    let target = N_WORKERS as u64 * WORK_PER_WORKER;
+    while WORK_DONE.load(Ordering::Relaxed) < target || !WAITER_WOKE.load(Ordering::Acquire) {
+        sched::yield_now();
+    }
+
+    assert!(object::close(h), "handle close failed");
+
+    kprintln!(
+        "THOS: sched ok         {} threads, {} work units, {} ctx switches",
+        N_WORKERS + 2,
+        WORK_DONE.load(Ordering::Relaxed),
+        sched::ctx_switches()
+    );
+    kprintln!(
+        "THOS: wait primitive   waiter woke via Event; handles open {}",
+        object::open_count()
     );
 }
 
