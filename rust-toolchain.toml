@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# THOS kernel needs nightly: the `limine` crate (and typical bare-metal deps)
+# use unstable features (`ptr_metadata` etc.). Pinned for reproducibility;
+# bump deliberately and re-run CI.
+[toolchain]
+channel = "nightly-2026-08-20"
+components = ["rust-src", "llvm-tools"]
+targets = ["x86_64-unknown-none"]

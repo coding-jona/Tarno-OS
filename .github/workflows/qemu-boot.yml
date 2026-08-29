@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: qemu-boot (Milestones 0 + 1a)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        run: |
+          # rust-toolchain.toml pins the nightly; this just makes the target present.
+          rustup show active-toolchain || rustup toolchain install nightly --profile minimal
+          rustup target add x86_64-unknown-none
+          rustup component add rust-src llvm-tools
+
+      - name: Install QEMU + xorriso + OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 xorriso ovmf
+
+      - name: Build Limine
+        run: make -C third_party/limine
+
+      - name: Build kernel + ISO
+        run: cargo xtask iso
+
+      - name: Boot in QEMU and assert milestone output
+        run: |
+          set -o pipefail
+          timeout 60 cargo xtask run 2>&1 | tee boot.log || true
+          grep -q "THOS: kmain reached (Milestone 0)" boot.log
+          grep -q "THOS: framebuffer painted" boot.log
+          grep -q "THOS: usable RAM" boot.log
+          grep -q "THOS: heap smoke ok" boot.log
+          grep -q "THOS: frame alloc ok" boot.log
+          grep -q "THOS: halting." boot.log
