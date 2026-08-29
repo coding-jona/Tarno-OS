@@ -114,7 +114,8 @@ const QEMU_SUCCESS: i32 = 33;
 
 fn run_qemu(iso: &Path, gui: bool) {
     let mut qemu = Command::new("qemu-system-x86_64");
-    qemu.args(["-M", "q35", "-m", "512M", "-cdrom", iso.to_str().unwrap()]);
+    // -smp 4 so the MADT actually carries multiple Local APICs to enumerate.
+    qemu.args(["-M", "q35", "-m", "512M", "-smp", "4", "-cdrom", iso.to_str().unwrap()]);
     qemu.args(["-serial", "stdio", "-no-reboot"]);
     qemu.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     if !gui {

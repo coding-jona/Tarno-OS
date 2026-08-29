@@ -10,7 +10,7 @@
 use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
-use crate::{exit_qemu, gdt, hcf, kprintln, ExitCode};
+use crate::{apic, exit_qemu, gdt, hcf, kprintln, ExitCode};
 
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
@@ -33,6 +33,10 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_stack_index(gdt::PAGE_FAULT_IST_INDEX);
     }
 
+    // APIC vectors (>= 32).
+    idt[apic::TIMER_VECTOR].set_handler_fn(apic_timer);
+    idt[apic::SPURIOUS_VECTOR].set_handler_fn(apic_spurious);
+
     idt
 });
 
@@ -47,6 +51,15 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
         "THOS trap: #BP at {:#x}",
         frame.instruction_pointer.as_u64()
     );
+}
+
+extern "x86-interrupt" fn apic_timer(_frame: InterruptStackFrame) {
+    apic::on_timer_tick();
+    apic::eoi();
+}
+
+extern "x86-interrupt" fn apic_spurious(_frame: InterruptStackFrame) {
+    // A spurious interrupt gets no EOI by design.
 }
 
 // --- fatal ---

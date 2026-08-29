@@ -7,8 +7,11 @@
 //! Milestone 1b: load a fresh GDT + TSS (IST stacks) and an IDT with CPU
 //! exception handlers; `int3` round-trips.
 //!
+//! Milestone 1d+1e: parse the MADT; bring up the BSP Local APIC + a
+//! PIT-calibrated ~100 Hz periodic timer; interrupts fire.
+//!
 //! Still ahead in Phase 1 (see docs/thos/roadmap.md): `syscall` entry,
-//! ACPI/APIC, SMP bring-up of all 24 threads, scheduler, object manager,
+//! SMP bring-up of all 24 threads, scheduler, object manager,
 //! the one wait/sync primitive, timers.
 
 #![no_std]
@@ -18,6 +21,8 @@
 
 extern crate alloc;
 
+mod acpi;
+mod apic;
 mod gdt;
 mod idt;
 mod mm;
@@ -26,7 +31,7 @@ mod serial;
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use limine::framebuffer::Framebuffer;
-use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest};
+use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 /// Limine base-revision marker. Kept in the `.requests` section.
@@ -50,6 +55,10 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[used]
 #[link_section = ".requests"]
 static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
+
+#[used]
+#[link_section = ".requests"]
+static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 #[used]
 #[link_section = ".requests_start_marker"]
@@ -84,6 +93,7 @@ extern "C" fn kmain() -> ! {
     kprintln!("THOS: traps ok (returned from #BP)");
 
     memory_bringup();
+    acpi_apic_bringup();
 
     kprintln!("THOS: halting.");
     exit_qemu(ExitCode::Success);
@@ -134,6 +144,58 @@ fn memory_bringup() {
         free_after,
         free_restored,
         f.start_address().as_u64()
+    );
+}
+
+/// Milestone 1d + 1e: parse the MADT (CPU list, IO APICs, IRQ overrides), then
+/// bring up the BSP Local APIC and its PIT-calibrated periodic timer, and prove
+/// interrupts actually fire by waiting on a few ticks.
+fn acpi_apic_bringup() {
+    let rsdp = RSDP_REQUEST
+        .response()
+        .expect("Limine RSDP request unanswered")
+        .address as *const u8;
+
+    let info = unsafe { acpi::parse(rsdp) };
+    let enabled = info.cpus.iter().filter(|c| c.enabled).count();
+
+    kprintln!(
+        "THOS: ACPI rev {}       LAPIC @ {:#x}",
+        info.revision,
+        info.local_apic_addr
+    );
+    kprintln!(
+        "THOS: CPUs             {} ({} enabled now)",
+        info.cpus.len(),
+        enabled
+    );
+    for io in &info.io_apics {
+        kprintln!(
+            "THOS: IOAPIC id {}      @ {:#x}  gsi_base {}",
+            io.id,
+            io.address,
+            io.gsi_base
+        );
+    }
+    kprintln!("THOS: IRQ overrides    {}", info.overrides.len());
+
+    unsafe { apic::init_bsp(info.local_apic_addr) };
+    kprintln!(
+        "THOS: LAPIC id {}       timer {} counts/ms",
+        apic::bsp_apic_id(),
+        apic::counts_per_ms()
+    );
+
+    x86_64::instructions::interrupts::enable();
+    let start = apic::ticks();
+    while apic::ticks() < start + 5 {
+        x86_64::instructions::hlt();
+    }
+    x86_64::instructions::interrupts::disable();
+    kprintln!(
+        "THOS: APIC timer ok    {} ticks @ ~{} Hz",
+        apic::ticks(),
+        apic::timer_hz()
     );
 }
 
