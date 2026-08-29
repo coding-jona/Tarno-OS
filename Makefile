@@ -1,14 +1,35 @@
 .POSIX:
 
-.PHONY: build test lint devuan-iso devuan-run clean
+.PHONY: build iso run run-gui toolchain clean \
+        go-build go-test go-lint devuan-iso devuan-run
+
+# ---- THOS kernel (primary) ----
 
 build:
+	cargo xtask build
+
+iso:
+	cargo xtask iso
+
+run:
+	cargo xtask run
+
+run-gui:
+	cargo xtask run --gui
+
+toolchain:
+	rustup target add x86_64-unknown-none
+	rustup component add rust-src llvm-tools
+
+# ---- frozen Devuan distribution (see FROZEN.md) ----
+
+go-build:
 	go build ./...
 
-test:
+go-test:
 	go test ./...
 
-lint:
+go-lint:
 	golangci-lint run ./...
 
 devuan-iso:
@@ -18,4 +39,5 @@ devuan-run:
 	./scripts/run-devuan-live.sh
 
 clean:
-	cd tarno-devuan-live && (command -v sudo >/dev/null 2>&1 && sudo lb clean || doas lb clean)
+	cargo clean || true
+	rm -rf target/iso_root target/thos.iso boot.log

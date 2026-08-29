@@ -4,17 +4,22 @@
 //! Milestone 0: come up under Limine, prove serial + framebuffer output, halt.
 //! Milestone 1a: ingest the Limine memory map, stand up the physical frame
 //! allocator and a bootstrap heap, print memory stats.
+//! Milestone 1b: load a fresh GDT + TSS (IST stacks) and an IDT with CPU
+//! exception handlers; `int3` round-trips.
 //!
-//! Still ahead in Phase 1 (see docs/thos/roadmap.md): IDT/traps, `syscall`
-//! entry, ACPI/APIC, SMP bring-up of all 24 threads, scheduler, object manager,
+//! Still ahead in Phase 1 (see docs/thos/roadmap.md): `syscall` entry,
+//! ACPI/APIC, SMP bring-up of all 24 threads, scheduler, object manager,
 //! the one wait/sync primitive, timers.
 
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
+mod gdt;
+mod idt;
 mod mm;
 mod serial;
 
@@ -71,6 +76,12 @@ extern "C" fn kmain() -> ! {
         },
         None => kprintln!("THOS: framebuffer request unanswered"),
     }
+
+    gdt::init();
+    idt::init();
+    kprintln!("THOS: GDT + IDT loaded");
+    x86_64::instructions::interrupts::int3();
+    kprintln!("THOS: traps ok (returned from #BP)");
 
     memory_bringup();
 
@@ -149,7 +160,7 @@ fn paint_smoke_test(fb: &Framebuffer) {
 }
 
 /// Halt and catch fire: disable interrupts, park the CPU.
-fn hcf() -> ! {
+pub(crate) fn hcf() -> ! {
     loop {
         unsafe {
             core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags));
@@ -161,12 +172,12 @@ fn hcf() -> ! {
 /// Writing here makes QEMU exit with `(code << 1) | 1`; used by `cargo xtask run`
 /// and CI so a headless boot terminates instead of hanging on `hlt`.
 #[derive(Clone, Copy)]
-enum ExitCode {
+pub(crate) enum ExitCode {
     Success = 0x10,
     Failed = 0x11,
 }
 
-fn exit_qemu(code: ExitCode) {
+pub(crate) fn exit_qemu(code: ExitCode) {
     unsafe {
         core::arch::asm!(
             "out dx, eax",

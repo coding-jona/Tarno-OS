@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-name: qemu-boot (Milestones 0 + 1a)
+name: qemu-boot (Milestones 0, 1a, 1b)
 
 on:
   push:
@@ -38,6 +38,8 @@ jobs:
           timeout 60 cargo xtask run 2>&1 | tee boot.log || true
           grep -q "THOS: kmain reached (Milestone 0)" boot.log
           grep -q "THOS: framebuffer painted" boot.log
+          grep -q "THOS: GDT + IDT loaded" boot.log
+          grep -q "THOS: traps ok (returned from #BP)" boot.log
           grep -q "THOS: usable RAM" boot.log
           grep -q "THOS: heap smoke ok" boot.log
           grep -q "THOS: frame alloc ok" boot.log
