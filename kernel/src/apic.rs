@@ -76,24 +76,30 @@ pub fn timer_hz() -> u32 {
     TIMER_HZ
 }
 
-/// Bring the BSP's Local APIC up and arm the calibrated periodic timer.
-///
-/// # Safety
-/// `local_apic_addr` must be the physical LAPIC base from the MADT, and the IDT
-/// must already carry [`TIMER_VECTOR`] / [`SPURIOUS_VECTOR`] handlers.
-pub unsafe fn init_bsp(local_apic_addr: u64) {
+/// Record the LAPIC MMIO base (from the MADT). Call once, on the BSP, before
+/// any other APIC access.
+pub fn set_base(local_apic_addr: u64) {
     LAPIC_BASE.store(local_apic_addr + hhdm_offset(), Ordering::Relaxed);
+}
 
-    BSP_APIC_ID.store((read(REG_ID) >> 24) as u8, Ordering::Relaxed);
-
-    // Accept all priorities; software-enable with the spurious vector.
+/// Software-enable *this* CPU's Local APIC and return its APIC ID. Safe to call
+/// on the BSP and every AP. MMIO is per-CPU, so each caller touches its own APIC.
+pub fn enable_this_cpu() -> u32 {
     write(REG_TPR, 0);
     write(REG_SVR, SVR_ENABLE | SPURIOUS_VECTOR as u32);
-
-    // Nothing wired to LINT0/1 or the error LVT yet — mask them.
     write(REG_LVT_LINT0, LVT_MASKED);
     write(REG_LVT_LINT1, LVT_MASKED);
     write(REG_LVT_ERROR, LVT_MASKED);
+    read(REG_ID) >> 24
+}
+
+/// Bring up the BSP APIC and arm its PIT-calibrated ~100 Hz periodic timer.
+///
+/// # Safety
+/// The IDT must already carry [`TIMER_VECTOR`] / [`SPURIOUS_VECTOR`] handlers.
+pub unsafe fn init_bsp(local_apic_addr: u64) {
+    set_base(local_apic_addr);
+    BSP_APIC_ID.store(enable_this_cpu() as u8, Ordering::Relaxed);
 
     let per_ms = calibrate_against_pit();
     COUNTS_PER_MS.store(per_ms, Ordering::Relaxed);

@@ -10,9 +10,11 @@
 //! Milestone 1d+1e: parse the MADT; bring up the BSP Local APIC + a
 //! PIT-calibrated ~100 Hz periodic timer; interrupts fire.
 //!
+//! Milestone 1f: Limine starts the APs; each does its own GDT/TSS, shared
+//! IDT, Local APIC, GS base, then parks. All CPUs report online.
+//!
 //! Still ahead in Phase 1 (see docs/thos/roadmap.md): `syscall` entry,
-//! SMP bring-up of all 24 threads, scheduler, object manager,
-//! the one wait/sync primitive, timers.
+//! scheduler, the one wait/sync primitive, object manager.
 
 #![no_std]
 #![no_main]
@@ -27,11 +29,12 @@ mod gdt;
 mod idt;
 mod mm;
 mod serial;
+mod smp;
 
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use limine::framebuffer::Framebuffer;
-use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest};
+use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest, RsdpRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 /// Limine base-revision marker. Kept in the `.requests` section.
@@ -61,6 +64,10 @@ static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 #[used]
+#[link_section = ".requests"]
+static MP_REQUEST: MpRequest = MpRequest::new(0);
+
+#[used]
 #[link_section = ".requests_start_marker"]
 static REQUESTS_START: RequestsStartMarker = RequestsStartMarker::new();
 
@@ -86,7 +93,7 @@ extern "C" fn kmain() -> ! {
         None => kprintln!("THOS: framebuffer request unanswered"),
     }
 
-    gdt::init();
+    gdt::init(0);
     idt::init();
     kprintln!("THOS: GDT + IDT loaded");
     x86_64::instructions::interrupts::int3();
@@ -94,6 +101,9 @@ extern "C" fn kmain() -> ! {
 
     memory_bringup();
     acpi_apic_bringup();
+
+    let mp = MP_REQUEST.response().expect("Limine MP request unanswered");
+    smp::init(mp);
 
     kprintln!("THOS: halting.");
     exit_qemu(ExitCode::Success);

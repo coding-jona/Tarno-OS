@@ -1,68 +1,60 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Phase 1 — GDT + TSS.
+//! Phase 1 — per-CPU GDT + TSS.
 //!
-//! A fresh flat GDT (64-bit kernel code + data) plus one TSS whose IST slots
-//! give the nastiest faults their own known-good stacks:
-//!   * IST0 — #DF double fault (a bad kernel stack must not turn #DF into a
-//!     triple fault / reboot)
+//! Each logical CPU gets its own GDT and its own TSS: a fault on one CPU must
+//! not land on another CPU's IST stack. IST slots:
+//!   * IST0 — #DF double fault
 //!   * IST1 — NMI
-//!   * IST2 — #PF page fault (so a stack-overflow page fault is still handled)
+//!   * IST2 — #PF page fault
 //!
-//! Per-CPU GDT/TSS come with SMP bring-up; this is the BSP's.
+//! Layout is identical on every CPU, so the segment selectors are shared.
 
-use spin::Lazy;
 use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
 use x86_64::instructions::tables::load_tss;
-use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
+use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
+
+pub const MAX_CPUS: usize = 32;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 pub const NMI_IST_INDEX: u16 = 1;
 pub const PAGE_FAULT_IST_INDEX: u16 = 2;
 
-/// 20 KiB per emergency stack. Not huge, but these handlers only log and halt.
 const IST_STACK_SIZE: usize = 4096 * 5;
+const IST_SLOTS: [u16; 3] = [DOUBLE_FAULT_IST_INDEX, NMI_IST_INDEX, PAGE_FAULT_IST_INDEX];
 
-fn ist_stack() -> VirtAddr {
-    // One private static arena per call site. `#[used]` static mut, addr-of only.
-    static mut STACKS: [[u8; IST_STACK_SIZE]; 3] = [[0; IST_STACK_SIZE]; 3];
-    static NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let i = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let base = unsafe { core::ptr::addr_of_mut!(STACKS[i]) } as u64;
-    // x86 stacks grow down: hand out the top.
-    VirtAddr::new(base + IST_STACK_SIZE as u64)
-}
+#[repr(align(16))]
+struct IstStacks([[u8; IST_STACK_SIZE]; 3]);
 
-static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
-    let mut tss = TaskStateSegment::new();
-    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = ist_stack();
-    tss.interrupt_stack_table[NMI_IST_INDEX as usize] = ist_stack();
-    tss.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = ist_stack();
-    tss
-});
+static mut GDT: [GlobalDescriptorTable; MAX_CPUS] =
+    [const { GlobalDescriptorTable::new() }; MAX_CPUS];
+static mut TSS: [TaskStateSegment; MAX_CPUS] = [const { TaskStateSegment::new() }; MAX_CPUS];
+static mut IST_STACKS: [IstStacks; MAX_CPUS] =
+    [const { IstStacks([[0; IST_STACK_SIZE]; 3]) }; MAX_CPUS];
 
-struct Selectors {
-    code: SegmentSelector,
-    data: SegmentSelector,
-    tss: SegmentSelector,
-}
-
-static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
-    let mut gdt = GlobalDescriptorTable::new();
-    let code = gdt.append(Descriptor::kernel_code_segment());
-    let data = gdt.append(Descriptor::kernel_data_segment());
-    let tss = gdt.append(Descriptor::tss_segment(&TSS));
-    (gdt, Selectors { code, data, tss })
-});
-
-pub fn init() {
-    GDT.0.load();
+/// Build, load, and activate this CPU's GDT + TSS. `cpu` is a dense index
+/// (0 = BSP). Call once per CPU, early, with interrupts disabled.
+pub fn init(cpu: usize) {
+    assert!(cpu < MAX_CPUS, "cpu index out of range");
     unsafe {
-        CS::set_reg(GDT.1.code);
-        DS::set_reg(GDT.1.data);
-        ES::set_reg(GDT.1.data);
-        SS::set_reg(GDT.1.data);
-        load_tss(GDT.1.tss);
+        let tss = core::ptr::addr_of_mut!(TSS[cpu]);
+        for (i, slot) in IST_SLOTS.iter().enumerate() {
+            let stack = core::ptr::addr_of!(IST_STACKS[cpu].0[i]);
+            let top = stack as u64 + IST_STACK_SIZE as u64;
+            (*tss).interrupt_stack_table[*slot as usize] = VirtAddr::new(top);
+        }
+
+        let gdt = core::ptr::addr_of_mut!(GDT[cpu]);
+        let code = (*gdt).append(Descriptor::kernel_code_segment());
+        let data = (*gdt).append(Descriptor::kernel_data_segment());
+        let tss_sel = (*gdt).append(Descriptor::tss_segment(&*tss));
+
+        (*gdt).load_unsafe();
+        CS::set_reg(code);
+        DS::set_reg(data);
+        ES::set_reg(data);
+        SS::set_reg(data);
+        load_tss(tss_sel);
     }
 }
