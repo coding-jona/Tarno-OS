@@ -43,17 +43,32 @@ except ImportError:
     )
     sys.exit(2)
 
-BOOT_TIMEOUT = 900  # pure TCG (no /dev/kvm) can be genuinely slow to
-# get a whole live-boot + debconf + live-config + OpenRC + labwc chain
-# up; generous on purpose rather than a flaky race against real
-# hardware's much faster equivalent boot.
+BOOT_TIMEOUT = 2400  # pure TCG (no /dev/kvm, or /dev/kvm present but
+# not actually usable - see has_kvm()'s own caveat) can be genuinely
+# slow to get a whole live-boot + debconf + live-config + OpenRC +
+# labwc chain up. A first real run against this exact ISO timed out
+# completely at the previous value (900s) with zero serial output the
+# entire time - not a single boot message, meaning the boot was still
+# somewhere in that stack, not crashed (a crash or a real login prompt
+# both produce visible output) - so this is now generous enough to
+# actually distinguish "still booting under TCG" from "genuinely
+# stuck", instead of just timing out on slow-but-fine hardware.
 CMD_TIMEOUT = 60
 SENTINEL = "TARNO_SMOKE_CMD_DONE"
 
 
 def has_kvm():
+    """Best-effort check - confirms /dev/kvm exists and this process can
+    open it for read+write (what actually using it requires), not just
+    read (opening read-only would report a node that's udev-owned
+    root:root 0600 as "usable" when it isn't). Still not a guarantee:
+    QEMU's own `accel=kvm:tcg` can fail to init KVM for other reasons
+    (missing capability, nested-virt not actually enabled on the host)
+    and silently fall back to tcg with no visible warning - this only
+    rules out the one failure mode checkable from here without
+    actually spawning QEMU."""
     try:
-        with open("/dev/kvm", "rb"):
+        with open("/dev/kvm", "r+b"):
             return True
     except OSError:
         return False
@@ -118,7 +133,11 @@ def wait_for_shell(child):
     take a while to even start accepting input during early boot -
     retry sending a probe command instead of guessing a fixed delay."""
     deadline_attempts = BOOT_TIMEOUT // 10
-    for _ in range(deadline_attempts):
+    for attempt in range(deadline_attempts):
+        if attempt % 6 == 0:  # once a minute - so a slow-but-fine boot
+            # is visibly still-alive in the CI log instead of looking
+            # identical to a stuck one until the final timeout fires
+            print(f"... still waiting for a shell on ttyS0 ({attempt * 10}s elapsed)")
         child.sendline(f"echo {SENTINEL}:$?")
         try:
             child.expect(rf"{SENTINEL}:(\d+)", timeout=10)
@@ -142,6 +161,15 @@ def main():
         return 2
 
     failures = []
+
+    kvm_usable = has_kvm()
+    print(f"/dev/kvm usable (read+write): {kvm_usable}")
+    if not kvm_usable:
+        print(
+            "no KVM acceleration - this boot runs under plain software "
+            "emulation (TCG), which is slow but still functionally "
+            "correct for the config/boot bugs this test checks for"
+        )
 
     cmd = qemu_cmd(iso_path)
     print("+ " + " ".join(cmd))

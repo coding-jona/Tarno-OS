@@ -108,7 +108,15 @@ jobs:
     name: boot the ISO in QEMU and check it actually reaches a desktop
     needs: build-devuan-image
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A first real run against this ISO timed out completely at 30
+    # (with a 900s in-script boot timeout) with zero serial output the
+    # whole time - not a crash, just a live-boot+OpenRC+labwc boot that
+    # plain TCG (no confirmed /dev/kvm access) genuinely didn't finish
+    # in time. Both this and the script's own BOOT_TIMEOUT raised
+    # together, with headroom past qemu-smoke-test.py's now-2400s
+    # boot wait for setup, the post-login command round trips, and
+    # cleanup.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -133,8 +141,17 @@ jobs:
       - name: install qemu + pexpect
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86
+          sudo apt-get install -y qemu-system-x86 cpu-checker
           pip install --quiet pexpect
+
+      # Purely informational (never fails the job) - the previous run
+      # timed out with no way to tell whether KVM was actually in play
+      # or this was plain TCG the whole time. qemu-smoke-test.py prints
+      # its own has_kvm() check too, but kvm-ok additionally reports
+      # *why* not (missing CPU extension vs. permission vs. no device
+      # at all), which /dev/kvm-open-and-see can't distinguish.
+      - name: check KVM availability (informational)
+        run: kvm-ok || true
 
       - name: boot smoke test
         run: |

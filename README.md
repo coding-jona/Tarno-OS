@@ -100,8 +100,23 @@ run end-to-end against the real ISO - this sandbox has no `/dev/kvm`,
 no `qemu-system-x86_64` installed, and its network policy blocks
 `deb.devuan.org` (same class of restriction as `flathub.org`/
 `codeberg.org` elsewhere in this README), so an actual `lb build` +
-QEMU boot isn't possible here. The next CI run of this workflow is the
-first real end-to-end test.
+QEMU boot isn't possible here.
+
+That first real end-to-end run found a real problem, just not the one
+this test was built to catch: it timed out completely with zero serial
+output the whole time, not a single boot message. Not a crash -
+`BOOT_TIMEOUT` (900s) was simply too short for a full live-boot +
+OpenRC + labwc boot under plain TCG (no confirmed `/dev/kvm` access on
+that runner - `accel=kvm:tcg` silently falls back with no warning if
+KVM init fails for any reason, so a "should have KVM" runner doesn't
+guarantee it worked). Raised to 2400s (and the job's own
+`timeout-minutes` to 60 to match), added a once-a-minute "still
+waiting" heartbeat so a slow-but-fine boot looks different from a
+stuck one in the log, and added an explicit `kvm-ok` diagnostic step
+(informational, doesn't gate the job) plus a startup print of
+`has_kvm()`'s own result, so the next run says outright whether
+acceleration was actually available instead of leaving it to guesswork
+after the fact.
 
 ## Updates
 
