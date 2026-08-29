@@ -91,7 +91,15 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) ->
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
     let cr2 = x86_64::registers::control::Cr2::read_raw();
-    kprintln!("THOS trap: #PF page fault  cr2={:#x}  err={:?}", cr2, code);
+    let rsp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack)) };
+    kprintln!(
+        "THOS trap: #PF cr2={:#x} err={:?} rip={:#x} handler_rsp={:#x}",
+        cr2,
+        code,
+        frame.instruction_pointer.as_u64(),
+        rsp
+    );
     kprintln!("{:#?}", frame);
     exit_qemu(ExitCode::Failed);
     hcf();

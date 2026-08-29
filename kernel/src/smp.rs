@@ -98,6 +98,9 @@ pub fn init(mp: &MpResponse) {
 
 /// Limine AP entry point. Runs on the AP's own stack, in long mode.
 unsafe extern "C" fn ap_entry(_info: &MpInfo) -> ! {
+    // Move off Limine's page tables onto the shared kernel tables first.
+    crate::vmm::activate();
+
     let index = NEXT_INDEX.fetch_add(1, Ordering::Relaxed);
     assert!((index as usize) < MAX_CPUS, "more CPUs than MAX_CPUS");
 

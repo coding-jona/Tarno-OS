@@ -34,6 +34,7 @@ mod object;
 mod sched;
 mod serial;
 mod smp;
+mod vmm;
 mod wait;
 
 use alloc::sync::Arc;
@@ -41,7 +42,9 @@ use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use limine::framebuffer::Framebuffer;
-use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest, RsdpRequest};
+use limine::request::{
+    ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest, RsdpRequest,
+};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 /// Limine base-revision marker. Kept in the `.requests` section.
@@ -73,6 +76,10 @@ static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[used]
 #[link_section = ".requests"]
 static MP_REQUEST: MpRequest = MpRequest::new(0);
+
+#[used]
+#[link_section = ".requests"]
+static EXEC_ADDR_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
 
 #[used]
 #[link_section = ".requests_start_marker"]
@@ -108,6 +115,7 @@ extern "C" fn kmain() -> ! {
 
     memory_bringup();
     acpi_apic_bringup();
+    vmm_bringup();
 
     let mp = MP_REQUEST.response().expect("Limine MP request unanswered");
     smp::init(mp);
@@ -215,6 +223,22 @@ fn acpi_apic_bringup() {
         "THOS: APIC timer ok    {} ticks @ ~{} Hz",
         apic::ticks(),
         apic::timer_hz()
+    );
+}
+
+/// Build THOS's own page tables and switch onto them.
+fn vmm_bringup() {
+    let hhdm = HHDM_REQUEST.response().expect("HHDM request unanswered").offset;
+    let memmap = MEMMAP_REQUEST.response().expect("memory-map request unanswered");
+    let ka = EXEC_ADDR_REQUEST
+        .response()
+        .expect("Limine executable-address request unanswered");
+
+    vmm::init(hhdm, memmap.entries(), ka.physical_base, ka.virtual_base);
+
+    kprintln!(
+        "THOS: own page tables  PML4 switched; {} GiB HHDM + 4 GiB identity + W^X kernel",
+        vmm::hhdm_gib(memmap.entries())
     );
 }
 

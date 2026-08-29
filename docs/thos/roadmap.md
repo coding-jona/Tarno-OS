@@ -3,6 +3,11 @@
 Each phase produces an independently useful, testable artifact. You can stop after any
 phase without being back at zero.
 
+**Status:** Phase 0 ✔ · Phase 1 ✔ (memory, GDT/IDT/traps, ACPI/MADT, Local APIC + timer,
+SMP, scheduler + wait primitive + handle table) · own page tables ✔ (W^X kernel + HHDM +
+low identity, every CPU switched). Next: Phase 2 — VFS, AHCI, the POSIX personality.
+The `syscall` fast path moved into Phase 2 (it needs the personality layer).
+
 Honest scale: from "boots to a framebuffer" to "a Windows game runs" is multiple
 person-decades for a small team. The phasing front-loads the finite, well-understood
 work (executive core, personalities) and hits the GPU driver mountain deliberately and

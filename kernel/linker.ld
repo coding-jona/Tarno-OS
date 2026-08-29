@@ -14,13 +14,16 @@ PHDRS
 SECTIONS
 {
     . = 0xffffffff80000000;
+    __kernel_start = .;
 
+    __text_start = .;
     .text : {
         *(.text .text.*)
     } :text
-
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __text_end = .;
 
+    __rodata_start = .;
     .rodata : {
         *(.rodata .rodata.*)
     } :rodata
@@ -33,15 +36,33 @@ SECTIONS
     } :rodata
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __rodata_end = .;
 
+    __data_start = .;
     .data : {
         *(.data .data.*)
+    } :data
+
+    /* Relocated read-only data + GOT land in the writable segment; keep them
+     * inside [__data_start, __data_end) so the VMM maps them. */
+    .data.rel.ro : {
+        *(.data.rel.ro .data.rel.ro.* .data.rel.ro.local)
+    } :data
+    .got : {
+        *(.got)
+    } :data
+    .got.plt : {
+        *(.got.plt)
     } :data
 
     .bss : {
         *(COMMON)
         *(.bss .bss.*)
     } :data
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __data_end = .;
+
+    __kernel_end = .;
 
     /DISCARD/ : {
         *(.eh_frame*)

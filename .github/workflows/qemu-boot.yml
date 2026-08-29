@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-name: qemu-boot (Milestones 0, 1a-1g)
+name: qemu-boot (Milestones 0, 1a-1g, VMM)
 
 on:
   push:
@@ -49,5 +49,6 @@ jobs:
           grep -q "THOS: APIC timer ok" boot.log
           grep -qE "THOS: SMP +4/4 CPUs online" boot.log
           grep -q "THOS: sched ok" boot.log
+          grep -q "THOS: own page tables" boot.log
           grep -q "THOS: wait primitive" boot.log
           grep -q "THOS: halting." boot.log
