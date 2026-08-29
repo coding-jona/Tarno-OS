@@ -34,6 +34,7 @@ mod object;
 mod sched;
 mod serial;
 mod smp;
+mod syscall;
 mod vmm;
 mod wait;
 
@@ -119,6 +120,9 @@ extern "C" fn kmain() -> ! {
 
     let mp = MP_REQUEST.response().expect("Limine MP request unanswered");
     smp::init(mp);
+
+    syscall::init_cpu(0);
+    syscall::selftest();
 
     scheduler_milestone();
 

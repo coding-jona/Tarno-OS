@@ -13,24 +13,45 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use limine::mp::MpInfo;
 use limine::request::MpResponse;
-use x86_64::registers::model_specific::GsBase;
+use x86_64::registers::model_specific::{GsBase, KernelGsBase};
 use x86_64::VirtAddr;
 
 use crate::gdt::MAX_CPUS;
 use crate::{apic, gdt, idt, kprintln};
 
 /// CPU-local block. Reachable via the GS base once set; `self_ptr` at offset 0
-/// lets `gs:[0]` recover the pointer (used by the scheduler in 1g).
+/// lets `gs:[0]` recover the pointer. Field offsets 16/24 are referenced by the
+/// `syscall` entry stub — keep them in sync with `syscall::PERCPU_*`.
 #[repr(C)]
 pub struct PerCpu {
-    pub self_ptr: usize,
-    pub cpu_index: u32,
-    pub lapic_id: u32,
+    pub self_ptr: usize,   // 0
+    pub cpu_index: u32,    // 8
+    pub lapic_id: u32,     // 12
+    pub kernel_rsp: u64,   // 16 — kernel stack loaded by `syscall`
+    pub user_scratch: u64, // 24 — user rsp stashed across `syscall`
 }
 
 static mut PER_CPU: [PerCpu; MAX_CPUS] = [const {
-    PerCpu { self_ptr: 0, cpu_index: 0, lapic_id: 0 }
+    PerCpu { self_ptr: 0, cpu_index: 0, lapic_id: 0, kernel_rsp: 0, user_scratch: 0 }
 }; MAX_CPUS];
+
+const SYSCALL_STACK_SIZE: usize = 16 * 1024;
+#[repr(align(16))]
+#[allow(dead_code)]
+struct SyscallStack([u8; SYSCALL_STACK_SIZE]);
+static mut SYSCALL_STACKS: [SyscallStack; MAX_CPUS] =
+    [const { SyscallStack([0; SYSCALL_STACK_SIZE]) }; MAX_CPUS];
+
+/// Top of this CPU's dedicated `syscall` entry stack.
+pub fn syscall_stack_top(cpu: usize) -> u64 {
+    assert!(cpu < MAX_CPUS);
+    unsafe { core::ptr::addr_of!(SYSCALL_STACKS[cpu]) as u64 + SYSCALL_STACK_SIZE as u64 }
+}
+
+pub fn set_kernel_rsp(cpu: usize, rsp: u64) {
+    assert!(cpu < MAX_CPUS);
+    unsafe { (*core::ptr::addr_of_mut!(PER_CPU[cpu])).kernel_rsp = rsp }
+}
 
 static CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
 static CPUS_ONLINE: AtomicUsize = AtomicUsize::new(0);
@@ -65,7 +86,10 @@ unsafe fn install_percpu(index: u32, lapic_id: u32) {
     (*pc).self_ptr = pc as usize;
     (*pc).cpu_index = index;
     (*pc).lapic_id = lapic_id;
+    // Both bases point at the per-CPU block, so the `swapgs` in the syscall
+    // entry stub is a no-op value-wise until userspace installs its own TLS.
     GsBase::write(VirtAddr::new(pc as u64));
+    KernelGsBase::write(VirtAddr::new(pc as u64));
 }
 
 /// Finish BSP-side CPU-local setup (the BSP's GDT/IDT/APIC were already brought
@@ -108,6 +132,7 @@ unsafe extern "C" fn ap_entry(_info: &MpInfo) -> ! {
     idt::init(); // shared IDT, just `lidt`
     let lapic_id = apic::enable_this_cpu();
     install_percpu(index, lapic_id);
+    crate::syscall::init_cpu(index as usize);
     apic::start_periodic_timer();
 
     kprintln!("THOS: AP {} online     lapic {}", index, lapic_id);

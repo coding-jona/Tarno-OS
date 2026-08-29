@@ -108,6 +108,43 @@ pub unsafe fn activate() {
     Cr3::write(frame, Cr3Flags::empty());
 }
 
+/// Map a single 4 KiB page into the (active) kernel page tables and flush it.
+/// Used for the ring-3 self-test; the real process model gets per-process
+/// `vmspace` objects.
+pub fn map_page(virt: u64, phys: u64, writable: bool, user: bool, exec: bool) {
+    let hhdm = crate::mm::hhdm_offset();
+    let pml4_frame = *KERNEL_PML4.get().expect("vmm::init not called yet");
+    let pml4: &mut PageTable = unsafe {
+        &mut *crate::mm::phys_to_virt(pml4_frame.start_address()).as_mut_ptr::<PageTable>()
+    };
+    let mut m = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(hhdm)) };
+
+    let mut f = F::PRESENT;
+    if writable {
+        f |= F::WRITABLE;
+    }
+    if user {
+        f |= F::USER_ACCESSIBLE;
+    }
+    if !exec {
+        f |= F::NO_EXECUTE;
+    }
+
+    // Parent tables need USER_ACCESSIBLE too, or a ring-3 walk faults.
+    let parent = if user {
+        F::PRESENT | F::WRITABLE | F::USER_ACCESSIBLE
+    } else {
+        F::PRESENT | F::WRITABLE
+    };
+
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys));
+    let mut fa = FRAME_ALLOC.lock();
+    unsafe { m.map_to_with_table_flags(page, frame, f, parent, &mut *fa) }
+        .expect("map_page")
+        .flush();
+}
+
 fn map_1g(m: &mut OffsetPageTable<'_>, v: VirtAddr, p: PhysAddr, f: F) {
     let page = Page::<Size1GiB>::containing_address(v);
     let frame = PhysFrame::<Size1GiB>::containing_address(p);
