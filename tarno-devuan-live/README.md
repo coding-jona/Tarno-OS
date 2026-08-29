@@ -15,12 +15,15 @@ hooks - neither comes for free under openrc-init. Wifi isn't wired up.
 Status: builds an `.hybrid.iso` in CI, `tarnod` is packaged in, ISOLINUX
 boots (see git history for the module-symlink fix). tty1 autologs in as
 `user` (`0200-agetty-console.chroot`, agetty `--autologin`) - no
-username/password to type at all. `user-setup` + `sudo` are still what
-actually creates that account and gives it admin rights
-(`/usr/lib/live/config/0030-user-setup`, `0040-sudo` - both silently
-no-op if their package isn't installed, which is what happened before
-this was added). root is permanently locked by live-config itself,
-regardless.
+username/password to type at all. The account is created at build time
+by `0175-user-account.chroot` (plain `adduser`, fixed group list,
+locked password) rather than left to live-config's own runtime
+`0030-user-setup` component - that component happily no-ops once the
+account it wants already exists, which used to leave `user` in zero
+supplementary groups (see the top-level README's "Tenth real boot
+test" for the actual bug this caused). Admin rights come from
+`etc/sudoers.d/tarno-user` (`NOPASSWD`, by username, not by group).
+root is permanently locked by live-config itself, regardless.
 
 Build/test locally: see the top-level README.md (`make devuan-iso`,
 `make devuan-run`).

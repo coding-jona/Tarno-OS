@@ -50,6 +50,59 @@ succeed against a loopback device. The rsync + chroot + full boot cycle
 still needs a real machine to fully confirm end to end (needs the live
 system's own root, not reproducible in a dev sandbox).
 
+## Automated boot test
+
+`.github/workflows/build-devuan-image.yml` has a second job,
+`qemu-smoke-test`, that runs after every build: boots the produced ISO
+in QEMU and fails the workflow if it doesn't reach a real working
+desktop. This exists because a recurring line in this same README used
+to be "a VM test never hit this" - several real bugs (dhcpcd vs.
+live-boot's network reset, seatd/video-group crashing labwc back to a
+shell) only ever surfaced on someone's actual laptop, not because VMs
+can't reproduce them, but because nothing was actually driving a VM
+boot to completion and inspecting the result.
+
+`scripts/qemu-smoke-test.py` is what does that: a real virtual GPU
+(`-vga std`, `-display none` just means QEMU doesn't pop a window on
+the CI runner - the guest still gets a real graphics device to drive
+via DRM/KMS, same as real hardware) plus a second, independent serial
+console (`ttyS0`, autologin, see `0200-agetty-console.chroot`) the
+script drives directly - reachable regardless of whatever labwc/seatd
+are doing on the "real" tty1/monitor console, so a crash there is
+something this script can observe and report instead of a silent
+black `-display none` screen. It asserts the same things this project
+has always manually checked by hand on real hardware: `/tmp/
+tarno-desktop.log` has no `Permission denied` and no `labwc exited`,
+`rc-status default` shows `seatd`/`dhcpcd`/`tarno-earlysetup`/`tarnod`
+all `started`, `user` is actually in the `video` group,
+`/etc/network/interfaces` is still loopback-only, and `labwc`/`waybar`
+are both still running processes at the end of boot - not just "did
+QEMU exit 0".
+
+Best-effort KVM acceleration (`-accel kvm:tcg`, GitHub-hosted runners
+have had `/dev/kvm` since ~2023, just not group-writable by default -
+the workflow fixes that the same way the Android-emulator CI action
+ecosystem does), falling back to plain software emulation (slower,
+still functionally correct - these are boot/config bugs, not
+performance-dependent ones) if that doesn't pan out.
+
+Verified locally: the actual command-parsing mechanics
+(`run_cmd`/`wait_for_shell` in `qemu-smoke-test.py`) run against a
+real pty (`pexpect.spawn("/bin/bash", ...)`, not a mock) - caught and
+fixed two real bugs this way before they could produce a silently
+wrong CI result: bash's bracketed-paste-mode escape codes breaking the
+naive first-line-strip output parsing, and `rc-status default`'s
+actual output format (a leading `*` bullet before each service name)
+not matching the original regex. The `rc-status`/`tarno-desktop.log`/
+`pgrep` assertions themselves checked against realistic sample text
+built from this project's own prior real-hardware findings. **Not**
+run end-to-end against the real ISO - this sandbox has no `/dev/kvm`,
+no `qemu-system-x86_64` installed, and its network policy blocks
+`deb.devuan.org` (same class of restriction as `flathub.org`/
+`codeberg.org` elsewhere in this README), so an actual `lb build` +
+QEMU boot isn't possible here. The next CI run of this workflow is the
+first real end-to-end test.
+
 ## Updates
 
 Tarno OS ships its own tools as a normal apt repo instead of a custom
@@ -410,6 +463,77 @@ documented sanity-check pattern (confirmed against the literal grep
 expression from `/etc/init.d/dhcpcd`, so `dhcpcd` would actually start
 against this content).
 
+Ninth: real hardware repeatedly landed at a plain shell prompt instead
+of the desktop, no crash message visible - the actual symptom being
+"the OS just drops me into a shell". Root-caused by reading the real
+`live-config`, `user-setup`, and `seatd` packages rather than
+guessing: `live-config`'s own `0030-user-setup` component explicitly
+overrides `user-setup`'s default group list with an *empty* string
+(`debconf-set-selections passwd/user-default-groups`) unless a
+`live-config.user-default-groups=` kernel cmdline parameter says
+otherwise, which nothing in this image sets - so the live `user`
+account ends up in zero supplementary groups, not even
+`user-setup`'s own (already `video`-less) built-in default. Devuan's
+packaged `/etc/init.d/seatd` runs `seatd -g video` (`/etc/default/
+seatd`), which makes the seatd socket owned by the `video` group -
+without membership, `labwc`'s `libseat` backend can't connect to it
+at all, `labwc` exits immediately, and since `tarno-desktop.sh`
+deliberately doesn't `exec labwc` (so a crash is visible instead of
+silently bouncing back to login), that exit drops straight back into
+the interactive login shell - exactly the reported symptom. A
+kernel-cmdline fix wouldn't reach a disk-installed system either
+(`tarno-disk-install`'s `GRUB_CMDLINE_LINUX_DEFAULT` has no
+`boot=live`, so `live-config` - and any group list it'd assign -
+never runs again there); fixed instead with `usermod -aG video user`
+in `tarno-earlysetup`, every boot, same "don't fight the timing, just
+win the last word" approach as the two fixups above - this way both
+the live USB and anything already installed to disk self-heal on
+their next boot. Verified locally: the `usermod -aG video` logic
+tested in isolation against a real throwaway user account (starts in
+no supplementary groups, ends in exactly `video` after one run,
+idempotent on a second run). Not run against a real `seatd`/`labwc`
+pair - no such stack in this sandbox to exercise the actual socket
+connection end to end.
+
+Tenth: the Eighth and Ninth fixes above both worked by winning a race
+every boot - actively reverting whatever a third-party live-boot/
+live-config component had just done. Asked to stop patching around
+that and remove what's actually getting in the way instead, so both
+got fixed at the root:
+
+- The `/etc/network/interfaces` reset isn't `live-config` at all - it's
+  `live-boot`'s own `9990-netbase.sh`, which runs from the initramfs
+  (before `openrc-init`/anything in this image ever starts) and
+  *unconditionally* overwrites the file, confirmed against its actual
+  source. It has a documented escape hatch for exactly this: `if
+  [ "${STATICIP}" = "frommedia" ] && [ -e "${IFFILE}" ]; then ...
+  return; fi` - leave an already-existing file alone. Now set via
+  `STATICIP=frommedia` in `auto/config`'s `--bootappend-live`, so
+  live-boot never touches the file in the first place.
+- The empty-groups bug came from `live-config`'s `0030-user-setup`
+  always starting `user` from zero supplementary groups. Its own
+  `Config()` already skips itself entirely if the account it wants to
+  create already exists (`grep -q "^${LIVE_USERNAME}:" /etc/passwd`) -
+  so new hook `0175-user-account.chroot` creates `user` at *build*
+  time instead, with the right groups (`video`, `audio`, `cdrom`,
+  `dialout`, `plugdev`) from the start, no cmdline flag or
+  component-disabling needed, just winning the race by already being
+  done before live-config ever checks.
+
+`tarno-earlysetup`'s two reverts from the Eighth/Ninth fixes stay in
+place regardless, as zero-cost safety nets in case either escape hatch
+ever behaves differently on some Devuan version - but neither should
+have anything left to do. Verified locally: `live-boot`'s and
+`live-config`'s actual packaged source (`9990-netbase.sh`,
+`0030-user-setup`) read directly to confirm both guards exist and
+behave as described; the `0175-user-account.chroot` logic (`adduser`
++ `usermod -aG` + `passwd -l`) run in isolation against a real
+throwaway account - correct groups, correct locked-password state
+(`!` in `/etc/shadow`), idempotent on a second run. Not run through an
+actual `lb build` + boot - no OpenRC/live-boot host in this sandbox to
+confirm `STATICIP=frommedia` and the build-time account both behave
+identically on Devuan's exact packaged versions.
+
 ## WiFi
 
 [iwd](https://iwd.wiki.kernel.org/) instead of wpa_supplicant + a
@@ -440,10 +564,11 @@ available here), so real on-device confirmation is still needed.
 
 There isn't one - tty1 autologs in as `user` (agetty `--autologin`, see
 `tarno-devuan-live/config/hooks/0200-agetty-console.chroot`), same as
-every mainstream live image. `user-setup` + `sudo` create the account
-and add it to the `sudo` group (see `tarno-devuan-live/README.md`);
-root is always locked. Log in as `user` by hand only if you `chvt` to
-another console.
+every mainstream live image. The account itself is created at *build*
+time by `0175-user-account.chroot` (`adduser` + a fixed group list,
+locked password - see the Tenth real boot test above for why this
+moved off `user-setup`'s own runtime account creation); root is always
+locked. Log in as `user` by hand only if you `chvt` to another console.
 
 Passwordless sudo specifically comes from `etc/sudoers.d/tarno-user`
 (`user ALL=(ALL) NOPASSWD: ALL`, chmod'd to the `0440` sudo insists on

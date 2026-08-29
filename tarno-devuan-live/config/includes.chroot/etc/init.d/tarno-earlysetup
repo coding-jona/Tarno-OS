@@ -9,20 +9,34 @@
 # exactly what tarno-desktop.sh does - gets "Permission denied".
 # Confirmed on a real boot.
 #
-# Also restores /etc/network/interfaces to loopback-only every boot.
-# The file baked into the image (config/includes.chroot/etc/network/
-# interfaces) IS correct on disk - confirmed by diffing the actual git
-# source against a real boot - but live-config's own runtime network
-# component regenerates it fresh on every boot (a stock `allow-hotplug
-# eth0` / `iface eth0 inet dhcp` "just works out of the box" default),
-# running before openrc-init/this service ever gets a chance, so
-# there's no ordering trick that beats it - it has to be actively
-# reverted instead. Confirmed on a real boot: `cat
-# /etc/network/interfaces` showed exactly that stock content, and
-# `dhcpcd` refused to start because of it ("... defines some
-# interfaces that will use a DHCP client"), same failure class as the
-# original bug this was meant to have already fixed at build time.
-description="Tarno OS early boot fixups (fix /tmp perms + /etc/network/interfaces before anything else runs)"
+# Also restores /etc/network/interfaces to loopback-only every boot -
+# now a zero-cost safety net rather than the actual fix. The real
+# problem was live-boot's own 9990-netbase.sh (runs from the
+# initramfs, before openrc-init/this service ever gets a chance)
+# unconditionally overwriting the file with a stock `allow-hotplug
+# eth0` / `iface eth0 inet dhcp` "just works out of the box" default -
+# confirmed on a real boot (`dhcpcd` refused to start: "... defines
+# some interfaces that will use a DHCP client") and against live-boot's
+# own source. Actually fixed at the root via `STATICIP=frommedia` in
+# auto/config's --bootappend-live (see its comment there) - live-boot
+# leaves an already-existing /etc/network/interfaces alone with that
+# set, so this block should now never have anything to do. Left in
+# place in case that ever isn't true on some Devuan version.
+#
+# Also adds `user` to the `video` group every boot - also now a
+# zero-cost safety net. The real problem and real fix are the same
+# shape as the network one above: live-config's 0030-user-setup
+# component wipes `user`'s group list to empty (root-caused by reading
+# its actual source - see git history/PR for the long version), which
+# left labwc unable to reach seatd's socket (owned by the `video`
+# group) and crashing straight back to a login shell. Actually fixed
+# at the root by creating `user` ourselves at build time instead, with
+# the right groups from the start (see hooks/0175-user-account.chroot)
+# - live-config's own user-setup component already no-ops if the
+# account it wants to create already exists, so this needs no cmdline
+# flag or component-disabling, just winning the race by already being
+# done. Left in place as a safety net for the same reason as above.
+description="Tarno OS early boot fixups (fix /tmp perms + safety nets for /etc/network/interfaces and user's video group, actually fixed at the root elsewhere - see comments above)"
 
 depend() {
 	before agetty.tty1 dhcpcd
@@ -40,5 +54,9 @@ start() {
 	auto lo
 	iface lo inet loopback
 	EOF
+	eend $?
+
+	ebegin "Adding user to the video group (seatd's socket needs it)"
+	usermod -aG video user 2>/dev/null
 	eend $?
 }

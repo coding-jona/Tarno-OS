@@ -1,0 +1,46 @@
+#!/bin/sh
+# Creates the `user` account ourselves at build time instead of relying
+# on live-config's own 0030-user-setup runtime component to do it.
+#
+# Root-caused (by reading live-config's actual source) as the cause of
+# a real "the OS just drops me into a shell" report: 0030-user-setup
+# preseeds user-setup's `passwd/user-default-groups` debconf question
+# with an EMPTY string unless a `live-config.user-default-groups=`
+# kernel cmdline param says otherwise (nothing in this image set one),
+# so `user` ended up in zero supplementary groups - not even
+# user-setup's own (already `video`-less) built-in default. seatd's
+# packaged init script runs `seatd -g video` (its socket is owned by
+# the `video` group), so without membership labwc's libseat backend
+# couldn't connect to it at all and exited immediately, dropping
+# straight back to a shell (tarno-desktop.sh deliberately doesn't
+# `exec labwc`, so a crash here stays visible instead of silently
+# bouncing back to login).
+#
+# Rather than keep patching the account's groups back on every boot
+# (what an earlier fix did, in tarno-earlysetup - still there as a
+# zero-cost safety net), this creates the account itself with the
+# right groups from the start. live-config's own 0030-user-setup has a
+# built-in guard for exactly this - `grep -q "^${LIVE_USERNAME}:"
+# /etc/passwd; then exit 0` - so once `user` already exists it quietly
+# no-ops every boot instead of needing to be disabled.
+#
+# Password left unset/locked (`passwd -l`) - tty1's autologin uses
+# `login -f user` (see 0200-agetty-console.chroot), which is
+# pre-authenticated and never prompts for one, and root is (correctly)
+# always locked either way; no meaningful password exists to protect
+# anything on a live/demo system regardless (same reasoning as
+# tarnod's world-writable socket and the NOPASSWD sudoers drop-in).
+#
+# Groups: `video` is the one with a confirmed real bug behind it
+# (seatd's socket, see above). The rest mirror the standard set a
+# Debian/Devuan desktop's first regular user gets (`adduser` defaults
+# plus the live-image conventions user-setup itself used to apply):
+# `audio` (ALSA device nodes), `cdrom`/`dialout` (optical/serial
+# device access), `plugdev` (USB storage auto-mount).
+set -e
+
+if ! getent passwd user >/dev/null; then
+	adduser --disabled-password --gecos "" --uid 1000 user
+fi
+usermod -aG video,audio,cdrom,dialout,plugdev user
+passwd -l user >/dev/null

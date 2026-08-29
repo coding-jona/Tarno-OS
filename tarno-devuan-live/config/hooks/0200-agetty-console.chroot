@@ -33,3 +33,19 @@ echo 'agetty_options="--autologin user"' > /etc/conf.d/agetty.tty1
 # the documented way to get a manual login on another console (see
 # README's "Login" section).
 sed -i '/respawn.*getty.*tty1$/ s/^/#/' /etc/inittab
+
+# Second autologin console on ttyS0 (serial), same pattern as tty1
+# above - not for real hardware (most laptops have no serial port at
+# all, this just idles harmlessly there), it's for the automated QEMU
+# boot smoke test (scripts/qemu-smoke-test.py). Real hardware testing
+# needs a person; CI needs a console it can reliably reach regardless
+# of whatever labwc/seatd/DRM are doing on the "real" tty1/monitor
+# console, so bugs there (like the seatd/video-group one this hook's
+# git history is from) show up as a failed assertion instead of a
+# green build that only "looks" fine. Same "no meaningful password on
+# a live/demo system" reasoning as tty1's autologin - this is not a
+# new security tradeoff, just the existing one reachable from one more
+# device node.
+ln -sf agetty /etc/init.d/agetty.ttyS0
+rc-update add agetty.ttyS0 default
+echo 'agetty_options="--autologin user"' > /etc/conf.d/agetty.ttyS0

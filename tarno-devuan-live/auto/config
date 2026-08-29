@@ -28,7 +28,22 @@ lb config noauto \
 	--firmware-chroot false \
 	--firmware-binary false \
 	--binary-images iso-hybrid \
-	--bootappend-live "boot=live components init=/sbin/openrc-init" \
+	--bootappend-live "boot=live components init=/sbin/openrc-init STATICIP=frommedia" \
 	"${@}"
+
+# STATICIP=frommedia (in --bootappend-live above) tells live-boot's own
+# 9990-netbase.sh (runs from the initramfs, before openrc-init/anything
+# in this image ever starts) to leave /etc/network/interfaces alone if
+# one already exists on the media - otherwise it *unconditionally*
+# overwrites it with a stock `allow-hotplug <iface>` / `iface <iface>
+# inet dhcp` block for every detected NIC, no matter what's baked into
+# the image. Confirmed on a real boot (this is the actual root cause
+# tarno-earlysetup's own /etc/network/interfaces reset was fighting
+# every boot - see its comment) and confirmed against live-boot's own
+# source (lib/live/boot/9990-netbase.sh, the exact `if [ "${STATICIP}"
+# = "frommedia" ] && [ -e "${IFFILE}" ]; then ... return; fi` guard).
+# tarno-earlysetup's reset stays in place regardless, as a zero-cost
+# safety net - this stops the fight at the root instead of relying on
+# always winning a boot-order race.
 
 exit 0
