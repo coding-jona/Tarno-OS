@@ -35,6 +35,7 @@ mod idt;
 mod mm;
 mod object;
 mod pci;
+mod process;
 mod sched;
 mod serial;
 mod smp;
@@ -127,7 +128,6 @@ extern "C" fn kmain() -> ! {
     smp::init(mp);
 
     syscall::init_cpu(0);
-    syscall::selftest();
 
     scheduler_milestone();
     storage_milestone();
@@ -341,14 +341,25 @@ fn storage_milestone() {
     let bytes = fs.read_path("/hello").expect("read /hello from ext2");
     kprintln!("THOS: ext2 ok          /hello = {} bytes", bytes.len());
 
-    let img = elf::load(&bytes).expect("load ELF");
-    kprintln!("THOS: elf ok           entry {:#x}", img.entry);
-
-    const USER_STACK: u64 = 0x5555_2000_0000;
-    let sframe = mm::FRAME_ALLOC.lock().alloc().expect("user stack frame");
-    vmm::map_page(USER_STACK, sframe.start_address().as_u64(), true, true, false);
-    syscall::enter_user(img.entry, USER_STACK + 0x1000);
-    kprintln!("THOS: user ELF ran      (returned via SYS_EXIT)");
+    // Two instances of the same ELF, each in its own address space, running as
+    // real preemptible user threads. Each prints and then SYS_EXITs.
+    let want = 2;
+    for i in 0..want {
+        let proc = process::Process::new();
+        let img = elf::load(&*proc, &bytes).expect("load ELF");
+        if i == 0 {
+            kprintln!("THOS: elf ok           entry {:#x}", img.entry);
+        }
+        let ustack = proc.new_user_stack();
+        sched::spawn_user("hello", proc, img.entry, ustack);
+    }
+    while syscall::user_exits() < want {
+        sched::yield_now();
+    }
+    kprintln!(
+        "THOS: user process ok  {} procs, own address spaces, exited via SYS_EXIT",
+        want
+    );
 }
 
 /// Fill the framebuffer with a recognizable gradient so a human at the target

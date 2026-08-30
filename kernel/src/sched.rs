@@ -22,9 +22,13 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use spin::Mutex;
 use x86_64::instructions::interrupts;
+use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::structures::paging::PhysFrame;
+use x86_64::{PhysAddr, VirtAddr};
 
 use crate::gdt::MAX_CPUS;
-use crate::smp;
+use crate::process::Process;
+use crate::{gdt, smp, vmm};
 
 core::arch::global_asm!(
     r#"
@@ -54,12 +58,25 @@ thos_thread_trampoline:
     mov rdi, r13
     call r12
     call thos_thread_exit
+
+.globl thos_user_thread_start
+// entered via `ret` from thos_ctx_switch with
+//   r12=user rip, r13=user rsp, r14=user cs, r15=user ss
+thos_user_thread_start:
+    push r15
+    push r13
+    push 0x202          // RFLAGS with IF=1 -> the user thread is preemptible
+    push r14
+    push r12
+    swapgs
+    iretq
 "#
 );
 
 extern "C" {
     fn thos_ctx_switch(save_to: *mut u64, load_from: *const u64);
     fn thos_thread_trampoline() -> !;
+    fn thos_user_thread_start() -> !;
 }
 
 #[no_mangle]
@@ -77,7 +94,7 @@ enum State {
     Exited,
 }
 
-#[allow(dead_code)] // id/name are for debugging + future /proc-style views
+#[allow(dead_code)] // id/name/proc are for debugging, lifetime, /proc-style views
 pub struct Thread {
     pub id: u64,
     pub name: &'static str,
@@ -88,6 +105,15 @@ pub struct Thread {
     /// the bootloader gave us (the BSP boot thread, each AP's idle thread).
     _stack: Option<Box<[u8]>>,
     is_idle: bool,
+    /// Physical PML4 base to load into CR3 for this thread (kernel PML4 for
+    /// kernel threads; the process PML4 for user threads).
+    cr3: u64,
+    /// Top of this thread's kernel stack — programmed into TSS.RSP0 and the
+    /// syscall entry (`gs:[kernel_rsp]`) when it runs, so a ring transition
+    /// from user lands here. `None` = never takes a ring transition.
+    kstack_top: Option<u64>,
+    /// Held to keep the address space alive for the thread's lifetime.
+    proc: Option<Arc<Process>>,
 }
 
 unsafe impl Send for Thread {}
@@ -114,34 +140,74 @@ impl Thread {
             ctx: UnsafeCell::new(0),
             _stack: None,
             is_idle,
+            cr3: vmm::kernel_pml4_phys(),
+            kstack_top: None,
+            proc: None,
         })
     }
 
-    fn spawned(id: u64, name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -> Arc<Self> {
+    /// Lay out the initial kernel stack so the first `thos_ctx_switch` pops the
+    /// six saved registers and `ret`s into `entry_asm` with r12..r15 preloaded.
+    fn build_stack(entry_asm: u64, r12: u64, r13: u64, r14: u64, r15: u64) -> (Box<[u8]>, u64, u64) {
         let mut stack = vec![0u8; KSTACK_SIZE].into_boxed_slice();
         let base = stack.as_mut_ptr() as usize;
-        // 16-byte aligned, then -8 so that after the trampoline's own `call`
-        // the callee sees rsp % 16 == 0.
-        let mut sp = (base + KSTACK_SIZE) & !0xF;
-        sp -= 8;
+        let top = (base + KSTACK_SIZE) & !0xF;
+        let mut sp = top - 8; // so the callee sees rsp % 16 == 0 after its `call`
         sp -= 7 * 8;
         unsafe {
             let s = sp as *mut u64;
-            *s.add(0) = 0; // r15
-            *s.add(1) = 0; // r14
-            *s.add(2) = arg as u64; // r13
-            *s.add(3) = entry as u64; // r12
+            *s.add(0) = r15;
+            *s.add(1) = r14;
+            *s.add(2) = r13;
+            *s.add(3) = r12;
             *s.add(4) = 0; // rbx
             *s.add(5) = 0; // rbp
-            *s.add(6) = thos_thread_trampoline as *const () as u64; // return address
+            *s.add(6) = entry_asm; // return address
         }
+        (stack, sp as u64, top as u64)
+    }
+
+    fn spawned(id: u64, name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -> Arc<Self> {
+        let (stack, sp, top) = Self::build_stack(
+            thos_thread_trampoline as *const () as u64,
+            entry as u64,
+            arg as u64,
+            0,
+            0,
+        );
         Arc::new(Self {
             id,
             name,
             state: Mutex::new(State::Ready),
-            ctx: UnsafeCell::new(sp as u64),
+            ctx: UnsafeCell::new(sp),
             _stack: Some(stack),
             is_idle: false,
+            cr3: vmm::kernel_pml4_phys(),
+            kstack_top: Some(top),
+            proc: None,
+        })
+    }
+
+    fn spawned_user(id: u64, name: &'static str, proc: Arc<Process>, entry: u64, user_rsp: u64) -> Arc<Self> {
+        let s = gdt::selectors();
+        let (stack, sp, top) = Self::build_stack(
+            thos_user_thread_start as *const () as u64,
+            entry,
+            user_rsp,
+            (s.user_code.0 | 3) as u64,
+            (s.user_data.0 | 3) as u64,
+        );
+        let cr3 = proc.pml4_phys();
+        Arc::new(Self {
+            id,
+            name,
+            state: Mutex::new(State::Ready),
+            ctx: UnsafeCell::new(sp),
+            _stack: Some(stack),
+            is_idle: false,
+            cr3,
+            kstack_top: Some(top),
+            proc: Some(proc),
         })
     }
 }
@@ -235,6 +301,29 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -
     id
 }
 
+/// Create a runnable *user* thread: it enters ring 3 at `entry` on `user_rsp`
+/// the first time it is scheduled, in `proc`'s address space.
+pub fn spawn_user(name: &'static str, proc: Arc<Process>, entry: u64, user_rsp: u64) -> u64 {
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let t = Thread::spawned_user(id, name, proc, entry, user_rsp);
+    SCHED.lock().ready.push_back(t);
+    id
+}
+
+/// Point CR3 + the ring-transition stacks at the thread we're about to run.
+/// Runs with interrupts disabled, right before `thos_ctx_switch`.
+fn apply_cpu_state(cpu: usize, cr3: u64, kstack_top: Option<u64>) {
+    let cur = Cr3::read().0.start_address().as_u64();
+    if cr3 != cur {
+        let frame = PhysFrame::from_start_address(PhysAddr::new(cr3)).expect("cr3 aligned");
+        unsafe { Cr3::write(frame, Cr3Flags::empty()) };
+    }
+    if let Some(top) = kstack_top {
+        gdt::set_kernel_stack(cpu, VirtAddr::new(top));
+        smp::set_kernel_rsp(cpu, top);
+    }
+}
+
 /// Voluntarily give up the CPU.
 pub fn yield_now() {
     if !STARTED.load(Ordering::Acquire) {
@@ -267,18 +356,19 @@ pub fn unblock(t: Arc<Thread>) {
 /// Terminate the current thread. Never returns.
 pub fn exit() -> ! {
     interrupts::disable();
-    let load = {
+    let (load, cpu, cr3, kstack_top) = {
         let mut s = SCHED.lock();
         let cpu = smp::this_cpu() as usize;
         let prev = s.cpus[cpu].current.take().expect("exit: no current thread");
         prev.set_state(State::Exited);
         let next = pick_next(&mut s, cpu);
         next.set_state(State::Running);
-        let load = next.ctx_ptr();
+        let out = (next.ctx_ptr(), cpu, next.cr3, next.kstack_top);
         s.cpus[cpu].current = Some(next);
         s.graveyard.push(prev); // keep the stack alive
-        load
+        out
     };
+    apply_cpu_state(cpu, cr3, kstack_top);
     let mut scratch = 0u64;
     unsafe { thos_ctx_switch(&mut scratch, load) };
     unreachable!("switched back into an exited thread")
@@ -293,7 +383,7 @@ fn pick_next(s: &mut Inner, cpu: usize) -> Arc<Thread> {
 /// The core switch. `block` = don't return the current thread to the ready
 /// queue (it is going to sleep). Must run with interrupts disabled.
 fn reschedule(block: bool) {
-    let (save, load) = {
+    let (save, load, cpu, cr3, kstack_top) = {
         let mut s = SCHED.lock();
         let cpu = smp::this_cpu() as usize;
 
@@ -315,14 +405,15 @@ fn reschedule(block: bool) {
             s.ready.push_back(prev.clone());
         }
         next.set_state(State::Running);
+        let out = (prev.ctx_ptr(), next.ctx_ptr(), cpu, next.cr3, next.kstack_top);
         s.cpus[cpu].current = Some(next.clone());
-
-        (prev.ctx_ptr(), next.ctx_ptr())
+        out
         // `prev` / `next` locals drop here. `next` stays alive via
         // `cpus[cpu].current`; `prev` stays alive via the ready queue (yield),
         // a wait queue (block), or the graveyard (exit, handled separately).
     };
 
+    apply_cpu_state(cpu, cr3, kstack_top);
     CTX_SWITCHES.fetch_add(1, Ordering::Relaxed);
     unsafe { thos_ctx_switch(save, load) };
 }

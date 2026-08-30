@@ -7,7 +7,7 @@
 //! with the userland loader (`ld.so` equivalent) in the POSIX personality.
 
 use crate::mm::{phys_to_virt, FRAME_ALLOC};
-use crate::vmm;
+use crate::process::Process;
 
 pub struct Image {
     pub entry: u64,
@@ -23,7 +23,7 @@ fn u64le(b: &[u8]) -> u64 {
     u64::from_le_bytes(b[..8].try_into().unwrap())
 }
 
-pub fn load(image: &[u8]) -> Result<Image, &'static str> {
+pub fn load(proc: &Process, image: &[u8]) -> Result<Image, &'static str> {
     if image.len() < 64 || &image[0..4] != b"\x7FELF" {
         return Err("not an ELF");
     }
@@ -55,13 +55,21 @@ pub fn load(image: &[u8]) -> Result<Image, &'static str> {
         let p_vaddr = u64le(&ph[16..]);
         let p_filesz = u64le(&ph[32..]);
         let p_memsz = u64le(&ph[40..]);
-        map_segment(image, p_offset, p_vaddr, p_filesz, p_memsz, flags);
+        map_segment(proc, image, p_offset, p_vaddr, p_filesz, p_memsz, flags);
     }
 
     Ok(Image { entry: e_entry })
 }
 
-fn map_segment(image: &[u8], p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64, flags: u32) {
+fn map_segment(
+    proc: &Process,
+    image: &[u8],
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    flags: u32,
+) {
     let exec = flags & 1 != 0;
     let vstart = p_vaddr;
     let vend = p_vaddr + p_memsz;
@@ -86,7 +94,7 @@ fn map_segment(image: &[u8], p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz
 
         // Map writable for now (a real loader tightens to W^X per p_flags once
         // relocations are applied).
-        vmm::map_page(page, phys.as_u64(), true, true, exec);
+        proc.map(page, phys.as_u64(), true, exec);
         page += 4096;
     }
 }

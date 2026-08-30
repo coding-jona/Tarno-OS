@@ -22,9 +22,9 @@ use x86_64::{PhysAddr, VirtAddr};
 
 const FRAME_SIZE: u64 = 4096;
 
-/// Bootstrap heap: 2 MiB static arena. Enough for early executive-core
+/// Bootstrap heap: 8 MiB static arena. Enough through early Phase 2;
 /// bookkeeping; replaced by a page-backed heap once we own the page tables.
-const HEAP_SIZE: usize = 2 * 1024 * 1024;
+const HEAP_SIZE: usize = 8 * 1024 * 1024;
 static mut HEAP_ARENA: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 #[global_allocator]
@@ -38,7 +38,6 @@ pub fn hhdm_offset() -> u64 {
 }
 
 /// Translate a physical address into its HHDM virtual address.
-#[allow(dead_code)] // used once page-table management lands
 pub fn phys_to_virt(pa: PhysAddr) -> VirtAddr {
     VirtAddr::new(pa.as_u64() + hhdm_offset())
 }
