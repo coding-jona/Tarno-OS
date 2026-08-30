@@ -5,6 +5,8 @@
 //! them (with a US layout + shift), echoes to the serial console, does minimal
 //! line editing (backspace), and queues bytes for `read` on fd 0.
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use alloc::collections::VecDeque;
 
 use spin::Mutex;
@@ -15,6 +17,21 @@ static QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
 static PREV: Mutex<[u8; 6]> = Mutex::new([0; 6]);
 /// Bytes on the current line not yet consumed by a reader — for backspace.
 static LINE_LEN: Mutex<usize> = Mutex::new(0);
+
+/// Echo mode: 0 = echo the character, 1 = echo `*` (password entry),
+/// 2 = echo nothing.
+static ECHO: AtomicU8 = AtomicU8::new(0);
+
+#[allow(dead_code)] // used by the `interactive` login flow
+pub const ECHO_NORMAL: u8 = 0;
+#[allow(dead_code)]
+pub const ECHO_MASKED: u8 = 1;
+
+/// Set how typed characters are echoed to the serial console.
+#[allow(dead_code)]
+pub fn set_echo(mode: u8) {
+    ECHO.store(mode, Ordering::Relaxed);
+}
 
 /// HID Usage ID → ASCII for a **German (QWERTZ, ISO)** layout.
 ///
@@ -87,13 +104,16 @@ pub fn feed_report(rpt: &[u8; 8]) {
         if c == 0 {
             continue;
         }
+        let echo = ECHO.load(Ordering::Relaxed);
         if c == 0x08 {
             let mut ll = LINE_LEN.lock();
             if *ll > 0 {
                 *ll -= 1;
                 let mut q = QUEUE.lock();
                 q.pop_back();
-                serial::write_bytes(b"\x08 \x08");
+                if echo != 2 {
+                    serial::write_bytes(b"\x08 \x08");
+                }
             }
         } else {
             QUEUE.lock().push_back(c);
@@ -103,7 +123,11 @@ pub fn feed_report(rpt: &[u8; 8]) {
             } else {
                 *ll += 1;
             }
-            serial::write_bytes(&[c]);
+            match echo {
+                1 if c != b'\n' => serial::write_bytes(b"*"),
+                2 => {}
+                _ => serial::write_bytes(&[c]),
+            }
         }
     }
     *prev = keys;

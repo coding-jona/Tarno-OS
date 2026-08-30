@@ -179,6 +179,17 @@ Phasing:
 - **Phase 2 (stub):** the `Principal` object exists; a console `login` runs before
   the shell and sets the session's principal; files carry an owner + mode bits;
   one admin principal; `elevate` = a password re-check.
+  - Status: **first-run setup + login done** (`kernel/src/{cred,login}.rs`). No
+    account ships. First boot forces the operator to set the admin name +
+    password (masked) in a console overlay; it is PBKDF2-HMAC-SHA-256'd (salt
+    from `RDRAND`, soft-SHA — the kernel only enables SSE) into
+    `/etc/thos/admin.cred` on ext2. Every later boot authenticates against it;
+    the session `Principal` (uid 1000 — the admin session is unprivileged) is
+    stamped onto every task and returned by `getuid`/`getgid`. `cargo xtask
+    login-test`: setup runs once, reboot goes straight to login, a wrong
+    password is rejected. Still stub: PBKDF2 not argon2id, no `Principal`
+    object proper, no file-owner enforcement, no `elevate` yet, password
+    changing is "rewrite the store + reboot" not a settings action.
 - **Phase 3 (full):** SID / token model, NT DACL ↔ canonical-ACL translation, the
   UAC path, the trusted-path prompt, privilege sets (`SeDebugPrivilege` …).
 

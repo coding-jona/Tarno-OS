@@ -290,11 +290,29 @@ impl Process {
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static TASKS: Mutex<BTreeMap<u64, Arc<Task>>> = Mutex::new(BTreeMap::new());
 
+/// The logged-in session identity, stamped onto every task created after login.
+/// `(uid, name)`. Grows into the executive `Principal`.
+static SESSION_UID: AtomicU64 = AtomicU64::new(0);
+static SESSION_NAME: Mutex<String> = Mutex::new(String::new());
+
+/// Record the identity resolved by `login` (see `login::establish`).
+#[allow(dead_code)] // only the `interactive` build has a login flow
+pub fn set_session(name: &str, uid: u32) {
+    SESSION_UID.store(uid as u64, Ordering::Relaxed);
+    *SESSION_NAME.lock() = name.into();
+}
+
+/// This task's user id (from the login session; 0 for tasks spawned pre-login).
+pub fn current_uid() -> u32 {
+    sched::current().task().map(|t| t.uid).unwrap_or(0)
+}
+
 type Fd = Option<Arc<dyn FileOps>>;
 
 pub struct Task {
     pub pid: u64,
     pub ppid: u64,
+    pub uid: u32,
     space: Mutex<Arc<Process>>,
     exit_status: Mutex<Option<i32>>,
     exited: AtomicBool,
@@ -313,6 +331,7 @@ impl Task {
         let t = Arc::new(Self {
             pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
             ppid,
+            uid: SESSION_UID.load(Ordering::Relaxed) as u32,
             space: Mutex::new(space),
             exit_status: Mutex::new(None),
             exited: AtomicBool::new(false),

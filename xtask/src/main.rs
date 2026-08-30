@@ -36,6 +36,11 @@ fn main() {
             let iso = build_iso();
             kbd_test(&iso);
         }
+        "login-test" => {
+            build_kernel(&["interactive"]);
+            let iso = build_iso();
+            login_test(&iso);
+        }
         "bootpick" => {
             build_uefi();
         }
@@ -246,17 +251,14 @@ fn disk_image() -> PathBuf {
     img
 }
 
-/// Boot the (interactive-feature) kernel, type `init<Enter>` into the USB
-/// keyboard via the QEMU monitor, and check that the console echoed it *and*
-/// that the shell forked+execve'd `/init` (its "parent done" landed on serial).
-fn kbd_test(iso: &Path) {
-    use std::io::Read;
-    use std::time::{Duration, Instant};
+// --- shared plumbing for the interactive (monitor-driven) QEMU tests ---
 
-    let disk = disk_image();
+/// Spawn the interactive kernel with a USB keyboard, serial → file, and the
+/// QEMU monitor on a UNIX socket. Returns `(child, serial_log, monitor_sock)`.
+fn spawn_interactive_qemu(tag: &str, iso: &Path, disk: &Path) -> (std::process::Child, PathBuf, PathBuf) {
     let root = workspace_root();
-    let log = root.join("target/kbd-serial.log");
-    let sock = root.join("target/kbd-mon.sock");
+    let log = root.join(format!("target/{tag}-serial.log"));
+    let sock = root.join(format!("target/{tag}-mon.sock"));
     let _ = std::fs::remove_file(&log);
     let _ = std::fs::remove_file(&sock);
 
@@ -276,44 +278,141 @@ fn kbd_test(iso: &Path) {
             break;
         }
     }
-    let mut child = qemu.spawn().expect("spawn qemu");
+    let child = qemu.spawn().expect("spawn qemu");
+    (child, log, sock)
+}
 
-    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
-    let deadline = Instant::now() + Duration::from_secs(40);
-    while Instant::now() < deadline && !read_log().contains("interactive hold") {
-        std::thread::sleep(Duration::from_millis(300));
+/// Poll `log` until it contains `needle` or `secs` elapse.
+fn wait_for(log: &Path, needle: &str, secs: u64) -> bool {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if std::fs::read_to_string(log).unwrap_or_default().contains(needle) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
-    if !read_log().contains("interactive hold") {
-        let _ = child.kill();
-        eprintln!("kbd-test: kernel never reached the interactive hold\n{}", read_log());
-        exit(1);
-    }
-    std::thread::sleep(Duration::from_millis(500));
+    false
+}
 
-    for k in ["i", "n", "i", "t", "ret"] {
-        let mut s = std::os::unix::net::UnixStream::connect(&sock).expect("connect monitor");
-        use std::io::Write;
-        writeln!(s, "sendkey {k}").ok();
-        let mut _drain = String::new();
-        let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
-        let _ = s.read_to_string(&mut _drain);
-        std::thread::sleep(Duration::from_millis(150));
-    }
-    std::thread::sleep(Duration::from_millis(1500));
+fn mon(sock: &Path, cmd: &str) {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    let mut s = std::os::unix::net::UnixStream::connect(sock).expect("connect monitor");
+    writeln!(s, "{cmd}").ok();
+    let _ = s.set_read_timeout(Some(Duration::from_millis(80)));
+    let mut drain = String::new();
+    let _ = s.read_to_string(&mut drain);
+    std::thread::sleep(Duration::from_millis(110));
+}
 
-    let out = read_log();
+/// Type `text` (ascii `a-z0-9` only — QEMU `sendkey` names) then Enter.
+fn type_line(sock: &Path, text: &str) {
+    for c in text.chars() {
+        mon(sock, &format!("sendkey {c}"));
+    }
+    mon(sock, "sendkey ret");
+}
+
+fn kill(child: &mut std::process::Child, tag: &str, why: &str, log: &Path) -> ! {
+    let _ = child.kill();
+    let _ = child.wait();
+    eprintln!("{tag}: FAIL — {why}\n--- serial ---\n{}\n---", std::fs::read_to_string(log).unwrap_or_default());
+    exit(1);
+}
+
+/// Log in with the fixed test admin (`thos` / `pass`), running first-run setup
+/// first if the serial shows it.
+fn drive_login(sock: &Path, log: &Path, child: &mut std::process::Child, tag: &str) {
+    if wait_for(log, "THOS first-run setup", 8) {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        type_line(sock, "thos"); // admin username
+        type_line(sock, "pass"); // password
+        type_line(sock, "pass"); // repeat
+        if !wait_for(log, "THOS login:", 20) {
+            kill(child, tag, "no login prompt after first-run setup", log);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    type_line(sock, "thos");
+    type_line(sock, "pass");
+}
+
+/// Boot the interactive kernel: run first-run setup + login, then type
+/// `init<Enter>` and check the shell forked+execve'd it.
+fn kbd_test(iso: &Path) {
+    let _ = std::fs::remove_file(workspace_root().join("target/disk.img"));
+    let disk = disk_image();
+    let (mut child, log, sock) = spawn_interactive_qemu("kbd", iso, &disk);
+
+    if !wait_for(&log, "THOS first-run setup", 40) {
+        kill(&mut child, "kbd-test", "kernel never reached first-run setup", &log);
+    }
+    drive_login(&sock, &log, &mut child, "kbd-test");
+
+    if !wait_for(&log, "interactive hold", 25) {
+        kill(&mut child, "kbd-test", "never reached the shell after login", &log);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    type_line(&sock, "init");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    let out = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = child.kill();
     let _ = child.wait();
 
     let after = out.split("interactive hold").nth(1).unwrap_or("");
-    let echoed = after.contains("thos$ init");
-    let ran = after.contains("parent done");
-    if echoed && ran {
-        println!("kbd-test: OK — typed `init`, shell forked+execve'd it (saw \"parent done\")");
+    if after.contains("thos$ init") && after.contains("parent done") {
+        println!("kbd-test: OK — first-run setup + login, shell ran `init`");
     } else {
-        eprintln!(
-            "kbd-test: FAIL — echoed={echoed} ran={ran} (want both)\n---\n{after}\n---"
-        );
+        eprintln!("kbd-test: FAIL — after login:\n---\n{after}\n---");
+        exit(1);
+    }
+}
+
+/// First-run setup happens exactly once; reboot goes straight to login; a wrong
+/// password is rejected.
+fn login_test(iso: &Path) {
+    let _ = std::fs::remove_file(workspace_root().join("target/disk.img"));
+    let disk = disk_image();
+
+    // Boot 1 — fresh disk: must run first-run setup, then log in.
+    let (mut c1, log1, sock1) = spawn_interactive_qemu("login1", iso, &disk);
+    if !wait_for(&log1, "THOS first-run setup", 40) {
+        kill(&mut c1, "login-test", "boot 1 showed no first-run setup", &log1);
+    }
+    drive_login(&sock1, &log1, &mut c1, "login-test");
+    let ok1 = wait_for(&log1, "interactive hold", 25);
+    let _ = c1.kill();
+    let _ = c1.wait();
+    if !ok1 {
+        eprintln!("login-test: FAIL — boot 1 never reached the shell");
+        exit(1);
+    }
+
+    // Boot 2 — same disk: straight to login, no setup; reject a wrong password.
+    let (mut c2, log2, sock2) = spawn_interactive_qemu("login2", iso, &disk);
+    if !wait_for(&log2, "THOS login:", 40) {
+        kill(&mut c2, "login-test", "boot 2 showed no login prompt", &log2);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    type_line(&sock2, "thos");
+    type_line(&sock2, "wrongpw");
+    if !wait_for(&log2, "login incorrect", 20) {
+        kill(&mut c2, "login-test", "boot 2 did not reject the wrong password", &log2);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    type_line(&sock2, "thos");
+    type_line(&sock2, "pass");
+    let ok2 = wait_for(&log2, "interactive hold", 25);
+    let full2 = std::fs::read_to_string(&log2).unwrap_or_default();
+    let _ = c2.kill();
+    let _ = c2.wait();
+
+    if ok2 && !full2.contains("first-run setup") {
+        println!("login-test: OK — setup once, login on reboot, wrong password rejected");
+    } else {
+        eprintln!("login-test: FAIL — ok2={ok2}, setup_ran_again={}", full2.contains("first-run setup"));
         exit(1);
     }
 }

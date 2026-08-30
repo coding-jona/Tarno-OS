@@ -30,11 +30,15 @@ mod ahci;
 mod apic;
 mod console;
 mod cpu;
+#[cfg(feature = "interactive")]
+mod cred;
 mod elf;
 mod ext2;
 mod file;
 mod gdt;
 mod idt;
+#[cfg(feature = "interactive")]
+mod login;
 mod mm;
 mod object;
 mod pci;
@@ -139,11 +143,16 @@ extern "C" fn kmain() -> ! {
 
     #[cfg(feature = "interactive")]
     {
-        // Milestone 2: launch the shell off ext2 and hand it the USB keyboard.
+        // Milestone 2: first-run setup / login, then launch the shell off ext2
+        // and hand it the USB keyboard.
         let fs = ext2::open().expect("mount ext2 for the shell");
+        let session = login::establish(&fs);
+        process::set_session(&session.name, session.uid);
+        kprintln!("THOS: session          {} (uid {})", session.name, session.uid);
+
         let sh = fs.read_path("/sh").expect("read /sh from ext2");
         kprintln!("THOS: shell            /sh = {} bytes", sh.len());
-        process::spawn_init(&sh, &["/sh"], &["PATH=/"]);
+        process::spawn_init(&sh, &["/sh"], &["PATH=/", "HOME=/"]);
 
         kprintln!("THOS: interactive hold — type on the USB keyboard");
         loop {

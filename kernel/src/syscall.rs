@@ -47,6 +47,10 @@ const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_IOCTL: u64 = 16;
 const SYS_WRITEV: u64 = 20;
 const SYS_GETPID: u64 = 39;
+const SYS_GETUID: u64 = 102;
+const SYS_GETGID: u64 = 104;
+const SYS_GETEUID: u64 = 107;
+const SYS_GETEGID: u64 = 108;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
@@ -377,6 +381,7 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         }
 
         SYS_GETPID | SYS_GETTID => process::current_pid() as i64,
+        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => process::current_uid() as i64,
         SYS_SET_TID_ADDRESS => process::current_pid() as i64,
         SYS_IOCTL => ENOTTY,
         SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_RT_SIGRETURN | SYS_SET_ROBUST_LIST

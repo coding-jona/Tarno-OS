@@ -574,6 +574,7 @@ fn finish_switch() {
 /// Free the kernel stacks of exited threads. Safe to call from anywhere: a
 /// corpse is only dropped once no CPU is on its stack (`running` cleared by
 /// `finish_switch`) and nothing else still holds a reference.
+#[allow(dead_code)] // driven by the `stress` milestone today; a reaper thread later
 pub fn reap() {
     let mut s = SCHED.lock();
     let mut i = 0;

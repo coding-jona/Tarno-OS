@@ -69,8 +69,11 @@ jobs:
           grep -q "THOS: wait primitive" boot.log
           grep -q "THOS: halting." boot.log
 
-      - name: Interactive shell end-to-end (type `init` on the USB keyboard, expect it to run)
+      - name: Interactive shell end-to-end (first-run setup + login, then run `init`)
         run: cargo xtask kbd-test
+
+      - name: Login end-to-end (setup once, login on reboot, wrong password rejected)
+        run: cargo xtask login-test
 
       - name: Boot picker end-to-end (3 fake disks under OVMF, chainload the default)
         run: cargo xtask bootpick-test
