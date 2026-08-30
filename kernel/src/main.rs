@@ -26,14 +26,18 @@
 extern crate alloc;
 
 mod acpi;
+mod ahci;
 mod apic;
 mod gdt;
 mod idt;
 mod mm;
 mod object;
+mod pci;
 mod sched;
 mod serial;
 mod smp;
+mod syscall;
+mod vfs;
 mod vmm;
 mod wait;
 
@@ -120,7 +124,11 @@ extern "C" fn kmain() -> ! {
     let mp = MP_REQUEST.response().expect("Limine MP request unanswered");
     smp::init(mp);
 
+    syscall::init_cpu(0);
+    syscall::selftest();
+
     scheduler_milestone();
+    storage_milestone();
 
     kprintln!("THOS: halting.");
     exit_qemu(ExitCode::Success);
@@ -306,6 +314,35 @@ fn scheduler_milestone() {
         "THOS: wait primitive   waiter woke via Event; handles open {}",
         object::open_count()
     );
+}
+
+/// Phase 2 milestone: a VFS with an in-memory file opened through the handle
+/// table, and the AHCI driver reading real sectors off the SATA disk.
+fn storage_milestone() {
+    vfs::init();
+    let f = vfs::create("/hello");
+    f.write_at(0, b"hello from the ram fs\n");
+    let h = vfs::open("/hello").expect("open /hello");
+    let mut buf = [0u8; 64];
+    let n = vfs::read(h, &mut buf).unwrap_or(0);
+    serial::print(core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    vfs::close(h);
+    kprintln!("THOS: vfs ok           /hello {} bytes; entries {:?}", n, vfs::list());
+
+    match ahci::init() {
+        Ok(()) => {
+            let mut s0 = [0u8; ahci::SECTOR];
+            let mut s100 = [0u8; ahci::SECTOR];
+            ahci::read(0, &mut s0).expect("AHCI read LBA 0");
+            ahci::read(100, &mut s100).expect("AHCI read LBA 100");
+            kprintln!(
+                "THOS: ahci ok          LBA0=\"{}\" LBA100=\"{}\"",
+                core::str::from_utf8(&s0[..16]).unwrap_or("?"),
+                core::str::from_utf8(&s100[..16]).unwrap_or("?"),
+            );
+        }
+        Err(e) => kprintln!("THOS: ahci FAILED      {}", e),
+    }
 }
 
 /// Fill the framebuffer with a recognizable gradient so a human at the target

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-name: qemu-boot (Milestones 0, 1a-1g, VMM)
+name: qemu-boot (Phase 1-2: + syscall, VFS, AHCI)
 
 on:
   push:
@@ -50,5 +50,10 @@ jobs:
           grep -qE "THOS: SMP +4/4 CPUs online" boot.log
           grep -q "THOS: sched ok" boot.log
           grep -q "THOS: own page tables" boot.log
+          grep -q "hello from ring 3 via syscall" boot.log
+          grep -q "THOS: syscall selftest ok" boot.log
+          grep -q "hello from the ram fs" boot.log
+          grep -q "THOS: vfs ok" boot.log
+          grep -q 'THOS: ahci ok .*LBA0="THOS-AHCI-LBA0' boot.log
           grep -q "THOS: wait primitive" boot.log
           grep -q "THOS: halting." boot.log

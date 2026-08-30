@@ -112,10 +112,37 @@ fn copy(from: &Path, to: &Path) {
 /// `isa-debug-exit` port: `(0x10 << 1) | 1`.
 const QEMU_SUCCESS: i32 = 33;
 
+/// A raw disk image with recognizable markers, attached over AHCI so the driver
+/// has something to READ. LBA 0 and LBA 100 carry ASCII tags.
+fn disk_image() -> PathBuf {
+    let img = workspace_root().join("target/disk.img");
+    if !img.exists() {
+        let mut buf = vec![0u8; 16 * 1024 * 1024];
+        buf[0..16].copy_from_slice(b"THOS-AHCI-LBA0!!");
+        let l100 = 100 * 512;
+        buf[l100..l100 + 16].copy_from_slice(b"THOS-AHCI-LBA100");
+        std::fs::create_dir_all(img.parent().unwrap()).ok();
+        std::fs::write(&img, &buf).unwrap_or_else(|e| {
+            eprintln!("write {img:?}: {e}");
+            exit(1);
+        });
+    }
+    img
+}
+
 fn run_qemu(iso: &Path, gui: bool) {
+    let disk = disk_image();
     let mut qemu = Command::new("qemu-system-x86_64");
     // -smp 4 so the MADT actually carries multiple Local APICs to enumerate.
     qemu.args(["-M", "q35", "-m", "512M", "-smp", "4", "-cdrom", iso.to_str().unwrap()]);
+    qemu.args([
+        "-drive",
+        &format!("id=disk0,if=none,format=raw,file={}", disk.to_str().unwrap()),
+        "-device",
+        "ahci,id=ahci0",
+        "-device",
+        "ide-hd,drive=disk0,bus=ahci0.0",
+    ]);
     qemu.args(["-serial", "stdio", "-no-reboot"]);
     qemu.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     if !gui {

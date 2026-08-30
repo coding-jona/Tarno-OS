@@ -7,11 +7,14 @@
 //!   * IST1 — NMI
 //!   * IST2 — #PF page fault
 //!
-//! Layout is identical on every CPU, so the segment selectors are shared.
+//! Descriptor order is fixed so `SYSCALL`/`SYSRETQ` work:
+//!   1 kernel code · 2 kernel data · 3 user data · 4 user code · 5/6 TSS
+//! Layout is identical on every CPU, so the selectors are shared.
 
+use spin::Once;
 use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
 use x86_64::instructions::tables::load_tss;
-use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
+use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
 
@@ -33,6 +36,22 @@ static mut TSS: [TaskStateSegment; MAX_CPUS] = [const { TaskStateSegment::new() 
 static mut IST_STACKS: [IstStacks; MAX_CPUS] =
     [const { IstStacks([[0; IST_STACK_SIZE]; 3]) }; MAX_CPUS];
 
+#[derive(Clone, Copy)]
+pub struct Selectors {
+    pub kernel_code: SegmentSelector,
+    pub kernel_data: SegmentSelector,
+    pub user_data: SegmentSelector,
+    pub user_code: SegmentSelector,
+}
+
+static SELECTORS: Once<Selectors> = Once::new();
+
+/// The shared segment selectors (identical on every CPU). Valid after the BSP's
+/// `init(0)`.
+pub fn selectors() -> Selectors {
+    *SELECTORS.get().expect("gdt::init not called")
+}
+
 /// Build, load, and activate this CPU's GDT + TSS. `cpu` is a dense index
 /// (0 = BSP). Call once per CPU, early, with interrupts disabled.
 pub fn init(cpu: usize) {
@@ -46,15 +65,33 @@ pub fn init(cpu: usize) {
         }
 
         let gdt = core::ptr::addr_of_mut!(GDT[cpu]);
-        let code = (*gdt).append(Descriptor::kernel_code_segment());
-        let data = (*gdt).append(Descriptor::kernel_data_segment());
+        let kernel_code = (*gdt).append(Descriptor::kernel_code_segment());
+        let kernel_data = (*gdt).append(Descriptor::kernel_data_segment());
+        let user_data = (*gdt).append(Descriptor::user_data_segment());
+        let user_code = (*gdt).append(Descriptor::user_code_segment());
         let tss_sel = (*gdt).append(Descriptor::tss_segment(&*tss));
 
         (*gdt).load_unsafe();
-        CS::set_reg(code);
-        DS::set_reg(data);
-        ES::set_reg(data);
-        SS::set_reg(data);
+        CS::set_reg(kernel_code);
+        DS::set_reg(kernel_data);
+        ES::set_reg(kernel_data);
+        SS::set_reg(kernel_data);
         load_tss(tss_sel);
+
+        SELECTORS.call_once(|| Selectors {
+            kernel_code,
+            kernel_data,
+            user_data,
+            user_code,
+        });
+    }
+}
+
+/// Set this CPU's TSS ring-0 stack pointer (`RSP0`), used when an interrupt or
+/// `int` is taken while in ring 3.
+pub fn set_kernel_stack(cpu: usize, rsp0: VirtAddr) {
+    assert!(cpu < MAX_CPUS);
+    unsafe {
+        (*core::ptr::addr_of_mut!(TSS[cpu])).privilege_stack_table[0] = rsp0;
     }
 }
