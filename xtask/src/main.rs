@@ -421,12 +421,14 @@ fn kbd_test(iso: &Path) {
     std::thread::sleep(std::time::Duration::from_millis(500));
     type_line(&sock, "init");
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    // BusyBox applet links: `ls` (getdents64 + DirFile), `cd` (builtin),
-    // `cat` (MemFile) — all reached through `/bin/*` hard-links to `/busybox`.
-    type_line(&sock, "ls /bin");
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // BusyBox applet links reached via `/bin/*` hard-links to `/busybox`, plus a
+    // per-process cwd: `cd /bin` then a bare `ls` / `pwd` must act on /bin.
     type_line(&sock, "cd /bin");
     std::thread::sleep(std::time::Duration::from_millis(400));
+    type_line(&sock, "pwd");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    type_line(&sock, "ls");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     type_line(&sock, "cat /message");
     std::thread::sleep(std::time::Duration::from_millis(1000));
 
@@ -436,14 +438,16 @@ fn kbd_test(iso: &Path) {
 
     let after = out.split("interactive hold").nth(1).unwrap_or("");
     let shell_ok = after.contains("thos$ init") && after.contains("parent done");
-    // `ls /bin` must show the applet link names (they appear nowhere else).
+    // bare `ls` after `cd /bin` must list the applet link names.
     let ls_ok = ["busybox", "touch", "grep", "sleep"].iter().all(|n| after.contains(n));
+    // `pwd` prints the cwd we chdir'd into.
+    let cwd_ok = after.contains("\n/bin\n");
     let cat_ok = after.contains("hello a file read via open+lseek+read");
-    if shell_ok && ls_ok && cat_ok {
-        println!("kbd-test: OK — login, shell ran `init`, BusyBox `ls`/`cat` applets ran");
+    if shell_ok && ls_ok && cwd_ok && cat_ok {
+        println!("kbd-test: OK — login, `init`, BusyBox applets, per-process cwd (cd/pwd/ls)");
     } else {
         eprintln!(
-            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cat_ok={cat_ok}) — after login:\n---\n{after}\n---"
+            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok})\n---\n{after}\n---"
         );
         exit(1);
     }

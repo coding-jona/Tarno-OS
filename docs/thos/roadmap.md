@@ -129,10 +129,14 @@ late.
     `DT_*`), a `file::DirFile` that pre-renders `linux_dirent64` records, and the
     `getdents64` syscall; `open` on a directory now returns a `DirFile`. `cat`
     uses the existing `MemFile` path (plus a real `sendfile` so it takes its
-    fast path); `cd` is a shell built-in over the `chdir`→0 stub. `time` is
-    stubbed to a fixed epoch (no RTC yet). `cargo xtask kbd-test` now also runs
-    `ls /bin`, `cd /bin`, `cat /message` and checks their output.
-  - Not yet: a per-process CWD (so `ls` with no argument always lists `/`),
+    fast path). `time` is stubbed to a fixed epoch (no RTC yet).
+  - **Per-process cwd.** `Task` carries a normalised absolute `cwd`;
+    `process::resolve_path` folds `.` / `..` / relative paths against it and is
+    applied at every path syscall (`open`/`openat`, `execve`, `newfstatat`,
+    `unlink`/`rmdir`). `chdir` verifies the target is an ext2 directory before
+    storing; `getcwd` returns the real string; `fork` inherits it, `execve`
+    keeps it. `cargo xtask kbd-test` now does `cd /bin` then a bare `ls` / `pwd`
+    and checks they act on `/bin`. Still missing: `fchdir` (no fd→path yet),
     writing through `/bin/*` links, pipes (`pipe2`) for `|` and `$(…)`.
   - Disk I/O is batched: `mm` reserves a 1 MiB contiguous DMA arena, AHCI gives
     each tag a 32 KiB bounce buffer and transfers up to 32 KiB per NCQ command,

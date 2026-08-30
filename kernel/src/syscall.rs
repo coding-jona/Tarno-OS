@@ -287,7 +287,7 @@ fn sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
 }
 
 fn sys_unlink(path_ptr: u64, dir: bool) -> i64 {
-    let path = user_cstr(path_ptr);
+    let path = process::resolve_path(&user_cstr(path_ptr));
     let Some(fs) = ext2::open().ok() else { return EIO };
     let r = if dir { fs.rmdir_path(&path) } else { fs.unlink_path(&path) };
     match r {
@@ -301,7 +301,7 @@ fn sys_unlink(path_ptr: u64, dir: bool) -> i64 {
 }
 
 fn sys_open(path_ptr: u64) -> i64 {
-    let path = user_cstr(path_ptr);
+    let path = process::resolve_path(&user_cstr(path_ptr));
     let Some(task) = sched::current().task() else {
         return EBADF;
     };
@@ -425,16 +425,15 @@ fn sys_sendfile(out_fd: u64, in_fd: u64, off_ptr: u64, count: u64) -> i64 {
     total
 }
 
-/// `newfstatat(dirfd, path, statbuf, flags)` — absolute paths via ext2, plus
+/// `newfstatat(dirfd, path, statbuf, flags)` — path resolved against the task
+/// cwd (a real `dirfd` other than `AT_FDCWD` is not honoured), plus
 /// `AT_EMPTY_PATH` fstat.
 fn sys_newfstatat(dirfd: u64, path_ptr: u64, buf: u64, flags: u64) -> i64 {
-    let path = user_cstr(path_ptr);
-    if path.is_empty() && flags & 0x1000 != 0 {
+    let raw = user_cstr(path_ptr);
+    if raw.is_empty() && flags & 0x1000 != 0 {
         return sys_fstat(dirfd, buf);
     }
-    if !path.starts_with('/') {
-        return ENOENT; // no per-process cwd yet
-    }
+    let path = process::resolve_path(&raw);
     let Some(fs) = ext2::open().ok() else { return -5 /* EIO */ };
     let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
     let node = fs.read_inode(ino);
@@ -579,8 +578,23 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_IOCTL => sys_ioctl(a1, a2, a3),
         SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_RT_SIGRETURN | SYS_SET_ROBUST_LIST
         | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MPROTECT | SYS_MADVISE | SYS_MUNMAP | SYS_FUTEX
-        | SYS_PRCTL | SYS_CHDIR | SYS_FCHDIR | SYS_SETPGID | SYS_SETSID => 0,
+        | SYS_PRCTL | SYS_FCHDIR | SYS_SETPGID | SYS_SETSID => 0,
         SYS_RSEQ => ENOSYS,
+
+        // chdir: normalise against the cwd, verify it names a directory in ext2.
+        SYS_CHDIR => {
+            let path = process::resolve_path(&user_cstr(a1));
+            match ext2::open().ok().and_then(|fs| {
+                fs.path_lookup(&path).map(|ino| fs.read_inode(ino).mode)
+            }) {
+                Some(mode) if mode & 0xF000 == 0x4000 => {
+                    process::set_current_cwd(path);
+                    0
+                }
+                Some(_) => ENOTDIR,
+                None => ENOENT,
+            }
+        }
 
         // No process groups; job-control shells just want a plausible answer.
         SYS_GETPGRP | SYS_GETPGID => process::current_pid() as i64,
@@ -651,10 +665,19 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             0
         }
 
+        // getcwd(buf, size): write the path + NUL, return its length incl. NUL.
         SYS_GETCWD => {
-            let n = (a2 as usize).min(2);
-            unsafe { core::ptr::copy_nonoverlapping(b"/\0".as_ptr(), a1 as *mut u8, n) };
-            2
+            let cwd = process::current_cwd();
+            let need = cwd.len() + 1;
+            if a1 == 0 || (a2 as usize) < need {
+                -34 // ERANGE
+            } else {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(cwd.as_ptr(), a1 as *mut u8, cwd.len());
+                    *((a1 + cwd.len() as u64) as *mut u8) = 0;
+                }
+                need as i64
+            }
         }
         SYS_READLINK | SYS_READLINKAT => EINVAL,
         SYS_UNAME => {
@@ -679,7 +702,7 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_SETUID | SYS_SETGID => 0,
 
         SYS_EXECVE => {
-            let path = user_cstr(a1);
+            let path = process::resolve_path(&user_cstr(a1));
             let argv = user_cstr_array(a2);
             let envp = user_cstr_array(a3);
             match ext2::open().ok().and_then(|fs| fs.read_path(&path)) {

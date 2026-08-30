@@ -318,6 +318,8 @@ pub struct Task {
     exited: AtomicBool,
     /// File descriptor table. 0/1/2 seeded with the console.
     fds: Mutex<Vec<Fd>>,
+    /// Current working directory, always a normalised absolute path.
+    cwd: Mutex<String>,
 }
 
 fn seed_fds() -> Vec<Fd> {
@@ -336,6 +338,7 @@ impl Task {
             exit_status: Mutex::new(None),
             exited: AtomicBool::new(false),
             fds: Mutex::new(seed_fds()),
+            cwd: Mutex::new(String::from("/")),
         });
         TASKS.lock().insert(t.pid, t.clone());
         t
@@ -420,6 +423,50 @@ impl Task {
     fn clone_fds(&self) -> Vec<Fd> {
         self.fds.lock().clone()
     }
+
+    pub fn cwd(&self) -> String {
+        self.cwd.lock().clone()
+    }
+    pub fn set_cwd(&self, path: String) {
+        *self.cwd.lock() = path;
+    }
+}
+
+/// The current task's working directory (`"/"` if there is no task).
+pub fn current_cwd() -> String {
+    sched::current().task().map(|t| t.cwd()).unwrap_or_else(|| String::from("/"))
+}
+
+/// Store an already-normalised absolute path as the current task's cwd.
+pub fn set_current_cwd(path: String) {
+    if let Some(t) = sched::current().task() {
+        t.set_cwd(path);
+    }
+}
+
+/// Resolve `path` against the current task's cwd into a clean absolute path:
+/// `.` is dropped, `..` pops a component (never past `/`), and repeated or
+/// trailing slashes collapse. No symlink following (we have no symlinks).
+pub fn resolve_path(path: &str) -> String {
+    let base = if path.starts_with('/') { String::new() } else { current_cwd() };
+    let mut comps: Vec<&str> = Vec::new();
+    for part in base.split('/').chain(path.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                comps.pop();
+            }
+            p => comps.push(p),
+        }
+    }
+    let mut out = String::from("/");
+    for (i, c) in comps.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(c);
+    }
+    out
 }
 
 fn user_selectors() -> (u64, u64) {
@@ -485,6 +532,7 @@ pub fn fork(frame: &UserFrame) -> i64 {
 
     let child = Task::new(parent.pid, cspace);
     *child.fds.lock() = parent.clone_fds();
+    child.set_cwd(parent.cwd());
     let (cs, ss) = user_selectors();
     let mut cf = *frame;
     cf.rax = 0;
