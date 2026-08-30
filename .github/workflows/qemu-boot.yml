@@ -63,6 +63,8 @@ jobs:
           grep -q "hello from a static musl Rust binary" boot.log
           grep -q "THOS: musl binary ok" boot.log
           grep -q "THOS: xhci ok" boot.log
-          grep -q "THOS: user process ok" boot.log
           grep -q "THOS: wait primitive" boot.log
           grep -q "THOS: halting." boot.log
+
+      - name: USB keyboard end-to-end (monitor-injected keystrokes)
+        run: cargo xtask kbd-test

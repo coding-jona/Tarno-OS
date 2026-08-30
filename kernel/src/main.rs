@@ -137,9 +137,20 @@ extern "C" fn kmain() -> ! {
     scheduler_milestone();
     storage_milestone();
 
-    kprintln!("THOS: halting.");
-    exit_qemu(ExitCode::Success);
-    hcf();
+    #[cfg(feature = "interactive")]
+    {
+        kprintln!("THOS: interactive hold — type on the USB keyboard");
+        loop {
+            sched::yield_now();
+        }
+    }
+
+    #[cfg(not(feature = "interactive"))]
+    {
+        kprintln!("THOS: halting.");
+        exit_qemu(ExitCode::Success);
+        hcf();
+    }
 }
 
 /// Milestone 1a: memory map -> frame allocator + heap, then a smoke check that

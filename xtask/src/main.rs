@@ -20,20 +20,25 @@ fn main() {
 
     match cmd {
         "build" => {
-            build_kernel();
+            build_kernel(&[]);
         }
         "iso" => {
-            build_kernel();
+            build_kernel(&[]);
             build_iso();
         }
         "run" => {
-            build_kernel();
+            build_kernel(&[]);
             let iso = build_iso();
             run_qemu(&iso, gui);
         }
+        "kbd-test" => {
+            build_kernel(&["interactive"]);
+            let iso = build_iso();
+            kbd_test(&iso);
+        }
         other => {
             eprintln!("unknown command: {other}");
-            eprintln!("usage: cargo xtask [build|iso|run] [--gui]");
+            eprintln!("usage: cargo xtask [build|iso|run|kbd-test] [--gui]");
             exit(2);
         }
     }
@@ -57,10 +62,14 @@ fn run(cmd: &mut Command) {
     }
 }
 
-fn build_kernel() {
-    run(Command::new(env!("CARGO"))
-        .current_dir(workspace_root())
-        .args(["build", "--package", "thos-kernel", "--release"]));
+fn build_kernel(features: &[&str]) {
+    let mut c = Command::new(env!("CARGO"));
+    c.current_dir(workspace_root())
+        .args(["build", "--package", "thos-kernel", "--release"]);
+    if !features.is_empty() {
+        c.arg("--features").arg(features.join(","));
+    }
+    run(&mut c);
 }
 
 fn kernel_elf() -> PathBuf {
@@ -187,6 +196,74 @@ fn disk_image() -> PathBuf {
         img.to_str().unwrap(),
     ]));
     img
+}
+
+/// Boot the (interactive-feature) kernel, inject "hello\n" via the QEMU monitor
+/// into the USB keyboard, and check the console echoed it back on the serial
+/// line. Needs `socat` on PATH.
+fn kbd_test(iso: &Path) {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let disk = disk_image();
+    let root = workspace_root();
+    let log = root.join("target/kbd-serial.log");
+    let sock = root.join("target/kbd-mon.sock");
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&sock);
+
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu.args(["-M", "q35", "-m", "512M", "-smp", "4", "-cdrom", iso.to_str().unwrap()]);
+    qemu.args([
+        "-drive", &format!("id=disk0,if=none,format=raw,file={}", disk.to_str().unwrap()),
+        "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0",
+        "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0",
+    ]);
+    qemu.args(["-display", "none", "-no-reboot"]);
+    qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
+    qemu.args(["-monitor", &format!("unix:{},server,nowait", sock.to_str().unwrap())]);
+    for ovmf in ["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/ovmf/OVMF.fd"] {
+        if Path::new(ovmf).exists() {
+            qemu.args(["-drive", &format!("if=pflash,format=raw,readonly=on,file={ovmf}")]);
+            break;
+        }
+    }
+    let mut child = qemu.spawn().expect("spawn qemu");
+
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while Instant::now() < deadline && !read_log().contains("interactive hold") {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    if !read_log().contains("interactive hold") {
+        let _ = child.kill();
+        eprintln!("kbd-test: kernel never reached the interactive hold\n{}", read_log());
+        exit(1);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    for k in ["h", "e", "l", "l", "o", "ret"] {
+        let mut s = std::os::unix::net::UnixStream::connect(&sock).expect("connect monitor");
+        use std::io::Write;
+        writeln!(s, "sendkey {k}").ok();
+        let mut _drain = String::new();
+        let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
+        let _ = s.read_to_string(&mut _drain);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    std::thread::sleep(Duration::from_millis(800));
+
+    let out = read_log();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let after = out.split("interactive hold").nth(1).unwrap_or("");
+    if after.contains("hello") {
+        println!("kbd-test: OK — injected keystrokes echoed on the console");
+    } else {
+        eprintln!("kbd-test: FAIL — no echo after the hold marker\n---\n{after}\n---");
+        exit(1);
+    }
 }
 
 fn run_qemu(iso: &Path, gui: bool) {
