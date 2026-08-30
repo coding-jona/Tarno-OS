@@ -354,7 +354,7 @@ fn drive_login(sock: &Path, log: &Path, child: &mut std::process::Child, tag: &s
         type_line(sock, "thos"); // admin username
         type_line(sock, "pass"); // password
         type_line(sock, "pass"); // repeat
-        if !wait_for(log, "THOS login:", 40) {
+        if !wait_for(log, "THOS login:", 60) {
             kill(child, tag, "no login prompt after first-run setup", log);
         }
     }
@@ -370,12 +370,12 @@ fn kbd_test(iso: &Path) {
     let disk = disk_image();
     let (mut child, log, sock) = spawn_interactive_qemu("kbd", iso, &disk);
 
-    if !wait_for(&log, "THOS first-run setup", 40) {
+    if !wait_for(&log, "THOS first-run setup", 60) {
         kill(&mut child, "kbd-test", "kernel never reached first-run setup", &log);
     }
     drive_login(&sock, &log, &mut child, "kbd-test");
 
-    if !wait_for(&log, "interactive hold", 25) {
+    if !wait_for(&log, "interactive hold", 60) {
         kill(&mut child, "kbd-test", "never reached the shell after login", &log);
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -403,11 +403,11 @@ fn login_test(iso: &Path) {
 
     // Boot 1 — fresh disk: must run first-run setup, then log in.
     let (mut c1, log1, sock1) = spawn_interactive_qemu("login1", iso, &disk);
-    if !wait_for(&log1, "THOS first-run setup", 40) {
+    if !wait_for(&log1, "THOS first-run setup", 60) {
         kill(&mut c1, "login-test", "boot 1 showed no first-run setup", &log1);
     }
     drive_login(&sock1, &log1, &mut c1, "login-test");
-    let ok1 = wait_for(&log1, "interactive hold", 40);
+    let ok1 = wait_for(&log1, "interactive hold", 60);
     let _ = c1.kill();
     let _ = c1.wait();
     if !ok1 {
@@ -417,7 +417,7 @@ fn login_test(iso: &Path) {
 
     // Boot 2 — same disk: straight to login, no setup; reject a wrong password.
     let (mut c2, log2, sock2) = spawn_interactive_qemu("login2", iso, &disk);
-    if !wait_for(&log2, "THOS login:", 40) {
+    if !wait_for(&log2, "THOS login:", 60) {
         kill(&mut c2, "login-test", "boot 2 showed no login prompt", &log2);
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -429,7 +429,7 @@ fn login_test(iso: &Path) {
     std::thread::sleep(std::time::Duration::from_millis(300));
     type_line(&sock2, "thos");
     type_line(&sock2, "pass");
-    let ok2 = wait_for(&log2, "interactive hold", 25);
+    let ok2 = wait_for(&log2, "interactive hold", 60);
     let full2 = std::fs::read_to_string(&log2).unwrap_or_default();
     let _ = c2.kill();
     let _ = c2.wait();

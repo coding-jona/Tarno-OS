@@ -48,7 +48,7 @@ fn disk_range(off: u64, len: usize) -> Vec<u8> {
     let mut raw = vec![0u8; sectors * SECTOR];
     let mut done = 0;
     while done < sectors {
-        let n = (sectors - done).min(8);
+        let n = (sectors - done).min(64);
         ahci::read(start_lba + done as u64, &mut raw[done * SECTOR..(done + n) * SECTOR])
             .expect("ext2 disk read");
         done += n;
@@ -97,7 +97,7 @@ fn disk_write(off: u64, data: &[u8]) {
 
     let mut done = 0;
     while done < sectors {
-        let n = (sectors - done).min(8);
+        let n = (sectors - done).min(64);
         ahci::read(start_lba + done as u64, &mut raw[done * SECTOR..(done + n) * SECTOR])
             .expect("ext2 rmw read");
         done += n;
@@ -108,7 +108,7 @@ fn disk_write(off: u64, data: &[u8]) {
 
     let mut done = 0;
     while done < sectors {
-        let n = (sectors - done).min(8);
+        let n = (sectors - done).min(64);
         ahci::write(start_lba + done as u64, &raw[done * SECTOR..(done + n) * SECTOR])
             .expect("ext2 rmw write");
         done += n;
@@ -168,59 +168,75 @@ impl Ext2 {
         }
     }
 
-    /// Append one data block (a `0` pointer is a hole → zeros).
-    fn feed_block(&self, out: &mut Vec<u8>, bn: u32) {
-        if bn == 0 {
-            let bs = self.block_size as usize;
-            out.resize(out.len() + bs, 0);
-        } else {
-            out.extend_from_slice(&self.block(bn));
-        }
-    }
+    /// Every data-block number of `inode` in file order, capped at the file's
+    /// block count. `0` = a sparse hole.
+    fn block_map(&self, inode: &Inode) -> Vec<u32> {
+        let bs = self.block_size as usize;
+        let per = bs / 4;
+        let nblocks = (inode.size as usize).div_ceil(bs).max(1);
+        let mut out: Vec<u32> = Vec::with_capacity(nblocks);
 
-    /// Follow a single-indirect block: `bs/4` data-block pointers.
-    fn feed_indirect(&self, out: &mut Vec<u8>, ind_bn: u32, total: usize) {
-        if ind_bn == 0 {
-            let span = (self.block_size as usize / 4) * self.block_size as usize;
-            let n = span.min(total.saturating_sub(out.len()));
-            out.resize(out.len() + n, 0);
-            return;
-        }
-        let ind = self.block(ind_bn);
-        for c in ind.chunks_exact(4) {
-            if out.len() >= total {
+        out.extend_from_slice(&inode.block[..12.min(nblocks)]);
+
+        // one single-indirect block's worth of pointers (or a run of holes)
+        let single = |bn: u32, out: &mut Vec<u32>| {
+            if out.len() >= nblocks {
                 return;
             }
-            self.feed_block(out, le32(c));
+            let take = per.min(nblocks - out.len());
+            if bn == 0 {
+                out.resize(out.len() + take, 0);
+            } else {
+                let ind = self.block(bn);
+                out.extend(ind.chunks_exact(4).take(take).map(le32));
+            }
+        };
+
+        if nblocks > 12 {
+            single(inode.block[12], &mut out);
         }
+        if out.len() < nblocks {
+            if inode.block[13] == 0 {
+                for _ in 0..per {
+                    if out.len() >= nblocks {
+                        break;
+                    }
+                    single(0, &mut out);
+                }
+            } else {
+                for dc in self.block(inode.block[13]).chunks_exact(4) {
+                    if out.len() >= nblocks {
+                        break;
+                    }
+                    single(le32(dc), &mut out);
+                }
+            }
+        }
+        out
     }
 
     pub fn read_file(&self, inode: &Inode) -> Vec<u8> {
         let total = inode.size as usize;
+        let bs = self.block_size as usize;
+        let blocks = self.block_map(inode);
+
+        // Emit consecutive runs of block numbers in one disk read each.
         let mut out = Vec::with_capacity(total);
-
-        for i in 0..12 {
-            if out.len() >= total {
-                break;
-            }
-            self.feed_block(&mut out, inode.block[i]);
-        }
-
-        if out.len() < total {
-            self.feed_indirect(&mut out, inode.block[12], total);
-        }
-
-        // Double indirect: bs/4 single-indirect blocks.
-        if out.len() < total && inode.block[13] != 0 {
-            let dind = self.block(inode.block[13]);
-            for c in dind.chunks_exact(4) {
-                if out.len() >= total {
-                    break;
+        let mut i = 0;
+        while i < blocks.len() {
+            if blocks[i] == 0 {
+                let j = blocks[i..].iter().take_while(|&&b| b == 0).count() + i;
+                out.resize(out.len() + (j - i) * bs, 0);
+                i = j;
+            } else {
+                let mut j = i + 1;
+                while j < blocks.len() && blocks[j] == blocks[j - 1] + 1 {
+                    j += 1;
                 }
-                self.feed_indirect(&mut out, le32(c), total);
+                out.extend_from_slice(&disk_range(blocks[i] as u64 * bs as u64, (j - i) * bs));
+                i = j;
             }
         }
-
         out.truncate(total);
         out
     }

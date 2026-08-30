@@ -74,6 +74,17 @@ const CMD_IDENTIFY: u8 = 0xEC;
 
 const MAX_TAGS: u8 = 32;
 const POLL_LIMIT: u32 = 4_000_000;
+/// Per-tag DMA bounce buffer size — the maximum bytes per command. `MAX_TAGS *
+/// BOUNCE` must fit `mm::dma_arena()` (1 MiB).
+const BOUNCE: usize = 32 * 1024;
+
+/// Physical base of the DMA bounce arena (`mm::dma_arena`); tag `t`'s buffer is
+/// `DMA_PHYS + t * BOUNCE`.
+static DMA_PHYS: AtomicU64 = AtomicU64::new(0);
+
+fn tag_bounce(tag: u8) -> u64 {
+    DMA_PHYS.load(Ordering::Relaxed) + tag as u64 * BOUNCE as u64
+}
 
 // --- controller state (set once in `init`, then lock-free so the IRQ handler
 //     never contends on a mutex) ---
@@ -171,6 +182,10 @@ pub fn init() -> Result<(), &'static str> {
     }
     let base = crate::vmm::map_mmio(abar, 0x2000);
     HBA_BASE.store(base, Ordering::Relaxed);
+
+    let (dma_phys, dma_len) = crate::mm::dma_arena();
+    assert!(dma_len as usize >= MAX_TAGS as usize * BOUNCE, "DMA arena too small");
+    DMA_PHYS.store(dma_phys, Ordering::Relaxed);
     let hba = Hba { base };
     hba.w(GHC, hba.r(GHC) | GHC_AE);
 
@@ -541,10 +556,10 @@ fn poll_tag0() -> Result<(), &'static str> {
     Err("READ LOG EXT timed out")
 }
 
-/// `READ LOG EXT` (0x2F) of one 512-byte log page, non-queued on tag 0.
+/// `READ LOG EXT` (0x2F) of one 512-byte log page, non-queued on tag 0. Only
+/// called from `recover` (queue drained), so tag 0's bounce buffer is free.
 fn read_log_ext(page: u8) -> Result<[u8; 512], &'static str> {
-    let frame = FRAME_ALLOC.lock().alloc().ok_or("no bounce frame")?;
-    let phys = frame.start_address().as_u64();
+    let phys = tag_bounce(0);
     {
         wait_ready(&Hba::cur());
         let _s = SUBMIT.lock();
@@ -568,7 +583,6 @@ fn read_log_ext(page: u8) -> Result<[u8; 512], &'static str> {
             );
         }
     }
-    FRAME_ALLOC.lock().dealloc(frame);
     r.map(|()| buf)
 }
 
@@ -578,7 +592,14 @@ pub fn recover_count() -> u64 {
     RECOVER_COUNT.load(Ordering::Relaxed)
 }
 
-fn transfer(is_write: bool, lba: u64, sectors: u16, buf_phys: u64) -> Result<(), &'static str> {
+enum Xfer<'a> {
+    Read(&'a mut [u8]),
+    Write(&'a [u8]),
+}
+
+/// One data transfer of `sectors` sectors at `lba` through the tag's DMA
+/// bounce buffer.
+fn transfer(op: Xfer, lba: u64, sectors: u16) -> Result<(), &'static str> {
     if HBA_BASE.load(Ordering::Relaxed) == 0 {
         return Err("AHCI not initialised");
     }
@@ -587,17 +608,30 @@ fn transfer(is_write: bool, lba: u64, sectors: u16, buf_phys: u64) -> Result<(),
         return Err("AHCI: LBA past end of disk");
     }
     let ncq = DEPTH.load(Ordering::Relaxed) > 1;
+    let is_write = matches!(op, Xfer::Write(_));
     let bytes = sectors as u32 * SECTOR as u32;
     let tag = alloc_tag();
-    PENDING.lock()[tag as usize] = Some(Pending { is_write, lba, sectors, buf_phys });
+    let bphys = tag_bounce(tag);
+    let bvirt = phys_to_virt(x86_64::PhysAddr::new(bphys)).as_mut_ptr::<u8>();
+
+    if let Xfer::Write(src) = &op {
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), bvirt, src.len()) };
+    }
+    PENDING.lock()[tag as usize] = Some(Pending { is_write, lba, sectors, buf_phys: bphys });
 
     {
         wait_ready(&Hba::cur());
         let _s = SUBMIT.lock();
-        issue(tag, ncq, is_write, Some((buf_phys, bytes)), fis(is_write, ncq, lba, sectors, tag));
+        issue(tag, ncq, is_write, Some((bphys, bytes)), fis(is_write, ncq, lba, sectors, tag));
     }
     let r = wait(tag, ncq, IRQ_ON.load(Ordering::Relaxed));
     PENDING.lock()[tag as usize] = None;
+
+    if r.is_ok() {
+        if let Xfer::Read(dst) = op {
+            unsafe { core::ptr::copy_nonoverlapping(bvirt, dst.as_mut_ptr(), dst.len()) };
+        }
+    }
     free_tag(tag);
     r
 }
@@ -635,37 +669,22 @@ fn fis(is_write: bool, ncq: bool, lba: u64, sectors: u16, tag: u8) -> impl FnOnc
     }
 }
 
-/// Read `buf.len() / 512` sectors starting at `lba` into `buf`.
+/// Read `buf.len() / 512` sectors starting at `lba` into `buf` (≤ 32 KiB).
 pub fn read(lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {
-    assert!(buf.len() % SECTOR == 0 && !buf.is_empty() && buf.len() <= 4096);
+    assert!(buf.len() % SECTOR == 0 && !buf.is_empty() && buf.len() <= BOUNCE);
     let sectors = (buf.len() / SECTOR) as u16;
-    let frame = FRAME_ALLOC.lock().alloc().ok_or("no bounce frame")?;
-    let phys = frame.start_address();
-    let r = transfer(false, lba, sectors, phys.as_u64());
-    if r.is_ok() {
-        unsafe {
-            core::ptr::copy_nonoverlapping(phys_to_virt(phys).as_ptr::<u8>(), buf.as_mut_ptr(), buf.len());
-        }
-    }
-    FRAME_ALLOC.lock().dealloc(frame);
-    r
+    transfer(Xfer::Read(buf), lba, sectors)
 }
 
-/// Write `buf.len() / 512` sectors at `lba`, durably: the NCQ path sets FUA,
-/// the legacy path issues `FLUSH CACHE EXT` afterwards.
+/// Write `buf.len() / 512` sectors at `lba` (≤ 32 KiB), durably: the NCQ path
+/// sets FUA, the legacy path issues `FLUSH CACHE EXT` afterwards.
 pub fn write(lba: u64, buf: &[u8]) -> Result<(), &'static str> {
-    assert!(buf.len() % SECTOR == 0 && !buf.is_empty() && buf.len() <= 4096);
+    assert!(buf.len() % SECTOR == 0 && !buf.is_empty() && buf.len() <= BOUNCE);
     let sectors = (buf.len() / SECTOR) as u16;
-    let frame = FRAME_ALLOC.lock().alloc().ok_or("no bounce frame")?;
-    let phys = frame.start_address();
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf.as_ptr(), phys_to_virt(phys).as_mut_ptr::<u8>(), buf.len());
-    }
-    let mut r = transfer(true, lba, sectors, phys.as_u64());
+    let mut r = transfer(Xfer::Write(buf), lba, sectors);
     if r.is_ok() && DEPTH.load(Ordering::Relaxed) == 1 {
         r = flush();
     }
-    FRAME_ALLOC.lock().dealloc(frame);
     r
 }
 
@@ -701,8 +720,7 @@ pub fn flush() -> Result<(), &'static str> {
 
 /// `IDENTIFY DEVICE` on tag 0 (non-queued); raw 512-byte block. Init only.
 fn identify() -> Result<[u8; 512], &'static str> {
-    let frame = FRAME_ALLOC.lock().alloc().ok_or("no bounce frame")?;
-    let buf_phys = frame.start_address().as_u64();
+    let buf_phys = tag_bounce(0);
     {
         wait_ready(&Hba::cur());
         let _s = SUBMIT.lock();
@@ -725,6 +743,5 @@ fn identify() -> Result<[u8; 512], &'static str> {
             );
         }
     }
-    FRAME_ALLOC.lock().dealloc(frame);
     r.map(|()| block)
 }
