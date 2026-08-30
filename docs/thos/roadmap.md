@@ -61,6 +61,17 @@ late.
 - Port **musl** as the userland libc; a BusyBox-style shell.
 - **Milestone 2:** booted from the real SSD, interactive shell on a real keyboard,
   statically linked Linux `x86_64` ELF binaries (BusyBox) run unmodified.
+  - Status: interactive shell (`/sh`, static-musl Rust) reads the USB keyboard,
+    `fork`+`execve`+`wait4`s programs off ext2, reports exit status. Verified in
+    CI (`cargo xtask kbd-test` types `init` and checks it runs). Still on the QEMU
+    disk image, not the real SSD (no installer yet).
+  - Fixed along the way: (1) SMP scheduler race — a thread that yielded from
+    inside a syscall could be resumed on a second CPU before the first finished
+    unwinding its kernel stack; now a per-thread `running` claim + deferred
+    ready-queue hand-off (`thos_finish_switch`). (2) `%fs` base (TLS) is now
+    context-switched per thread and inherited across `fork` — musl deref's `%fs`
+    constantly. (3) `fork` now copies PML4[0] (static-musl ELFs load at
+    `0x400000`), not just the higher user half.
 
 ## Phase 3 — NT personality (userspace level, still GOP graphics)
 
@@ -128,6 +139,35 @@ NVMe) to see Windows' own files:
   data path through the NT-personality sockets.
 
 ---
+
+## Multi-boot: THOS as the OS picker (deferred — Phase 2/3 side quest)
+
+Goal: set the Kingston (THOS) first in the mainboard boot order; every power-on
+lands in a THOS-drawn menu that lists the OSes found on the other disks (Windows
+on the NVMe, Devuan on the Samsung, …) and boots the chosen one with **no
+keypress required** for the default after a timeout.
+
+Feasible, and it splits cleanly from the kernel:
+
+- **Enumeration.** THOS is UEFI-only, so the honest path is an EFI boot
+  application (our own, or Limine's config) that reads each disk's **GPT** +
+  **ESP (FAT32)** and collects `\EFI\**\*.efi` loaders plus the firmware's
+  `Boot####` / `BootOrder` NVRAM vars. No NTFS/ext parsing needed — every OS's
+  loader lives on a FAT ESP. Needs: a GPT reader, a FAT32 reader, and the EFI
+  `LoadImage`/`StartImage` + variable protocols.
+- **Chainloading.** Picking "Windows" = `LoadImage` on
+  `\EFI\Microsoft\Boot\bootmgfw.efi` from that disk's ESP and `StartImage`.
+  Picking "THOS" = load our kernel as today. This is exactly what rEFInd and the
+  systemd-boot menu do; it is not virtualization and not a fork.
+- **Where it lives.** A `loaders/thos-boot` EFI app, or a thin fork of Limine's
+  menu. The THOS kernel itself stays uninvolved — the picker runs before any
+  kernel loads. So it can be built any time after the FAT/GPT readers exist
+  (they're already on the Phase 2 list for reading the ESP).
+- **Risks to keep in mind.** Firmware NVRAM quirks (some boards re-assert their
+  own `BootOrder`), Secure Boot (chainloading MS's loader is fine; loading our
+  unsigned kernel needs SB off or our keys enrolled), and BitLocker (measuring a
+  different pre-boot environment can trigger a recovery-key prompt on the
+  Windows side — needs testing before relying on it).
 
 ## Open decisions
 

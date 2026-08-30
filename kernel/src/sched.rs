@@ -56,6 +56,7 @@ thos_ctx_switch:
 .globl thos_thread_trampoline
 // entered via `ret` from thos_ctx_switch with r12=entry, r13=arg
 thos_thread_trampoline:
+    call thos_finish_switch        // release the thread that yielded to us
     mov rdi, r13
     call r12
     call thos_thread_exit
@@ -64,6 +65,7 @@ thos_thread_trampoline:
 // entered via `ret` from thos_ctx_switch with
 //   r12=user rip, r13=user rsp, r14=user cs, r15=user ss
 thos_user_thread_start:
+    call thos_finish_switch        // release the thread that yielded to us
     push r15
     push r13
     push 0x202          // RFLAGS with IF=1 -> the user thread is preemptible
@@ -118,6 +120,16 @@ pub struct Thread {
     task: Option<Arc<Task>>,
     /// Owned resume frame for a fork child (kept alive; `r12` points at it).
     _uframe: Option<Box<UserFrame>>,
+    /// `true` while some CPU is executing on this thread's kernel stack. A CPU
+    /// about to resume this thread spins on this first, so a thread that
+    /// yielded from a syscall on CPU A is never re-entered on CPU B before A
+    /// has finished unwinding off its stack.
+    running: AtomicBool,
+    /// User `%fs` base (TLS pointer). Thread-private CPU state that must be
+    /// reloaded on every switch into this thread — musl dereferences `%fs`
+    /// constantly. 0 for kernel threads and for a fresh image before its
+    /// first `arch_prctl(SET_FS)`.
+    fsbase: AtomicU64,
 }
 
 unsafe impl Send for Thread {}
@@ -148,6 +160,8 @@ impl Thread {
             kstack_top: None,
             task: None,
             _uframe: None,
+            running: AtomicBool::new(true), // it is running right now
+            fsbase: AtomicU64::new(0),
         })
     }
 
@@ -191,6 +205,8 @@ impl Thread {
             kstack_top: Some(top),
             task: None,
             _uframe: None,
+            running: AtomicBool::new(false),
+            fsbase: AtomicU64::new(0),
         })
     }
 
@@ -215,10 +231,18 @@ impl Thread {
             kstack_top: Some(top),
             task: Some(task),
             _uframe: None,
+            running: AtomicBool::new(false),
+            fsbase: AtomicU64::new(0),
         })
     }
 
-    fn spawned_user_frame(id: u64, name: &'static str, task: Arc<Task>, frame: UserFrame) -> Arc<Self> {
+    fn spawned_user_frame(
+        id: u64,
+        name: &'static str,
+        task: Arc<Task>,
+        frame: UserFrame,
+        fsbase: u64,
+    ) -> Arc<Self> {
         let uframe = Box::new(frame);
         let fptr = &*uframe as *const UserFrame as u64;
         let cr3 = task.space().pml4_phys();
@@ -240,6 +264,8 @@ impl Thread {
             kstack_top: Some(top),
             task: Some(task),
             _uframe: Some(uframe),
+            running: AtomicBool::new(false),
+            fsbase: AtomicU64::new(fsbase),
         })
     }
 
@@ -251,6 +277,10 @@ impl Thread {
 struct CpuSlot {
     current: Option<Arc<Thread>>,
     idle: Option<Arc<Thread>>,
+    /// The thread this CPU just switched away from, waiting for the thread we
+    /// switched *into* to run `thos_finish_switch` and release it. `bool` =
+    /// it was blocking (do not return it to the ready queue).
+    handoff: Option<(Arc<Thread>, bool)>,
 }
 
 struct Inner {
@@ -264,7 +294,7 @@ struct Inner {
 static SCHED: Mutex<Inner> = Mutex::new(Inner {
     ready: VecDeque::new(),
     cpus: [const {
-        CpuSlot { current: None, idle: None }
+        CpuSlot { current: None, idle: None, handoff: None }
     }; MAX_CPUS],
     graveyard: alloc::vec::Vec::new(),
 });
@@ -298,6 +328,14 @@ impl Thread {
     /// space).
     pub fn set_cr3(&self, v: u64) {
         self.cr3.store(v, Ordering::Relaxed);
+    }
+    /// This thread's saved user `%fs` base.
+    pub fn fsbase(&self) -> u64 {
+        self.fsbase.load(Ordering::Relaxed)
+    }
+    /// Record this thread's user `%fs` base (from `arch_prctl(SET_FS)` / execve).
+    pub fn set_fsbase(&self, v: u64) {
+        self.fsbase.store(v, Ordering::Relaxed);
     }
 }
 
@@ -366,21 +404,26 @@ pub fn spawn_user(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64
 
 /// Create a runnable user thread that resumes from a full [`UserFrame`] (a
 /// fork child).
-pub fn spawn_user_frame(name: &'static str, task: Arc<Task>, frame: UserFrame) -> u64 {
+pub fn spawn_user_frame(name: &'static str, task: Arc<Task>, frame: UserFrame, fsbase: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
-    let t = Thread::spawned_user_frame(id, name, task, frame);
+    let t = Thread::spawned_user_frame(id, name, task, frame, fsbase);
     SCHED.lock().ready.push_back(t);
     id
 }
 
 /// Point CR3 + the ring-transition stacks at the thread we're about to run.
 /// Runs with interrupts disabled, right before `thos_ctx_switch`.
-fn apply_cpu_state(cpu: usize, cr3: u64, kstack_top: Option<u64>) {
+fn apply_cpu_state(cpu: usize, cr3: u64, kstack_top: Option<u64>, fsbase: u64) {
+    use x86_64::registers::model_specific::FsBase;
     let cur = Cr3::read().0.start_address().as_u64();
     if cr3 != cur {
         let frame = PhysFrame::from_start_address(PhysAddr::new(cr3)).expect("cr3 aligned");
         unsafe { Cr3::write(frame, Cr3Flags::empty()) };
     }
+    // Reload the user TLS base for the thread we're switching to (0 for kernel
+    // threads). Cheap wrmsr; without it a forked musl child runs on the
+    // parent's — or a stale — `%fs` and faults on its first TLS access.
+    FsBase::write(VirtAddr::new(fsbase));
     if let Some(top) = kstack_top {
         gdt::set_kernel_stack(cpu, VirtAddr::new(top));
         smp::set_kernel_rsp(cpu, top);
@@ -419,19 +462,25 @@ pub fn unblock(t: Arc<Thread>) {
 /// Terminate the current thread. Never returns.
 pub fn exit() -> ! {
     interrupts::disable();
-    let (load, cpu, cr3, kstack_top) = {
+    let (load, next, cpu, cr3, kstack_top, fsbase) = {
         let mut s = SCHED.lock();
         let cpu = smp::this_cpu() as usize;
         let prev = s.cpus[cpu].current.take().expect("exit: no current thread");
         prev.set_state(State::Exited);
         let next = pick_next(&mut s, cpu);
         next.set_state(State::Running);
-        let out = (next.ctx_ptr(), cpu, next.cr3(), next.kstack_top);
+        let out = (next.ctx_ptr(), next.clone(), cpu, next.cr3(), next.kstack_top, next.fsbase());
         s.cpus[cpu].current = Some(next);
-        s.graveyard.push(prev); // keep the stack alive
+        // Nothing to hand off: an exited thread is never resumed, so its stack
+        // can be reclaimed from the graveyard without waiting on `running`.
+        s.cpus[cpu].handoff = None;
+        s.graveyard.push(prev); // keep the stack alive until a reaper frees it
         out
     };
-    apply_cpu_state(cpu, cr3, kstack_top);
+    apply_cpu_state(cpu, cr3, kstack_top, fsbase);
+    while next.running.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
     let mut scratch = 0u64;
     unsafe { thos_ctx_switch(&mut scratch, load) };
     unreachable!("switched back into an exited thread")
@@ -446,7 +495,7 @@ fn pick_next(s: &mut Inner, cpu: usize) -> Arc<Thread> {
 /// The core switch. `block` = don't return the current thread to the ready
 /// queue (it is going to sleep). Must run with interrupts disabled.
 fn reschedule(block: bool) {
-    let (save, load, cpu, cr3, kstack_top) = {
+    let (save, load, next, cpu, cr3, kstack_top, fsbase) = {
         let mut s = SCHED.lock();
         let cpu = smp::this_cpu() as usize;
 
@@ -459,24 +508,64 @@ fn reschedule(block: bool) {
             return;
         }
 
-        // Commit only now that we know a real switch is happening, so `prev` is
-        // never both `current` and queued at the same time.
+        // Commit only now that we know a real switch is happening.
         if block {
             prev.set_state(State::Blocked);
         } else if prev.state() == State::Running && !prev.is_idle {
             prev.set_state(State::Ready);
-            s.ready.push_back(prev.clone());
         }
         next.set_state(State::Running);
-        let out = (prev.ctx_ptr(), next.ctx_ptr(), cpu, next.cr3(), next.kstack_top);
+
+        // Defer requeueing `prev` (and clearing its `running` claim) until the
+        // thread we switch into runs `thos_finish_switch` — by then this CPU is
+        // fully off `prev`'s kernel stack, so no other CPU can resume `prev`
+        // mid-unwind.
+        s.cpus[cpu].handoff = Some((prev.clone(), block));
+        let out = (
+            prev.ctx_ptr(),
+            next.ctx_ptr(),
+            next.clone(),
+            cpu,
+            next.cr3(),
+            next.kstack_top,
+            next.fsbase(),
+        );
         s.cpus[cpu].current = Some(next.clone());
         out
-        // `prev` / `next` locals drop here. `next` stays alive via
-        // `cpus[cpu].current`; `prev` stays alive via the ready queue (yield),
-        // a wait queue (block), or the graveyard (exit, handled separately).
     };
 
-    apply_cpu_state(cpu, cr3, kstack_top);
+    apply_cpu_state(cpu, cr3, kstack_top, fsbase);
     CTX_SWITCHES.fetch_add(1, Ordering::Relaxed);
+
+    // Claim `next`'s stack: wait out any CPU still unwinding off it.
+    while next.running.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+
     unsafe { thos_ctx_switch(save, load) };
+
+    // Back in a freshly-resumed thread's context on this CPU: release whatever
+    // thread this CPU last switched away from.
+    finish_switch();
+}
+
+/// Release the thread this CPU handed off in its last context switch: clear its
+/// `running` claim and, unless it was blocking, return it to the ready queue.
+/// Called right after `thos_ctx_switch` and at the top of every thread
+/// trampoline (a fresh thread's first run does not return through `reschedule`).
+#[no_mangle]
+extern "C" fn thos_finish_switch() {
+    finish_switch();
+}
+
+fn finish_switch() {
+    let mut s = SCHED.lock();
+    let cpu = smp::this_cpu() as usize;
+    let Some((prev, was_blocking)) = s.cpus[cpu].handoff.take() else {
+        return;
+    };
+    if !was_blocking && prev.state() == State::Ready && !prev.is_idle {
+        s.ready.push_back(prev.clone());
+    }
+    prev.running.store(false, Ordering::Release);
 }

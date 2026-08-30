@@ -195,12 +195,29 @@ fn disk_image() -> PathBuf {
         "-w", "-R", &format!("write {} rusthello", rsbin.to_str().unwrap()),
         img.to_str().unwrap(),
     ]));
+
+    // The THOS shell -> /sh (static-musl Rust, same recipe as rusthello).
+    let shsrc = root.join("xtask/testdata/sh.rs");
+    let shbin = root.join("target/sh");
+    run(Command::new("rustc").args([
+        "--target", "x86_64-unknown-linux-musl",
+        "-C", "relocation-model=static",
+        "-C", "link-args=-no-pie",
+        "-C", "strip=symbols",
+        "-O",
+        "-o", shbin.to_str().unwrap(),
+        shsrc.to_str().unwrap(),
+    ]));
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} sh", shbin.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
     img
 }
 
-/// Boot the (interactive-feature) kernel, inject "hello\n" via the QEMU monitor
-/// into the USB keyboard, and check the console echoed it back on the serial
-/// line. Needs `socat` on PATH.
+/// Boot the (interactive-feature) kernel, type `init<Enter>` into the USB
+/// keyboard via the QEMU monitor, and check that the console echoed it *and*
+/// that the shell forked+execve'd `/init` (its "parent done" landed on serial).
 fn kbd_test(iso: &Path) {
     use std::io::Read;
     use std::time::{Duration, Instant};
@@ -242,7 +259,7 @@ fn kbd_test(iso: &Path) {
     }
     std::thread::sleep(Duration::from_millis(500));
 
-    for k in ["h", "e", "l", "l", "o", "ret"] {
+    for k in ["i", "n", "i", "t", "ret"] {
         let mut s = std::os::unix::net::UnixStream::connect(&sock).expect("connect monitor");
         use std::io::Write;
         writeln!(s, "sendkey {k}").ok();
@@ -251,17 +268,21 @@ fn kbd_test(iso: &Path) {
         let _ = s.read_to_string(&mut _drain);
         std::thread::sleep(Duration::from_millis(150));
     }
-    std::thread::sleep(Duration::from_millis(800));
+    std::thread::sleep(Duration::from_millis(1500));
 
     let out = read_log();
     let _ = child.kill();
     let _ = child.wait();
 
     let after = out.split("interactive hold").nth(1).unwrap_or("");
-    if after.contains("hello") {
-        println!("kbd-test: OK — injected keystrokes echoed on the console");
+    let echoed = after.contains("thos$ init");
+    let ran = after.contains("parent done");
+    if echoed && ran {
+        println!("kbd-test: OK — typed `init`, shell forked+execve'd it (saw \"parent done\")");
     } else {
-        eprintln!("kbd-test: FAIL — no echo after the hold marker\n---\n{after}\n---");
+        eprintln!(
+            "kbd-test: FAIL — echoed={echoed} ran={ran} (want both)\n---\n{after}\n---"
+        );
         exit(1);
     }
 }

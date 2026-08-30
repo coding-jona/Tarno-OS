@@ -203,6 +203,7 @@ thos_user_resume:
 // Kernel-thread trampoline for a fork child: r12 = &UserFrame.
 .globl thos_user_thread_resume
 thos_user_thread_resume:
+    call thos_finish_switch            // release the thread that yielded to us
     mov rdi, r12
     jmp thos_user_resume
 "#,
@@ -350,6 +351,7 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_ARCH_PRCTL => match a1 {
             ARCH_SET_FS => {
                 FsBase::write(VirtAddr::new(a2));
+                sched::current().set_fsbase(a2); // survive context switches
                 0
             }
             ARCH_GET_FS => {

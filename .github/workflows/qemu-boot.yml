@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-name: qemu-boot (Phase 1-2: + xHCI keyboard)
+name: qemu-boot (Phase 1-2: + xHCI keyboard + shell)
 
 on:
   push:
@@ -66,5 +66,5 @@ jobs:
           grep -q "THOS: wait primitive" boot.log
           grep -q "THOS: halting." boot.log
 
-      - name: USB keyboard end-to-end (monitor-injected keystrokes)
+      - name: Interactive shell end-to-end (type `init` on the USB keyboard, expect it to run)
         run: cargo xtask kbd-test

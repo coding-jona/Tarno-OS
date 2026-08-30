@@ -139,6 +139,12 @@ extern "C" fn kmain() -> ! {
 
     #[cfg(feature = "interactive")]
     {
+        // Milestone 2: launch the shell off ext2 and hand it the USB keyboard.
+        let fs = ext2::open().expect("mount ext2 for the shell");
+        let sh = fs.read_path("/sh").expect("read /sh from ext2");
+        kprintln!("THOS: shell            /sh = {} bytes", sh.len());
+        process::spawn_init(&sh, &["/sh"], &["PATH=/"]);
+
         kprintln!("THOS: interactive hold — type on the USB keyboard");
         loop {
             sched::yield_now();

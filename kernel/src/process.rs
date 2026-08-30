@@ -83,7 +83,10 @@ impl Process {
     fn for_each_user_page(&self, mut f: impl FnMut(u64, u64, bool, bool)) {
         let hhdm = hhdm_offset();
         let tbl = |phys: u64| unsafe { &*((phys + hhdm) as *const PageTable) };
-        for i4 in 1..256u64 {
+        // 0..256 = the whole user half. Index 0 matters: a static-musl ELF
+        // loads at 0x400000, so its text/data live under PML4[0]. (The kernel's
+        // low identity map was already dropped from PML4[0] in `Process::new`.)
+        for i4 in 0..256u64 {
             let e4 = &tbl(self.pml4_phys)[i4 as usize];
             if !e4.flags().contains(PageTableFlags::PRESENT) {
                 continue;
@@ -420,7 +423,10 @@ pub fn fork(frame: &UserFrame) -> i64 {
     cf.rax = 0;
     cf.cs = cs;
     cf.ss = ss;
-    sched::spawn_user_frame("fork-child", child.clone(), cf);
+    // The child inherits the parent thread's TLS base — it is CPU state, not
+    // memory, so copying the address space alone does not carry it over.
+    let fsbase = sched::current().fsbase();
+    sched::spawn_user_frame("fork-child", child.clone(), cf, fsbase);
     child.pid as i64
 }
 
@@ -439,6 +445,7 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
     let new_cr3 = space.pml4_phys();
     task.set_space(space);
     cur.set_cr3(new_cr3);
+    cur.set_fsbase(0); // fresh image: TLS is re-established by its own arch_prctl
 
     let (cs, ss) = user_selectors();
     let f = UserFrame {
@@ -450,6 +457,7 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
         ..Default::default()
     };
 
+    x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(0));
     unsafe {
         Cr3::write(
             PhysFrame::from_start_address(PhysAddr::new(new_cr3)).unwrap(),
