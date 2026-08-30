@@ -34,6 +34,8 @@ const TIMER_DIV_16: u32 = 0b0011;
 
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 pub const TIMER_VECTOR: u8 = 0x20;
+/// AHCI MSI-X / MSI completion interrupt.
+pub const AHCI_VECTOR: u8 = 0x21;
 
 /// ~100 Hz.
 const TIMER_HZ: u32 = 100;

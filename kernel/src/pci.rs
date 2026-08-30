@@ -45,6 +45,35 @@ pub fn read16(loc: Location, offset: u8) -> u16 {
     (read32(loc, offset) >> ((offset as u32 & 2) * 8)) as u16
 }
 
+/// 16-bit config write (read-modify-write of the containing dword).
+pub fn write16(loc: Location, offset: u8, value: u16) {
+    let shift = (offset as u32 & 2) * 8;
+    let d = read32(loc, offset & 0xFC);
+    write32(loc, offset & 0xFC, (d & !(0xFFFF << shift)) | ((value as u32) << shift));
+}
+
+/// Config offset of the capability with `id` (0x05 = MSI, 0x11 = MSI-X), if any.
+pub fn find_cap(loc: Location, id: u8) -> Option<u8> {
+    if read16(loc, 0x06) & (1 << 4) == 0 {
+        return None; // status register: capability list present
+    }
+    let mut ptr = read32(loc, 0x34) as u8 & 0xFC;
+    for _ in 0..48 {
+        if ptr < 0x40 {
+            return None;
+        }
+        let hdr = read32(loc, ptr);
+        if hdr as u8 == id {
+            return Some(ptr);
+        }
+        ptr = (hdr >> 8) as u8 & 0xFC;
+        if ptr == 0 {
+            return None;
+        }
+    }
+    None
+}
+
 /// class (0x0B), subclass (0x0A), prog-if (0x09).
 fn class_code(loc: Location) -> (u8, u8, u8) {
     let v = read32(loc, 0x08);

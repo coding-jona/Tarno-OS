@@ -58,6 +58,7 @@ jobs:
           grep -q "THOS: ahci ok" boot.log
           grep -q "THOS: ahci cap ok" boot.log
           grep -q "THOS: ahci ncq ok" boot.log
+          grep -qE "THOS: ahci irq +MSI" boot.log
           grep -q "THOS: ext2 ok" boot.log
           grep -q "THOS: elf ok" boot.log
           grep -q "child ran" boot.log

@@ -566,7 +566,11 @@ fn storage_milestone() {
         sched::yield_now();
     }
     assert_eq!(NCQ_BAD.load(Ordering::Relaxed), 0, "concurrent NCQ I/O corrupted data");
-    kprintln!("THOS: ahci ncq ok      8 concurrent readers/writers verified (depth {})", ahci::queue_depth());
+    kprintln!(
+        "THOS: ahci ncq ok      8 concurrent readers/writers verified (depth {}, {} completion IRQs)",
+        ahci::queue_depth(),
+        ahci::irq_count(),
+    );
 
     // ext2 write: create a file + a dir + a nested file, read them back through
     // our own read path. `cargo xtask ext2-test` then e2fsck's the image and

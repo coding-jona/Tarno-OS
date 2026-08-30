@@ -76,8 +76,14 @@ late.
     `FLUSH CACHE EXT` without NCQ. `cargo xtask ahci-test` verifies the sector
     count against the backing file and a past-the-end read is rejected; the
     boot milestone runs **8 threads doing concurrent read/write/verify** through
-    the NCQ path with no corruption. Next: MSI-X completion interrupts instead
-    of polling; NCQ error recovery (`READ LOG EXT` + port restart).
+    the NCQ path with no corruption. **Completion is interrupt-driven**: the
+    driver programs the device's MSI-X (preferred) or MSI capability to raise a
+    vector on the BSP, disables legacy INTx, and a parked submitter blocks on a
+    per-tag wait queue that the IRQ wakes; a timer poll is a safety net and pure
+    `yield` polling is the fallback with no MSI. `cargo xtask ahci-test` asserts
+    the completion IRQ actually fired (QEMU's `ich9-ahci` gives MSI; real Raptor
+    Lake `8086:7a62` gives MSI-X). Next: NCQ error recovery (`READ LOG EXT` +
+    port restart).
 - **xHCI driver** (Intel `8086:7a60`) + USB HID (keyboard/mouse). PS/2 only as a QEMU
   stopgap.
 - ELF loader; **POSIX personality**: syscall table (Linux ABI subset), signals, `futex`

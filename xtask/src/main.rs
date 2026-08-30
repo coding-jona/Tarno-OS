@@ -701,6 +701,18 @@ fn ahci_test(iso: &Path) {
         exit(1);
     }
 
+    // The completion path must be interrupt-driven, not the timer safety net:
+    // the "ahci ncq ok" line reports how many completion IRQs were taken.
+    let irqs: u64 = serial
+        .lines()
+        .find(|l| l.contains("ahci ncq ok"))
+        .and_then(|l| l.rsplit_once(", ").and_then(|(_, r)| r.split_whitespace().next()?.parse().ok()))
+        .unwrap_or(0);
+    if !serial.contains("MSI") || irqs == 0 {
+        eprintln!("ahci-test: FAIL — no MSI completion interrupts (irqs={irqs})\n{serial}");
+        exit(1);
+    }
+
     // Host-side: the pattern the kernel wrote must now be in the disk file.
     let mut f = std::fs::File::open(&disk).expect("open disk.img");
     let mut got = [0u8; 512];
