@@ -50,6 +50,14 @@ late.
 
 - VFS layer + `vnode` object; RAM-FS; **ext2 read/write** (or a simple own FS); **FAT**
   (read the ESP).
+  - Status: ext2 read (12 direct + single + double indirect) and write —
+    block/inode bitmap allocators, `write_path` (create or overwrite a regular
+    file), `mkdir_path`; superblock + group-descriptor counts kept in sync.
+    `cargo xtask ext2-test` has the kernel create a file, a dir and a nested
+    file, then the host runs `e2fsck -fn` (clean) and `debugfs cat` on the
+    result. Missing: `unlink`/`rmdir`, growing a dir past 12 direct blocks,
+    htree, backup superblock/GDT copies (needed before writing the multi-group
+    SSD), timestamps.
 - **AHCI/SATA driver** (Intel `8086:7a62`, standard AHCI 1.3.1 register interface,
   MSI/MSI-X, command list / FIS) → real root FS from the **Kingston A400 240 GB SATA
   SSD** (`sdc`). NVMe is Windows' disk and is never touched; an NVMe driver is
@@ -90,6 +98,26 @@ late.
 - **Milestone 3:** a statically linked Win32 **console** `.exe` (`CreateFile`,
   `WriteFile(stdout)`, `WaitForSingleObject`) runs through the THOS NT path — **with no
   wine process in the tree**. ELF and PE processes appear in one `ps` output.
+
+### 32-bit Windows apps — WOW64 thunks, not code translation
+
+An x86-64 CPU runs 32-bit code natively (long mode's compatibility sub-mode), so
+there is **no instruction translation** and no emulator for i386 `.exe`s — same as
+on real Windows. What a 32-bit PE32 process needs on top of the 64-bit kernel:
+
+- run its threads with a **32-bit code segment** (compat mode); the loader picks
+  the segment from the PE `Machine` field (`0x14c` i386 vs `0x8664` x86-64);
+- a **32-bit `ntdll`** whose stubs widen arguments and enter the 64-bit kernel —
+  the classic **WOW64 thunk layer**: marshal the 32-bit stack/register args into
+  the 64-bit `Nt*` ABI, call, narrow the result back. Pointers stay in the low
+  4 GiB for these processes so handles/addresses round-trip.
+- 32-bit and 64-bit code **never mix in one process** (no loading a 32-bit DLL
+  into a 64-bit process or vice versa), exactly like Windows.
+
+Real architecture emulation (x86 ↔ ARM, à la Rosetta / Windows-on-ARM) is **out
+of scope** — the target is Intel x86-64, where every mainstream Windows binary is
+i386 or x86-64 and runs on the metal. WOW64 is a Phase 3+ item, after the 64-bit
+NT path of Milestone 3 works.
 
 ### Filesystems for the NT personality — no NTFS driver needed
 

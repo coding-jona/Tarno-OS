@@ -48,10 +48,15 @@ fn main() {
             let iso = build_iso();
             ahci_test(&iso);
         }
+        "ext2-test" => {
+            build_kernel(&[]);
+            let iso = build_iso();
+            ext2_test(&iso);
+        }
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test] [--gui]"
+                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test|ext2-test] [--gui]"
             );
             exit(2);
         }
@@ -511,22 +516,16 @@ fn bootpick_test() {
 }
 
 // ===========================================================================
-//  AHCI write path — boot the kernel's write/read-back milestone, then confirm
-//  from the host that the pattern actually persisted into the disk image.
+//  Disk write tests — boot the kernel's storage milestone headless, then verify
+//  the result from the host against the raw disk image.
 // ===========================================================================
 
-/// Must match `SCRATCH_LBA` / the pattern in `kernel/src/main.rs`.
-const AHCI_SCRATCH_LBA: u64 = 20_000;
-
-fn ahci_test(iso: &Path) {
-    use std::io::Read;
+/// Boot the non-interactive kernel with `disk` attached over AHCI, wait for a
+/// clean `ExitCode::Success` halt, and return the serial log. Exits on failure.
+fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path) -> String {
     use std::time::{Duration, Instant};
 
-    let root = workspace_root();
-    // Force a fresh disk image so the scratch sector starts as zeros.
-    let _ = std::fs::remove_file(root.join("target/disk.img"));
-    let disk = disk_image();
-    let log = root.join("target/ahci-serial.log");
+    let log = workspace_root().join(format!("target/{tag}-serial.log"));
     let _ = std::fs::remove_file(&log);
 
     let mut qemu = Command::new("qemu-system-x86_64");
@@ -560,9 +559,23 @@ fn ahci_test(iso: &Path) {
 
     let serial = std::fs::read_to_string(&log).unwrap_or_default();
     if status.and_then(|s| s.code()) != Some(QEMU_SUCCESS) {
-        eprintln!("ahci-test: kernel did not halt cleanly\n--- serial ---\n{serial}\n---");
+        eprintln!("{tag}: kernel did not halt cleanly\n--- serial ---\n{serial}\n---");
         exit(1);
     }
+    serial
+}
+
+/// Must match `SCRATCH_LBA` / the pattern in `kernel/src/main.rs`.
+const AHCI_SCRATCH_LBA: u64 = 20_000;
+
+fn ahci_test(iso: &Path) {
+    use std::io::Read;
+
+    let root = workspace_root();
+    let _ = std::fs::remove_file(root.join("target/disk.img")); // fresh: scratch = zeros
+    let disk = disk_image();
+
+    let serial = boot_kernel_headless("ahci", iso, &disk);
     if !serial.contains("THOS: ahci write ok") {
         eprintln!("ahci-test: FAIL — no in-boot write/read-back marker\n{serial}");
         exit(1);
@@ -576,13 +589,57 @@ fn ahci_test(iso: &Path) {
 
     let want: Vec<u8> = (0..512u32).map(|i| (i as u8) ^ 0xA5).collect();
     if got[..] == want[..] {
-        println!(
-            "ahci-test: OK — kernel round-tripped LBA {AHCI_SCRATCH_LBA} and it persisted to the image"
-        );
+        println!("ahci-test: OK — kernel round-tripped LBA {AHCI_SCRATCH_LBA} and it persisted");
     } else {
         eprintln!("ahci-test: FAIL — disk image scratch sector does not hold the pattern");
-        eprintln!("  first 16 want: {:02x?}", &want[..16]);
-        eprintln!("  first 16 got:  {:02x?}", &got[..16]);
+        eprintln!("  want[..16] {:02x?}\n  got [..16] {:02x?}", &want[..16], &got[..16]);
+        exit(1);
+    }
+}
+
+/// Boot the ext2-write milestone, then from the host run `e2fsck -fn` on the
+/// image and `debugfs` the files the kernel created.
+fn ext2_test(iso: &Path) {
+    let root = workspace_root();
+    let _ = std::fs::remove_file(root.join("target/disk.img")); // start from a pristine fs
+    let disk = disk_image();
+
+    let serial = boot_kernel_headless("ext2", iso, &disk);
+    if !serial.contains("THOS: ext2 write ok") {
+        eprintln!("ext2-test: FAIL — no in-boot ext2-write marker\n{serial}");
+        exit(1);
+    }
+
+    // The filesystem must still be consistent after our writes.
+    let fsck = Command::new("e2fsck")
+        .args(["-fn", disk.to_str().unwrap()])
+        .output()
+        .expect("run e2fsck");
+    if !fsck.status.success() {
+        eprintln!(
+            "ext2-test: FAIL — e2fsck reported problems (exit {:?})\n{}\n{}",
+            fsck.status.code(),
+            String::from_utf8_lossy(&fsck.stdout),
+            String::from_utf8_lossy(&fsck.stderr),
+        );
+        exit(1);
+    }
+
+    let cat = |path: &str| -> String {
+        let o = Command::new("debugfs")
+            .args(["-R", &format!("cat {path}"), disk.to_str().unwrap()])
+            .output()
+            .expect("run debugfs");
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let a = cat("/thos-created.txt");
+    let b = cat("/thosdir/nested.txt");
+    if a.contains("ext2 write works on THOS") && b.contains("nested ok") {
+        println!("ext2-test: OK — e2fsck clean; /thos-created.txt + /thosdir/nested.txt on disk");
+    } else {
+        eprintln!("ext2-test: FAIL — created files not readable from the host");
+        eprintln!("  /thos-created.txt   = {a:?}");
+        eprintln!("  /thosdir/nested.txt = {b:?}");
         exit(1);
     }
 }

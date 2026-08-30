@@ -64,6 +64,7 @@ jobs:
           grep -q "hello from a static musl Rust binary" boot.log
           grep -q "THOS: musl binary ok" boot.log
           grep -q "THOS: ahci write ok" boot.log
+          grep -q "THOS: ext2 write ok" boot.log
           grep -q "THOS: xhci ok" boot.log
           grep -q "THOS: wait primitive" boot.log
           grep -q "THOS: halting." boot.log
@@ -76,3 +77,6 @@ jobs:
 
       - name: AHCI write end-to-end (kernel round-trip + host verifies it persisted)
         run: cargo xtask ahci-test
+
+      - name: ext2 write end-to-end (kernel creates files; host e2fsck + debugfs verify)
+        run: cargo xtask ext2-test

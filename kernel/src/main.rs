@@ -395,6 +395,20 @@ fn storage_milestone() {
     assert!(rbuf == wbuf, "AHCI write / read-back mismatch");
     kprintln!("THOS: ahci write ok    LBA {} round-tripped + flushed", SCRATCH_LBA);
 
+    // ext2 write: create a file + a dir + a nested file, read them back through
+    // our own read path. `cargo xtask ext2-test` then e2fsck's the image and
+    // cat's the files from the host to prove it is a valid on-disk ext2.
+    {
+        let fs = ext2::open().expect("remount ext2");
+        let payload = b"ext2 write works on THOS\n";
+        fs.write_path("/thos-created.txt", payload).expect("ext2 write_path");
+        fs.mkdir_path("/thosdir").expect("ext2 mkdir_path");
+        fs.write_path("/thosdir/nested.txt", b"nested ok\n").expect("ext2 nested write");
+        assert!(fs.read_path("/thos-created.txt").as_deref() == Some(payload.as_slice()));
+        assert!(fs.read_path("/thosdir/nested.txt").as_deref() == Some(b"nested ok\n".as_slice()));
+        kprintln!("THOS: ext2 write ok    /thos-created.txt + /thosdir/nested.txt");
+    }
+
     // USB keyboard via xHCI -> the line-disciplined console -> fd 0.
     match xhci::init() {
         Ok(x) => {
