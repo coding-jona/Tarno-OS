@@ -605,6 +605,23 @@ fn storage_milestone() {
     #[cfg(feature = "stress")]
     smp_stress_milestone(&init);
 
+    #[cfg(feature = "faulttest")]
+    {
+        // `cargo xtask ncq-error-test` runs QEMU with blkdebug poisoning one
+        // read of this LBA. The read must fail *cleanly* (no hang, no panic),
+        // recovery must run, and a retry must succeed on the restarted port.
+        const BAD_LBA: u64 = 41_000;
+        let mut b = [0u8; ahci::SECTOR];
+        let r = ahci::read(BAD_LBA, &mut b);
+        assert!(r.is_err(), "poisoned read did not surface an error: {r:?}");
+        assert!(ahci::recover_count() >= 1, "error was not run through recovery");
+        kprintln!(
+            "THOS: ncq error ok     poisoned read -> {:?}; {} recovery pass(es), no hang",
+            r.unwrap_err(),
+            ahci::recover_count(),
+        );
+    }
+
     // USB keyboard via xHCI -> the line-disciplined console -> fd 0.
     match xhci::init() {
         Ok(x) => {

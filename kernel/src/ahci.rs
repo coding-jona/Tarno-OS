@@ -48,6 +48,7 @@ const P_TFD: usize = 0x20;
 const P_SIG: usize = 0x24;
 const P_SSTS: usize = 0x28;
 const P_SERR: usize = 0x30;
+const P_SCTL: usize = 0x2C;
 const P_SACT: usize = 0x34;
 const P_CI: usize = 0x38;
 
@@ -90,8 +91,25 @@ static SUBMIT: Mutex<()> = Mutex::new(());
 static FREE_TAGS: AtomicU32 = AtomicU32::new(0);
 /// One bit per tag whose submitter is currently parked in `wait`.
 static INFLIGHT: AtomicU32 = AtomicU32::new(0);
+/// One bit per tag whose command failed (set by error recovery).
+static TAG_ERR: AtomicU32 = AtomicU32::new(0);
 /// Completion interrupts actually taken (vs. the timer safety net doing the work).
 static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+/// NCQ error-recovery passes performed.
+static RECOVER_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Only one thread drives error recovery; the rest wait for their tag verdict.
+static RECOVER: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Copy)]
+struct Pending {
+    is_write: bool,
+    lba: u64,
+    sectors: u16,
+    buf_phys: u64,
+}
+/// The parameters of every in-flight command, so recovery can re-issue the
+/// tags the drive aborted that were not the one that actually failed.
+static PENDING: Mutex<[Option<Pending>; 32]> = Mutex::new([None; 32]);
 /// A parked submitter blocks here; the IRQ (and the timer safety net) wake it.
 static TAG_WAKE: [WaitQueue; 32] = [const { WaitQueue::new() }; 32];
 
@@ -389,7 +407,10 @@ fn issue(tag: u8, ncq: bool, is_write: bool, buf: Option<(u64, u32)>, fill_fis: 
 }
 
 /// Wait for tag `tag` to complete. `blocking` parks on the tag's wait queue
-/// (woken by the completion IRQ); otherwise it polls with `yield`.
+/// (woken by the completion IRQ); otherwise it polls with `yield`. On a
+/// task-file / NCQ error it drives (or waits on) error recovery: recovery
+/// re-issues the tags the drive aborted that were not the failing one, so a
+/// survivor's `wait` still returns `Ok`; only the failing tag returns `Err`.
 fn wait(tag: u8, ncq: bool, blocking: bool) -> Result<(), &'static str> {
     let hba = Hba::cur();
     let mask = 1u32 << tag;
@@ -398,10 +419,21 @@ fn wait(tag: u8, ncq: bool, blocking: bool) -> Result<(), &'static str> {
     }
     let r = (|| {
         for _ in 0..POLL_LIMIT {
-            let is = hba.pr(P_IS);
-            if is & IS_TFES != 0 || hba.pr(P_TFD) & TFD_ERR != 0 {
-                hba.pw(P_IS, is);
-                return Err("AHCI task-file error");
+            if TAG_ERR.fetch_and(!mask, Ordering::AcqRel) & mask != 0 {
+                return Err("AHCI I/O error");
+            }
+            if hba.pr(P_IS) & IS_TFES != 0 || hba.pr(P_TFD) & TFD_ERR != 0 {
+                match RECOVER.try_lock() {
+                    Some(_g) => recover(&hba),
+                    None => sched::yield_now(), // another thread is recovering
+                }
+                continue;
+            }
+            if RECOVER.is_locked() {
+                // Recovery in progress: PxSACT was cleared by the port stop, so
+                // a cleared tag bit here is not a real completion — wait it out.
+                sched::yield_now();
+                continue;
             }
             let done = if ncq {
                 hba.pr(P_SACT) & mask == 0
@@ -426,6 +458,126 @@ fn wait(tag: u8, ncq: bool, blocking: bool) -> Result<(), &'static str> {
     r
 }
 
+/// SATA error recovery: stop the port, COMRESET the link to force the device
+/// out of its aborted-NCQ state, restart the port, best-effort `READ LOG EXT`
+/// for the failing tag, then fail that tag and re-issue every other aborted one.
+fn recover(hba: &Hba) {
+    RECOVER_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Aborted tags — captured before the reset clears PxSACT/PxCI.
+    let aborted = hba.pr(P_SACT) | hba.pr(P_CI);
+
+    // Stop the engine.
+    hba.pw(P_CMD, hba.pr(P_CMD) & !CMD_ST);
+    for _ in 0..1_000_000 {
+        if hba.pr(P_CMD) & CMD_CR == 0 {
+            break;
+        }
+    }
+
+    // COMRESET: PxSCTL.DET = 1, hold, DET = 0, wait for the link to come back.
+    hba.pw(P_SCTL, (hba.pr(P_SCTL) & !0xF) | 1);
+    for _ in 0..2_000_000 {
+        core::hint::spin_loop(); // >= 1 ms
+    }
+    hba.pw(P_SCTL, hba.pr(P_SCTL) & !0xF);
+    for _ in 0..5_000_000 {
+        if hba.pr(P_SSTS) & 0xF == 3 {
+            break; // device present, PHY communication established
+        }
+        core::hint::spin_loop();
+    }
+
+    hba.pw(P_SERR, 0xFFFF_FFFF);
+    hba.pw(P_IS, 0xFFFF_FFFF);
+    hba.w(HBA_IS, hba.r(HBA_IS));
+    hba.pw(P_CMD, hba.pr(P_CMD) | CMD_ST);
+    for _ in 0..5_000_000 {
+        if hba.pr(P_TFD) & (TFD_BSY | TFD_DRQ) == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    // Best-effort: which NCQ tag actually failed (bit 7 = non-NCQ error).
+    let failed = match read_log_ext(0x10) {
+        Ok(pg) if pg[0] & 0x80 == 0 => Some(pg[0] & 0x1F),
+        _ => None,
+    };
+
+    let pend = PENDING.lock();
+    for t in 0..MAX_TAGS {
+        if aborted & (1u32 << t) == 0 {
+            continue;
+        }
+        match (failed, pend[t as usize]) {
+            (Some(f), Some(p)) if f != t => {
+                let _s = SUBMIT.lock();
+                let bytes = p.sectors as u32 * SECTOR as u32;
+                issue(t, true, p.is_write, Some((p.buf_phys, bytes)), fis(p.is_write, true, p.lba, p.sectors, t));
+            }
+            _ => {
+                TAG_ERR.fetch_or(1u32 << t, Ordering::Release);
+            }
+        }
+    }
+    drop(pend);
+    wake_parked();
+    crate::kprintln!("THOS: ahci recover     port restarted; failing NCQ tag {:?}", failed);
+}
+
+/// Bounded poll for tag 0's `PxCI` bit (used only inside `recover`, so it must
+/// not itself trigger recovery). Short budget — this is best-effort diagnostics.
+fn poll_tag0() -> Result<(), &'static str> {
+    let hba = Hba::cur();
+    for _ in 0..500_000 {
+        if hba.pr(P_IS) & IS_TFES != 0 {
+            return Err("READ LOG EXT errored");
+        }
+        if hba.pr(P_CI) & 1 == 0 {
+            return Ok(());
+        }
+        sched::yield_now();
+    }
+    Err("READ LOG EXT timed out")
+}
+
+/// `READ LOG EXT` (0x2F) of one 512-byte log page, non-queued on tag 0.
+fn read_log_ext(page: u8) -> Result<[u8; 512], &'static str> {
+    let frame = FRAME_ALLOC.lock().alloc().ok_or("no bounce frame")?;
+    let phys = frame.start_address().as_u64();
+    {
+        wait_ready(&Hba::cur());
+        let _s = SUBMIT.lock();
+        issue(0, false, false, Some((phys, 512)), |f| unsafe {
+            f.add(0).write_volatile(FIS_TYPE_H2D);
+            f.add(1).write_volatile(1 << 7);
+            f.add(2).write_volatile(0x2F); // READ LOG EXT
+            f.add(4).write_volatile(page); // LBA 7:0  = log page
+            f.add(7).write_volatile(1 << 6); // LBA mode
+            f.add(12).write_volatile(1); // count = 1 sector
+        });
+    }
+    let r = poll_tag0();
+    let mut buf = [0u8; 512];
+    if r.is_ok() {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                phys_to_virt(x86_64::PhysAddr::new(phys)).as_ptr::<u8>(),
+                buf.as_mut_ptr(),
+                512,
+            );
+        }
+    }
+    FRAME_ALLOC.lock().dealloc(frame);
+    r.map(|()| buf)
+}
+
+/// NCQ error-recovery passes performed.
+#[allow(dead_code)] // read by the `faulttest` milestone
+pub fn recover_count() -> u64 {
+    RECOVER_COUNT.load(Ordering::Relaxed)
+}
+
 fn transfer(is_write: bool, lba: u64, sectors: u16, buf_phys: u64) -> Result<(), &'static str> {
     if HBA_BASE.load(Ordering::Relaxed) == 0 {
         return Err("AHCI not initialised");
@@ -437,6 +589,7 @@ fn transfer(is_write: bool, lba: u64, sectors: u16, buf_phys: u64) -> Result<(),
     let ncq = DEPTH.load(Ordering::Relaxed) > 1;
     let bytes = sectors as u32 * SECTOR as u32;
     let tag = alloc_tag();
+    PENDING.lock()[tag as usize] = Some(Pending { is_write, lba, sectors, buf_phys });
 
     {
         wait_ready(&Hba::cur());
@@ -444,6 +597,7 @@ fn transfer(is_write: bool, lba: u64, sectors: u16, buf_phys: u64) -> Result<(),
         issue(tag, ncq, is_write, Some((buf_phys, bytes)), fis(is_write, ncq, lba, sectors, tag));
     }
     let r = wait(tag, ncq, IRQ_ON.load(Ordering::Relaxed));
+    PENDING.lock()[tag as usize] = None;
     free_tag(tag);
     r
 }

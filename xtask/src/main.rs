@@ -63,6 +63,11 @@ fn main() {
             let iso = build_iso();
             smp_test(&iso);
         }
+        "ncq-error-test" => {
+            build_kernel(&["faulttest"]);
+            let iso = build_iso();
+            ncq_error_test(&iso);
+        }
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
@@ -795,6 +800,72 @@ fn smp_test(iso: &Path) {
         println!("smp-test: OK — {}", line.trim());
     } else {
         eprintln!("smp-test: FAIL — stress milestone did not pass\n--- serial ---\n{serial}\n---");
+        exit(1);
+    }
+}
+
+/// Boot with QEMU `blkdebug` poisoning one read of LBA 41000, so the kernel's
+/// NCQ error-recovery path runs: the read must fail cleanly (no hang / panic),
+/// the port must recover, and the retry must succeed.
+fn ncq_error_test(iso: &Path) {
+    use std::time::{Duration, Instant};
+
+    let root = workspace_root();
+    let _ = std::fs::remove_file(root.join("target/disk.img"));
+    let disk = disk_image();
+    let cfg = root.join("target/ncq-fault.conf");
+    std::fs::write(
+        &cfg,
+        "[inject-error]\nevent = \"read_aio\"\nerrno = \"5\"\nonce = \"on\"\nsector = \"41000\"\n",
+    )
+    .unwrap();
+    let log = root.join("target/ncq-serial.log");
+    let _ = std::fs::remove_file(&log);
+
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu.args(["-M", "q35", "-m", "512M", "-smp", "4", "-cdrom", iso.to_str().unwrap()]);
+    qemu.args([
+        "-drive",
+        &format!(
+            "if=none,id=disk0,format=raw,file=blkdebug:{}:{}",
+            cfg.to_str().unwrap(),
+            disk.to_str().unwrap()
+        ),
+        "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0",
+    ]);
+    qemu.args(["-display", "none", "-no-reboot"]);
+    qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
+    qemu.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+    for ovmf in ["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/ovmf/OVMF.fd"] {
+        if Path::new(ovmf).exists() {
+            qemu.args(["-drive", &format!("if=pflash,format=raw,readonly=on,file={ovmf}")]);
+            break;
+        }
+    }
+
+    let mut child = qemu.spawn().expect("spawn qemu");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("wait qemu") {
+            break Some(s);
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let serial = std::fs::read_to_string(&log).unwrap_or_default();
+
+    if status.and_then(|s| s.code()) != Some(QEMU_SUCCESS) {
+        eprintln!("ncq-error-test: FAIL — kernel did not halt cleanly (hang / panic on the poisoned read)\n--- serial ---\n{serial}\n---");
+        exit(1);
+    }
+    if serial.contains("THOS: ncq error ok") && serial.contains("THOS: ahci recover") {
+        let line = serial.lines().find(|l| l.contains("ncq error ok")).unwrap_or("");
+        println!("ncq-error-test: OK — {}", line.trim());
+    } else {
+        eprintln!("ncq-error-test: FAIL — recovery markers missing\n--- serial ---\n{serial}\n---");
         exit(1);
     }
 }

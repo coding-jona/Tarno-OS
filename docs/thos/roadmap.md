@@ -82,8 +82,17 @@ late.
     per-tag wait queue that the IRQ wakes; a timer poll is a safety net and pure
     `yield` polling is the fallback with no MSI. `cargo xtask ahci-test` asserts
     the completion IRQ actually fired (QEMU's `ich9-ahci` gives MSI; real Raptor
-    Lake `8086:7a62` gives MSI-X). Next: NCQ error recovery (`READ LOG EXT` +
-    port restart).
+    Lake `8086:7a62` gives MSI-X).
+  - NCQ error handling: on `PxIS.TFES` one thread runs `recover()` (port stop →
+    COMRESET via `PxSCTL.DET` → restart → best-effort `READ LOG EXT` page 0x10
+    for the failing tag); the failing tag's `wait` returns `Err`, every other
+    aborted tag is re-issued so its `wait` still returns `Ok`, and the per-tag
+    parked waiters are woken. `PENDING[32]` records each in-flight command's
+    params for the re-issue. `cargo xtask ncq-error-test` uses QEMU `blkdebug`
+    to fail one read and asserts the error surfaces as `Err` with a recovery
+    pass and **no hang** (a wedged port or lost waiter would time the test out).
+    Post-recovery port usability is real-hardware territory — QEMU's AHCI does
+    not model link recovery after an NCQ abort well enough to verify it.
 - **xHCI driver** (Intel `8086:7a60`) + USB HID (keyboard/mouse). PS/2 only as a QEMU
   stopgap.
 - ELF loader; **POSIX personality**: syscall table (Linux ABI subset), signals, `futex`

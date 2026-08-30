@@ -91,3 +91,6 @@ jobs:
 
       - name: SMP scheduler stress (24 vCPUs; hundreds of threads churn/block/fork)
         run: cargo xtask smp-test
+
+      - name: AHCI NCQ error handling (blkdebug poisons a read; error surfaces, no hang)
+        run: cargo xtask ncq-error-test

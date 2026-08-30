@@ -30,3 +30,6 @@ interactive = []
 # `stress`: run the SMP scheduler stress milestone (many threads churning
 # yield / block / wake / fork across every CPU). Driven by `cargo xtask smp-test`.
 stress = []
+# `faulttest`: read an LBA that `cargo xtask ncq-error-test` poisons via QEMU
+# blkdebug, to exercise AHCI NCQ error recovery.
+faulttest = []
