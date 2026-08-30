@@ -57,6 +57,7 @@ jobs:
           grep -q "THOS: elf ok" boot.log
           grep -q "child ran" boot.log
           grep -q "parent done" boot.log
+          grep -q "a file read via open" boot.log
           grep -q "THOS: fork/exec/wait4  ok" boot.log
           grep -q "THOS: user process ok" boot.log
           grep -q "THOS: wait primitive" boot.log

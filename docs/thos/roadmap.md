@@ -75,6 +75,21 @@ late.
   `WriteFile(stdout)`, `WaitForSingleObject`) runs through the THOS NT path — **with no
   wine process in the tree**. ELF and PE processes appear in one `ps` output.
 
+### Filesystems for the NT personality — no NTFS driver needed
+
+Windows apps expect `C:\...` with NTFS *semantics* (ADS, ACLs, case-insensitive,
+reparse points), **not** a real NTFS on-disk driver. `C:` is a directory tree on the
+ext4 root — the `\Device\HarddiskVolume` → drive-letter → VFS-path mapping does the
+translation, exactly like Wine's `drive_c/`. Case-insensitivity and ADS are handled in
+the NT VFS layer, on top of ext4.
+
+A real **NTFS driver** is only for *mounting the actual Windows partition* (the 512 GB
+NVMe) to see Windows' own files:
+- **read-only NTFS**: moderate (MFT, runlists, `$DATA`, basic compression) — optional,
+  post-Milestone-3.
+- **read-write NTFS**: hard and risky (`$LogFile`, USN journal, consistency) — Phase 4+
+  research item, same tier as loading `.sys` drivers. Not on the critical path.
+
 ## Phase 4 — Real graphics (the GPU mountain)
 
 - **GPU driver for Navi 23** — decide after a 2–4 week spike:

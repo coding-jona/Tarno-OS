@@ -160,6 +160,14 @@ fn disk_image() -> PathBuf {
             img.to_str().unwrap(),
         ]));
     }
+
+    // A plain data file for the open/read/lseek test.
+    let msg = root.join("target/message");
+    std::fs::write(&msg, b"hello a file read via open+lseek+read\n").unwrap();
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} message", msg.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
     img
 }
 

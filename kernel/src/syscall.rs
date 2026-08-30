@@ -31,7 +31,10 @@ pub fn user_exits() -> u64 {
 // Linux x86-64 syscall numbers.
 const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
+const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_FSTAT: u64 = 5;
+const SYS_LSEEK: u64 = 8;
 const SYS_MMAP: u64 = 9;
 const SYS_BRK: u64 = 12;
 const SYS_RT_SIGACTION: u64 = 13;
@@ -50,6 +53,7 @@ const SYS_SET_ROBUST_LIST: u64 = 273;
 const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
 const SYS_RSEQ: u64 = 334;
+const SYS_OPENAT: u64 = 257;
 
 const ENOSYS: i64 = -38;
 const EBADF: i64 = -9;
@@ -200,13 +204,55 @@ pub fn init_cpu(_cpu: usize) {
     );
 }
 
+fn cur_fd(fd: u64) -> Option<alloc::sync::Arc<dyn crate::file::FileOps>> {
+    sched::current().task()?.fd_get(fd as i32)
+}
+
 fn sys_write(fd: u64, ptr: u64, len: u64) -> i64 {
-    if fd != 1 && fd != 2 {
-        return EBADF;
+    match cur_fd(fd) {
+        Some(f) => {
+            let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+            f.write(bytes)
+        }
+        None => EBADF,
     }
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-    serial::write_bytes(bytes);
-    len as i64
+}
+
+fn sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
+    match cur_fd(fd) {
+        Some(f) => {
+            let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
+            f.read(buf)
+        }
+        None => EBADF,
+    }
+}
+
+fn sys_open(path_ptr: u64) -> i64 {
+    let path = user_cstr(path_ptr);
+    let Some(task) = sched::current().task() else {
+        return EBADF;
+    };
+    match ext2::open().ok().and_then(|fs| fs.read_path(&path)) {
+        Some(bytes) => task.fd_alloc(crate::file::MemFile::new(bytes)) as i64,
+        None => ENOENT,
+    }
+}
+
+/// Minimal `struct stat` (x86-64 layout): mode @24, nlink @16, size @48,
+/// blksize @56, blocks @64. Everything else zero.
+fn sys_fstat(fd: u64, buf: u64) -> i64 {
+    let Some(f) = cur_fd(fd) else { return EBADF };
+    let (mode, size) = f.stat();
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, 144);
+        *((buf + 16) as *mut u64) = 1; // st_nlink
+        *((buf + 24) as *mut u32) = mode;
+        *((buf + 48) as *mut i64) = size as i64;
+        *((buf + 56) as *mut i64) = 4096; // st_blksize
+        *((buf + 64) as *mut i64) = ((size + 511) / 512) as i64;
+    }
+    0
 }
 
 /// Read a NUL-terminated string from user memory (we're under the caller's CR3).
@@ -250,21 +296,33 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
 
     let ret: i64 = match nr {
         SYS_WRITE => sys_write(a1, a2, a3),
+        SYS_READ => sys_read(a1, a2, a3),
 
         SYS_WRITEV => {
-            if a1 != 1 && a1 != 2 {
-                EBADF
-            } else {
-                let iov = unsafe { core::slice::from_raw_parts(a2 as *const [u64; 2], a3 as usize) };
-                let mut total = 0i64;
-                for &[base, len] in iov {
-                    total += sys_write(a1, base, len).max(0);
+            let iov = unsafe { core::slice::from_raw_parts(a2 as *const [u64; 2], a3 as usize) };
+            let mut total = 0i64;
+            for &[base, len] in iov {
+                let r = sys_write(a1, base, len);
+                if r < 0 {
+                    total = if total == 0 { r } else { total };
+                    break;
                 }
-                total
+                total += r;
             }
+            total
         }
 
-        SYS_READ => 0,
+        SYS_OPEN => sys_open(a1),
+        SYS_OPENAT => sys_open(a2), // dirfd ignored; paths are absolute
+        SYS_CLOSE => {
+            if sched::current().task().map(|t| t.fd_close(a1 as i32)).unwrap_or(false) {
+                0
+            } else {
+                EBADF
+            }
+        }
+        SYS_LSEEK => cur_fd(a1).map(|f| f.seek(a2 as i64, a3 as u32)).unwrap_or(EBADF),
+        SYS_FSTAT => sys_fstat(a1, a2),
 
         SYS_ARCH_PRCTL => match a1 {
             ARCH_SET_FS => {
@@ -296,7 +354,7 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_GETPID => process::current_pid() as i64,
         SYS_SET_TID_ADDRESS => process::current_pid() as i64,
         SYS_IOCTL => ENOTTY,
-        SYS_CLOSE | SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_SET_ROBUST_LIST | SYS_PRLIMIT64 => 0,
+        SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_SET_ROBUST_LIST | SYS_PRLIMIT64 => 0,
         SYS_RSEQ => ENOSYS,
 
         SYS_FORK => process::fork(frame),

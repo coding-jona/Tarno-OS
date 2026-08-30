@@ -30,6 +30,7 @@ mod ahci;
 mod apic;
 mod elf;
 mod ext2;
+mod file;
 mod gdt;
 mod idt;
 mod mm;

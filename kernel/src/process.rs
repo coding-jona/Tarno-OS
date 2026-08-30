@@ -22,6 +22,7 @@ use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
 use x86_64::PhysAddr;
 
 use crate::elf::{self, Image};
+use crate::file::{ConsoleFile, FileOps};
 use crate::mm::{hhdm_offset, phys_to_virt, FRAME_ALLOC};
 use crate::syscall::{self, UserFrame};
 use crate::{gdt, sched, vmm};
@@ -281,12 +282,22 @@ impl Process {
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static TASKS: Mutex<BTreeMap<u64, Arc<Task>>> = Mutex::new(BTreeMap::new());
 
+type Fd = Option<Arc<dyn FileOps>>;
+
 pub struct Task {
     pub pid: u64,
     pub ppid: u64,
     space: Mutex<Arc<Process>>,
     exit_status: Mutex<Option<i32>>,
     exited: AtomicBool,
+    /// File descriptor table. 0/1/2 seeded with the console.
+    fds: Mutex<Vec<Fd>>,
+}
+
+fn seed_fds() -> Vec<Fd> {
+    let stdin: Arc<dyn FileOps> = Arc::new(ConsoleFile { writable: false });
+    let out: Arc<dyn FileOps> = Arc::new(ConsoleFile { writable: true });
+    alloc::vec![Some(stdin), Some(out.clone()), Some(out)]
 }
 
 impl Task {
@@ -297,6 +308,7 @@ impl Task {
             space: Mutex::new(space),
             exit_status: Mutex::new(None),
             exited: AtomicBool::new(false),
+            fds: Mutex::new(seed_fds()),
         });
         TASKS.lock().insert(t.pid, t.clone());
         t
@@ -308,6 +320,42 @@ impl Task {
 
     fn set_space(&self, s: Arc<Process>) {
         *self.space.lock() = s;
+    }
+
+    pub fn fd_get(&self, fd: i32) -> Option<Arc<dyn FileOps>> {
+        let fds = self.fds.lock();
+        fds.get(fd as usize).and_then(|f| f.clone())
+    }
+
+    pub fn fd_alloc(&self, file: Arc<dyn FileOps>) -> i32 {
+        let mut fds = self.fds.lock();
+        let slot = fds.iter().position(|f| f.is_none());
+        match slot {
+            Some(i) => {
+                fds[i] = Some(file);
+                i as i32
+            }
+            None => {
+                fds.push(Some(file));
+                (fds.len() - 1) as i32
+            }
+        }
+    }
+
+    pub fn fd_close(&self, fd: i32) -> bool {
+        let mut fds = self.fds.lock();
+        match fds.get_mut(fd as usize) {
+            Some(slot @ Some(_)) => {
+                *slot = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// fork inherits the parent's open files (shared, like POSIX).
+    fn clone_fds(&self) -> Vec<Fd> {
+        self.fds.lock().clone()
     }
 }
 
@@ -361,6 +409,7 @@ pub fn fork(frame: &UserFrame) -> i64 {
     });
 
     let child = Task::new(parent.pid, cspace);
+    *child.fds.lock() = parent.clone_fds();
     let (cs, ss) = user_selectors();
     let mut cf = *frame;
     cf.rax = 0;
