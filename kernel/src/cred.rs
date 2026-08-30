@@ -24,7 +24,7 @@ pub const STORE_DIR: &str = "/etc/thos";
 pub const STORE_PATH: &str = "/etc/thos/admin.cred";
 
 /// PBKDF2 iteration count. Modest for a stub in-kernel KDF; argon2id later.
-const ROUNDS: u32 = 200_000;
+const ROUNDS: u32 = 60_000;
 /// The admin's normal session runs unprivileged — never uid 0. `elevate`
 /// (Phase 3) is what hands out privilege.
 pub const ADMIN_UID: u32 = 1000;

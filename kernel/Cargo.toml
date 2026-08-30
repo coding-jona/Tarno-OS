@@ -33,3 +33,7 @@ stress = []
 # `faulttest`: read an LBA that `cargo xtask ncq-error-test` poisons via QEMU
 # blkdebug, to exercise AHCI NCQ error recovery.
 faulttest = []
+# `bbtest`: run a stock static BusyBox in storage_milestone. Driven by
+# `cargo xtask busybox-test`. Off by default — reading the 2 MiB binary a
+# block at a time slows every boot.
+bbtest = []

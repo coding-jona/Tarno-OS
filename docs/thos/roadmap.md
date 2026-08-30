@@ -106,6 +106,12 @@ late.
     `fork`+`execve`+`wait4`s programs off ext2, reports exit status. Verified in
     CI (`cargo xtask kbd-test` types `init` and checks it runs). Still on the QEMU
     disk image, not the real SSD (no installer yet).
+  - **Stock static BusyBox runs unmodified** (`cargo xtask busybox-test`, from the
+    `busybox-static` package): `busybox echo …` loads via the ELF loader and
+    exits cleanly through the POSIX personality — the Milestone-2 "unmodified
+    Linux x86-64 binary" bar. Feature-gated (`bbtest`) because reading the 2 MiB
+    binary one 1 KiB ext2 block at a time slows every boot — an ext2 read-batching
+    pass is a pending perf follow-up, after which BusyBox `sh` can replace `/sh`.
   - Fixed along the way: (1) SMP scheduler race — a thread that yielded from
     inside a syscall could be resumed on a second CPU before the first finished
     unwinding its kernel stack; now a per-thread `running` claim + deferred

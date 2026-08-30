@@ -543,6 +543,24 @@ fn storage_milestone() {
     }
     kprintln!("THOS: musl binary ok   (static Rust/musl ran to exit)");
 
+    // Milestone 2: an unmodified stock static BusyBox. Feature-gated — reading
+    // the 2 MiB binary a block at a time makes every boot noticeably slower.
+    #[cfg(feature = "bbtest")]
+    {
+        let bb = fs.read_path("/busybox").expect("read /busybox from ext2");
+        kprintln!("THOS: ext2 ok          /busybox = {} bytes", bb.len());
+        let before = syscall::user_exits();
+        process::spawn_init(
+            &bb,
+            &["busybox", "echo", "THOS: busybox says hello"],
+            &["PATH=/", "HOME=/"],
+        );
+        while syscall::user_exits() <= before {
+            sched::yield_now();
+        }
+        kprintln!("THOS: busybox ok       stock static BusyBox ran unmodified");
+    }
+
     // AHCI write: round-trip a known pattern through a scratch sector past the
     // ext2 image (LBA 50000 = ~25 MiB; the fs is the first 16 MiB). The host
     // side of `cargo xtask ahci-test` re-checks this landed in the disk file.

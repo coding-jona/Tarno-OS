@@ -26,7 +26,7 @@ jobs:
       - name: Install QEMU + xorriso + OVMF
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 xorriso ovmf e2fsprogs binutils mtools dosfstools
+          sudo apt-get install -y qemu-system-x86 xorriso ovmf e2fsprogs binutils mtools dosfstools busybox-static
 
       - name: Build Limine
         run: make -C third_party/limine
@@ -94,3 +94,6 @@ jobs:
 
       - name: AHCI NCQ error handling (blkdebug poisons a read; error surfaces, no hang)
         run: cargo xtask ncq-error-test
+
+      - name: Stock BusyBox runs unmodified (Milestone 2)
+        run: cargo xtask busybox-test

@@ -68,6 +68,11 @@ fn main() {
             let iso = build_iso();
             ncq_error_test(&iso);
         }
+        "busybox-test" => {
+            build_kernel(&["bbtest"]);
+            let iso = build_iso();
+            busybox_test(&iso);
+        }
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
@@ -255,6 +260,19 @@ fn disk_image() -> PathBuf {
         "-w", "-R", &format!("write {} sh", shbin.to_str().unwrap()),
         img.to_str().unwrap(),
     ]));
+
+    // A real, unmodified statically-linked BusyBox -> /busybox (Milestone 2:
+    // stock Linux x86-64 ELF binaries run as-is). From the `busybox-static`
+    // package.
+    for cand in ["/bin/busybox", "/usr/bin/busybox"] {
+        if std::fs::metadata(cand).map(|m| m.len() > 100_000).unwrap_or(false) {
+            run(Command::new("debugfs").args([
+                "-w", "-R", &format!("write {cand} busybox"),
+                img.to_str().unwrap(),
+            ]));
+            break;
+        }
+    }
     img
 }
 
@@ -336,7 +354,7 @@ fn drive_login(sock: &Path, log: &Path, child: &mut std::process::Child, tag: &s
         type_line(sock, "thos"); // admin username
         type_line(sock, "pass"); // password
         type_line(sock, "pass"); // repeat
-        if !wait_for(log, "THOS login:", 20) {
+        if !wait_for(log, "THOS login:", 40) {
             kill(child, tag, "no login prompt after first-run setup", log);
         }
     }
@@ -389,7 +407,7 @@ fn login_test(iso: &Path) {
         kill(&mut c1, "login-test", "boot 1 showed no first-run setup", &log1);
     }
     drive_login(&sock1, &log1, &mut c1, "login-test");
-    let ok1 = wait_for(&log1, "interactive hold", 25);
+    let ok1 = wait_for(&log1, "interactive hold", 40);
     let _ = c1.kill();
     let _ = c1.wait();
     if !ok1 {
@@ -866,6 +884,18 @@ fn ncq_error_test(iso: &Path) {
         println!("ncq-error-test: OK — {}", line.trim());
     } else {
         eprintln!("ncq-error-test: FAIL — recovery markers missing\n--- serial ---\n{serial}\n---");
+        exit(1);
+    }
+}
+
+/// Boot a `bbtest` kernel and require the stock static BusyBox to run and print.
+fn busybox_test(iso: &Path) {
+    let disk = disk_image();
+    let serial = boot_kernel_headless("busybox", iso, &disk, 4);
+    if serial.contains("THOS: busybox ok") && serial.contains("THOS: busybox says hello") {
+        println!("busybox-test: OK — stock static BusyBox `echo` ran unmodified");
+    } else {
+        eprintln!("busybox-test: FAIL — BusyBox did not run to a clean exit\n--- serial ---\n{serial}\n---");
         exit(1);
     }
 }

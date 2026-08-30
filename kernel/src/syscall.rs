@@ -59,6 +59,7 @@ const SYS_ARCH_PRCTL: u64 = 158;
 const SYS_SET_TID_ADDRESS: u64 = 218;
 const SYS_EXIT_GROUP: u64 = 231;
 const SYS_SET_ROBUST_LIST: u64 = 273;
+const SYS_PRCTL: u64 = 157;
 const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
 const SYS_RSEQ: u64 = 334;
@@ -410,7 +411,8 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_SET_TID_ADDRESS => process::current_pid() as i64,
         SYS_IOCTL => ENOTTY,
         SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_RT_SIGRETURN | SYS_SET_ROBUST_LIST
-        | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MPROTECT | SYS_MADVISE | SYS_MUNMAP | SYS_FUTEX => 0,
+        | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MPROTECT | SYS_MADVISE | SYS_MUNMAP | SYS_FUTEX
+        | SYS_PRCTL => 0,
         SYS_RSEQ => ENOSYS,
 
         // poll: mark valid fds as "no events", invalid as POLLNVAL.
