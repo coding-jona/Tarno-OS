@@ -508,11 +508,18 @@ fn storage_milestone() {
     vfs::close(h);
     kprintln!("THOS: vfs ok           /hello {} bytes; entries {:?}", n, vfs::list());
 
-    ahci::init().expect("AHCI init");
+    ahci::init().expect("AHCI init"); // logs "THOS: ahci ident ..."
     let mut sb = [0u8; ahci::SECTOR];
     ahci::read(2, &mut sb).expect("AHCI read LBA 2");
     let magic = u16::from_le_bytes([sb[56], sb[57]]);
     kprintln!("THOS: ahci ok          LBA 2 read; ext2 magic {:#06x}", magic);
+
+    // Capacity from IDENTIFY: the disk must hold the fs, and a read one sector
+    // past the end must be rejected by the bounds check (not the drive).
+    let cap = ahci::capacity_sectors();
+    assert!(cap >= 32_768, "disk reports only {cap} sectors — smaller than the fs");
+    assert!(ahci::read(cap, &mut [0u8; ahci::SECTOR]).is_err(), "read past EOD not rejected");
+    kprintln!("THOS: ahci cap ok      {} sectors; out-of-range read rejected", cap);
 
     let fs = ext2::open().expect("mount ext2");
     let init = fs.read_path("/init").expect("read /init from ext2");
@@ -536,10 +543,28 @@ fn storage_milestone() {
     }
     kprintln!("THOS: musl binary ok   (static Rust/musl ran to exit)");
 
+    // Milestone 2: an unmodified stock static BusyBox. Feature-gated — reading
+    // the 2 MiB binary a block at a time makes every boot noticeably slower.
+    #[cfg(feature = "bbtest")]
+    {
+        let bb = fs.read_path("/busybox").expect("read /busybox from ext2");
+        kprintln!("THOS: ext2 ok          /busybox = {} bytes", bb.len());
+        let before = syscall::user_exits();
+        process::spawn_init(
+            &bb,
+            &["busybox", "echo", "THOS: busybox says hello"],
+            &["PATH=/", "HOME=/"],
+        );
+        while syscall::user_exits() <= before {
+            sched::yield_now();
+        }
+        kprintln!("THOS: busybox ok       stock static BusyBox ran unmodified");
+    }
+
     // AHCI write: round-trip a known pattern through a scratch sector past the
-    // ext2 image (LBA 20000 = ~10 MiB; the fs is the first 8 MiB). The host
+    // ext2 image (LBA 50000 = ~25 MiB; the fs is the first 16 MiB). The host
     // side of `cargo xtask ahci-test` re-checks this landed in the disk file.
-    const SCRATCH_LBA: u64 = 20_000;
+    const SCRATCH_LBA: u64 = 50_000;
     let mut wbuf = [0u8; ahci::SECTOR];
     for (i, b) in wbuf.iter_mut().enumerate() {
         *b = (i as u8) ^ 0xA5;
@@ -548,7 +573,22 @@ fn storage_milestone() {
     let mut rbuf = [0u8; ahci::SECTOR];
     ahci::read(SCRATCH_LBA, &mut rbuf).expect("AHCI read-back");
     assert!(rbuf == wbuf, "AHCI write / read-back mismatch");
-    kprintln!("THOS: ahci write ok    LBA {} round-tripped + flushed", SCRATCH_LBA);
+    kprintln!("THOS: ahci write ok    LBA {} round-tripped (durable)", SCRATCH_LBA);
+
+    // Concurrent NCQ: 8 threads hammer distinct scratch regions at once, so
+    // several tags are outstanding and the drive reorders them.
+    for i in 0..8 {
+        sched::spawn("ncq-io", ncq_io_worker, i);
+    }
+    while NCQ_DONE.load(Ordering::Relaxed) < 8 {
+        sched::yield_now();
+    }
+    assert_eq!(NCQ_BAD.load(Ordering::Relaxed), 0, "concurrent NCQ I/O corrupted data");
+    kprintln!(
+        "THOS: ahci ncq ok      8 concurrent readers/writers verified (depth {}, {} completion IRQs)",
+        ahci::queue_depth(),
+        ahci::irq_count(),
+    );
 
     // ext2 write: create a file + a dir + a nested file, read them back through
     // our own read path. `cargo xtask ext2-test` then e2fsck's the image and
@@ -565,10 +605,40 @@ fn storage_milestone() {
         assert!(fs.read_path("/thos-created.txt").as_deref() == Some(payload.as_slice()));
         assert!(fs.read_path("/thosdir/nested.txt").as_deref() == Some(b"nested ok\n".as_slice()));
         kprintln!("THOS: ext2 write ok    /thos-created.txt + /thosdir/nested.txt");
+
+        // unlink / rmdir: make a throwaway file + dir, delete them, prove gone.
+        fs.write_path("/thos-temp.txt", b"delete me\n").expect("ext2 temp write");
+        let _ = fs.mkdir_path("/thos-tmpdir");
+        assert!(fs.rmdir_path("/thosdir") == Err("directory not empty"));
+        fs.unlink_path("/thosdir/nested.txt").expect("ext2 unlink nested");
+        fs.rmdir_path("/thosdir").expect("ext2 rmdir");
+        fs.unlink_path("/thos-temp.txt").expect("ext2 unlink");
+        fs.rmdir_path("/thos-tmpdir").expect("ext2 rmdir tmpdir");
+        assert!(fs.read_path("/thos-temp.txt").is_none());
+        assert!(fs.path_lookup("/thosdir").is_none());
+        assert!(fs.unlink_path("/thos-temp.txt") == Err("no such file"));
+        kprintln!("THOS: ext2 unlink ok   removed files + dirs, backups re-synced");
     }
 
     #[cfg(feature = "stress")]
     smp_stress_milestone(&init);
+
+    #[cfg(feature = "faulttest")]
+    {
+        // `cargo xtask ncq-error-test` runs QEMU with blkdebug poisoning one
+        // read of this LBA. The read must fail *cleanly* (no hang, no panic),
+        // recovery must run, and a retry must succeed on the restarted port.
+        const BAD_LBA: u64 = 41_000;
+        let mut b = [0u8; ahci::SECTOR];
+        let r = ahci::read(BAD_LBA, &mut b);
+        assert!(r.is_err(), "poisoned read did not surface an error: {r:?}");
+        assert!(ahci::recover_count() >= 1, "error was not run through recovery");
+        kprintln!(
+            "THOS: ncq error ok     poisoned read -> {:?}; {} recovery pass(es), no hang",
+            r.unwrap_err(),
+            ahci::recover_count(),
+        );
+    }
 
     // USB keyboard via xHCI -> the line-disciplined console -> fd 0.
     match xhci::init() {
@@ -579,6 +649,27 @@ fn storage_milestone() {
         }
         Err(e) => kprintln!("THOS: xhci             {}", e),
     }
+}
+
+// --- concurrent NCQ I/O check (storage_milestone) ---
+static NCQ_DONE: AtomicU64 = AtomicU64::new(0);
+static NCQ_BAD: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn ncq_io_worker(i: usize) -> ! {
+    let lba = 40_000 + i as u64; // a distinct scratch sector per worker, past the fs
+    let mut w = [0u8; ahci::SECTOR];
+    for (j, b) in w.iter_mut().enumerate() {
+        *b = (j as u8).wrapping_add((i as u8).wrapping_mul(17));
+    }
+    for _ in 0..16 {
+        let mut r = [0u8; ahci::SECTOR];
+        if ahci::write(lba, &w).is_err() || ahci::read(lba, &mut r).is_err() || r != w {
+            NCQ_BAD.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+    }
+    NCQ_DONE.fetch_add(1, Ordering::Relaxed);
+    sched::exit()
 }
 
 static XHCI: spin::Mutex<Option<xhci::Xhci>> = spin::Mutex::new(None);

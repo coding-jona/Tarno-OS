@@ -52,21 +52,47 @@ late.
   (read the ESP).
   - Status: ext2 read (12 direct + single + double indirect) and write —
     block/inode bitmap allocators, `write_path` (create or overwrite a regular
-    file), `mkdir_path`; superblock + group-descriptor counts kept in sync.
-    `cargo xtask ext2-test` has the kernel create a file, a dir and a nested
-    file, then the host runs `e2fsck -fn` (clean) and `debugfs cat` on the
-    result. Missing: `unlink`/`rmdir`, growing a dir past 12 direct blocks,
-    htree, backup superblock/GDT copies (needed before writing the multi-group
-    SSD), timestamps.
+    file), `mkdir_path`, `unlink_path`, `rmdir_path`; primary superblock +
+    group-descriptor counts kept in sync, and the **backup SB + GDT re-synced
+    from the primary after every mutation** (`sparse_super` honoured) so a
+    multi-group filesystem stays `e2fsck`-clean. `unlink`/`rmdir`/`unlinkat`
+    syscalls wired. `cargo xtask ext2-test` runs on a **2-block-group** image:
+    the kernel creates a file/dir/nested file, then deletes files + dirs
+    (rejecting a non-empty `rmdir`), and the host runs `e2fsck -fn` against
+    **both the primary and the group-1 backup superblock** (both clean).
+    Missing: growing a dir past 12 direct blocks, htree, timestamps, hard
+    links, 64-bit sizes, journalling.
 - **AHCI/SATA driver** (Intel `8086:7a62`, standard AHCI 1.3.1 register interface,
   MSI/MSI-X, command list / FIS) → real root FS from the **Kingston A400 240 GB SATA
   SSD** (`sdc`). NVMe is Windows' disk and is never touched; an NVMe driver is
   out of scope for v1.
-  - Status: polled driver, single command slot. `READ`/`WRITE DMA EXT` +
-    `FLUSH CACHE EXT` all working. `cargo xtask ahci-test` has the kernel write a
-    pattern to a scratch LBA, read it back, and then re-checks from the host that
-    it persisted into the disk image. Next: `IDENTIFY` (real capacity), multi-slot
-    / NCQ, MSI-X completion interrupts instead of polling.
+  - Status: 32-tag command list. `IDENTIFY DEVICE` gives the 48-bit (fallback
+    28-bit) sector count + model + NCQ support/depth; `read`/`write`
+    bounds-check the LBA. When the drive advertises NCQ, I/O goes through
+    `READ`/`WRITE FPDMA QUEUED` (write sets FUA for durability) issued via
+    `PxSACT`+`PxCI` — up to `queue depth` transfers outstanding, drive reorders
+    them; completion is polled from `PxSACT` and a waiting thread `yield`s
+    instead of spinning a core. Falls back to single-tag `DMA EXT` +
+    `FLUSH CACHE EXT` without NCQ. `cargo xtask ahci-test` verifies the sector
+    count against the backing file and a past-the-end read is rejected; the
+    boot milestone runs **8 threads doing concurrent read/write/verify** through
+    the NCQ path with no corruption. **Completion is interrupt-driven**: the
+    driver programs the device's MSI-X (preferred) or MSI capability to raise a
+    vector on the BSP, disables legacy INTx, and a parked submitter blocks on a
+    per-tag wait queue that the IRQ wakes; a timer poll is a safety net and pure
+    `yield` polling is the fallback with no MSI. `cargo xtask ahci-test` asserts
+    the completion IRQ actually fired (QEMU's `ich9-ahci` gives MSI; real Raptor
+    Lake `8086:7a62` gives MSI-X).
+  - NCQ error handling: on `PxIS.TFES` one thread runs `recover()` (port stop →
+    COMRESET via `PxSCTL.DET` → restart → best-effort `READ LOG EXT` page 0x10
+    for the failing tag); the failing tag's `wait` returns `Err`, every other
+    aborted tag is re-issued so its `wait` still returns `Ok`, and the per-tag
+    parked waiters are woken. `PENDING[32]` records each in-flight command's
+    params for the re-issue. `cargo xtask ncq-error-test` uses QEMU `blkdebug`
+    to fail one read and asserts the error surfaces as `Err` with a recovery
+    pass and **no hang** (a wedged port or lost waiter would time the test out).
+    Post-recovery port usability is real-hardware territory — QEMU's AHCI does
+    not model link recovery after an NCQ abort well enough to verify it.
 - **xHCI driver** (Intel `8086:7a60`) + USB HID (keyboard/mouse). PS/2 only as a QEMU
   stopgap.
 - ELF loader; **POSIX personality**: syscall table (Linux ABI subset), signals, `futex`
@@ -80,6 +106,16 @@ late.
     `fork`+`execve`+`wait4`s programs off ext2, reports exit status. Verified in
     CI (`cargo xtask kbd-test` types `init` and checks it runs). Still on the QEMU
     disk image, not the real SSD (no installer yet).
+  - **Stock static BusyBox runs unmodified** (`cargo xtask busybox-test`, from the
+    `busybox-static` package): `busybox echo …` loads via the ELF loader and
+    exits cleanly through the POSIX personality — the Milestone-2 "unmodified
+    Linux x86-64 binary" bar. Still `bbtest`-gated only to keep the default boot
+    log terse. Next: make BusyBox `sh` the login shell in place of `/sh`.
+  - Disk I/O is batched: `mm` reserves a 1 MiB contiguous DMA arena, AHCI gives
+    each tag a 32 KiB bounce buffer and transfers up to 32 KiB per NCQ command,
+    and `ext2::read_file` issues one read per run of consecutive blocks. The
+    boot milestone's concurrent-NCQ test went from ~1000–5000 completion IRQs
+    to ~190.
   - Fixed along the way: (1) SMP scheduler race — a thread that yielded from
     inside a syscall could be resumed on a second CPU before the first finished
     unwinding its kernel stack; now a per-thread `running` claim + deferred

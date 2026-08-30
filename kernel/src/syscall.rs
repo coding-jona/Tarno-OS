@@ -59,10 +59,14 @@ const SYS_ARCH_PRCTL: u64 = 158;
 const SYS_SET_TID_ADDRESS: u64 = 218;
 const SYS_EXIT_GROUP: u64 = 231;
 const SYS_SET_ROBUST_LIST: u64 = 273;
+const SYS_PRCTL: u64 = 157;
 const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
 const SYS_RSEQ: u64 = 334;
 const SYS_OPENAT: u64 = 257;
+const SYS_UNLINK: u64 = 87;
+const SYS_RMDIR: u64 = 84;
+const SYS_UNLINKAT: u64 = 263;
 const SYS_POLL: u64 = 7;
 const SYS_MPROTECT: u64 = 10;
 const SYS_MADVISE: u64 = 28;
@@ -90,6 +94,10 @@ const _USE_ECHILD: i64 = ECHILD;
 const EINVAL: i64 = -22;
 const ENOTTY: i64 = -25;
 const ENOENT: i64 = -2;
+const EIO: i64 = -5;
+const EISDIR: i64 = -21;
+const ENOTDIR: i64 = -20;
+const ENOTEMPTY: i64 = -39;
 
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
@@ -256,6 +264,20 @@ fn sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
     }
 }
 
+fn sys_unlink(path_ptr: u64, dir: bool) -> i64 {
+    let path = user_cstr(path_ptr);
+    let Some(fs) = ext2::open().ok() else { return EIO };
+    let r = if dir { fs.rmdir_path(&path) } else { fs.unlink_path(&path) };
+    match r {
+        Ok(()) => 0,
+        Err("no such file") | Err("no such directory") | Err("parent dir missing") => ENOENT,
+        Err("is a directory") => EISDIR,
+        Err("not a directory") => ENOTDIR,
+        Err("directory not empty") => ENOTEMPTY,
+        Err(_) => EINVAL,
+    }
+}
+
 fn sys_open(path_ptr: u64) -> i64 {
     let path = user_cstr(path_ptr);
     let Some(task) = sched::current().task() else {
@@ -342,6 +364,10 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
 
         SYS_OPEN => sys_open(a1),
         SYS_OPENAT => sys_open(a2), // dirfd ignored; paths are absolute
+
+        SYS_UNLINK => sys_unlink(a1, false),
+        SYS_RMDIR => sys_unlink(a1, true),
+        SYS_UNLINKAT => sys_unlink(a2, a3 & 0x200 != 0), // flags=a3; AT_REMOVEDIR=0x200
         SYS_CLOSE => {
             if sched::current().task().map(|t| t.fd_close(a1 as i32)).unwrap_or(false) {
                 0
@@ -385,7 +411,8 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_SET_TID_ADDRESS => process::current_pid() as i64,
         SYS_IOCTL => ENOTTY,
         SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_RT_SIGRETURN | SYS_SET_ROBUST_LIST
-        | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MPROTECT | SYS_MADVISE | SYS_MUNMAP | SYS_FUTEX => 0,
+        | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MPROTECT | SYS_MADVISE | SYS_MUNMAP | SYS_FUTEX
+        | SYS_PRCTL => 0,
         SYS_RSEQ => ENOSYS,
 
         // poll: mark valid fds as "no events", invalid as POLLNVAL.

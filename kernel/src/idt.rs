@@ -35,6 +35,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 
     // APIC vectors (>= 32).
     idt[apic::TIMER_VECTOR].set_handler_fn(apic_timer);
+    idt[apic::AHCI_VECTOR].set_handler_fn(ahci_irq);
     idt[apic::SPURIOUS_VECTOR].set_handler_fn(apic_spurious);
 
     idt
@@ -56,7 +57,13 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
 extern "x86-interrupt" fn apic_timer(_frame: InterruptStackFrame) {
     apic::on_timer_tick();
     apic::eoi();
+    crate::ahci::poll_wake(); // safety net for a dropped AHCI completion IRQ
     crate::sched::on_tick();
+}
+
+extern "x86-interrupt" fn ahci_irq(_frame: InterruptStackFrame) {
+    crate::ahci::on_irq();
+    apic::eoi();
 }
 
 extern "x86-interrupt" fn apic_spurious(_frame: InterruptStackFrame) {

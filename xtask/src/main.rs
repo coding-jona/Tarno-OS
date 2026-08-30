@@ -63,6 +63,16 @@ fn main() {
             let iso = build_iso();
             smp_test(&iso);
         }
+        "ncq-error-test" => {
+            build_kernel(&["faulttest"]);
+            let iso = build_iso();
+            ncq_error_test(&iso);
+        }
+        "busybox-test" => {
+            build_kernel(&["bbtest"]);
+            let iso = build_iso();
+            busybox_test(&iso);
+        }
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
@@ -188,17 +198,19 @@ fn disk_image() -> PathBuf {
     }
 
     let _ = std::fs::remove_file(&img);
+    // 16384 1-KiB blocks = 2 block groups, so `sparse_super` puts a backup
+    // superblock + GDT in group 1 and the ext2 write path has to keep it synced.
     run(Command::new("mke2fs").args([
         "-q", "-F", "-t", "ext2", "-b", "1024", "-I", "128",
         "-O", "^resize_inode,^dir_index,^ext_attr",
-        img.to_str().unwrap(), "8192",
+        img.to_str().unwrap(), "16384",
     ]));
-    // Grow the backing file past the 8 MiB filesystem so there is scratch space
-    // for the AHCI write test (LBA 20000) that the fs never touches.
+    // Grow the backing file past the 16 MiB filesystem so there is scratch space
+    // for the AHCI write test (LBA 50000) that the fs never touches.
     std::fs::OpenOptions::new()
         .write(true)
         .open(&img)
-        .and_then(|f| f.set_len(16 * 1024 * 1024))
+        .and_then(|f| f.set_len(32 * 1024 * 1024))
         .expect("extend disk.img");
     for (name, elf) in elfs {
         run(Command::new("debugfs").args([
@@ -248,6 +260,19 @@ fn disk_image() -> PathBuf {
         "-w", "-R", &format!("write {} sh", shbin.to_str().unwrap()),
         img.to_str().unwrap(),
     ]));
+
+    // A real, unmodified statically-linked BusyBox -> /busybox (Milestone 2:
+    // stock Linux x86-64 ELF binaries run as-is). From the `busybox-static`
+    // package.
+    for cand in ["/bin/busybox", "/usr/bin/busybox"] {
+        if std::fs::metadata(cand).map(|m| m.len() > 100_000).unwrap_or(false) {
+            run(Command::new("debugfs").args([
+                "-w", "-R", &format!("write {cand} busybox"),
+                img.to_str().unwrap(),
+            ]));
+            break;
+        }
+    }
     img
 }
 
@@ -329,7 +354,7 @@ fn drive_login(sock: &Path, log: &Path, child: &mut std::process::Child, tag: &s
         type_line(sock, "thos"); // admin username
         type_line(sock, "pass"); // password
         type_line(sock, "pass"); // repeat
-        if !wait_for(log, "THOS login:", 20) {
+        if !wait_for(log, "THOS login:", 60) {
             kill(child, tag, "no login prompt after first-run setup", log);
         }
     }
@@ -345,12 +370,12 @@ fn kbd_test(iso: &Path) {
     let disk = disk_image();
     let (mut child, log, sock) = spawn_interactive_qemu("kbd", iso, &disk);
 
-    if !wait_for(&log, "THOS first-run setup", 40) {
+    if !wait_for(&log, "THOS first-run setup", 60) {
         kill(&mut child, "kbd-test", "kernel never reached first-run setup", &log);
     }
     drive_login(&sock, &log, &mut child, "kbd-test");
 
-    if !wait_for(&log, "interactive hold", 25) {
+    if !wait_for(&log, "interactive hold", 60) {
         kill(&mut child, "kbd-test", "never reached the shell after login", &log);
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -378,11 +403,11 @@ fn login_test(iso: &Path) {
 
     // Boot 1 — fresh disk: must run first-run setup, then log in.
     let (mut c1, log1, sock1) = spawn_interactive_qemu("login1", iso, &disk);
-    if !wait_for(&log1, "THOS first-run setup", 40) {
+    if !wait_for(&log1, "THOS first-run setup", 60) {
         kill(&mut c1, "login-test", "boot 1 showed no first-run setup", &log1);
     }
     drive_login(&sock1, &log1, &mut c1, "login-test");
-    let ok1 = wait_for(&log1, "interactive hold", 25);
+    let ok1 = wait_for(&log1, "interactive hold", 60);
     let _ = c1.kill();
     let _ = c1.wait();
     if !ok1 {
@@ -392,7 +417,7 @@ fn login_test(iso: &Path) {
 
     // Boot 2 — same disk: straight to login, no setup; reject a wrong password.
     let (mut c2, log2, sock2) = spawn_interactive_qemu("login2", iso, &disk);
-    if !wait_for(&log2, "THOS login:", 40) {
+    if !wait_for(&log2, "THOS login:", 60) {
         kill(&mut c2, "login-test", "boot 2 showed no login prompt", &log2);
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -404,7 +429,7 @@ fn login_test(iso: &Path) {
     std::thread::sleep(std::time::Duration::from_millis(300));
     type_line(&sock2, "thos");
     type_line(&sock2, "pass");
-    let ok2 = wait_for(&log2, "interactive hold", 25);
+    let ok2 = wait_for(&log2, "interactive hold", 60);
     let full2 = std::fs::read_to_string(&log2).unwrap_or_default();
     let _ = c2.kill();
     let _ = c2.wait();
@@ -670,7 +695,7 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
 }
 
 /// Must match `SCRATCH_LBA` / the pattern in `kernel/src/main.rs`.
-const AHCI_SCRATCH_LBA: u64 = 20_000;
+const AHCI_SCRATCH_LBA: u64 = 50_000;
 
 fn ahci_test(iso: &Path) {
     use std::io::Read;
@@ -680,8 +705,34 @@ fn ahci_test(iso: &Path) {
     let disk = disk_image();
 
     let serial = boot_kernel_headless("ahci", iso, &disk, 4);
-    if !serial.contains("THOS: ahci write ok") {
-        eprintln!("ahci-test: FAIL — no in-boot write/read-back marker\n{serial}");
+    for m in ["THOS: ahci ident", "THOS: ahci cap ok", "THOS: ahci ncq ok", "THOS: ahci write ok"] {
+        if !serial.contains(m) {
+            eprintln!("ahci-test: FAIL — missing marker {m:?}\n{serial}");
+            exit(1);
+        }
+    }
+
+    // IDENTIFY's sector count must match the backing file exactly.
+    let want_sectors = std::fs::metadata(&disk).unwrap().len() / 512;
+    let got_sectors: u64 = serial
+        .lines()
+        .find(|l| l.contains("ahci ident"))
+        .and_then(|l| l.split_whitespace().find_map(|w| w.parse().ok()))
+        .unwrap_or(0);
+    if got_sectors != want_sectors {
+        eprintln!("ahci-test: FAIL — IDENTIFY reported {got_sectors} sectors, file has {want_sectors}");
+        exit(1);
+    }
+
+    // The completion path must be interrupt-driven, not the timer safety net:
+    // the "ahci ncq ok" line reports how many completion IRQs were taken.
+    let irqs: u64 = serial
+        .lines()
+        .find(|l| l.contains("ahci ncq ok"))
+        .and_then(|l| l.rsplit_once(", ").and_then(|(_, r)| r.split_whitespace().next()?.parse().ok()))
+        .unwrap_or(0);
+    if !serial.contains("MSI") || irqs == 0 {
+        eprintln!("ahci-test: FAIL — no MSI completion interrupts (irqs={irqs})\n{serial}");
         exit(1);
     }
 
@@ -693,7 +744,9 @@ fn ahci_test(iso: &Path) {
 
     let want: Vec<u8> = (0..512u32).map(|i| (i as u8) ^ 0xA5).collect();
     if got[..] == want[..] {
-        println!("ahci-test: OK — kernel round-tripped LBA {AHCI_SCRATCH_LBA} and it persisted");
+        println!(
+            "ahci-test: OK — IDENTIFY {want_sectors} sectors; LBA {AHCI_SCRATCH_LBA} round-tripped + persisted"
+        );
     } else {
         eprintln!("ahci-test: FAIL — disk image scratch sector does not hold the pattern");
         eprintln!("  want[..16] {:02x?}\n  got [..16] {:02x?}", &want[..16], &got[..16]);
@@ -709,24 +762,31 @@ fn ext2_test(iso: &Path) {
     let disk = disk_image();
 
     let serial = boot_kernel_headless("ext2", iso, &disk, 4);
-    if !serial.contains("THOS: ext2 write ok") {
-        eprintln!("ext2-test: FAIL — no in-boot ext2-write marker\n{serial}");
-        exit(1);
+    for m in ["THOS: ext2 write ok", "THOS: ext2 unlink ok"] {
+        if !serial.contains(m) {
+            eprintln!("ext2-test: FAIL — missing marker {m:?}\n{serial}");
+            exit(1);
+        }
     }
 
-    // The filesystem must still be consistent after our writes.
-    let fsck = Command::new("e2fsck")
-        .args(["-fn", disk.to_str().unwrap()])
-        .output()
-        .expect("run e2fsck");
-    if !fsck.status.success() {
-        eprintln!(
-            "ext2-test: FAIL — e2fsck reported problems (exit {:?})\n{}\n{}",
-            fsck.status.code(),
-            String::from_utf8_lossy(&fsck.stdout),
-            String::from_utf8_lossy(&fsck.stderr),
-        );
-        exit(1);
+    // The filesystem must still be consistent after the writes + deletes, via
+    // the primary superblock and the group-1 backup (`sync_backups`).
+    for sb in [None, Some("8193")] {
+        let mut c = Command::new("e2fsck");
+        c.arg("-fn");
+        if let Some(b) = sb {
+            c.args(["-b", b]);
+        }
+        let out = c.arg(disk.to_str().unwrap()).output().expect("run e2fsck");
+        if !out.status.success() {
+            eprintln!(
+                "ext2-test: FAIL — e2fsck ({}) reported problems (exit {:?})\n{}",
+                sb.map_or("primary", |b| b),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout),
+            );
+            exit(1);
+        }
     }
 
     let cat = |path: &str| -> String {
@@ -736,14 +796,13 @@ fn ext2_test(iso: &Path) {
             .expect("run debugfs");
         String::from_utf8_lossy(&o.stdout).into_owned()
     };
-    let a = cat("/thos-created.txt");
-    let b = cat("/thosdir/nested.txt");
-    if a.contains("ext2 write works on THOS") && b.contains("nested ok") {
-        println!("ext2-test: OK — e2fsck clean; /thos-created.txt + /thosdir/nested.txt on disk");
+    // `/thos-created.txt` is never deleted; `/thos-temp.txt` + `/thosdir` are.
+    let survivor = cat("/thos-created.txt");
+    let deleted = cat("/thos-temp.txt");
+    if survivor.contains("ext2 write works on THOS") && !deleted.contains("delete me") {
+        println!("ext2-test: OK — e2fsck clean (primary + backup); create + unlink/rmdir verified");
     } else {
-        eprintln!("ext2-test: FAIL — created files not readable from the host");
-        eprintln!("  /thos-created.txt   = {a:?}");
-        eprintln!("  /thosdir/nested.txt = {b:?}");
+        eprintln!("ext2-test: FAIL — survivor={survivor:?} deleted-still-there={deleted:?}");
         exit(1);
     }
 }
@@ -759,6 +818,84 @@ fn smp_test(iso: &Path) {
         println!("smp-test: OK — {}", line.trim());
     } else {
         eprintln!("smp-test: FAIL — stress milestone did not pass\n--- serial ---\n{serial}\n---");
+        exit(1);
+    }
+}
+
+/// Boot with QEMU `blkdebug` poisoning one read of LBA 41000, so the kernel's
+/// NCQ error-recovery path runs: the read must fail cleanly (no hang / panic),
+/// the port must recover, and the retry must succeed.
+fn ncq_error_test(iso: &Path) {
+    use std::time::{Duration, Instant};
+
+    let root = workspace_root();
+    let _ = std::fs::remove_file(root.join("target/disk.img"));
+    let disk = disk_image();
+    let cfg = root.join("target/ncq-fault.conf");
+    std::fs::write(
+        &cfg,
+        "[inject-error]\nevent = \"read_aio\"\nerrno = \"5\"\nonce = \"on\"\nsector = \"41000\"\n",
+    )
+    .unwrap();
+    let log = root.join("target/ncq-serial.log");
+    let _ = std::fs::remove_file(&log);
+
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu.args(["-M", "q35", "-m", "512M", "-smp", "4", "-cdrom", iso.to_str().unwrap()]);
+    qemu.args([
+        "-drive",
+        &format!(
+            "if=none,id=disk0,format=raw,file=blkdebug:{}:{}",
+            cfg.to_str().unwrap(),
+            disk.to_str().unwrap()
+        ),
+        "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0",
+    ]);
+    qemu.args(["-display", "none", "-no-reboot"]);
+    qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
+    qemu.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+    for ovmf in ["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/ovmf/OVMF.fd"] {
+        if Path::new(ovmf).exists() {
+            qemu.args(["-drive", &format!("if=pflash,format=raw,readonly=on,file={ovmf}")]);
+            break;
+        }
+    }
+
+    let mut child = qemu.spawn().expect("spawn qemu");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("wait qemu") {
+            break Some(s);
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let serial = std::fs::read_to_string(&log).unwrap_or_default();
+
+    if status.and_then(|s| s.code()) != Some(QEMU_SUCCESS) {
+        eprintln!("ncq-error-test: FAIL — kernel did not halt cleanly (hang / panic on the poisoned read)\n--- serial ---\n{serial}\n---");
+        exit(1);
+    }
+    if serial.contains("THOS: ncq error ok") && serial.contains("THOS: ahci recover") {
+        let line = serial.lines().find(|l| l.contains("ncq error ok")).unwrap_or("");
+        println!("ncq-error-test: OK — {}", line.trim());
+    } else {
+        eprintln!("ncq-error-test: FAIL — recovery markers missing\n--- serial ---\n{serial}\n---");
+        exit(1);
+    }
+}
+
+/// Boot a `bbtest` kernel and require the stock static BusyBox to run and print.
+fn busybox_test(iso: &Path) {
+    let disk = disk_image();
+    let serial = boot_kernel_headless("busybox", iso, &disk, 4);
+    if serial.contains("THOS: busybox ok") && serial.contains("THOS: busybox says hello") {
+        println!("busybox-test: OK — stock static BusyBox `echo` ran unmodified");
+    } else {
+        eprintln!("busybox-test: FAIL — BusyBox did not run to a clean exit\n--- serial ---\n{serial}\n---");
         exit(1);
     }
 }

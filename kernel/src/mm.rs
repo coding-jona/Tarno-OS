@@ -22,9 +22,10 @@ use x86_64::{PhysAddr, VirtAddr};
 
 const FRAME_SIZE: u64 = 4096;
 
-/// Bootstrap heap: 8 MiB static arena. Enough through early Phase 2;
-/// bookkeeping; replaced by a page-backed heap once we own the page tables.
-const HEAP_SIZE: usize = 8 * 1024 * 1024;
+/// Bootstrap heap: 32 MiB static arena. Covers the SMP stress milestone's
+/// hundreds of 16 KiB kernel stacks with room to spare; replaced by a
+/// page-backed heap once the page tables are ours (they now are — TODO).
+const HEAP_SIZE: usize = 32 * 1024 * 1024;
 static mut HEAP_ARENA: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 #[global_allocator]
@@ -43,6 +44,16 @@ pub fn phys_to_virt(pa: PhysAddr) -> VirtAddr {
 }
 
 pub static FRAME_ALLOC: Mutex<FrameAllocator> = Mutex::new(FrameAllocator::new());
+
+/// A contiguous physical region reserved at init for DMA bounce buffers (AHCI).
+/// Carved off the largest usable region and never handed to `FRAME_ALLOC`.
+const DMA_ARENA_BYTES: u64 = 1024 * 1024;
+static DMA_ARENA: AtomicU64 = AtomicU64::new(0);
+
+/// `(phys_base, len)` of the contiguous DMA bounce arena.
+pub fn dma_arena() -> (u64, u64) {
+    (DMA_ARENA.load(Ordering::Relaxed), DMA_ARENA_BYTES)
+}
 
 /// Summary printed at Milestone 1a.
 pub struct MemStats {
@@ -64,6 +75,15 @@ pub unsafe fn init(hhdm: u64, entries: &[&Entry]) -> MemStats {
         heap_bytes: HEAP_SIZE,
     };
 
+    // Reserve the DMA bounce arena at the start of the largest usable region.
+    let dma_base = entries
+        .iter()
+        .filter(|e| e.type_ == MEMMAP_USABLE && e.length >= DMA_ARENA_BYTES * 4)
+        .max_by_key(|e| e.length)
+        .map(|e| align_up(e.base, FRAME_SIZE))
+        .expect("no usable region large enough for the DMA arena");
+    DMA_ARENA.store(dma_base, Ordering::Relaxed);
+
     let mut alloc = FRAME_ALLOC.lock();
     for entry in entries {
         if entry.type_ != MEMMAP_USABLE {
@@ -76,6 +96,10 @@ pub unsafe fn init(hhdm: u64, entries: &[&Entry]) -> MemStats {
         let end = align_down(entry.base + entry.length, FRAME_SIZE);
         let mut pa = start;
         while pa + FRAME_SIZE <= end {
+            if pa >= dma_base && pa < dma_base + DMA_ARENA_BYTES {
+                pa += FRAME_SIZE; // reserved DMA arena — never allocatable
+                continue;
+            }
             // Don't hand the allocator the frames backing the static heap arena;
             // those are inside the kernel image, already excluded from USABLE.
             alloc.push(hhdm, PhysAddr::new(pa));
