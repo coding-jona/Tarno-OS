@@ -109,9 +109,13 @@ late.
   - **Stock static BusyBox runs unmodified** (`cargo xtask busybox-test`, from the
     `busybox-static` package): `busybox echo …` loads via the ELF loader and
     exits cleanly through the POSIX personality — the Milestone-2 "unmodified
-    Linux x86-64 binary" bar. Feature-gated (`bbtest`) because reading the 2 MiB
-    binary one 1 KiB ext2 block at a time slows every boot — an ext2 read-batching
-    pass is a pending perf follow-up, after which BusyBox `sh` can replace `/sh`.
+    Linux x86-64 binary" bar. Still `bbtest`-gated only to keep the default boot
+    log terse. Next: make BusyBox `sh` the login shell in place of `/sh`.
+  - Disk I/O is batched: `mm` reserves a 1 MiB contiguous DMA arena, AHCI gives
+    each tag a 32 KiB bounce buffer and transfers up to 32 KiB per NCQ command,
+    and `ext2::read_file` issues one read per run of consecutive blocks. The
+    boot milestone's concurrent-NCQ test went from ~1000–5000 completion IRQs
+    to ~190.
   - Fixed along the way: (1) SMP scheduler race — a thread that yielded from
     inside a syscall could be resumed on a second CPU before the first finished
     unwinding its kernel stack; now a per-thread `running` claim + deferred
