@@ -682,8 +682,22 @@ fn ahci_test(iso: &Path) {
     let disk = disk_image();
 
     let serial = boot_kernel_headless("ahci", iso, &disk, 4);
-    if !serial.contains("THOS: ahci write ok") {
-        eprintln!("ahci-test: FAIL — no in-boot write/read-back marker\n{serial}");
+    for m in ["THOS: ahci ident", "THOS: ahci cap ok", "THOS: ahci write ok"] {
+        if !serial.contains(m) {
+            eprintln!("ahci-test: FAIL — missing marker {m:?}\n{serial}");
+            exit(1);
+        }
+    }
+
+    // IDENTIFY's sector count must match the backing file exactly.
+    let want_sectors = std::fs::metadata(&disk).unwrap().len() / 512;
+    let got_sectors: u64 = serial
+        .lines()
+        .find(|l| l.contains("ahci ident"))
+        .and_then(|l| l.split_whitespace().find_map(|w| w.parse().ok()))
+        .unwrap_or(0);
+    if got_sectors != want_sectors {
+        eprintln!("ahci-test: FAIL — IDENTIFY reported {got_sectors} sectors, file has {want_sectors}");
         exit(1);
     }
 
@@ -695,7 +709,9 @@ fn ahci_test(iso: &Path) {
 
     let want: Vec<u8> = (0..512u32).map(|i| (i as u8) ^ 0xA5).collect();
     if got[..] == want[..] {
-        println!("ahci-test: OK — kernel round-tripped LBA {AHCI_SCRATCH_LBA} and it persisted");
+        println!(
+            "ahci-test: OK — IDENTIFY {want_sectors} sectors; LBA {AHCI_SCRATCH_LBA} round-tripped + persisted"
+        );
     } else {
         eprintln!("ahci-test: FAIL — disk image scratch sector does not hold the pattern");
         eprintln!("  want[..16] {:02x?}\n  got [..16] {:02x?}", &want[..16], &got[..16]);

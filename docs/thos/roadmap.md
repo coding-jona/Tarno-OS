@@ -67,10 +67,13 @@ late.
   SSD** (`sdc`). NVMe is Windows' disk and is never touched; an NVMe driver is
   out of scope for v1.
   - Status: polled driver, single command slot. `READ`/`WRITE DMA EXT` +
-    `FLUSH CACHE EXT` all working. `cargo xtask ahci-test` has the kernel write a
-    pattern to a scratch LBA, read it back, and then re-checks from the host that
-    it persisted into the disk image. Next: `IDENTIFY` (real capacity), multi-slot
-    / NCQ, MSI-X completion interrupts instead of polling.
+    `FLUSH CACHE EXT` + `IDENTIFY DEVICE` working. IDENTIFY gives the real
+    48-bit (fallback 28-bit) sector count and model string; `read`/`write`
+    bounds-check against it. `cargo xtask ahci-test` writes a pattern to a
+    scratch LBA, reads it back, checks from the host that it persisted, and
+    asserts the reported sector count equals the backing file exactly; the
+    milestone also proves a read one sector past the end is rejected. Next:
+    multi-slot / NCQ, MSI-X completion interrupts instead of polling.
 - **xHCI driver** (Intel `8086:7a60`) + USB HID (keyboard/mouse). PS/2 only as a QEMU
   stopgap.
 - ELF loader; **POSIX personality**: syscall table (Linux ABI subset), signals, `futex`

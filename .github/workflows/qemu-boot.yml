@@ -54,7 +54,9 @@ jobs:
           grep -q "THOS: own page tables" boot.log
           grep -q "hello from the ram fs" boot.log
           grep -q "THOS: vfs ok" boot.log
+          grep -q "THOS: ahci ident" boot.log
           grep -q "THOS: ahci ok" boot.log
+          grep -q "THOS: ahci cap ok" boot.log
           grep -q "THOS: ext2 ok" boot.log
           grep -q "THOS: elf ok" boot.log
           grep -q "child ran" boot.log

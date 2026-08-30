@@ -508,11 +508,18 @@ fn storage_milestone() {
     vfs::close(h);
     kprintln!("THOS: vfs ok           /hello {} bytes; entries {:?}", n, vfs::list());
 
-    ahci::init().expect("AHCI init");
+    ahci::init().expect("AHCI init"); // logs "THOS: ahci ident ..."
     let mut sb = [0u8; ahci::SECTOR];
     ahci::read(2, &mut sb).expect("AHCI read LBA 2");
     let magic = u16::from_le_bytes([sb[56], sb[57]]);
     kprintln!("THOS: ahci ok          LBA 2 read; ext2 magic {:#06x}", magic);
+
+    // Capacity from IDENTIFY: the disk must hold the fs, and a read one sector
+    // past the end must be rejected by the bounds check (not the drive).
+    let cap = ahci::capacity_sectors();
+    assert!(cap >= 32_768, "disk reports only {cap} sectors — smaller than the fs");
+    assert!(ahci::read(cap, &mut [0u8; ahci::SECTOR]).is_err(), "read past EOD not rejected");
+    kprintln!("THOS: ahci cap ok      {} sectors; out-of-range read rejected", cap);
 
     let fs = ext2::open().expect("mount ext2");
     let init = fs.read_path("/init").expect("read /init from ext2");

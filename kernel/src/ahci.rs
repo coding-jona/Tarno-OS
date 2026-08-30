@@ -55,6 +55,7 @@ const FIS_TYPE_H2D: u8 = 0x27;
 const CMD_READ_DMA_EX: u8 = 0x25;
 const CMD_WRITE_DMA_EX: u8 = 0x35;
 const CMD_FLUSH_CACHE_EX: u8 = 0xEA;
+const CMD_IDENTIFY: u8 = 0xEC;
 
 struct Hba {
     base: u64, // HHDM virtual address of the ABAR
@@ -81,15 +82,16 @@ pub struct Disk {
     /// Physical base of the per-port command area (cmd list @ +0, FIS @ +0x400,
     /// command table @ +0x500).
     cmd_phys: u64,
+    /// Addressable 512-byte sectors, from `IDENTIFY DEVICE`.
+    sectors: u64,
 }
 
 unsafe impl Send for Disk {}
 
 static DISK: Mutex<Option<Disk>> = Mutex::new(None);
 
-/// Probe PCI, enable the HBA, bring up the first SATA port. Returns the number
-/// of 512-byte sectors is not known without IDENTIFY yet — returns Ok on a
-/// working port.
+/// Probe PCI, enable the HBA, bring up the first SATA port, and `IDENTIFY` it
+/// for the real sector count. `Ok` on a working port.
 pub fn init() -> Result<(), &'static str> {
     let loc = pci::find_ahci().ok_or("no AHCI controller on bus 0")?;
     pci::enable_bus_master(loc);
@@ -143,8 +145,111 @@ pub fn init() -> Result<(), &'static str> {
     hba.pw(port, P_CMD, cmd);
 
     let _ = CAP;
-    *DISK.lock() = Some(Disk { hba, port, cmd_phys });
+    *DISK.lock() = Some(Disk { hba, port, cmd_phys, sectors: 0 });
+
+    // IDENTIFY DEVICE for the capacity + model.
+    let id = identify()?;
+    let lba48 = u16::from_le_bytes([id[2 * 83], id[2 * 83 + 1]]) & (1 << 10) != 0;
+    let s48 = u64::from_le_bytes(id[200..208].try_into().unwrap());
+    let s28 = u32::from_le_bytes(id[120..124].try_into().unwrap()) as u64;
+    let sectors = if lba48 && s48 != 0 { s48 } else { s28 };
+    if sectors == 0 {
+        return Err("AHCI IDENTIFY: zero sector count");
+    }
+    DISK.lock().as_mut().unwrap().sectors = sectors;
+
+    // Model number: words 27..46, 40 bytes, byte-swapped per word.
+    let mut model = [b' '; 40];
+    for i in 0..20 {
+        model[i * 2] = id[54 + i * 2 + 1];
+        model[i * 2 + 1] = id[54 + i * 2];
+    }
+    let model = core::str::from_utf8(&model).unwrap_or("?").trim();
+    crate::kprintln!(
+        "THOS: ahci ident       {} — {} sectors ({} MiB)",
+        model,
+        sectors,
+        sectors * SECTOR as u64 / (1024 * 1024),
+    );
     Ok(())
+}
+
+/// Total addressable 512-byte sectors on the active disk.
+pub fn capacity_sectors() -> u64 {
+    DISK.lock().as_ref().map(|d| d.sectors).unwrap_or(0)
+}
+
+/// Issue `IDENTIFY DEVICE` and return its raw 512-byte response block.
+fn identify() -> Result<[u8; 512], &'static str> {
+    let frame = FRAME_ALLOC.lock().alloc().ok_or("no bounce frame")?;
+    let buf_phys = frame.start_address().as_u64();
+
+    let r = {
+        let guard = DISK.lock();
+        let d = guard.as_ref().ok_or("AHCI not initialised")?;
+        let (hba, port) = (&d.hba, d.port);
+
+        for _ in 0..1_000_000 {
+            if hba.pr(port, P_TFD) & (TFD_BSY | TFD_DRQ) == 0 {
+                break;
+            }
+        }
+
+        let clist = phys_to_virt(x86_64::PhysAddr::new(d.cmd_phys)).as_mut_ptr::<u32>();
+        let ctba = d.cmd_phys + 0x500;
+        let ctab = phys_to_virt(x86_64::PhysAddr::new(ctba)).as_mut_ptr::<u8>();
+
+        unsafe {
+            core::ptr::write_volatile(clist.add(0), 5u32 | (1u32 << 16)); // cfl=5, PRDTL=1, data-in
+            core::ptr::write_volatile(clist.add(1), 0);
+            core::ptr::write_volatile(clist.add(2), ctba as u32);
+            core::ptr::write_volatile(clist.add(3), (ctba >> 32) as u32);
+            core::ptr::write_bytes(ctab, 0, 0x80 + 16);
+
+            let prdt = ctab.add(0x80) as *mut u32;
+            core::ptr::write_volatile(prdt.add(0), buf_phys as u32);
+            core::ptr::write_volatile(prdt.add(1), (buf_phys >> 32) as u32);
+            core::ptr::write_volatile(prdt.add(2), 0);
+            core::ptr::write_volatile(prdt.add(3), 512 - 1); // byte count - 1
+
+            let f = ctab;
+            f.add(0).write_volatile(FIS_TYPE_H2D);
+            f.add(1).write_volatile(1 << 7); // C = 1
+            f.add(2).write_volatile(CMD_IDENTIFY);
+            f.add(7).write_volatile(0); // device: not LBA mode for IDENTIFY
+        }
+
+        fence(Ordering::SeqCst);
+        hba.pw(port, P_IS, 0xFFFF_FFFF);
+        hba.pw(port, P_CI, 1);
+
+        let mut out = Err("AHCI IDENTIFY timed out");
+        for _ in 0..10_000_000 {
+            if hba.pr(port, P_CI) & 1 == 0 {
+                out = if hba.pr(port, P_IS) & IS_TFES != 0 {
+                    Err("AHCI IDENTIFY task-file error")
+                } else {
+                    fence(Ordering::SeqCst);
+                    Ok(())
+                };
+                break;
+            }
+        }
+        out
+    };
+
+    let mut block = [0u8; 512];
+    if r.is_ok() {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                phys_to_virt(x86_64::PhysAddr::new(buf_phys)).as_ptr::<u8>(),
+                block.as_mut_ptr(),
+                512,
+            );
+        }
+    }
+    FRAME_ALLOC.lock().dealloc(frame);
+    r.map(|()| block)
 }
 
 fn transfer(write: bool, lba: u64, sectors: u16, buf_phys: u64) -> Result<(), &'static str> {
@@ -152,6 +257,10 @@ fn transfer(write: bool, lba: u64, sectors: u16, buf_phys: u64) -> Result<(), &'
     let d = guard.as_ref().ok_or("AHCI not initialised")?;
     let hba = &d.hba;
     let port = d.port;
+
+    if d.sectors != 0 && lba + sectors as u64 > d.sectors {
+        return Err("AHCI: LBA past end of disk");
+    }
 
     // Wait for the port to be idle.
     for _ in 0..1_000_000 {
