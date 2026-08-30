@@ -1,4 +1,38 @@
-# Tarno OS
+# Tarno OS → THOS
+
+> **⚠️ The project has pivoted.** Tarno OS is now **THOS**, a **clean-slate hybrid
+> kernel** that runs native ELF/POSIX **and** native PE/Win32 programs side by side on
+> one target machine — no Linux fork, no virtualization. Motivation: end the split
+> between separate Windows and Linux environments.
+>
+> - Architecture — [`docs/thos/architecture.md`](docs/thos/architecture.md)
+> - Roadmap & milestones — [`docs/thos/roadmap.md`](docs/thos/roadmap.md)
+> - Honest feasibility — [`docs/thos/feasibility.md`](docs/thos/feasibility.md)
+> - Target hardware — [`docs/thos/hw-target.md`](docs/thos/hw-target.md)
+> - Licensing — [`docs/thos/licensing.md`](docs/thos/licensing.md)
+>
+> The Devuan-distro work is frozen ([`FROZEN.md`](FROZEN.md)); its roadmap is at
+> [`docs/legacy-roadmap-devuan.md`](docs/legacy-roadmap-devuan.md).
+
+## THOS quickstart
+
+```sh
+make toolchain              # rustup target + rust-src + llvm-tools
+git submodule update --init # third_party/limine (v9.x-binary, pinned in .gitmodules)
+make -C third_party/limine  # build the limine host tool
+make run                    # build kernel + ISO, boot in QEMU, serial on stdout
+```
+
+Milestone 0: the kernel comes up under Limine, writes to COM1 **and** paints the GOP
+framebuffer, then halts. Milestone 1a: it ingests the Limine memory map, stands up the
+physical frame allocator and a bootstrap heap. CI:
+[`.github/workflows/qemu-boot.yml`](.github/workflows/qemu-boot.yml).
+
+---
+
+## Frozen: the Devuan distribution
+
+<details><summary>Previous Tarno OS — a Devuan-based Linux distro. Frozen, kept in the repo.</summary>
 
 A Devuan-based Linux distro with OpenRC instead of systemd, and `tarnod`
 (this repo's Go daemon) doing gaming-mode tuning, eBPF security, and a
@@ -592,3 +626,5 @@ stanza, which made dhcpcd's own init script refuse to start at all
 Overridden to loopback-only (`config/includes.chroot/etc/network/interfaces`)
 since dhcpcd, not ifupdown, manages every interface in this image.
 WiFi is wired up now too, see "WiFi" above. See `ROADMAP.md`.
+
+</details>

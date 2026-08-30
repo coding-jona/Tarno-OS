@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[workspace]
+resolver = "2"
+members = ["kernel", "xtask"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/coding-jona/Tarno-OS"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

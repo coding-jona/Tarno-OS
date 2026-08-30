@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tkernel/linker.ld",
+    "-C", "link-arg=-no-pie",
+    "-C", "relocation-model=static",
+    "-C", "code-model=kernel",
+]
+
+[alias]
+xtask = "run --package xtask --target x86_64-unknown-linux-gnu --"

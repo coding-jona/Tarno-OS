@@ -4,3 +4,11 @@ tarno-devuan-live/config/includes.chroot/usr/bin/tarnod
 tarno-devuan-live/config/includes.chroot/usr/bin/tarno-disk-install
 tarno-devuan-live/config/includes.chroot/usr/bin/tarnoctl
 __pycache__/
+
+# THOS kernel build
+/target/
+/target/iso_root/
+/target/thos.iso
+/boot.log
+**/*.rs.bk
+/third_party/limine/*.o
