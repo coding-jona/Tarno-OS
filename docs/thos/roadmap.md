@@ -140,29 +140,43 @@ NVMe) to see Windows' own files:
 
 ---
 
-## Multi-boot: THOS as the OS picker (deferred — Phase 2/3 side quest)
+## Multi-boot: THOS as the OS picker
 
 Goal: set the Kingston (THOS) first in the mainboard boot order; every power-on
 lands in a THOS-drawn menu that lists the OSes found on the other disks (Windows
 on the NVMe, Devuan on the Samsung, …) and boots the chosen one with **no
 keypress required** for the default after a timeout.
 
-Feasible, and it splits cleanly from the kernel:
+**Status — v1 built (`loaders/thos-boot`), verified in QEMU.** A standalone
+`x86_64-unknown-uefi` app (the `uefi` crate). It:
 
-- **Enumeration.** THOS is UEFI-only, so the honest path is an EFI boot
-  application (our own, or Limine's config) that reads each disk's **GPT** +
-  **ESP (FAT32)** and collects `\EFI\**\*.efi` loaders plus the firmware's
-  `Boot####` / `BootOrder` NVRAM vars. No NTFS/ext parsing needed — every OS's
-  loader lives on a FAT ESP. Needs: a GPT reader, a FAT32 reader, and the EFI
-  `LoadImage`/`StartImage` + variable protocols.
+- enumerates loaders two ways and merges them: the `Boot####` / `BootOrder`
+  NVRAM entries (filtered to on-disk `*.efi` options — firmware apps like the
+  setup UI, UEFI shell, and the generic "UEFI …" fallbacks are dropped), and a
+  direct probe of every `SimpleFileSystem` volume for well-known paths
+  (`\EFI\Microsoft\Boot\bootmgfw.efi`, `\EFI\<distro>\{shim,grub}x64.efi`,
+  `\EFI\systemd\systemd-bootx64.efi`, `\EFI\limine\BOOTX64.EFI` → "THOS");
+- reads `\EFI\thos\boot.conf` from the ESP it launched from — `timeout=<secs>`
+  and `default=<index>`|`<label substring>`;
+- draws a text menu (redraws only on change), counts down, and on select does
+  `LoadImage(FromDevicePath)` + `StartImage`. No `BootOrder` writes.
+
+`cargo xtask bootpick-test` boots it under OVMF with three fake disks (a THOS
+disk with the picker + a `default=THOS` conf, a "Windows" disk, a "Linux" disk)
+and asserts it enumerated all three and chainloaded the THOS entry.
+
+**Still to do before relying on it:** read GPT explicitly (today we lean on the
+firmware's own partition/FAT drivers, which is enough for real ESPs but not for
+listing partitions ourselves); a graphical (GOP) menu; real-hardware test on the
+ASRock board; and the risks below.
+
 - **Chainloading.** Picking "Windows" = `LoadImage` on
   `\EFI\Microsoft\Boot\bootmgfw.efi` from that disk's ESP and `StartImage`.
-  Picking "THOS" = load our kernel as today. This is exactly what rEFInd and the
-  systemd-boot menu do; it is not virtualization and not a fork.
-- **Where it lives.** A `loaders/thos-boot` EFI app, or a thin fork of Limine's
-  menu. The THOS kernel itself stays uninvolved — the picker runs before any
-  kernel loads. So it can be built any time after the FAT/GPT readers exist
-  (they're already on the Phase 2 list for reading the ESP).
+  Picking "THOS" = chainload our Limine + kernel as today. This is exactly what
+  rEFInd and the systemd-boot menu do; it is not virtualization and not a fork.
+- **Where it lives.** `loaders/thos-boot`. The THOS kernel stays uninvolved —
+  the picker runs before any kernel loads. Ships onto the Kingston ESP as
+  `\EFI\BOOT\BOOTX64.EFI` (additive; touches no other disk).
 - **Risks to keep in mind.** Firmware NVRAM quirks (some boards re-assert their
   own `BootOrder`), Secure Boot (chainloading MS's loader is fine; loading our
   unsigned kernel needs SB off or our keys enrolled), and BitLocker (measuring a

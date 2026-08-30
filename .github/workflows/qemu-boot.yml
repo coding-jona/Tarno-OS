@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-name: qemu-boot (Phase 1-2: + xHCI keyboard + shell)
+name: qemu-boot (Phase 1-2: + xHCI keyboard + shell + boot picker)
 
 on:
   push:
@@ -21,11 +21,12 @@ jobs:
           rustup target add x86_64-unknown-none
           rustup component add rust-src llvm-tools
           rustup target add x86_64-unknown-linux-musl
+          rustup target add x86_64-unknown-uefi
 
       - name: Install QEMU + xorriso + OVMF
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 xorriso ovmf e2fsprogs binutils
+          sudo apt-get install -y qemu-system-x86 xorriso ovmf e2fsprogs binutils mtools dosfstools
 
       - name: Build Limine
         run: make -C third_party/limine
@@ -68,3 +69,6 @@ jobs:
 
       - name: Interactive shell end-to-end (type `init` on the USB keyboard, expect it to run)
         run: cargo xtask kbd-test
+
+      - name: Boot picker end-to-end (3 fake disks under OVMF, chainload the default)
+        run: cargo xtask bootpick-test

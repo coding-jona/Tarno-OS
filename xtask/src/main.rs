@@ -36,9 +36,16 @@ fn main() {
             let iso = build_iso();
             kbd_test(&iso);
         }
+        "bootpick" => {
+            build_uefi();
+        }
+        "bootpick-test" => {
+            build_uefi();
+            bootpick_test();
+        }
         other => {
             eprintln!("unknown command: {other}");
-            eprintln!("usage: cargo xtask [build|iso|run|kbd-test] [--gui]");
+            eprintln!("usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test] [--gui]");
             exit(2);
         }
     }
@@ -330,5 +337,161 @@ fn run_qemu(iso: &Path, gui: bool) {
             eprintln!("qemu killed by signal");
             exit(1);
         }
+    }
+}
+
+// ===========================================================================
+//  Boot picker (loaders/thos-boot) — build + a multi-disk OVMF smoke test.
+// ===========================================================================
+
+fn build_uefi() {
+    let mut c = Command::new(env!("CARGO"));
+    c.current_dir(workspace_root()).args([
+        "build",
+        "--package",
+        "thos-boot",
+        "--target",
+        "x86_64-unknown-uefi",
+        "--release",
+    ]);
+    run(&mut c);
+}
+
+fn uefi_efi(name: &str) -> PathBuf {
+    workspace_root().join(format!("target/x86_64-unknown-uefi/release/{name}.efi"))
+}
+
+/// Make a bare-FAT (no partition table) disk image and populate it from a
+/// staging tree via mtools. `files` maps an in-image path to a local source.
+fn make_fat(dir: &Path, name: &str, files: &[(&str, PathBuf)]) -> PathBuf {
+    let img = dir.join(name);
+    let stage = dir.join(format!("{name}.stage"));
+    let _ = std::fs::remove_dir_all(&stage);
+    let _ = std::fs::remove_file(&img);
+
+    for (dest, src) in files {
+        let out = stage.join(dest.trim_start_matches('/'));
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        std::fs::copy(src, &out)
+            .unwrap_or_else(|e| panic!("stage {src:?} -> {out:?}: {e}"));
+    }
+
+    run(Command::new("dd").args([
+        "if=/dev/zero",
+        &format!("of={}", img.to_str().unwrap()),
+        "bs=1M",
+        "count=64",
+        "status=none",
+    ]));
+    run(Command::new("mkfs.vfat").args(["-F", "32", "-n", "THOSTEST", img.to_str().unwrap()]));
+
+    for entry in std::fs::read_dir(&stage).unwrap() {
+        let p = entry.unwrap().path();
+        let mut c = Command::new("mcopy");
+        c.env("MTOOLS_SKIP_CHECK", "1").args([
+            "-s",
+            "-i",
+            img.to_str().unwrap(),
+            p.to_str().unwrap(),
+            "::/",
+        ]);
+        run(&mut c);
+    }
+    img
+}
+
+/// Boot the picker under OVMF with three fake disks (a "THOS" disk carrying the
+/// picker + a `boot.conf` with `default=THOS`, a "Windows" disk, a "Linux"
+/// disk), and assert it enumerated all three and chainloaded the THOS entry.
+fn bootpick_test() {
+    use std::time::{Duration, Instant};
+
+    let root = workspace_root();
+    let dir = root.join("target/bootpick");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let picker = uefi_efi("thos-boot");
+    let stub = uefi_efi("thos-boot-stub");
+    let conf = dir.join("boot.conf");
+    std::fs::write(&conf, b"timeout=1\ndefault=THOS\n").unwrap();
+
+    let thos = make_fat(
+        &dir,
+        "bp-thos.img",
+        &[
+            ("/EFI/BOOT/BOOTX64.EFI", picker.clone()),
+            ("/EFI/limine/BOOTX64.EFI", stub.clone()),
+            ("/EFI/thos/boot.conf", conf.clone()),
+        ],
+    );
+    let win = make_fat(&dir, "bp-win.img", &[("/EFI/Microsoft/Boot/bootmgfw.efi", stub.clone())]);
+    let lin = make_fat(&dir, "bp-lin.img", &[("/EFI/debian/grubx64.efi", stub.clone())]);
+
+    let log = dir.join("serial.log");
+    let _ = std::fs::remove_file(&log);
+
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu.args(["-M", "q35", "-m", "256M", "-no-reboot", "-display", "none"]);
+    qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
+    qemu.arg("-device").arg("ahci,id=ahci0");
+    for (i, img) in [&thos, &win, &lin].iter().enumerate() {
+        qemu.args([
+            "-drive",
+            &format!("id=d{i},if=none,format=raw,file={}", img.to_str().unwrap()),
+            "-device",
+            &format!("ide-hd,drive=d{i},bus=ahci0.{i}"),
+        ]);
+    }
+    // OVMF: prefer the unified image (writable, so NVRAM works); fall back to
+    // the split CODE/VARS pair with a private VARS copy.
+    if Path::new("/usr/share/ovmf/OVMF.fd").exists() {
+        let v = dir.join("OVMF.fd");
+        std::fs::copy("/usr/share/ovmf/OVMF.fd", &v).unwrap();
+        qemu.args(["-drive", &format!("if=pflash,format=raw,file={}", v.to_str().unwrap())]);
+    } else if Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd").exists() {
+        let v = dir.join("OVMF_VARS.fd");
+        std::fs::copy("/usr/share/OVMF/OVMF_VARS_4M.fd", &v).unwrap();
+        qemu.args([
+            "-drive",
+            "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "-drive",
+            &format!("if=pflash,format=raw,file={}", v.to_str().unwrap()),
+        ]);
+    } else {
+        eprintln!("bootpick-test: no OVMF firmware found");
+        exit(1);
+    }
+
+    let mut child = qemu.spawn().expect("spawn qemu");
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && !read_log().contains("STUB OK") {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let out = read_log();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let want = [
+        ("picker banner", "THOS boot picker"),
+        ("windows entry", "Windows Boot Manager"),
+        ("linux entry", "Debian (GRUB)"),
+        ("thos entry", "THOS"),
+        ("chainloaded a stub", "STUB OK"),
+        ("chainloaded the THOS entry", "limine"),
+    ];
+    let mut ok = true;
+    for (what, needle) in want {
+        if !out.contains(needle) {
+            eprintln!("bootpick-test: FAIL — missing {what} ({needle:?})");
+            ok = false;
+        }
+    }
+    if ok {
+        println!("bootpick-test: OK — enumerated 3 disks, counted down, chainloaded THOS");
+    } else {
+        eprintln!("--- serial log ---\n{out}\n---");
+        exit(1);
     }
 }
