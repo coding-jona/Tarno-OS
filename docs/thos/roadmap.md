@@ -171,6 +171,41 @@ NVMe) to see Windows' own files:
 - **Milestone 6:** a real NDIS `.sys` binds a virtual NIC in QEMU, then the board NIC;
   data path through the NT-personality sockets.
 
+## Phase 7 — Hardware breadth (LAST — only once the OS is feature-complete on the target)
+
+Everything above is **hard-coded for the one machine** (ASRock B760M-HDV, i7-13700KF,
+RX 6600). Broad hardware support is deliberately the *final* phase: it multiplies
+every driver's test surface and is worthless before the OS itself is done.
+
+Enabling structure (small, can land earlier as good hygiene):
+
+- **Driver-binding registry** — each driver declares a match table
+  (`{pci_vendor, pci_device, class, acpi_hid}`); the bus code binds automatically
+  from PCI/ACPI enumeration instead of the current hand-written `find_ahci()` /
+  `find_xhci()`. This is the one piece worth building before Phase 7.
+- **Stable loadable-driver ABI** — a versioned in-kernel interface so drivers ship
+  **prebuilt** and load at runtime (`insmod`-style), *not* recompiled per machine.
+  Without this you have re-invented DKMS / Gentoo: a toolchain + kernel source on
+  every install. Compiling a driver on the target stays an **escape hatch** for
+  unpackaged hardware, never the model. (Firmware blobs — e.g. `amdgpu/*.bin` — are
+  fetched, never compiled, regardless.)
+- **`hwdetect` + a driver repo** — map detected IDs to driver packages, fetch them.
+
+Scope notes for when this phase actually starts:
+
+- **Intel CPUs** (desktop): mild — differences are ACPI tables, chipset AHCI/xHCI
+  (already standard interfaces), CPU features via CPUID.
+- **Intel laptops**: a big step beyond desktop — embedded controller, ACPI
+  thermal/battery/backlight, S0ix sleep, `_DSM` quirks, Thunderbolt. The platform
+  surface here rivals the GPU.
+- **AMD GPUs beyond Navi 23**: each generation (RDNA1/2/3, Vega, APUs) is its own
+  DCN display block + power management + firmware set — multiplies the Phase 4
+  "GPU mountain".
+
+Fork-in-the-road to decide before Phase 7: monolithic-with-loadable-modules (Linux
+model) vs. userspace drivers (Fuchsia model). The stable-ABI item above assumes the
+former.
+
 ---
 
 ## Multi-boot: THOS as the OS picker
@@ -223,3 +258,6 @@ ASRock board; and the risks below.
    (see [`licensing.md`](licensing.md)); the Wine-vs-own build choice is still open.
 3. ~~Exact NIC / board chips~~ — resolved, see [`hw-target.md`](hw-target.md).
 4. **TCP/IP stack** — own vs smoltcp/lwIP port; decide in Phase 5.
+5. **Driver model** — monolithic-with-loadable-modules vs userspace drivers.
+   Only forces a decision at **Phase 7** (hardware breadth); until then everything
+   is compiled in for the one target machine.
