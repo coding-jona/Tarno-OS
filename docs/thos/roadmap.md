@@ -72,6 +72,8 @@ late.
 - ELF loader; **POSIX personality**: syscall table (Linux ABI subset), signals, `futex`
   = the wait primitive, `mmap`, processes / `fork` / `execve`, TTY over serial + FB.
 - Port **musl** as the userland libc; a BusyBox-style shell.
+- **Identity stub**: the `Principal` object + a console `login` before the shell +
+  file owner/mode bits (see *Identity, privilege & login* below).
 - **Milestone 2:** booted from the real SSD, interactive shell on a real keyboard,
   statically linked Linux `x86_64` ELF binaries (BusyBox) run unmodified.
   - Status: interactive shell (`/sh`, static-musl Rust) reads the USB keyboard,
@@ -140,6 +142,45 @@ NVMe) to see Windows' own files:
   post-Milestone-3.
 - **read-write NTFS**: hard and risky (`$LogFile`, USN journal, consistency) — Phase 4+
   research item, same tier as loading `.sys` drivers. Not on the critical path.
+
+### Identity, privilege & login
+
+Old Tarno-OS inherited the whole Unix multi-user stack (PAM, shadow, sudoers,
+polkit) and the pain was gluing it together. THOS picks **one** coherent model
+instead of bolting Unix and Windows identity side by side.
+
+- **One executive `Principal` / security context (token)**: a stable principal id
+  + group membership + a privilege set. The **POSIX** personality projects it as
+  `uid/gid`; the **NT** personality projects it as a SID + access token —
+  deterministic mapping, not two separate identities the way Wine fakes one.
+- **Multi-user-*capable* from day one, single-user in practice.** The token layer
+  has SIDs / groups / per-principal `\home` from the start; the installer creates
+  exactly one **admin** principal. Adding users later needs no redesign. *(User
+  decision, 2026-08-30.)*
+- **One canonical ACL in the VFS.** Unix mode bits and an NT DACL are both *views*
+  of it (like macOS: POSIX perms + native ACLs coexist).
+- **No root login — admin elevates** (the most defensible model, *user decision*):
+  - `SYSTEM` / principal 0 has **no password and no login**. A credential that
+    doesn't exist can't be phished or brute-forced.
+  - Even the admin's normal session runs **unprivileged** (low integrity, uid ≠ 0).
+    Ambient privilege is the exception, never the default.
+  - **One elevation primitive** `elevate(cmd)`: policy check (caller in the admin
+    group?) + re-authentication + the request travels a **trusted path** (a
+    secure-attention key, à la Ctrl-Alt-Del) so no app can draw a fake prompt.
+    The elevated token is **scoped** to that process/operation with only a short
+    grace window — not a standing root shell. A `doas`-style CLI and a Win32
+    UAC-manifest are just two front-ends to this one mechanism.
+  - **Recovery** is a boot-time mode (offered by the boot picker) gated by
+    **physical presence + the disk passphrase**, not by a reachable account.
+- **Auth**: `argon2id` password hashes in a THOS-native credential store
+  (SAM/shadow-shaped but our own format), not `/etc/shadow`.
+
+Phasing:
+- **Phase 2 (stub):** the `Principal` object exists; a console `login` runs before
+  the shell and sets the session's principal; files carry an owner + mode bits;
+  one admin principal; `elevate` = a password re-check.
+- **Phase 3 (full):** SID / token model, NT DACL ↔ canonical-ACL translation, the
+  UAC path, the trusted-path prompt, privilege sets (`SeDebugPrivilege` …).
 
 ## Phase 4 — Real graphics (the GPU mountain)
 
