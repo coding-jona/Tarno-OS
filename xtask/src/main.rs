@@ -273,6 +273,30 @@ fn disk_image() -> PathBuf {
             break;
         }
     }
+
+    // BusyBox applet links: `/bin/<applet>` hard-links to the single `/busybox`
+    // inode, so the shell can run `ls`, `cat`, ... by PATH lookup (BusyBox
+    // dispatches on `basename(argv[0])`). `debugfs ln` does not maintain the
+    // inode link count, so set it explicitly afterwards or e2fsck complains.
+    const APPLETS: &[&str] = &[
+        "busybox", "ls", "cat", "echo", "pwd", "mkdir", "rmdir", "rm", "cp", "mv",
+        "ln", "touch", "head", "tail", "wc", "grep", "sort", "uniq", "true", "false",
+        "env", "sleep", "clear", "sh",
+    ];
+    run(Command::new("debugfs").args(["-w", "-R", "mkdir /bin", img.to_str().unwrap()]));
+    for app in APPLETS {
+        run(Command::new("debugfs").args([
+            "-w", "-R", &format!("ln /busybox /bin/{app}"),
+            img.to_str().unwrap(),
+        ]));
+    }
+    // links_count = the root `/busybox` entry + every `/bin/*` link.
+    let links = 1 + APPLETS.len();
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("sif /busybox links_count {links}"),
+        img.to_str().unwrap(),
+    ]));
+
     img
 }
 
@@ -334,7 +358,23 @@ fn mon(sock: &Path, cmd: &str) {
 /// Type `text` (ascii `a-z0-9` only — QEMU `sendkey` names) then Enter.
 fn type_line(sock: &Path, text: &str) {
     for c in text.chars() {
-        mon(sock, &format!("sendkey {c}"));
+        // QEMU `sendkey` wants key *names*, not glyphs, for non-alphanumerics.
+        // Key *names* / chords for QEMU `sendkey`. The kernel console maps
+        // scancodes through a **German (QWERTZ)** layout, so `/` is `shift-7`
+        // and the US `/`-key (`slash`) would actually produce `-`.
+        let key = match c {
+            ' ' => "spc",
+            '/' => "shift-7",
+            '-' => "slash",
+            '_' => "shift-slash",
+            '.' => "dot",
+            ',' => "comma",
+            _ => {
+                mon(sock, &format!("sendkey {c}"));
+                continue;
+            }
+        };
+        mon(sock, &format!("sendkey {key}"));
     }
     mon(sock, "sendkey ret");
 }
@@ -381,16 +421,30 @@ fn kbd_test(iso: &Path) {
     std::thread::sleep(std::time::Duration::from_millis(500));
     type_line(&sock, "init");
     std::thread::sleep(std::time::Duration::from_millis(1500));
+    // BusyBox applet links: `ls` (getdents64 + DirFile), `cd` (builtin),
+    // `cat` (MemFile) — all reached through `/bin/*` hard-links to `/busybox`.
+    type_line(&sock, "ls /bin");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    type_line(&sock, "cd /bin");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    type_line(&sock, "cat /message");
+    std::thread::sleep(std::time::Duration::from_millis(1000));
 
     let out = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = child.kill();
     let _ = child.wait();
 
     let after = out.split("interactive hold").nth(1).unwrap_or("");
-    if after.contains("thos$ init") && after.contains("parent done") {
-        println!("kbd-test: OK — first-run setup + login, shell ran `init`");
+    let shell_ok = after.contains("thos$ init") && after.contains("parent done");
+    // `ls /bin` must show the applet link names (they appear nowhere else).
+    let ls_ok = ["busybox", "touch", "grep", "sleep"].iter().all(|n| after.contains(n));
+    let cat_ok = after.contains("hello a file read via open+lseek+read");
+    if shell_ok && ls_ok && cat_ok {
+        println!("kbd-test: OK — login, shell ran `init`, BusyBox `ls`/`cat` applets ran");
     } else {
-        eprintln!("kbd-test: FAIL — after login:\n---\n{after}\n---");
+        eprintln!(
+            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cat_ok={cat_ok}) — after login:\n---\n{after}\n---"
+        );
         exit(1);
     }
 }

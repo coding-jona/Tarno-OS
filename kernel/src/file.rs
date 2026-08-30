@@ -6,6 +6,7 @@
 //! slurped into memory — our ext2 is read-only, so this is enough for `cat`).
 //! Pipes, real streaming ext2, `/dev`, sockets all slot in here later.
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -19,6 +20,8 @@ pub const SEEK_END: u32 = 2;
 const EBADF: i64 = -9;
 const ESPIPE: i64 = -29;
 const EINVAL: i64 = -22;
+const EISDIR: i64 = -21;
+const ENOTDIR: i64 = -20;
 
 pub trait FileOps: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> i64;
@@ -26,6 +29,12 @@ pub trait FileOps: Send + Sync {
     fn seek(&self, offset: i64, whence: u32) -> i64;
     /// (mode bits for `st_mode`, size for `st_size`).
     fn stat(&self) -> (u32, u64);
+    /// Fill `buf` with `struct linux_dirent64` records; `0` at end-of-dir,
+    /// `-EINVAL` if `buf` is too small for even one record. Not a directory by
+    /// default.
+    fn getdents64(&self, _buf: &mut [u8]) -> i64 {
+        ENOTDIR
+    }
 }
 
 // --- console ---
@@ -35,6 +44,7 @@ pub struct ConsoleFile {
 }
 
 const S_IFCHR: u32 = 0o020000;
+const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 
 /// stdin backed by the keyboard console: a blocking line read.
@@ -124,5 +134,75 @@ impl FileOps for MemFile {
     }
     fn stat(&self) -> (u32, u64) {
         (S_IFREG | 0o644, self.data.len() as u64)
+    }
+}
+
+// --- directory: a pre-rendered `getdents64` blob ---
+
+/// The 19-byte fixed head of `struct linux_dirent64`
+/// (`d_ino`, `d_off`, `d_reclen`, `d_type`), before the NUL-terminated name.
+const DIRENT_HEAD: usize = 8 + 8 + 2 + 1;
+
+pub struct DirFile {
+    /// Back-to-back `linux_dirent64` records, each `d_reclen`-aligned to 8.
+    blob: Vec<u8>,
+    pos: Mutex<usize>,
+}
+
+impl DirFile {
+    /// `entries`: `(inode, d_type, name)` — `d_type` already in Linux `DT_*`.
+    pub fn new(entries: &[(u64, u8, String)]) -> Arc<Self> {
+        let mut blob = Vec::new();
+        for (ino, dtype, name) in entries {
+            let reclen = (DIRENT_HEAD + name.len() + 1 + 7) & !7;
+            let s = blob.len();
+            blob.resize(s + reclen, 0);
+            blob[s..s + 8].copy_from_slice(&ino.to_le_bytes());
+            blob[s + 8..s + 16].copy_from_slice(&((s + reclen) as i64).to_le_bytes()); // d_off
+            blob[s + 16..s + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+            blob[s + 18] = *dtype;
+            blob[s + DIRENT_HEAD..s + DIRENT_HEAD + name.len()].copy_from_slice(name.as_bytes());
+        }
+        Arc::new(Self { blob, pos: Mutex::new(0) })
+    }
+}
+
+impl FileOps for DirFile {
+    fn read(&self, _buf: &mut [u8]) -> i64 {
+        EISDIR
+    }
+    fn write(&self, _buf: &[u8]) -> i64 {
+        EISDIR
+    }
+    fn seek(&self, offset: i64, whence: u32) -> i64 {
+        // Only a rewind (`SEEK_SET 0`) is meaningful for a dir stream.
+        let mut pos = self.pos.lock();
+        match whence {
+            SEEK_SET => {
+                *pos = offset.max(0) as usize;
+                *pos as i64
+            }
+            _ => EINVAL,
+        }
+    }
+    fn stat(&self) -> (u32, u64) {
+        (S_IFDIR | 0o755, self.blob.len() as u64)
+    }
+    fn getdents64(&self, buf: &mut [u8]) -> i64 {
+        let mut pos = self.pos.lock();
+        let mut n = 0;
+        while *pos + n < self.blob.len() {
+            let rl = self.blob[*pos + n + 16] as usize | (self.blob[*pos + n + 17] as usize) << 8;
+            if n + rl > buf.len() {
+                break;
+            }
+            buf[n..n + rl].copy_from_slice(&self.blob[*pos + n..*pos + n + rl]);
+            n += rl;
+        }
+        if n == 0 {
+            return if *pos < self.blob.len() { EINVAL } else { 0 };
+        }
+        *pos += n;
+        n as i64
     }
 }

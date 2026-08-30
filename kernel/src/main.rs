@@ -156,7 +156,7 @@ extern "C" fn kmain() -> ! {
         process::spawn_init(
             &sh,
             &["sh"],
-            &["PATH=/", "HOME=/", "PWD=/", "TERM=dumb", "PS1=thos$ "],
+            &["PATH=/bin:/", "HOME=/", "PWD=/", "TERM=dumb", "PS1=thos$ "],
         );
 
         kprintln!("THOS: interactive hold — type on the USB keyboard");

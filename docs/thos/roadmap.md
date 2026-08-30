@@ -120,9 +120,20 @@ late.
   - **Stock static BusyBox runs unmodified** (`cargo xtask busybox-test`, from the
     `busybox-static` package): `busybox echo …` loads via the ELF loader and
     exits cleanly through the POSIX personality — the Milestone-2 "unmodified
-    Linux x86-64 binary" bar. Next: applet symlinks / a coreutils set on the
-    disk image so `ls`, `cat`, `cd` work from the prompt; pipes (`pipe2`) for
-    `|` and `$(…)`.
+    Linux x86-64 binary" bar.
+  - **BusyBox applets from the prompt.** The disk image lays down `/bin/<applet>`
+    as **hard links** to the single `/busybox` inode (`debugfs ln` + an explicit
+    `links_count` so `e2fsck` stays clean); the shell's `PATH` is `/bin:/` and
+    BusyBox dispatches on `basename(argv[0])`. `ls` needed real directory reads,
+    which the kernel did not have: `ext2::read_dir` (entry filetype → Linux
+    `DT_*`), a `file::DirFile` that pre-renders `linux_dirent64` records, and the
+    `getdents64` syscall; `open` on a directory now returns a `DirFile`. `cat`
+    uses the existing `MemFile` path (plus a real `sendfile` so it takes its
+    fast path); `cd` is a shell built-in over the `chdir`→0 stub. `time` is
+    stubbed to a fixed epoch (no RTC yet). `cargo xtask kbd-test` now also runs
+    `ls /bin`, `cd /bin`, `cat /message` and checks their output.
+  - Not yet: a per-process CWD (so `ls` with no argument always lists `/`),
+    writing through `/bin/*` links, pipes (`pipe2`) for `|` and `$(…)`.
   - Disk I/O is batched: `mm` reserves a 1 MiB contiguous DMA arena, AHCI gives
     each tag a 32 KiB bounce buffer and transfers up to 32 KiB per NCQ command,
     and `ext2::read_file` issues one read per run of consecutive blocks. The

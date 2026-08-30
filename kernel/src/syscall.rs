@@ -85,6 +85,9 @@ const SYS_SYSINFO: u64 = 99;
 const SYS_WAITID: u64 = 247;
 const SYS_CLONE: u64 = 56;
 const SYS_NEWFSTATAT: u64 = 262;
+const SYS_GETDENTS64: u64 = 217;
+const SYS_TIME: u64 = 201;
+const SYS_SENDFILE: u64 = 40;
 const SYS_SETUID: u64 = 105;
 const SYS_SETGID: u64 = 106;
 const SYS_MPROTECT: u64 = 10;
@@ -302,9 +305,16 @@ fn sys_open(path_ptr: u64) -> i64 {
     let Some(task) = sched::current().task() else {
         return EBADF;
     };
-    match ext2::open().ok().and_then(|fs| fs.read_path(&path)) {
-        Some(bytes) => task.fd_alloc(crate::file::MemFile::new(bytes)) as i64,
-        None => ENOENT,
+    let Some(fs) = ext2::open().ok() else { return EIO };
+    let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
+    let node = fs.read_inode(ino);
+    if node.mode & 0xF000 == 0x4000 {
+        // A directory: hand back a `getdents64`-able stream.
+        let entries: alloc::vec::Vec<(u64, u8, alloc::string::String)> =
+            fs.read_dir(ino).into_iter().map(|(i, t, n)| (i as u64, t, n)).collect();
+        task.fd_alloc(crate::file::DirFile::new(&entries)) as i64
+    } else {
+        task.fd_alloc(crate::file::MemFile::new(fs.read_file(&node))) as i64
     }
 }
 
@@ -364,6 +374,55 @@ fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
         0x5410 => 0, // TIOCSPGRP
         _ => ENOTTY,
     }
+}
+
+/// `sendfile(out_fd, in_fd, off_ptr, count)` — copy `count` bytes from `in_fd`
+/// to `out_fd` through a small bounce buffer. If `off_ptr` is non-NULL it names
+/// the start offset in `in_fd` and receives the new offset; `in_fd`'s own file
+/// position is otherwise used.
+fn sys_sendfile(out_fd: u64, in_fd: u64, off_ptr: u64, count: u64) -> i64 {
+    let (Some(src), Some(dst)) = (cur_fd(in_fd), cur_fd(out_fd)) else {
+        return EBADF;
+    };
+    if off_ptr != 0 {
+        let start = unsafe { *(off_ptr as *const i64) };
+        if src.seek(start, crate::file::SEEK_SET) < 0 {
+            return EINVAL;
+        }
+    }
+    let mut buf = [0u8; 4096];
+    let mut left = count as usize;
+    let mut total: i64 = 0;
+    while left > 0 {
+        let want = left.min(buf.len());
+        let n = src.read(&mut buf[..want]);
+        if n <= 0 {
+            if n < 0 && total == 0 {
+                return n;
+            }
+            break;
+        }
+        let n = n as usize;
+        let w = dst.write(&buf[..n]);
+        if w < 0 {
+            if total == 0 {
+                return w;
+            }
+            break;
+        }
+        total += w;
+        left -= w as usize;
+        if (w as usize) < n {
+            break;
+        }
+    }
+    if off_ptr != 0 {
+        let cur = src.seek(0, crate::file::SEEK_CUR);
+        if cur >= 0 {
+            unsafe { *(off_ptr as *mut i64) = cur };
+        }
+    }
+    total
 }
 
 /// `newfstatat(dirfd, path, statbuf, flags)` — absolute paths via ext2, plus
@@ -461,6 +520,28 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             }
         }
         SYS_LSEEK => cur_fd(a1).map(|f| f.seek(a2 as i64, a3 as u32)).unwrap_or(EBADF),
+
+        // time(2): seconds since the epoch. No RTC yet — a fixed plausible value
+        // keeps `ls` and friends from tripping the unhandled-syscall path.
+        SYS_TIME => {
+            let t: i64 = 1_735_689_600; // 2025-01-01
+            if a1 != 0 {
+                unsafe { *(a1 as *mut i64) = t };
+            }
+            t
+        }
+
+        // sendfile(out, in, *offset, count): plain copy loop through a bounce
+        // buffer. Lets `cat` / `cp` use their fast path instead of falling back.
+        SYS_SENDFILE => sys_sendfile(a1, a2, a3, a4),
+
+        SYS_GETDENTS64 => match cur_fd(a1) {
+            Some(f) => {
+                let buf = unsafe { core::slice::from_raw_parts_mut(a2 as *mut u8, a3 as usize) };
+                f.getdents64(buf)
+            }
+            None => EBADF,
+        },
         SYS_FSTAT => sys_fstat(a1, a2),
 
         SYS_ARCH_PRCTL => match a1 {
