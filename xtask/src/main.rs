@@ -433,13 +433,15 @@ fn kbd_test(iso: &Path) {
     // BusyBox applet links reached via `/bin/*` hard-links to `/busybox`, plus a
     // per-process cwd: `cd /bin` then a bare `ls` / `pwd` must act on /bin.
     type_line(&sock, "cd /bin");
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    type_line(&sock, "pwd");
     std::thread::sleep(std::time::Duration::from_millis(600));
+    type_line(&sock, "pwd");
+    std::thread::sleep(std::time::Duration::from_millis(800));
     type_line(&sock, "ls");
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    std::thread::sleep(std::time::Duration::from_millis(2000));
     type_line(&sock, "cat /message");
-    std::thread::sleep(std::time::Duration::from_millis(1000));
+    // Wait for the last command's output rather than a fixed sleep — the host
+    // running CI can be slow enough that a 2 MiB BusyBox applet takes seconds.
+    let _ = wait_for(&log, "hello a file read via open+lseek+read", 30);
 
     let out = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = child.kill();
