@@ -63,6 +63,7 @@ jobs:
           grep -q "THOS: fork/exec/wait4  ok" boot.log
           grep -q "hello from a static musl Rust binary" boot.log
           grep -q "THOS: musl binary ok" boot.log
+          grep -q "THOS: ahci write ok" boot.log
           grep -q "THOS: xhci ok" boot.log
           grep -q "THOS: wait primitive" boot.log
           grep -q "THOS: halting." boot.log
@@ -72,3 +73,6 @@ jobs:
 
       - name: Boot picker end-to-end (3 fake disks under OVMF, chainload the default)
         run: cargo xtask bootpick-test
+
+      - name: AHCI write end-to-end (kernel round-trip + host verifies it persisted)
+        run: cargo xtask ahci-test

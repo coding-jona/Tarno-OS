@@ -54,6 +54,7 @@ const SIG_SATA: u32 = 0x0000_0101;
 const FIS_TYPE_H2D: u8 = 0x27;
 const CMD_READ_DMA_EX: u8 = 0x25;
 const CMD_WRITE_DMA_EX: u8 = 0x35;
+const CMD_FLUSH_CACHE_EX: u8 = 0xEA;
 
 struct Hba {
     base: u64, // HHDM virtual address of the ABAR
@@ -233,4 +234,70 @@ pub fn read(lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {
     }
     FRAME_ALLOC.lock().dealloc(frame);
     Ok(())
+}
+
+/// Write `buf.len() / 512` sectors starting at `lba` from `buf`, then flush the
+/// drive's write cache so the data is durable before this returns.
+pub fn write(lba: u64, buf: &[u8]) -> Result<(), &'static str> {
+    assert!(buf.len() % SECTOR == 0 && !buf.is_empty() && buf.len() <= 4096);
+    let sectors = (buf.len() / SECTOR) as u16;
+
+    let frame = FRAME_ALLOC.lock().alloc().ok_or("no bounce frame")?;
+    let phys = frame.start_address();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            buf.as_ptr(),
+            phys_to_virt(phys).as_mut_ptr::<u8>(),
+            buf.len(),
+        );
+    }
+    let r = transfer(true, lba, sectors, phys.as_u64()).and_then(|()| flush());
+    FRAME_ALLOC.lock().dealloc(frame);
+    r
+}
+
+/// Issue `FLUSH CACHE EXT` (no data transfer) on the active port.
+fn flush() -> Result<(), &'static str> {
+    let guard = DISK.lock();
+    let d = guard.as_ref().ok_or("AHCI not initialised")?;
+    let hba = &d.hba;
+    let port = d.port;
+
+    for _ in 0..1_000_000 {
+        if hba.pr(port, P_TFD) & (TFD_BSY | TFD_DRQ) == 0 {
+            break;
+        }
+    }
+
+    let clist = phys_to_virt(x86_64::PhysAddr::new(d.cmd_phys)).as_mut_ptr::<u32>();
+    let ctba = d.cmd_phys + 0x500;
+    let ctab = phys_to_virt(x86_64::PhysAddr::new(ctba)).as_mut_ptr::<u8>();
+
+    unsafe {
+        core::ptr::write_volatile(clist.add(0), 5u32); // cfl = 5 dwords, PRDTL = 0, no W
+        core::ptr::write_volatile(clist.add(1), 0);
+        core::ptr::write_volatile(clist.add(2), ctba as u32);
+        core::ptr::write_volatile(clist.add(3), (ctba >> 32) as u32);
+
+        core::ptr::write_bytes(ctab, 0, 0x80);
+        let f = ctab;
+        f.add(0).write_volatile(FIS_TYPE_H2D);
+        f.add(1).write_volatile(1 << 7); // C = 1
+        f.add(2).write_volatile(CMD_FLUSH_CACHE_EX);
+        f.add(7).write_volatile(1 << 6); // LBA mode
+    }
+
+    fence(Ordering::SeqCst);
+    hba.pw(port, P_IS, 0xFFFF_FFFF);
+    hba.pw(port, P_CI, 1);
+
+    for _ in 0..10_000_000 {
+        if hba.pr(port, P_CI) & 1 == 0 {
+            if hba.pr(port, P_IS) & IS_TFES != 0 {
+                return Err("AHCI flush task-file error");
+            }
+            return Ok(());
+        }
+    }
+    Err("AHCI flush timed out")
 }

@@ -54,6 +54,11 @@ late.
   MSI/MSI-X, command list / FIS) → real root FS from the **Kingston A400 240 GB SATA
   SSD** (`sdc`). NVMe is Windows' disk and is never touched; an NVMe driver is
   out of scope for v1.
+  - Status: polled driver, single command slot. `READ`/`WRITE DMA EXT` +
+    `FLUSH CACHE EXT` all working. `cargo xtask ahci-test` has the kernel write a
+    pattern to a scratch LBA, read it back, and then re-checks from the host that
+    it persisted into the disk image. Next: `IDENTIFY` (real capacity), multi-slot
+    / NCQ, MSI-X completion interrupts instead of polling.
 - **xHCI driver** (Intel `8086:7a60`) + USB HID (keyboard/mouse). PS/2 only as a QEMU
   stopgap.
 - ELF loader; **POSIX personality**: syscall table (Linux ABI subset), signals, `futex`

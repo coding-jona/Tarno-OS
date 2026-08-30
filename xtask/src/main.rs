@@ -43,9 +43,16 @@ fn main() {
             build_uefi();
             bootpick_test();
         }
+        "ahci-test" => {
+            build_kernel(&[]);
+            let iso = build_iso();
+            ahci_test(&iso);
+        }
         other => {
             eprintln!("unknown command: {other}");
-            eprintln!("usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test] [--gui]");
+            eprintln!(
+                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test] [--gui]"
+            );
             exit(2);
         }
     }
@@ -171,6 +178,13 @@ fn disk_image() -> PathBuf {
         "-O", "^resize_inode,^dir_index,^ext_attr",
         img.to_str().unwrap(), "8192",
     ]));
+    // Grow the backing file past the 8 MiB filesystem so there is scratch space
+    // for the AHCI write test (LBA 20000) that the fs never touches.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&img)
+        .and_then(|f| f.set_len(16 * 1024 * 1024))
+        .expect("extend disk.img");
     for (name, elf) in elfs {
         run(Command::new("debugfs").args([
             "-w", "-R", &format!("write {} {name}", elf.to_str().unwrap()),
@@ -492,6 +506,83 @@ fn bootpick_test() {
         println!("bootpick-test: OK — enumerated 3 disks, counted down, chainloaded THOS");
     } else {
         eprintln!("--- serial log ---\n{out}\n---");
+        exit(1);
+    }
+}
+
+// ===========================================================================
+//  AHCI write path — boot the kernel's write/read-back milestone, then confirm
+//  from the host that the pattern actually persisted into the disk image.
+// ===========================================================================
+
+/// Must match `SCRATCH_LBA` / the pattern in `kernel/src/main.rs`.
+const AHCI_SCRATCH_LBA: u64 = 20_000;
+
+fn ahci_test(iso: &Path) {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let root = workspace_root();
+    // Force a fresh disk image so the scratch sector starts as zeros.
+    let _ = std::fs::remove_file(root.join("target/disk.img"));
+    let disk = disk_image();
+    let log = root.join("target/ahci-serial.log");
+    let _ = std::fs::remove_file(&log);
+
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu.args(["-M", "q35", "-m", "512M", "-smp", "4", "-cdrom", iso.to_str().unwrap()]);
+    qemu.args([
+        "-drive", &format!("id=disk0,if=none,format=raw,file={}", disk.to_str().unwrap()),
+        "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0",
+    ]);
+    qemu.args(["-display", "none", "-no-reboot"]);
+    qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
+    qemu.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+    for ovmf in ["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/ovmf/OVMF.fd"] {
+        if Path::new(ovmf).exists() {
+            qemu.args(["-drive", &format!("if=pflash,format=raw,readonly=on,file={ovmf}")]);
+            break;
+        }
+    }
+
+    let mut child = qemu.spawn().expect("spawn qemu");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("wait qemu") {
+            break Some(s);
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    let serial = std::fs::read_to_string(&log).unwrap_or_default();
+    if status.and_then(|s| s.code()) != Some(QEMU_SUCCESS) {
+        eprintln!("ahci-test: kernel did not halt cleanly\n--- serial ---\n{serial}\n---");
+        exit(1);
+    }
+    if !serial.contains("THOS: ahci write ok") {
+        eprintln!("ahci-test: FAIL — no in-boot write/read-back marker\n{serial}");
+        exit(1);
+    }
+
+    // Host-side: the pattern the kernel wrote must now be in the disk file.
+    let mut f = std::fs::File::open(&disk).expect("open disk.img");
+    let mut got = [0u8; 512];
+    std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(AHCI_SCRATCH_LBA * 512)).unwrap();
+    f.read_exact(&mut got).expect("read scratch sector");
+
+    let want: Vec<u8> = (0..512u32).map(|i| (i as u8) ^ 0xA5).collect();
+    if got[..] == want[..] {
+        println!(
+            "ahci-test: OK — kernel round-tripped LBA {AHCI_SCRATCH_LBA} and it persisted to the image"
+        );
+    } else {
+        eprintln!("ahci-test: FAIL — disk image scratch sector does not hold the pattern");
+        eprintln!("  first 16 want: {:02x?}", &want[..16]);
+        eprintln!("  first 16 got:  {:02x?}", &got[..16]);
         exit(1);
     }
 }

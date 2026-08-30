@@ -381,6 +381,20 @@ fn storage_milestone() {
     }
     kprintln!("THOS: musl binary ok   (static Rust/musl ran to exit)");
 
+    // AHCI write: round-trip a known pattern through a scratch sector past the
+    // ext2 image (LBA 20000 = ~10 MiB; the fs is the first 8 MiB). The host
+    // side of `cargo xtask ahci-test` re-checks this landed in the disk file.
+    const SCRATCH_LBA: u64 = 20_000;
+    let mut wbuf = [0u8; ahci::SECTOR];
+    for (i, b) in wbuf.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0xA5;
+    }
+    ahci::write(SCRATCH_LBA, &wbuf).expect("AHCI write");
+    let mut rbuf = [0u8; ahci::SECTOR];
+    ahci::read(SCRATCH_LBA, &mut rbuf).expect("AHCI read-back");
+    assert!(rbuf == wbuf, "AHCI write / read-back mismatch");
+    kprintln!("THOS: ahci write ok    LBA {} round-tripped + flushed", SCRATCH_LBA);
+
     // USB keyboard via xHCI -> the line-disciplined console -> fd 0.
     match xhci::init() {
         Ok(x) => {
