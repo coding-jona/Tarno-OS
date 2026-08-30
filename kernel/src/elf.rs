@@ -11,6 +11,10 @@ use crate::process::Process;
 
 pub struct Image {
     pub entry: u64,
+    /// Virtual address the program headers landed at (for `AT_PHDR`).
+    pub phdr: u64,
+    pub phent: u64,
+    pub phnum: u64,
 }
 
 fn u16le(b: &[u8]) -> u16 {
@@ -41,12 +45,13 @@ pub fn load(proc: &Process, image: &[u8]) -> Result<Image, &'static str> {
     }
 
     let e_entry = u64le(&image[24..]);
-    let e_phoff = u64le(&image[32..]) as usize;
-    let e_phentsize = u16le(&image[54..]) as usize;
-    let e_phnum = u16le(&image[56..]) as usize;
+    let e_phoff = u64le(&image[32..]) as u64;
+    let e_phentsize = u16le(&image[54..]) as u64;
+    let e_phnum = u16le(&image[56..]) as u64;
 
+    let mut phdr_vaddr = 0u64;
     for i in 0..e_phnum {
-        let ph = &image[e_phoff + i * e_phentsize..];
+        let ph = &image[(e_phoff + i * e_phentsize) as usize..];
         if u32le(&ph[0..]) != 1 {
             continue; // PT_LOAD only
         }
@@ -55,10 +60,20 @@ pub fn load(proc: &Process, image: &[u8]) -> Result<Image, &'static str> {
         let p_vaddr = u64le(&ph[16..]);
         let p_filesz = u64le(&ph[32..]);
         let p_memsz = u64le(&ph[40..]);
+        // Where did the program headers land? (the PT_LOAD whose file range
+        // covers e_phoff)
+        if e_phoff >= p_offset && e_phoff < p_offset + p_filesz {
+            phdr_vaddr = p_vaddr + (e_phoff - p_offset);
+        }
         map_segment(proc, image, p_offset, p_vaddr, p_filesz, p_memsz, flags);
     }
 
-    Ok(Image { entry: e_entry })
+    Ok(Image {
+        entry: e_entry,
+        phdr: phdr_vaddr,
+        phent: e_phentsize,
+        phnum: e_phnum,
+    })
 }
 
 fn map_segment(

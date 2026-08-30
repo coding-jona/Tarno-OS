@@ -252,6 +252,11 @@ pub fn current() -> Arc<Thread> {
         .expect("current: no current thread")
 }
 
+/// The address space of the thread running on this CPU, if it is a user thread.
+pub fn current_proc() -> Option<Arc<Process>> {
+    current().proc.clone()
+}
+
 /// BSP: turn the current execution into thread 0 and give this CPU an idle
 /// thread. Scheduling becomes active on return.
 pub fn init_bsp() {

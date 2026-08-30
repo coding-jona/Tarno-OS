@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-name: qemu-boot (Phase 1-2: + processes, VFS, AHCI, ext2, ELF)
+name: qemu-boot (Phase 1-2: processes, syscalls, argv, ext2, ELF)
 
 on:
   push:
@@ -55,7 +55,7 @@ jobs:
           grep -q "THOS: ahci ok" boot.log
           grep -q "THOS: ext2 ok" boot.log
           grep -q "THOS: elf ok" boot.log
-          grep -q "hello from an ext2-loaded ELF" boot.log
+          grep -q "argv0=/hello argc=2" boot.log
           grep -q "THOS: user process ok" boot.log
           grep -q "THOS: wait primitive" boot.log
           grep -q "THOS: halting." boot.log

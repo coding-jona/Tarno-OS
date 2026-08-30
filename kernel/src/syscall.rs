@@ -12,22 +12,47 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
+use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
 
-use crate::{gdt, sched, serial, smp};
+use crate::{gdt, kprintln, sched, serial, smp};
 
 static USER_EXITS: AtomicU64 = AtomicU64::new(0);
 
-/// How many user threads have called `SYS_EXIT` so far.
+/// How many user threads have called `exit` / `exit_group` so far.
 pub fn user_exits() -> u64 {
     USER_EXITS.load(Ordering::Acquire)
 }
 
-pub const SYS_WRITE: u64 = 1;
-pub const SYS_EXIT: u64 = 2;
-pub const SYS_GETPID: u64 = 3;
+// Linux x86-64 syscall numbers (the POSIX personality speaks the Linux ABI so
+// that unmodified static ELF binaries run).
+const SYS_READ: u64 = 0;
+const SYS_WRITE: u64 = 1;
+const SYS_CLOSE: u64 = 3;
+const SYS_MMAP: u64 = 9;
+const SYS_BRK: u64 = 12;
+const SYS_RT_SIGACTION: u64 = 13;
+const SYS_RT_SIGPROCMASK: u64 = 14;
+const SYS_IOCTL: u64 = 16;
+const SYS_WRITEV: u64 = 20;
+const SYS_GETPID: u64 = 39;
+const SYS_EXIT: u64 = 60;
+const SYS_ARCH_PRCTL: u64 = 158;
+const SYS_SET_TID_ADDRESS: u64 = 218;
+const SYS_EXIT_GROUP: u64 = 231;
+const SYS_SET_ROBUST_LIST: u64 = 273;
+const SYS_PRLIMIT64: u64 = 302;
+const SYS_GETRANDOM: u64 = 318;
+const SYS_RSEQ: u64 = 334;
+
+const ENOSYS: isize = -38;
+const EBADF: isize = -9;
+const EINVAL: isize = -22;
+const ENOTTY: isize = -25;
+
+const ARCH_SET_FS: u64 = 0x1002;
+const ARCH_GET_FS: u64 = 0x1003;
 
 /// Argument frame the entry stub builds on the kernel stack.
 #[repr(C)]
@@ -96,24 +121,91 @@ pub fn init_cpu(_cpu: usize) {
     );
 }
 
+/// Write a user buffer to the console (stdout/stderr only for now). We run
+/// under the caller's CR3, so user pointers are directly readable — a
+/// validating copy_from_user comes later.
+fn sys_write(fd: u64, ptr: u64, len: u64) -> isize {
+    if fd != 1 && fd != 2 {
+        return EBADF;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    serial::write_bytes(bytes);
+    len as isize
+}
+
 #[no_mangle]
 extern "C" fn thos_syscall_dispatch(args: &SyscallArgs) -> isize {
     match args.nr {
-        SYS_WRITE => {
-            // `args.a1` is a user pointer; we run under the caller's CR3, so a
-            // direct read is valid. A validating copy_from_user comes later.
-            let bytes =
-                unsafe { core::slice::from_raw_parts(args.a1 as *const u8, args.a2 as usize) };
-            if let Ok(s) = core::str::from_utf8(bytes) {
-                serial::print(s);
+        SYS_WRITE => sys_write(args.a1, args.a2, args.a3),
+
+        SYS_WRITEV => {
+            if args.a1 != 1 && args.a1 != 2 {
+                return EBADF;
+            }
+            let iov = unsafe {
+                core::slice::from_raw_parts(args.a2 as *const [u64; 2], args.a3 as usize)
+            };
+            let mut total = 0isize;
+            for &[base, len] in iov {
+                total += sys_write(args.a1, base, len).max(0);
+            }
+            total
+        }
+
+        SYS_READ => 0, // EOF for now
+
+        SYS_ARCH_PRCTL => match args.a1 {
+            ARCH_SET_FS => {
+                FsBase::write(VirtAddr::new(args.a2));
+                0
+            }
+            ARCH_GET_FS => {
+                unsafe { *(args.a2 as *mut u64) = FsBase::read().as_u64() };
+                0
+            }
+            _ => EINVAL,
+        },
+
+        SYS_BRK => match sched::current_proc() {
+            Some(p) => p.brk(args.a1) as isize,
+            None => EINVAL,
+        },
+
+        SYS_MMAP => match sched::current_proc() {
+            Some(p) => p.mmap_anon(args.a2) as isize,
+            None => EINVAL,
+        },
+
+        SYS_GETRANDOM => {
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(args.a1 as *mut u8, args.a2 as usize)
+            };
+            let mut x = RNG.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+            for b in buf.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = x as u8;
             }
             args.a2 as isize
         }
+
         SYS_GETPID => 1,
-        SYS_EXIT => {
+        SYS_SET_TID_ADDRESS => 1,
+        SYS_IOCTL => ENOTTY,
+        SYS_CLOSE | SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_SET_ROBUST_LIST | SYS_PRLIMIT64 => 0,
+        SYS_RSEQ => ENOSYS,
+
+        SYS_EXIT | SYS_EXIT_GROUP => {
             USER_EXITS.fetch_add(1, Ordering::Release);
             sched::exit()
         }
-        _ => -1,
+
+        n => {
+            kprintln!("THOS: unhandled syscall {}", n);
+            ENOSYS
+        }
     }
 }
+
+static RNG: AtomicU64 = AtomicU64::new(0x1234_5678_9abc_def0);

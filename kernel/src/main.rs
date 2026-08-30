@@ -350,14 +350,15 @@ fn storage_milestone() {
         if i == 0 {
             kprintln!("THOS: elf ok           entry {:#x}", img.entry);
         }
-        let ustack = proc.new_user_stack();
-        sched::spawn_user("hello", proc, img.entry, ustack);
+        let stack_top = proc.new_user_stack();
+        let rsp = proc.init_stack(stack_top, &["/hello", "world"], &["THOS=1"], &img);
+        sched::spawn_user("hello", proc, img.entry, rsp);
     }
     while syscall::user_exits() < want {
         sched::yield_now();
     }
     kprintln!(
-        "THOS: user process ok  {} procs, own address spaces, exited via SYS_EXIT",
+        "THOS: user process ok  {} procs, own address spaces, argv/auxv stack",
         want
     );
 }
