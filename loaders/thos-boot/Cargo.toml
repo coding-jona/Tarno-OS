@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[package]
+name = "thos-boot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "THOS UEFI boot picker: enumerate OSes on every disk, chainload one."
+
+[lib]
+name = "thos_boot"
+path = "src/lib.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "thos-boot"
+path = "src/main.rs"
+test = false
+bench = false
+
+# A tiny UEFI app used only by `cargo xtask bootpick-test` to stand in for a
+# real OS loader: it prints its own image path and exits.
+[[bin]]
+name = "thos-boot-stub"
+path = "src/bin/stub.rs"
+test = false
+bench = false
+
+[dependencies]
+uefi = { version = "0.40", features = ["alloc", "global_allocator", "panic_handler", "logger"] }

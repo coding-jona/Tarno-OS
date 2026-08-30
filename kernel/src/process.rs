@@ -22,6 +22,7 @@ use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
 use x86_64::PhysAddr;
 
 use crate::elf::{self, Image};
+use crate::file::{ConsoleFile, FileOps, KeyboardFile};
 use crate::mm::{hhdm_offset, phys_to_virt, FRAME_ALLOC};
 use crate::syscall::{self, UserFrame};
 use crate::{gdt, sched, vmm};
@@ -46,14 +47,19 @@ impl Process {
         let frame = FRAME_ALLOC.lock().alloc().expect("no frame for process PML4");
         let pml4_phys = frame.start_address().as_u64();
 
-        // Copy every entry of the kernel PML4: kernel-half + HHDM + identity are
-        // then shared with this process; the user half starts empty.
+        // Copy every entry of the kernel PML4 so the kernel half + HHDM are
+        // shared with this process, then drop PML4[0] — the kernel's low-4 GiB
+        // identity map. Kernel-CR3 threads keep it; a process must have its
+        // entire low half free so an ELF (e.g. static musl at 0x400000) can map
+        // there without colliding with a 1 GiB identity huge page.
         unsafe {
+            let dst = phys_to_virt(PhysAddr::new(pml4_phys)).as_mut_ptr::<u8>();
             core::ptr::copy_nonoverlapping(
                 phys_to_virt(PhysAddr::new(vmm::kernel_pml4_phys())).as_ptr::<u8>(),
-                phys_to_virt(PhysAddr::new(pml4_phys)).as_mut_ptr::<u8>(),
+                dst,
                 4096,
             );
+            *(dst as *mut u64) = 0; // PML4[0]
         }
 
         Arc::new(Self {
@@ -77,7 +83,10 @@ impl Process {
     fn for_each_user_page(&self, mut f: impl FnMut(u64, u64, bool, bool)) {
         let hhdm = hhdm_offset();
         let tbl = |phys: u64| unsafe { &*((phys + hhdm) as *const PageTable) };
-        for i4 in 1..256u64 {
+        // 0..256 = the whole user half. Index 0 matters: a static-musl ELF
+        // loads at 0x400000, so its text/data live under PML4[0]. (The kernel's
+        // low identity map was already dropped from PML4[0] in `Process::new`.)
+        for i4 in 0..256u64 {
             let e4 = &tbl(self.pml4_phys)[i4 as usize];
             if !e4.flags().contains(PageTableFlags::PRESENT) {
                 continue;
@@ -281,12 +290,40 @@ impl Process {
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static TASKS: Mutex<BTreeMap<u64, Arc<Task>>> = Mutex::new(BTreeMap::new());
 
+/// The logged-in session identity, stamped onto every task created after login.
+/// `(uid, name)`. Grows into the executive `Principal`.
+static SESSION_UID: AtomicU64 = AtomicU64::new(0);
+static SESSION_NAME: Mutex<String> = Mutex::new(String::new());
+
+/// Record the identity resolved by `login` (see `login::establish`).
+#[allow(dead_code)] // only the `interactive` build has a login flow
+pub fn set_session(name: &str, uid: u32) {
+    SESSION_UID.store(uid as u64, Ordering::Relaxed);
+    *SESSION_NAME.lock() = name.into();
+}
+
+/// This task's user id (from the login session; 0 for tasks spawned pre-login).
+pub fn current_uid() -> u32 {
+    sched::current().task().map(|t| t.uid).unwrap_or(0)
+}
+
+type Fd = Option<Arc<dyn FileOps>>;
+
 pub struct Task {
     pub pid: u64,
     pub ppid: u64,
+    pub uid: u32,
     space: Mutex<Arc<Process>>,
     exit_status: Mutex<Option<i32>>,
     exited: AtomicBool,
+    /// File descriptor table. 0/1/2 seeded with the console.
+    fds: Mutex<Vec<Fd>>,
+}
+
+fn seed_fds() -> Vec<Fd> {
+    let stdin: Arc<dyn FileOps> = Arc::new(KeyboardFile);
+    let out: Arc<dyn FileOps> = Arc::new(ConsoleFile { writable: true });
+    alloc::vec![Some(stdin), Some(out.clone()), Some(out)]
 }
 
 impl Task {
@@ -294,9 +331,11 @@ impl Task {
         let t = Arc::new(Self {
             pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
             ppid,
+            uid: SESSION_UID.load(Ordering::Relaxed) as u32,
             space: Mutex::new(space),
             exit_status: Mutex::new(None),
             exited: AtomicBool::new(false),
+            fds: Mutex::new(seed_fds()),
         });
         TASKS.lock().insert(t.pid, t.clone());
         t
@@ -308,6 +347,42 @@ impl Task {
 
     fn set_space(&self, s: Arc<Process>) {
         *self.space.lock() = s;
+    }
+
+    pub fn fd_get(&self, fd: i32) -> Option<Arc<dyn FileOps>> {
+        let fds = self.fds.lock();
+        fds.get(fd as usize).and_then(|f| f.clone())
+    }
+
+    pub fn fd_alloc(&self, file: Arc<dyn FileOps>) -> i32 {
+        let mut fds = self.fds.lock();
+        let slot = fds.iter().position(|f| f.is_none());
+        match slot {
+            Some(i) => {
+                fds[i] = Some(file);
+                i as i32
+            }
+            None => {
+                fds.push(Some(file));
+                (fds.len() - 1) as i32
+            }
+        }
+    }
+
+    pub fn fd_close(&self, fd: i32) -> bool {
+        let mut fds = self.fds.lock();
+        match fds.get_mut(fd as usize) {
+            Some(slot @ Some(_)) => {
+                *slot = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// fork inherits the parent's open files (shared, like POSIX).
+    fn clone_fds(&self) -> Vec<Fd> {
+        self.fds.lock().clone()
     }
 }
 
@@ -361,12 +436,16 @@ pub fn fork(frame: &UserFrame) -> i64 {
     });
 
     let child = Task::new(parent.pid, cspace);
+    *child.fds.lock() = parent.clone_fds();
     let (cs, ss) = user_selectors();
     let mut cf = *frame;
     cf.rax = 0;
     cf.cs = cs;
     cf.ss = ss;
-    sched::spawn_user_frame("fork-child", child.clone(), cf);
+    // The child inherits the parent thread's TLS base — it is CPU state, not
+    // memory, so copying the address space alone does not carry it over.
+    let fsbase = sched::current().fsbase();
+    sched::spawn_user_frame("fork-child", child.clone(), cf, fsbase);
     child.pid as i64
 }
 
@@ -385,6 +464,7 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
     let new_cr3 = space.pml4_phys();
     task.set_space(space);
     cur.set_cr3(new_cr3);
+    cur.set_fsbase(0); // fresh image: TLS is re-established by its own arch_prctl
 
     let (cs, ss) = user_selectors();
     let f = UserFrame {
@@ -396,6 +476,7 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
         ..Default::default()
     };
 
+    x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(0));
     unsafe {
         Cr3::write(
             PhysFrame::from_start_address(PhysAddr::new(new_cr3)).unwrap(),

@@ -51,24 +51,33 @@ fn class_code(loc: Location) -> (u8, u8, u8) {
     ((v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8)
 }
 
-/// Scan bus 0 for the first (class 0x01, subclass 0x06, prog-if 0x01) device.
-pub fn find_ahci() -> Option<Location> {
+/// Scan bus 0 for the first device with the given (class, subclass, prog-if).
+pub fn find_class(class: u8, subclass: u8, progif: u8) -> Option<Location> {
     for dev in 0..32u8 {
         for func in 0..8u8 {
             let loc = Location { bus: 0, dev, func };
-            let vendor = read16(loc, 0x00);
-            if vendor == 0xFFFF {
+            if read16(loc, 0x00) == 0xFFFF {
                 if func == 0 {
                     break;
                 }
                 continue;
             }
-            if class_code(loc) == (0x01, 0x06, 0x01) {
+            if class_code(loc) == (class, subclass, progif) {
                 return Some(loc);
             }
         }
     }
     None
+}
+
+/// AHCI SATA controller (0x01 / 0x06 / 0x01).
+pub fn find_ahci() -> Option<Location> {
+    find_class(0x01, 0x06, 0x01)
+}
+
+/// xHCI USB controller (0x0C / 0x03 / 0x30).
+pub fn find_xhci() -> Option<Location> {
+    find_class(0x0C, 0x03, 0x30)
 }
 
 /// 64-bit-aware BAR read. Returns the memory base address (mask off flag bits).

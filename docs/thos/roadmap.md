@@ -50,17 +50,50 @@ late.
 
 - VFS layer + `vnode` object; RAM-FS; **ext2 read/write** (or a simple own FS); **FAT**
   (read the ESP).
+  - Status: ext2 read (12 direct + single + double indirect) and write —
+    block/inode bitmap allocators, `write_path` (create or overwrite a regular
+    file), `mkdir_path`; superblock + group-descriptor counts kept in sync.
+    `cargo xtask ext2-test` has the kernel create a file, a dir and a nested
+    file, then the host runs `e2fsck -fn` (clean) and `debugfs cat` on the
+    result. Missing: `unlink`/`rmdir`, growing a dir past 12 direct blocks,
+    htree, backup superblock/GDT copies (needed before writing the multi-group
+    SSD), timestamps.
 - **AHCI/SATA driver** (Intel `8086:7a62`, standard AHCI 1.3.1 register interface,
   MSI/MSI-X, command list / FIS) → real root FS from the **Kingston A400 240 GB SATA
   SSD** (`sdc`). NVMe is Windows' disk and is never touched; an NVMe driver is
   out of scope for v1.
+  - Status: polled driver, single command slot. `READ`/`WRITE DMA EXT` +
+    `FLUSH CACHE EXT` all working. `cargo xtask ahci-test` has the kernel write a
+    pattern to a scratch LBA, read it back, and then re-checks from the host that
+    it persisted into the disk image. Next: `IDENTIFY` (real capacity), multi-slot
+    / NCQ, MSI-X completion interrupts instead of polling.
 - **xHCI driver** (Intel `8086:7a60`) + USB HID (keyboard/mouse). PS/2 only as a QEMU
   stopgap.
 - ELF loader; **POSIX personality**: syscall table (Linux ABI subset), signals, `futex`
   = the wait primitive, `mmap`, processes / `fork` / `execve`, TTY over serial + FB.
 - Port **musl** as the userland libc; a BusyBox-style shell.
+- **Identity stub**: the `Principal` object + a console `login` before the shell +
+  file owner/mode bits (see *Identity, privilege & login* below).
 - **Milestone 2:** booted from the real SSD, interactive shell on a real keyboard,
   statically linked Linux `x86_64` ELF binaries (BusyBox) run unmodified.
+  - Status: interactive shell (`/sh`, static-musl Rust) reads the USB keyboard,
+    `fork`+`execve`+`wait4`s programs off ext2, reports exit status. Verified in
+    CI (`cargo xtask kbd-test` types `init` and checks it runs). Still on the QEMU
+    disk image, not the real SSD (no installer yet).
+  - Fixed along the way: (1) SMP scheduler race — a thread that yielded from
+    inside a syscall could be resumed on a second CPU before the first finished
+    unwinding its kernel stack; now a per-thread `running` claim + deferred
+    ready-queue hand-off (`thos_finish_switch`). (2) `%fs` base (TLS) is now
+    context-switched per thread and inherited across `fork` — musl deref's `%fs`
+    constantly. (3) `fork` now copies PML4[0] (static-musl ELFs load at
+    `0x400000`), not just the higher user half.
+  - SMP stress: `cargo xtask smp-test` boots at **24 vCPUs** (the target's 8P×2 +
+    8E) and runs `smp_stress_milestone` — 512 threads churning `yield`/`exit` in
+    overlapping waves, 48 threads blocking + being mass-woken on the wait queue,
+    4 real user `fork`/`wait4` processes — then asserts exact run counts (no lost
+    / double-run) and per-thread stack canaries (no thread ran on two CPUs at
+    once). Added `sched::reap()` to free exited threads' kernel stacks (they
+    leaked forever before).
 
 ## Phase 3 — NT personality (userspace level, still GOP graphics)
 
@@ -74,6 +107,91 @@ late.
 - **Milestone 3:** a statically linked Win32 **console** `.exe` (`CreateFile`,
   `WriteFile(stdout)`, `WaitForSingleObject`) runs through the THOS NT path — **with no
   wine process in the tree**. ELF and PE processes appear in one `ps` output.
+
+### 32-bit Windows apps — WOW64 thunks, not code translation
+
+An x86-64 CPU runs 32-bit code natively (long mode's compatibility sub-mode), so
+there is **no instruction translation** and no emulator for i386 `.exe`s — same as
+on real Windows. What a 32-bit PE32 process needs on top of the 64-bit kernel:
+
+- run its threads with a **32-bit code segment** (compat mode); the loader picks
+  the segment from the PE `Machine` field (`0x14c` i386 vs `0x8664` x86-64);
+- a **32-bit `ntdll`** whose stubs widen arguments and enter the 64-bit kernel —
+  the classic **WOW64 thunk layer**: marshal the 32-bit stack/register args into
+  the 64-bit `Nt*` ABI, call, narrow the result back. Pointers stay in the low
+  4 GiB for these processes so handles/addresses round-trip.
+- 32-bit and 64-bit code **never mix in one process** (no loading a 32-bit DLL
+  into a 64-bit process or vice versa), exactly like Windows.
+
+Real architecture emulation (x86 ↔ ARM, à la Rosetta / Windows-on-ARM) is **out
+of scope** — the target is Intel x86-64, where every mainstream Windows binary is
+i386 or x86-64 and runs on the metal. WOW64 is a Phase 3+ item, after the 64-bit
+NT path of Milestone 3 works.
+
+### Filesystems for the NT personality — no NTFS driver needed
+
+Windows apps expect `C:\...` with NTFS *semantics* (ADS, ACLs, case-insensitive,
+reparse points), **not** a real NTFS on-disk driver. `C:` is a directory tree on the
+ext4 root — the `\Device\HarddiskVolume` → drive-letter → VFS-path mapping does the
+translation, exactly like Wine's `drive_c/`. Case-insensitivity and ADS are handled in
+the NT VFS layer, on top of ext4.
+
+A real **NTFS driver** is only for *mounting the actual Windows partition* (the 512 GB
+NVMe) to see Windows' own files:
+- **read-only NTFS**: moderate (MFT, runlists, `$DATA`, basic compression) — optional,
+  post-Milestone-3.
+- **read-write NTFS**: hard and risky (`$LogFile`, USN journal, consistency) — Phase 4+
+  research item, same tier as loading `.sys` drivers. Not on the critical path.
+
+### Identity, privilege & login
+
+Old Tarno-OS inherited the whole Unix multi-user stack (PAM, shadow, sudoers,
+polkit) and the pain was gluing it together. THOS picks **one** coherent model
+instead of bolting Unix and Windows identity side by side.
+
+- **One executive `Principal` / security context (token)**: a stable principal id
+  + group membership + a privilege set. The **POSIX** personality projects it as
+  `uid/gid`; the **NT** personality projects it as a SID + access token —
+  deterministic mapping, not two separate identities the way Wine fakes one.
+- **Multi-user-*capable* from day one, single-user in practice.** The token layer
+  has SIDs / groups / per-principal `\home` from the start; the installer creates
+  exactly one **admin** principal. Adding users later needs no redesign. *(User
+  decision, 2026-08-30.)*
+- **One canonical ACL in the VFS.** Unix mode bits and an NT DACL are both *views*
+  of it (like macOS: POSIX perms + native ACLs coexist).
+- **No root login — admin elevates** (the most defensible model, *user decision*):
+  - `SYSTEM` / principal 0 has **no password and no login**. A credential that
+    doesn't exist can't be phished or brute-forced.
+  - Even the admin's normal session runs **unprivileged** (low integrity, uid ≠ 0).
+    Ambient privilege is the exception, never the default.
+  - **One elevation primitive** `elevate(cmd)`: policy check (caller in the admin
+    group?) + re-authentication + the request travels a **trusted path** (a
+    secure-attention key, à la Ctrl-Alt-Del) so no app can draw a fake prompt.
+    The elevated token is **scoped** to that process/operation with only a short
+    grace window — not a standing root shell. A `doas`-style CLI and a Win32
+    UAC-manifest are just two front-ends to this one mechanism.
+  - **Recovery** is a boot-time mode (offered by the boot picker) gated by
+    **physical presence + the disk passphrase**, not by a reachable account.
+- **Auth**: `argon2id` password hashes in a THOS-native credential store
+  (SAM/shadow-shaped but our own format), not `/etc/shadow`.
+
+Phasing:
+- **Phase 2 (stub):** the `Principal` object exists; a console `login` runs before
+  the shell and sets the session's principal; files carry an owner + mode bits;
+  one admin principal; `elevate` = a password re-check.
+  - Status: **first-run setup + login done** (`kernel/src/{cred,login}.rs`). No
+    account ships. First boot forces the operator to set the admin name +
+    password (masked) in a console overlay; it is PBKDF2-HMAC-SHA-256'd (salt
+    from `RDRAND`, soft-SHA — the kernel only enables SSE) into
+    `/etc/thos/admin.cred` on ext2. Every later boot authenticates against it;
+    the session `Principal` (uid 1000 — the admin session is unprivileged) is
+    stamped onto every task and returned by `getuid`/`getgid`. `cargo xtask
+    login-test`: setup runs once, reboot goes straight to login, a wrong
+    password is rejected. Still stub: PBKDF2 not argon2id, no `Principal`
+    object proper, no file-owner enforcement, no `elevate` yet, password
+    changing is "rewrite the store + reboot" not a settings action.
+- **Phase 3 (full):** SID / token model, NT DACL ↔ canonical-ACL translation, the
+  UAC path, the trusted-path prompt, privilege sets (`SeDebugPrivilege` …).
 
 ## Phase 4 — Real graphics (the GPU mountain)
 
@@ -112,7 +230,85 @@ late.
 - **Milestone 6:** a real NDIS `.sys` binds a virtual NIC in QEMU, then the board NIC;
   data path through the NT-personality sockets.
 
+## Phase 7 — Hardware breadth (LAST — only once the OS is feature-complete on the target)
+
+Everything above is **hard-coded for the one machine** (ASRock B760M-HDV, i7-13700KF,
+RX 6600). Broad hardware support is deliberately the *final* phase: it multiplies
+every driver's test surface and is worthless before the OS itself is done.
+
+Enabling structure (small, can land earlier as good hygiene):
+
+- **Driver-binding registry** — each driver declares a match table
+  (`{pci_vendor, pci_device, class, acpi_hid}`); the bus code binds automatically
+  from PCI/ACPI enumeration instead of the current hand-written `find_ahci()` /
+  `find_xhci()`. This is the one piece worth building before Phase 7.
+- **Stable loadable-driver ABI** — a versioned in-kernel interface so drivers ship
+  **prebuilt** and load at runtime (`insmod`-style), *not* recompiled per machine.
+  Without this you have re-invented DKMS / Gentoo: a toolchain + kernel source on
+  every install. Compiling a driver on the target stays an **escape hatch** for
+  unpackaged hardware, never the model. (Firmware blobs — e.g. `amdgpu/*.bin` — are
+  fetched, never compiled, regardless.)
+- **`hwdetect` + a driver repo** — map detected IDs to driver packages, fetch them.
+
+Scope notes for when this phase actually starts:
+
+- **Intel CPUs** (desktop): mild — differences are ACPI tables, chipset AHCI/xHCI
+  (already standard interfaces), CPU features via CPUID.
+- **Intel laptops**: a big step beyond desktop — embedded controller, ACPI
+  thermal/battery/backlight, S0ix sleep, `_DSM` quirks, Thunderbolt. The platform
+  surface here rivals the GPU.
+- **AMD GPUs beyond Navi 23**: each generation (RDNA1/2/3, Vega, APUs) is its own
+  DCN display block + power management + firmware set — multiplies the Phase 4
+  "GPU mountain".
+
+Fork-in-the-road to decide before Phase 7: monolithic-with-loadable-modules (Linux
+model) vs. userspace drivers (Fuchsia model). The stable-ABI item above assumes the
+former.
+
 ---
+
+## Multi-boot: THOS as the OS picker
+
+Goal: set the Kingston (THOS) first in the mainboard boot order; every power-on
+lands in a THOS-drawn menu that lists the OSes found on the other disks (Windows
+on the NVMe, Devuan on the Samsung, …) and boots the chosen one with **no
+keypress required** for the default after a timeout.
+
+**Status — v1 built (`loaders/thos-boot`), verified in QEMU.** A standalone
+`x86_64-unknown-uefi` app (the `uefi` crate). It:
+
+- enumerates loaders two ways and merges them: the `Boot####` / `BootOrder`
+  NVRAM entries (filtered to on-disk `*.efi` options — firmware apps like the
+  setup UI, UEFI shell, and the generic "UEFI …" fallbacks are dropped), and a
+  direct probe of every `SimpleFileSystem` volume for well-known paths
+  (`\EFI\Microsoft\Boot\bootmgfw.efi`, `\EFI\<distro>\{shim,grub}x64.efi`,
+  `\EFI\systemd\systemd-bootx64.efi`, `\EFI\limine\BOOTX64.EFI` → "THOS");
+- reads `\EFI\thos\boot.conf` from the ESP it launched from — `timeout=<secs>`
+  and `default=<index>`|`<label substring>`;
+- draws a text menu (redraws only on change), counts down, and on select does
+  `LoadImage(FromDevicePath)` + `StartImage`. No `BootOrder` writes.
+
+`cargo xtask bootpick-test` boots it under OVMF with three fake disks (a THOS
+disk with the picker + a `default=THOS` conf, a "Windows" disk, a "Linux" disk)
+and asserts it enumerated all three and chainloaded the THOS entry.
+
+**Still to do before relying on it:** read GPT explicitly (today we lean on the
+firmware's own partition/FAT drivers, which is enough for real ESPs but not for
+listing partitions ourselves); a graphical (GOP) menu; real-hardware test on the
+ASRock board; and the risks below.
+
+- **Chainloading.** Picking "Windows" = `LoadImage` on
+  `\EFI\Microsoft\Boot\bootmgfw.efi` from that disk's ESP and `StartImage`.
+  Picking "THOS" = chainload our Limine + kernel as today. This is exactly what
+  rEFInd and the systemd-boot menu do; it is not virtualization and not a fork.
+- **Where it lives.** `loaders/thos-boot`. The THOS kernel stays uninvolved —
+  the picker runs before any kernel loads. Ships onto the Kingston ESP as
+  `\EFI\BOOT\BOOTX64.EFI` (additive; touches no other disk).
+- **Risks to keep in mind.** Firmware NVRAM quirks (some boards re-assert their
+  own `BootOrder`), Secure Boot (chainloading MS's loader is fine; loading our
+  unsigned kernel needs SB off or our keys enrolled), and BitLocker (measuring a
+  different pre-boot environment can trigger a recovery-key prompt on the
+  Windows side — needs testing before relying on it).
 
 ## Open decisions
 
@@ -121,3 +317,6 @@ late.
    (see [`licensing.md`](licensing.md)); the Wine-vs-own build choice is still open.
 3. ~~Exact NIC / board chips~~ — resolved, see [`hw-target.md`](hw-target.md).
 4. **TCP/IP stack** — own vs smoltcp/lwIP port; decide in Phase 5.
+5. **Driver model** — monolithic-with-loadable-modules vs userspace drivers.
+   Only forces a decision at **Phase 7** (hardware breadth); until then everything
+   is compiled in for the one target machine.

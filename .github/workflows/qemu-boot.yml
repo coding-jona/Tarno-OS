@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-name: qemu-boot (Phase 1-2: fork/exec/wait4, syscalls, ext2, ELF)
+name: qemu-boot (Phase 1-2: + xHCI keyboard + shell + boot picker)
 
 on:
   push:
@@ -20,11 +20,13 @@ jobs:
           rustup show active-toolchain || rustup toolchain install nightly --profile minimal
           rustup target add x86_64-unknown-none
           rustup component add rust-src llvm-tools
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add x86_64-unknown-uefi
 
       - name: Install QEMU + xorriso + OVMF
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 xorriso ovmf e2fsprogs binutils
+          sudo apt-get install -y qemu-system-x86 xorriso ovmf e2fsprogs binutils mtools dosfstools
 
       - name: Build Limine
         run: make -C third_party/limine
@@ -57,7 +59,30 @@ jobs:
           grep -q "THOS: elf ok" boot.log
           grep -q "child ran" boot.log
           grep -q "parent done" boot.log
+          grep -q "a file read via open" boot.log
           grep -q "THOS: fork/exec/wait4  ok" boot.log
-          grep -q "THOS: user process ok" boot.log
+          grep -q "hello from a static musl Rust binary" boot.log
+          grep -q "THOS: musl binary ok" boot.log
+          grep -q "THOS: ahci write ok" boot.log
+          grep -q "THOS: ext2 write ok" boot.log
+          grep -q "THOS: xhci ok" boot.log
           grep -q "THOS: wait primitive" boot.log
           grep -q "THOS: halting." boot.log
+
+      - name: Interactive shell end-to-end (first-run setup + login, then run `init`)
+        run: cargo xtask kbd-test
+
+      - name: Login end-to-end (setup once, login on reboot, wrong password rejected)
+        run: cargo xtask login-test
+
+      - name: Boot picker end-to-end (3 fake disks under OVMF, chainload the default)
+        run: cargo xtask bootpick-test
+
+      - name: AHCI write end-to-end (kernel round-trip + host verifies it persisted)
+        run: cargo xtask ahci-test
+
+      - name: ext2 write end-to-end (kernel creates files; host e2fsck + debugfs verify)
+        run: cargo xtask ext2-test
+
+      - name: SMP scheduler stress (24 vCPUs; hundreds of threads churn/block/fork)
+        run: cargo xtask smp-test

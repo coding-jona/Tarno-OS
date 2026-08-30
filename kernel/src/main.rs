@@ -28,10 +28,17 @@ extern crate alloc;
 mod acpi;
 mod ahci;
 mod apic;
+mod console;
+mod cpu;
+#[cfg(feature = "interactive")]
+mod cred;
 mod elf;
 mod ext2;
+mod file;
 mod gdt;
 mod idt;
+#[cfg(feature = "interactive")]
+mod login;
 mod mm;
 mod object;
 mod pci;
@@ -42,6 +49,7 @@ mod smp;
 mod syscall;
 mod vfs;
 mod vmm;
+mod xhci;
 mod wait;
 
 use alloc::sync::Arc;
@@ -114,6 +122,7 @@ extern "C" fn kmain() -> ! {
         None => kprintln!("THOS: framebuffer request unanswered"),
     }
 
+    cpu::enable_sse();
     gdt::init(0);
     idt::init();
     kprintln!("THOS: GDT + IDT loaded");
@@ -132,9 +141,31 @@ extern "C" fn kmain() -> ! {
     scheduler_milestone();
     storage_milestone();
 
-    kprintln!("THOS: halting.");
-    exit_qemu(ExitCode::Success);
-    hcf();
+    #[cfg(feature = "interactive")]
+    {
+        // Milestone 2: first-run setup / login, then launch the shell off ext2
+        // and hand it the USB keyboard.
+        let fs = ext2::open().expect("mount ext2 for the shell");
+        let session = login::establish(&fs);
+        process::set_session(&session.name, session.uid);
+        kprintln!("THOS: session          {} (uid {})", session.name, session.uid);
+
+        let sh = fs.read_path("/sh").expect("read /sh from ext2");
+        kprintln!("THOS: shell            /sh = {} bytes", sh.len());
+        process::spawn_init(&sh, &["/sh"], &["PATH=/", "HOME=/"]);
+
+        kprintln!("THOS: interactive hold — type on the USB keyboard");
+        loop {
+            sched::yield_now();
+        }
+    }
+
+    #[cfg(not(feature = "interactive"))]
+    {
+        kprintln!("THOS: halting.");
+        exit_qemu(ExitCode::Success);
+        hcf();
+    }
 }
 
 /// Milestone 1a: memory map -> frame allocator + heap, then a smoke check that
@@ -318,6 +349,152 @@ fn scheduler_milestone() {
     );
 }
 
+// --- SMP scheduler stress (feature = "stress", driven by `cargo xtask smp-test`) ---
+
+#[cfg(feature = "stress")]
+mod stress {
+    use super::*;
+
+    pub static SPAWNED: AtomicU64 = AtomicU64::new(0);
+    pub static EXITED: AtomicU64 = AtomicU64::new(0);
+    pub static RUNS: AtomicU64 = AtomicU64::new(0);
+    pub static BAD_CANARY: AtomicU64 = AtomicU64::new(0);
+
+    pub static PARK_Q: wait::WaitQueue = wait::WaitQueue::new();
+    pub static PARK_RUNS: AtomicU64 = AtomicU64::new(0);
+    pub static PARK_EXITED: AtomicU64 = AtomicU64::new(0);
+
+    pub const WAVES: u64 = 8;
+    pub const PER_WAVE: usize = 64;
+    pub const YIELDS: u64 = 60;
+    pub const PARKERS: usize = 48;
+    pub const WAKERS: usize = 4;
+    pub const PARK_CYCLES: u64 = 40;
+    pub const USER_INITS: u64 = 4;
+
+    /// Fill a stack buffer with a per-thread pattern, yield many times, then
+    /// check it survived. If the scheduler ever ran this thread on two CPUs at
+    /// once (kernel stack reused mid-flight) the yields would smash it.
+    fn canary_check(id: u64) -> bool {
+        let mut buf = [0u64; 96];
+        let seed = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(id.wrapping_add(1));
+        for (i, c) in buf.iter_mut().enumerate() {
+            *c = seed ^ i as u64;
+        }
+        for _ in 0..YIELDS {
+            RUNS.fetch_add(1, Ordering::Relaxed);
+            sched::yield_now();
+        }
+        buf.iter().enumerate().all(|(i, &c)| c == seed ^ i as u64)
+    }
+
+    pub extern "C" fn churn_worker(id: usize) -> ! {
+        if !canary_check(id as u64) {
+            BAD_CANARY.fetch_add(1, Ordering::Relaxed);
+        }
+        EXITED.fetch_add(1, Ordering::Relaxed);
+        sched::exit()
+    }
+
+    pub extern "C" fn parker(id: usize) -> ! {
+        let mut buf = [0u64; 64];
+        let seed = 0xA5A5_5A5Au64 ^ id as u64;
+        for (i, c) in buf.iter_mut().enumerate() {
+            *c = seed ^ i as u64;
+        }
+        for _ in 0..PARK_CYCLES {
+            PARK_Q.wait();
+            PARK_RUNS.fetch_add(1, Ordering::Relaxed);
+        }
+        if !buf.iter().enumerate().all(|(i, &c)| c == seed ^ i as u64) {
+            BAD_CANARY.fetch_add(1, Ordering::Relaxed);
+        }
+        PARK_EXITED.fetch_add(1, Ordering::Relaxed);
+        sched::exit()
+    }
+
+    pub extern "C" fn waker(_id: usize) -> ! {
+        while PARK_EXITED.load(Ordering::Relaxed) < PARKERS as u64 {
+            PARK_Q.wake_all();
+            sched::yield_now();
+        }
+        sched::exit()
+    }
+}
+
+/// Gate B: hammer the scheduler on every CPU — hundreds of threads churning
+/// `yield` / `exit`, a pool blocking and being mass-woken on the wait queue,
+/// and a few real user `fork`/`wait4` processes — then assert nothing was
+/// lost, double-run, or ran on two CPUs at once.
+#[cfg(feature = "stress")]
+fn smp_stress_milestone(init_bytes: &[u8]) {
+    use stress::*;
+
+    kprintln!(
+        "THOS: smp stress start {} CPUs; {} churn + {} parkers + {} user forks",
+        smp::cpu_count(),
+        WAVES as usize * PER_WAVE,
+        PARKERS,
+        USER_INITS,
+    );
+
+    let user_base = syscall::user_exits();
+    for i in 0..PARKERS {
+        sched::spawn("stress-park", parker, i);
+    }
+    for i in 0..WAKERS {
+        sched::spawn("stress-wake", waker, i);
+    }
+    for _ in 0..USER_INITS {
+        process::spawn_init(init_bytes, &["/init"], &["THOS=1"]);
+    }
+
+    for _ in 0..WAVES {
+        for i in 0..PER_WAVE {
+            SPAWNED.fetch_add(1, Ordering::Relaxed);
+            sched::spawn("stress-churn", churn_worker, i);
+        }
+        // Only let a wave half-drain before piling on the next, so create and
+        // destroy overlap across all CPUs the whole time.
+        let mark = EXITED.load(Ordering::Relaxed) + (PER_WAVE as u64 / 2);
+        while EXITED.load(Ordering::Relaxed) < mark {
+            sched::yield_now();
+        }
+        sched::reap(); // free exited stacks — the bootstrap heap is small
+    }
+
+    while EXITED.load(Ordering::Relaxed) < SPAWNED.load(Ordering::Relaxed)
+        || PARK_EXITED.load(Ordering::Relaxed) < PARKERS as u64
+        || syscall::user_exits() < user_base + USER_INITS * 2
+    {
+        sched::yield_now();
+        sched::reap();
+    }
+    sched::reap();
+
+    let spawned = SPAWNED.load(Ordering::Relaxed);
+    let runs = RUNS.load(Ordering::Relaxed);
+    let park_runs = PARK_RUNS.load(Ordering::Relaxed);
+    let bad = BAD_CANARY.load(Ordering::Relaxed);
+
+    assert_eq!(bad, 0, "SMP stress: {bad} threads saw a smashed stack canary");
+    assert_eq!(
+        runs,
+        spawned * YIELDS,
+        "SMP stress: churn run count {runs} != {spawned}*{YIELDS} (lost or double-run)"
+    );
+    assert_eq!(
+        park_runs,
+        PARKERS as u64 * PARK_CYCLES,
+        "SMP stress: parker run count {park_runs} != {PARKERS}*{PARK_CYCLES}"
+    );
+
+    kprintln!(
+        "THOS: smp stress ok    {spawned} churn + {PARKERS} parker threads clean; {runs}+{park_runs} runs, {} ctx switches",
+        sched::ctx_switches()
+    );
+}
+
 /// Phase 2 milestone: a VFS with an in-memory file opened through the handle
 /// table, and the AHCI driver reading real sectors off the SATA disk.
 fn storage_milestone() {
@@ -349,6 +526,83 @@ fn storage_milestone() {
         sched::yield_now();
     }
     kprintln!("THOS: fork/exec/wait4  ok (init + child both exited)");
+
+    // A real statically-linked musl Rust binary.
+    let rs = fs.read_path("/rusthello").expect("read /rusthello from ext2");
+    kprintln!("THOS: ext2 ok          /rusthello = {} bytes", rs.len());
+    process::spawn_init(&rs, &["/rusthello", "arg1"], &["PATH=/", "THOS=1"]);
+    while syscall::user_exits() < 3 {
+        sched::yield_now();
+    }
+    kprintln!("THOS: musl binary ok   (static Rust/musl ran to exit)");
+
+    // AHCI write: round-trip a known pattern through a scratch sector past the
+    // ext2 image (LBA 20000 = ~10 MiB; the fs is the first 8 MiB). The host
+    // side of `cargo xtask ahci-test` re-checks this landed in the disk file.
+    const SCRATCH_LBA: u64 = 20_000;
+    let mut wbuf = [0u8; ahci::SECTOR];
+    for (i, b) in wbuf.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0xA5;
+    }
+    ahci::write(SCRATCH_LBA, &wbuf).expect("AHCI write");
+    let mut rbuf = [0u8; ahci::SECTOR];
+    ahci::read(SCRATCH_LBA, &mut rbuf).expect("AHCI read-back");
+    assert!(rbuf == wbuf, "AHCI write / read-back mismatch");
+    kprintln!("THOS: ahci write ok    LBA {} round-tripped + flushed", SCRATCH_LBA);
+
+    // ext2 write: create a file + a dir + a nested file, read them back through
+    // our own read path. `cargo xtask ext2-test` then e2fsck's the image and
+    // cat's the files from the host to prove it is a valid on-disk ext2.
+    {
+        let fs = ext2::open().expect("remount ext2");
+        let payload = b"ext2 write works on THOS\n";
+        fs.write_path("/thos-created.txt", payload).expect("ext2 write_path");
+        match fs.mkdir_path("/thosdir") {
+            Ok(()) | Err("already exists") => {} // idempotent: disk.img is reused
+            Err(e) => panic!("ext2 mkdir_path: {e}"),
+        }
+        fs.write_path("/thosdir/nested.txt", b"nested ok\n").expect("ext2 nested write");
+        assert!(fs.read_path("/thos-created.txt").as_deref() == Some(payload.as_slice()));
+        assert!(fs.read_path("/thosdir/nested.txt").as_deref() == Some(b"nested ok\n".as_slice()));
+        kprintln!("THOS: ext2 write ok    /thos-created.txt + /thosdir/nested.txt");
+    }
+
+    #[cfg(feature = "stress")]
+    smp_stress_milestone(&init);
+
+    // USB keyboard via xHCI -> the line-disciplined console -> fd 0.
+    match xhci::init() {
+        Ok(x) => {
+            *XHCI.lock() = Some(x);
+            sched::spawn("xhci-poll", xhci_poll_thread, 0);
+            kprintln!("THOS: xhci ok          USB keyboard attached (poll thread up)");
+        }
+        Err(e) => kprintln!("THOS: xhci             {}", e),
+    }
+}
+
+static XHCI: spin::Mutex<Option<xhci::Xhci>> = spin::Mutex::new(None);
+
+extern "C" fn xhci_poll_thread(_: usize) -> ! {
+    loop {
+        let mut batch: [[u8; 8]; 8] = [[0; 8]; 8];
+        let mut n = 0;
+        if let Some(x) = XHCI.lock().as_mut() {
+            while n < batch.len() {
+                match x.poll_keyboard() {
+                    Some(r) => {
+                        batch[n] = r;
+                        n += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        for r in &batch[..n] {
+            console::feed_report(r);
+        }
+        sched::yield_now();
+    }
 }
 
 /// Fill the framebuffer with a recognizable gradient so a human at the target

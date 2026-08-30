@@ -19,7 +19,7 @@ use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, 
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
 
-use crate::{ext2, gdt, kprintln, process, sched, serial, smp};
+use crate::{ext2, gdt, kprintln, process, sched, smp};
 
 static USER_EXITS: AtomicU64 = AtomicU64::new(0);
 
@@ -28,10 +28,18 @@ pub fn user_exits() -> u64 {
     USER_EXITS.load(Ordering::Acquire)
 }
 
+/// Count a user thread that ended without `exit` (e.g. killed by a fault).
+pub fn note_user_exit() {
+    USER_EXITS.fetch_add(1, Ordering::Release);
+}
+
 // Linux x86-64 syscall numbers.
 const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
+const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_FSTAT: u64 = 5;
+const SYS_LSEEK: u64 = 8;
 const SYS_MMAP: u64 = 9;
 const SYS_BRK: u64 = 12;
 const SYS_RT_SIGACTION: u64 = 13;
@@ -39,6 +47,10 @@ const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_IOCTL: u64 = 16;
 const SYS_WRITEV: u64 = 20;
 const SYS_GETPID: u64 = 39;
+const SYS_GETUID: u64 = 102;
+const SYS_GETGID: u64 = 104;
+const SYS_GETEUID: u64 = 107;
+const SYS_GETEGID: u64 = 108;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
@@ -50,6 +62,25 @@ const SYS_SET_ROBUST_LIST: u64 = 273;
 const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
 const SYS_RSEQ: u64 = 334;
+const SYS_OPENAT: u64 = 257;
+const SYS_POLL: u64 = 7;
+const SYS_MPROTECT: u64 = 10;
+const SYS_MADVISE: u64 = 28;
+const SYS_MUNMAP: u64 = 11;
+const SYS_KILL: u64 = 62;
+const SYS_UNAME: u64 = 63;
+const SYS_GETCWD: u64 = 79;
+const SYS_READLINK: u64 = 89;
+const SYS_RT_SIGRETURN: u64 = 15;
+const SYS_SIGALTSTACK: u64 = 131;
+const SYS_GETTID: u64 = 186;
+const SYS_FUTEX: u64 = 202;
+const SYS_SCHED_GETAFFINITY: u64 = 204;
+const SYS_TKILL: u64 = 200;
+const SYS_TGKILL: u64 = 234;
+const SYS_CLOCK_GETTIME: u64 = 228;
+const SYS_PPOLL: u64 = 271;
+const SYS_READLINKAT: u64 = 267;
 
 const ENOSYS: i64 = -38;
 const EBADF: i64 = -9;
@@ -176,6 +207,7 @@ thos_user_resume:
 // Kernel-thread trampoline for a fork child: r12 = &UserFrame.
 .globl thos_user_thread_resume
 thos_user_thread_resume:
+    call thos_finish_switch            // release the thread that yielded to us
     mov rdi, r12
     jmp thos_user_resume
 "#,
@@ -200,13 +232,55 @@ pub fn init_cpu(_cpu: usize) {
     );
 }
 
+fn cur_fd(fd: u64) -> Option<alloc::sync::Arc<dyn crate::file::FileOps>> {
+    sched::current().task()?.fd_get(fd as i32)
+}
+
 fn sys_write(fd: u64, ptr: u64, len: u64) -> i64 {
-    if fd != 1 && fd != 2 {
-        return EBADF;
+    match cur_fd(fd) {
+        Some(f) => {
+            let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+            f.write(bytes)
+        }
+        None => EBADF,
     }
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-    serial::write_bytes(bytes);
-    len as i64
+}
+
+fn sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
+    match cur_fd(fd) {
+        Some(f) => {
+            let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
+            f.read(buf)
+        }
+        None => EBADF,
+    }
+}
+
+fn sys_open(path_ptr: u64) -> i64 {
+    let path = user_cstr(path_ptr);
+    let Some(task) = sched::current().task() else {
+        return EBADF;
+    };
+    match ext2::open().ok().and_then(|fs| fs.read_path(&path)) {
+        Some(bytes) => task.fd_alloc(crate::file::MemFile::new(bytes)) as i64,
+        None => ENOENT,
+    }
+}
+
+/// Minimal `struct stat` (x86-64 layout): mode @24, nlink @16, size @48,
+/// blksize @56, blocks @64. Everything else zero.
+fn sys_fstat(fd: u64, buf: u64) -> i64 {
+    let Some(f) = cur_fd(fd) else { return EBADF };
+    let (mode, size) = f.stat();
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, 144);
+        *((buf + 16) as *mut u64) = 1; // st_nlink
+        *((buf + 24) as *mut u32) = mode;
+        *((buf + 48) as *mut i64) = size as i64;
+        *((buf + 56) as *mut i64) = 4096; // st_blksize
+        *((buf + 64) as *mut i64) = ((size + 511) / 512) as i64;
+    }
+    0
 }
 
 /// Read a NUL-terminated string from user memory (we're under the caller's CR3).
@@ -250,25 +324,38 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
 
     let ret: i64 = match nr {
         SYS_WRITE => sys_write(a1, a2, a3),
+        SYS_READ => sys_read(a1, a2, a3),
 
         SYS_WRITEV => {
-            if a1 != 1 && a1 != 2 {
-                EBADF
-            } else {
-                let iov = unsafe { core::slice::from_raw_parts(a2 as *const [u64; 2], a3 as usize) };
-                let mut total = 0i64;
-                for &[base, len] in iov {
-                    total += sys_write(a1, base, len).max(0);
+            let iov = unsafe { core::slice::from_raw_parts(a2 as *const [u64; 2], a3 as usize) };
+            let mut total = 0i64;
+            for &[base, len] in iov {
+                let r = sys_write(a1, base, len);
+                if r < 0 {
+                    total = if total == 0 { r } else { total };
+                    break;
                 }
-                total
+                total += r;
             }
+            total
         }
 
-        SYS_READ => 0,
+        SYS_OPEN => sys_open(a1),
+        SYS_OPENAT => sys_open(a2), // dirfd ignored; paths are absolute
+        SYS_CLOSE => {
+            if sched::current().task().map(|t| t.fd_close(a1 as i32)).unwrap_or(false) {
+                0
+            } else {
+                EBADF
+            }
+        }
+        SYS_LSEEK => cur_fd(a1).map(|f| f.seek(a2 as i64, a3 as u32)).unwrap_or(EBADF),
+        SYS_FSTAT => sys_fstat(a1, a2),
 
         SYS_ARCH_PRCTL => match a1 {
             ARCH_SET_FS => {
                 FsBase::write(VirtAddr::new(a2));
+                sched::current().set_fsbase(a2); // survive context switches
                 0
             }
             ARCH_GET_FS => {
@@ -293,11 +380,65 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             a2 as i64
         }
 
-        SYS_GETPID => process::current_pid() as i64,
+        SYS_GETPID | SYS_GETTID => process::current_pid() as i64,
+        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => process::current_uid() as i64,
         SYS_SET_TID_ADDRESS => process::current_pid() as i64,
         SYS_IOCTL => ENOTTY,
-        SYS_CLOSE | SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_SET_ROBUST_LIST | SYS_PRLIMIT64 => 0,
+        SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_RT_SIGRETURN | SYS_SET_ROBUST_LIST
+        | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MPROTECT | SYS_MADVISE | SYS_MUNMAP | SYS_FUTEX => 0,
         SYS_RSEQ => ENOSYS,
+
+        // poll: mark valid fds as "no events", invalid as POLLNVAL.
+        SYS_POLL | SYS_PPOLL => {
+            let n = a2 as usize;
+            let fds = unsafe { core::slice::from_raw_parts_mut(a1 as *mut [u8; 8], n) };
+            let mut ready = 0i64;
+            for pfd in fds.iter_mut() {
+                let fd = i32::from_le_bytes([pfd[0], pfd[1], pfd[2], pfd[3]]);
+                let revents: u16 = if cur_fd(fd as u64).is_some() { 0 } else { 0x20 /* POLLNVAL */ };
+                pfd[6] = revents as u8;
+                pfd[7] = (revents >> 8) as u8;
+                if revents != 0 {
+                    ready += 1;
+                }
+            }
+            ready
+        }
+
+        SYS_CLOCK_GETTIME => {
+            unsafe { core::ptr::write_bytes(a2 as *mut u8, 0, 16) };
+            0
+        }
+
+        SYS_SCHED_GETAFFINITY => {
+            // report the online CPUs as a bitmask
+            let len = (a2 as usize).min(8);
+            let mask = ((1u64 << smp::cpu_count().min(64)) - 1).to_le_bytes();
+            unsafe { core::ptr::copy_nonoverlapping(mask.as_ptr(), a3 as *mut u8, len) };
+            len as i64
+        }
+
+        SYS_KILL | SYS_TKILL | SYS_TGKILL => {
+            // deliver only fatal signals; everything else is a no-op for now
+            let sig = if nr == SYS_TGKILL { a3 } else { a2 };
+            if sig == 6 || sig == 9 || sig == 15 {
+                process::set_exit_status(128 + sig as i32);
+                USER_EXITS.fetch_add(1, Ordering::Release);
+                sched::exit()
+            }
+            0
+        }
+
+        SYS_GETCWD => {
+            let n = (a2 as usize).min(2);
+            unsafe { core::ptr::copy_nonoverlapping(b"/\0".as_ptr(), a1 as *mut u8, n) };
+            2
+        }
+        SYS_READLINK | SYS_READLINKAT => EINVAL,
+        SYS_UNAME => {
+            unsafe { core::ptr::write_bytes(a1 as *mut u8, 0, 6 * 65) };
+            0
+        }
 
         SYS_FORK => process::fork(frame),
 

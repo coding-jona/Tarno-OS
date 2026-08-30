@@ -113,6 +113,37 @@ pub fn kernel_pml4_phys() -> u64 {
     KERNEL_PML4.get().expect("vmm::init not called yet").start_address().as_u64()
 }
 
+/// Map a device MMIO region (`phys`, `len` bytes) into the kernel PML4 at
+/// `HHDM + phys`, using 2 MiB pages, and return that virtual base. Idempotent
+/// enough: a page that is already present is skipped. New processes inherit it
+/// via the kernel-half copy.
+pub fn map_mmio(phys: u64, len: u64) -> u64 {
+    let hhdm = crate::mm::hhdm_offset();
+    let pml4: &mut PageTable = unsafe {
+        &mut *crate::mm::phys_to_virt(PhysAddr::new(kernel_pml4_phys())).as_mut_ptr::<PageTable>()
+    };
+    let mut m = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(hhdm)) };
+
+    let two_m = 2 * 1024 * 1024u64;
+    let start = phys & !(two_m - 1);
+    let end = (phys + len + two_m - 1) & !(two_m - 1);
+    let mut p = start;
+    while p < end {
+        let page = x86_64::structures::paging::Page::<x86_64::structures::paging::Size2MiB>::containing_address(
+            VirtAddr::new(hhdm + p),
+        );
+        let frame = PhysFrame::<x86_64::structures::paging::Size2MiB>::containing_address(PhysAddr::new(p));
+        let mut fa = FRAME_ALLOC.lock();
+        let flags = F::PRESENT | F::WRITABLE | F::NO_EXECUTE | F::NO_CACHE;
+        match unsafe { m.map_to(page, frame, flags, &mut *fa) } {
+            Ok(f) => f.flush(),
+            Err(_) => {} // already mapped (covered by the RAM HHDM)
+        }
+        p += two_m;
+    }
+    hhdm + phys
+}
+
 /// Map a 4 KiB page into an *arbitrary* PML4 (given by physical base). Used for
 /// per-process address spaces. Does not flush the TLB — the caller loads CR3.
 pub fn map_page_in(pml4_phys: u64, virt: u64, phys: u64, writable: bool, user: bool, exec: bool) {

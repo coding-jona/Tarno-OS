@@ -41,6 +41,39 @@ _start:
     mov     $12, %edx
     syscall
 
+    # --- open / lseek / read / write / close on a real ext2 file ---
+    mov     $257, %eax              # openat
+    mov     $-100, %edi             # AT_FDCWD
+    lea     mpath(%rip), %rsi
+    xor     %edx, %edx
+    xor     %r10d, %r10d
+    syscall
+    mov     %rax, %r12             # fd
+
+    mov     $8, %eax               # lseek(fd, 6, SEEK_SET)  -> skip "hello "
+    mov     %r12, %rdi
+    mov     $6, %esi
+    xor     %edx, %edx
+    syscall
+
+    sub     $128, %rsp
+    xor     %eax, %eax             # read(fd, buf, 128)
+    mov     %r12, %rdi
+    mov     %rsp, %rsi
+    mov     $128, %edx
+    syscall
+    mov     %rax, %rdx            # nread
+
+    mov     $SYS_write, %eax
+    mov     $1, %edi
+    mov     %rsp, %rsi
+    syscall
+    add     $128, %rsp
+
+    mov     $3, %eax              # close(fd)
+    mov     %r12, %rdi
+    syscall
+
     xor     %edi, %edi
     mov     $SYS_exit_group, %eax
     syscall
@@ -64,6 +97,7 @@ child:
 pmsg:   .ascii "parent done\n"
 efail:  .ascii "execve fail\n"
 cpath:  .asciz "/child"
+mpath:  .asciz "/message"
 
     .section .data
 cargv:  .quad cpath

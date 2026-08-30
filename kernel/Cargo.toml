@@ -18,3 +18,15 @@ limine = "0.6"
 linked_list_allocator = "0.10"
 spin = "0.9"
 x86_64 = "0.15"
+# SHA-256 for the credential store's PBKDF2 (HMAC + PBKDF2 are hand-rolled).
+# `force-soft`: no SHA-NI / AVX2 backend — the kernel only enables SSE, and
+# runtime CPU dispatch into an unsupported path faults with #UD.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+[features]
+# `interactive`: kmain holds after the milestones instead of halting, so a
+# human (or `cargo xtask kbd-test`) can type on the USB keyboard.
+interactive = []
+# `stress`: run the SMP scheduler stress milestone (many threads churning
+# yield / block / wake / fork across every CPU). Driven by `cargo xtask smp-test`.
+stress = []
