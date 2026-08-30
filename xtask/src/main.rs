@@ -201,6 +201,10 @@ fn run_qemu(iso: &Path, gui: bool) {
         "ahci,id=ahci0",
         "-device",
         "ide-hd,drive=disk0,bus=ahci0.0",
+        "-device",
+        "qemu-xhci,id=xhci",
+        "-device",
+        "usb-kbd,bus=xhci.0",
     ]);
     qemu.args(["-serial", "stdio", "-no-reboot"]);
     qemu.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);

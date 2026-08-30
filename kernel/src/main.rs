@@ -28,6 +28,7 @@ extern crate alloc;
 mod acpi;
 mod ahci;
 mod apic;
+mod console;
 mod cpu;
 mod elf;
 mod ext2;
@@ -44,6 +45,7 @@ mod smp;
 mod syscall;
 mod vfs;
 mod vmm;
+mod xhci;
 mod wait;
 
 use alloc::sync::Arc;
@@ -361,6 +363,40 @@ fn storage_milestone() {
         sched::yield_now();
     }
     kprintln!("THOS: musl binary ok   (static Rust/musl ran to exit)");
+
+    // USB keyboard via xHCI -> the line-disciplined console -> fd 0.
+    match xhci::init() {
+        Ok(x) => {
+            *XHCI.lock() = Some(x);
+            sched::spawn("xhci-poll", xhci_poll_thread, 0);
+            kprintln!("THOS: xhci ok          USB keyboard attached (poll thread up)");
+        }
+        Err(e) => kprintln!("THOS: xhci             {}", e),
+    }
+}
+
+static XHCI: spin::Mutex<Option<xhci::Xhci>> = spin::Mutex::new(None);
+
+extern "C" fn xhci_poll_thread(_: usize) -> ! {
+    loop {
+        let mut batch: [[u8; 8]; 8] = [[0; 8]; 8];
+        let mut n = 0;
+        if let Some(x) = XHCI.lock().as_mut() {
+            while n < batch.len() {
+                match x.poll_keyboard() {
+                    Some(r) => {
+                        batch[n] = r;
+                        n += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        for r in &batch[..n] {
+            console::feed_report(r);
+        }
+        sched::yield_now();
+    }
 }
 
 /// Fill the framebuffer with a recognizable gradient so a human at the target

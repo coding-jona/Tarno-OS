@@ -22,7 +22,7 @@ use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
 use x86_64::PhysAddr;
 
 use crate::elf::{self, Image};
-use crate::file::{ConsoleFile, FileOps};
+use crate::file::{ConsoleFile, FileOps, KeyboardFile};
 use crate::mm::{hhdm_offset, phys_to_virt, FRAME_ALLOC};
 use crate::syscall::{self, UserFrame};
 use crate::{gdt, sched, vmm};
@@ -300,7 +300,7 @@ pub struct Task {
 }
 
 fn seed_fds() -> Vec<Fd> {
-    let stdin: Arc<dyn FileOps> = Arc::new(ConsoleFile { writable: false });
+    let stdin: Arc<dyn FileOps> = Arc::new(KeyboardFile);
     let out: Arc<dyn FileOps> = Arc::new(ConsoleFile { writable: true });
     alloc::vec![Some(stdin), Some(out.clone()), Some(out)]
 }

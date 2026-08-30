@@ -96,7 +96,7 @@ pub fn init() -> Result<(), &'static str> {
     if abar == 0 {
         return Err("AHCI BAR5 is zero");
     }
-    let hba = Hba { base: phys_to_virt(x86_64::PhysAddr::new(abar)).as_u64() };
+    let hba = Hba { base: crate::vmm::map_mmio(abar, 0x2000) };
 
     hba.w(GHC, hba.r(GHC) | GHC_AE);
 

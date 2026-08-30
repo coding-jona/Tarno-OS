@@ -37,6 +37,30 @@ pub struct ConsoleFile {
 const S_IFCHR: u32 = 0o020000;
 const S_IFREG: u32 = 0o100000;
 
+/// stdin backed by the keyboard console: a blocking line read.
+pub struct KeyboardFile;
+
+impl FileOps for KeyboardFile {
+    fn read(&self, buf: &mut [u8]) -> i64 {
+        loop {
+            let n = crate::console::read(buf);
+            if n > 0 {
+                return n as i64;
+            }
+            crate::sched::yield_now();
+        }
+    }
+    fn write(&self, _buf: &[u8]) -> i64 {
+        EBADF
+    }
+    fn seek(&self, _o: i64, _w: u32) -> i64 {
+        ESPIPE
+    }
+    fn stat(&self) -> (u32, u64) {
+        (S_IFCHR | 0o620, 0)
+    }
+}
+
 impl FileOps for ConsoleFile {
     fn read(&self, _buf: &mut [u8]) -> i64 {
         0 // EOF on stdin for now
