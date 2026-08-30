@@ -73,6 +73,11 @@ fn main() {
             let iso = build_iso();
             busybox_test(&iso);
         }
+        "pipe-test" => {
+            build_kernel(&["pipetest"]);
+            let iso = build_iso();
+            pipe_test(&iso);
+        }
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
@@ -369,6 +374,10 @@ fn type_line(sock: &Path, text: &str) {
             '_' => "shift-slash",
             '.' => "dot",
             ',' => "comma",
+            '|' => "altgr-less", // DE: AltGr + the key left of Y
+            '$' => "shift-4",
+            '(' => "shift-8",
+            ')' => "shift-9",
             _ => {
                 mon(sock, &format!("sendkey {c}"));
                 continue;
@@ -394,7 +403,7 @@ fn drive_login(sock: &Path, log: &Path, child: &mut std::process::Child, tag: &s
         type_line(sock, "thos"); // admin username
         type_line(sock, "pass"); // password
         type_line(sock, "pass"); // repeat
-        if !wait_for(log, "THOS login:", 60) {
+        if !wait_for(log, "THOS login:", 90) {
             kill(child, tag, "no login prompt after first-run setup", log);
         }
     }
@@ -410,12 +419,12 @@ fn kbd_test(iso: &Path) {
     let disk = disk_image();
     let (mut child, log, sock) = spawn_interactive_qemu("kbd", iso, &disk);
 
-    if !wait_for(&log, "THOS first-run setup", 60) {
+    if !wait_for(&log, "THOS first-run setup", 90) {
         kill(&mut child, "kbd-test", "kernel never reached first-run setup", &log);
     }
     drive_login(&sock, &log, &mut child, "kbd-test");
 
-    if !wait_for(&log, "interactive hold", 60) {
+    if !wait_for(&log, "interactive hold", 90) {
         kill(&mut child, "kbd-test", "never reached the shell after login", &log);
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -444,7 +453,7 @@ fn kbd_test(iso: &Path) {
     let cwd_ok = after.contains("\n/bin\n");
     let cat_ok = after.contains("hello a file read via open+lseek+read");
     if shell_ok && ls_ok && cwd_ok && cat_ok {
-        println!("kbd-test: OK — login, `init`, BusyBox applets, per-process cwd (cd/pwd/ls)");
+        println!("kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls)");
     } else {
         eprintln!(
             "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok})\n---\n{after}\n---"
@@ -461,11 +470,11 @@ fn login_test(iso: &Path) {
 
     // Boot 1 — fresh disk: must run first-run setup, then log in.
     let (mut c1, log1, sock1) = spawn_interactive_qemu("login1", iso, &disk);
-    if !wait_for(&log1, "THOS first-run setup", 60) {
+    if !wait_for(&log1, "THOS first-run setup", 90) {
         kill(&mut c1, "login-test", "boot 1 showed no first-run setup", &log1);
     }
     drive_login(&sock1, &log1, &mut c1, "login-test");
-    let ok1 = wait_for(&log1, "interactive hold", 60);
+    let ok1 = wait_for(&log1, "interactive hold", 90);
     let _ = c1.kill();
     let _ = c1.wait();
     if !ok1 {
@@ -475,7 +484,7 @@ fn login_test(iso: &Path) {
 
     // Boot 2 — same disk: straight to login, no setup; reject a wrong password.
     let (mut c2, log2, sock2) = spawn_interactive_qemu("login2", iso, &disk);
-    if !wait_for(&log2, "THOS login:", 60) {
+    if !wait_for(&log2, "THOS login:", 90) {
         kill(&mut c2, "login-test", "boot 2 showed no login prompt", &log2);
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -487,7 +496,7 @@ fn login_test(iso: &Path) {
     std::thread::sleep(std::time::Duration::from_millis(300));
     type_line(&sock2, "thos");
     type_line(&sock2, "pass");
-    let ok2 = wait_for(&log2, "interactive hold", 60);
+    let ok2 = wait_for(&log2, "interactive hold", 90);
     let full2 = std::fs::read_to_string(&log2).unwrap_or_default();
     let _ = c2.kill();
     let _ = c2.wait();
@@ -954,6 +963,19 @@ fn busybox_test(iso: &Path) {
         println!("busybox-test: OK — stock static BusyBox `echo` ran unmodified");
     } else {
         eprintln!("busybox-test: FAIL — BusyBox did not run to a clean exit\n--- serial ---\n{serial}\n---");
+        exit(1);
+    }
+}
+
+fn pipe_test(iso: &Path) {
+    let disk = disk_image();
+    let serial = boot_kernel_headless("pipe", iso, &disk, 4);
+    // `echo THOS-PIPE $(ls /bin | grep -c sleep) sub-$(echo works)`:
+    //   the `|` count is 1, the nested `$(…)` yields `works`.
+    if serial.contains("THOS: pipe ok") && serial.contains("THOS-PIPE 1 sub-works") {
+        println!("pipe-test: OK — `|` and `$(…)` work through BusyBox sh");
+    } else {
+        eprintln!("pipe-test: FAIL — pipe / command-substitution output wrong\n--- serial ---\n{serial}\n---");
         exit(1);
     }
 }

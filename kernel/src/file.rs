@@ -6,9 +6,11 @@
 //! slurped into memory — our ext2 is read-only, so this is enough for `cat`).
 //! Pipes, real streaming ext2, `/dev`, sockets all slot in here later.
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -22,6 +24,7 @@ const ESPIPE: i64 = -29;
 const EINVAL: i64 = -22;
 const EISDIR: i64 = -21;
 const ENOTDIR: i64 = -20;
+const EPIPE: i64 = -32;
 
 pub trait FileOps: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> i64;
@@ -43,6 +46,7 @@ pub struct ConsoleFile {
     pub writable: bool,
 }
 
+const S_IFIFO: u32 = 0o010000;
 const S_IFCHR: u32 = 0o020000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
@@ -204,5 +208,105 @@ impl FileOps for DirFile {
         }
         *pos += n;
         n as i64
+    }
+}
+
+// --- pipe: a bounded in-memory byte stream with two typed endpoints ---
+
+const PIPE_CAP: usize = 64 * 1024;
+
+struct PipeInner {
+    buf: Mutex<VecDeque<u8>>,
+    readers: AtomicUsize,
+    writers: AtomicUsize,
+}
+
+/// Read end. EOF (`read` returns 0) once every write end is dropped.
+pub struct PipeReadEnd(Arc<PipeInner>);
+/// Write end. `write` returns `-EPIPE` once every read end is dropped.
+pub struct PipeWriteEnd(Arc<PipeInner>);
+
+/// A fresh pipe: `(read end, write end)`. Endpoint counts track distinct
+/// endpoint objects (an fd shared by `fork`/`dup` is one object), so EOF and
+/// `EPIPE` fire when the last holder of a side goes away.
+pub fn pipe() -> (Arc<PipeReadEnd>, Arc<PipeWriteEnd>) {
+    let inner = Arc::new(PipeInner {
+        buf: Mutex::new(VecDeque::new()),
+        readers: AtomicUsize::new(1),
+        writers: AtomicUsize::new(1),
+    });
+    (Arc::new(PipeReadEnd(inner.clone())), Arc::new(PipeWriteEnd(inner)))
+}
+
+impl Drop for PipeReadEnd {
+    fn drop(&mut self) {
+        self.0.readers.fetch_sub(1, Ordering::Release);
+    }
+}
+impl Drop for PipeWriteEnd {
+    fn drop(&mut self) {
+        self.0.writers.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl FileOps for PipeReadEnd {
+    fn read(&self, buf: &mut [u8]) -> i64 {
+        loop {
+            {
+                let mut q = self.0.buf.lock();
+                if !q.is_empty() {
+                    let n = buf.len().min(q.len());
+                    for b in buf.iter_mut().take(n) {
+                        *b = q.pop_front().unwrap();
+                    }
+                    return n as i64;
+                }
+                if self.0.writers.load(Ordering::Acquire) == 0 {
+                    return 0; // EOF — no writers left
+                }
+            }
+            crate::sched::yield_now();
+        }
+    }
+    fn write(&self, _buf: &[u8]) -> i64 {
+        EBADF
+    }
+    fn seek(&self, _o: i64, _w: u32) -> i64 {
+        ESPIPE
+    }
+    fn stat(&self) -> (u32, u64) {
+        (S_IFIFO | 0o600, 0)
+    }
+}
+
+impl FileOps for PipeWriteEnd {
+    fn read(&self, _buf: &mut [u8]) -> i64 {
+        EBADF
+    }
+    fn write(&self, data: &[u8]) -> i64 {
+        let mut done = 0;
+        while done < data.len() {
+            if self.0.readers.load(Ordering::Acquire) == 0 {
+                return if done == 0 { EPIPE } else { done as i64 };
+            }
+            {
+                let mut q = self.0.buf.lock();
+                let space = PIPE_CAP - q.len();
+                if space > 0 {
+                    let n = space.min(data.len() - done);
+                    q.extend(data[done..done + n].iter().copied());
+                    done += n;
+                    continue;
+                }
+            }
+            crate::sched::yield_now();
+        }
+        done as i64
+    }
+    fn seek(&self, _o: i64, _w: u32) -> i64 {
+        ESPIPE
+    }
+    fn stat(&self) -> (u32, u64) {
+        (S_IFIFO | 0o600, 0)
     }
 }

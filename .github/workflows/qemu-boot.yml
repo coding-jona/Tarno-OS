@@ -97,3 +97,6 @@ jobs:
 
       - name: Stock BusyBox runs unmodified (Milestone 2)
         run: cargo xtask busybox-test
+
+      - name: Pipes and command substitution (`|` + `$(…)` through BusyBox sh)
+        run: cargo xtask pipe-test

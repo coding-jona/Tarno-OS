@@ -136,8 +136,18 @@ late.
     `unlink`/`rmdir`). `chdir` verifies the target is an ext2 directory before
     storing; `getcwd` returns the real string; `fork` inherits it, `execve`
     keeps it. `cargo xtask kbd-test` now does `cd /bin` then a bare `ls` / `pwd`
-    and checks they act on `/bin`. Still missing: `fchdir` (no fd→path yet),
-    writing through `/bin/*` links, pipes (`pipe2`) for `|` and `$(…)`.
+    and checks they act on `/bin`.
+  - **Pipes.** `pipe` / `pipe2` back a bounded (64 KiB) in-memory byte stream
+    with two typed `FileOps` endpoints; `read` blocks (yield) until data or all
+    write ends drop (EOF), `write` blocks until space or all read ends drop
+    (`EPIPE`). Endpoint counts track distinct endpoint objects, so an fd shared
+    by `fork`/`dup` counts once. Descriptors now carry a **close-on-exec** flag
+    (`FdEntry`): `O_CLOEXEC` on `pipe2`/`dup3`, `fcntl(F_GETFD/F_SETFD)`, and
+    `execve` drops the marked fds. A zombie task's fd table is cleared at
+    `exit` so the far end of a pipe sees EOF before `wait4` reaps it.
+    `cargo xtask pipe-test` boots BusyBox `sh -c` with a `|` and two `$(…)` and
+    checks the exact output. Still missing: `fchdir` (no fd→path yet), writing
+    through `/bin/*` links, real (non-yield) blocking waits.
   - Disk I/O is batched: `mm` reserves a 1 MiB contiguous DMA arena, AHCI gives
     each tag a 32 KiB bounce buffer and transfers up to 32 KiB per NCQ command,
     and `ext2::read_file` issues one read per run of consecutive blocks. The

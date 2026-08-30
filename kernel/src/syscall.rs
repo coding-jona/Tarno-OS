@@ -71,6 +71,8 @@ const SYS_POLL: u64 = 7;
 const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
 const SYS_DUP3: u64 = 292;
+const SYS_PIPE: u64 = 22;
+const SYS_PIPE2: u64 = 293;
 const SYS_FCNTL: u64 = 72;
 const SYS_NANOSLEEP: u64 = 35;
 const SYS_CLOCK_NANOSLEEP: u64 = 230;
@@ -284,6 +286,24 @@ fn sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
         }
         None => EBADF,
     }
+}
+
+/// `pipe(fds)` / `pipe2(fds, flags)` — bounded in-memory pipe, two fresh fds
+/// written to `fds[0]` (read) and `fds[1]` (write). `O_CLOEXEC` (0o2000000) in
+/// `flags` marks both fds close-on-exec.
+fn sys_pipe(fds_ptr: u64, flags: u64) -> i64 {
+    let Some(task) = sched::current().task() else { return EBADF };
+    let cloexec = flags & 0o2000000 != 0;
+    let (r, w) = crate::file::pipe();
+    let rf: alloc::sync::Arc<dyn crate::file::FileOps> = r;
+    let wf: alloc::sync::Arc<dyn crate::file::FileOps> = w;
+    let rfd = task.fd_alloc_flags(rf, cloexec);
+    let wfd = task.fd_alloc_flags(wf, cloexec);
+    unsafe {
+        *(fds_ptr as *mut i32) = rfd;
+        *((fds_ptr + 4) as *mut i32) = wfd;
+    }
+    0
 }
 
 fn sys_unlink(path_ptr: u64, dir: bool) -> i64 {
@@ -599,14 +619,35 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         // No process groups; job-control shells just want a plausible answer.
         SYS_GETPGRP | SYS_GETPGID => process::current_pid() as i64,
 
-        SYS_DUP => process::current_fd_dup(a1 as i32, 0) as i64,
-        SYS_DUP2 | SYS_DUP3 => process::current_fd_dup2(a1 as i32, a2 as i32) as i64,
+        SYS_PIPE => sys_pipe(a1, 0),
+        SYS_PIPE2 => sys_pipe(a1, a2),
 
-        // fcntl: enough for a shell's redirection / cloexec bookkeeping.
+        SYS_DUP => process::current_fd_dup(a1 as i32, 0) as i64,
+        SYS_DUP2 => process::current_fd_dup2(a1 as i32, a2 as i32) as i64,
+        // dup3(old, new, flags): flags bit O_CLOEXEC (0o2000000); old==new is EINVAL.
+        SYS_DUP3 => {
+            if a1 == a2 {
+                EINVAL
+            } else {
+                process::current_fd_dup3(a1 as i32, a2 as i32, a3 & 0o2000000 != 0) as i64
+            }
+        }
+
+        // fcntl: F_DUPFD(0) / F_DUPFD_CLOEXEC(1030), F_GETFD(1) / F_SETFD(2),
+        // F_GETFL(3) / F_SETFL(4). FD_CLOEXEC is bit 0 of the F_*FD arg.
         SYS_FCNTL => match a2 {
-            0 | 1030 => process::current_fd_dup(a1 as i32, a3 as i32) as i64, // F_DUPFD[_CLOEXEC]
-            3 => 0o2,                                                        // F_GETFL -> O_RDWR
-            1 | 2 | 4 => 0, // F_GETFD / F_SETFD / F_SETFL
+            0 => process::current_fd_dup(a1 as i32, a3 as i32) as i64,
+            1030 => {
+                let fd = process::current_fd_dup(a1 as i32, a3 as i32);
+                if fd >= 0 {
+                    process::current_fd_set_cloexec(fd, true);
+                }
+                fd as i64
+            }
+            1 => process::current_fd_get_cloexec(a1 as i32) as i64,
+            2 => process::current_fd_set_cloexec(a1 as i32, a3 & 1 != 0) as i64,
+            3 => 0o2, // F_GETFL -> O_RDWR
+            4 => 0,   // F_SETFL
             _ => 0,
         },
 

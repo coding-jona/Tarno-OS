@@ -566,6 +566,26 @@ fn storage_milestone() {
         kprintln!("THOS: busybox ok       stock static BusyBox ran unmodified");
     }
 
+    // Pipes + command substitution: BusyBox `sh -c` with a `|` and two `$(…)`.
+    // `pipe2` + O_CLOEXEC + pipe EOF all have to work for this exact line.
+    #[cfg(feature = "pipetest")]
+    {
+        let bb = fs.read_path("/busybox").expect("read /busybox from ext2");
+        let pid = process::spawn_init(
+            &bb,
+            &[
+                "sh",
+                "-c",
+                "echo THOS-PIPE $(ls /bin | grep -c sleep) sub-$(echo works)",
+            ],
+            &["PATH=/bin:/", "HOME=/"],
+        );
+        while !process::pid_exited(pid) {
+            sched::yield_now();
+        }
+        kprintln!("THOS: pipe ok          `|` and `$(…)` through BusyBox sh");
+    }
+
     // AHCI write: round-trip a known pattern through a scratch sector past the
     // ext2 image (LBA 50000 = ~25 MiB; the fs is the first 16 MiB). The host
     // side of `cargo xtask ahci-test` re-checks this landed in the disk file.
