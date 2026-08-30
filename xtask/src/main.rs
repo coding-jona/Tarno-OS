@@ -112,21 +112,46 @@ fn copy(from: &Path, to: &Path) {
 /// `isa-debug-exit` port: `(0x10 << 1) | 1`.
 const QEMU_SUCCESS: i32 = 33;
 
-/// A raw disk image with recognizable markers, attached over AHCI so the driver
-/// has something to READ. LBA 0 and LBA 100 carry ASCII tags.
+/// An ext2 (1 KiB block) disk image containing `/hello` — the compiled test ELF
+/// — attached over AHCI. Rebuilt when the ELF source or this xtask changes.
+/// Needs `as`, `ld`, `mke2fs`, `debugfs` on PATH.
 fn disk_image() -> PathBuf {
-    let img = workspace_root().join("target/disk.img");
-    if !img.exists() {
-        let mut buf = vec![0u8; 16 * 1024 * 1024];
-        buf[0..16].copy_from_slice(b"THOS-AHCI-LBA0!!");
-        let l100 = 100 * 512;
-        buf[l100..l100 + 16].copy_from_slice(b"THOS-AHCI-LBA100");
-        std::fs::create_dir_all(img.parent().unwrap()).ok();
-        std::fs::write(&img, &buf).unwrap_or_else(|e| {
-            eprintln!("write {img:?}: {e}");
-            exit(1);
-        });
+    let root = workspace_root();
+    let img = root.join("target/disk.img");
+    let src = root.join("xtask/testdata/hello.s");
+
+    let fresh = img
+        .metadata()
+        .and_then(|a| Ok((a.modified()?, src.metadata()?.modified()?)))
+        .map(|(i, s)| i > s)
+        .unwrap_or(false);
+    if fresh {
+        return img;
     }
+
+    let obj = root.join("target/hello.o");
+    let elf = root.join("target/hello");
+    std::fs::create_dir_all(root.join("target")).ok();
+
+    run(Command::new("as").args([
+        "-64", "-o", obj.to_str().unwrap(), src.to_str().unwrap(),
+    ]));
+    run(Command::new("ld").args([
+        "-static", "-nostdlib", "-Ttext=0x666600000000", "-e", "_start",
+        "-o", elf.to_str().unwrap(), obj.to_str().unwrap(),
+    ]));
+
+    // 4 MiB, 1 KiB blocks, 128-byte inodes, no fancy features.
+    let _ = std::fs::remove_file(&img);
+    run(Command::new("mke2fs").args([
+        "-q", "-F", "-t", "ext2", "-b", "1024", "-I", "128",
+        "-O", "^resize_inode,^dir_index,^ext_attr",
+        img.to_str().unwrap(), "4096",
+    ]));
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} hello", elf.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
     img
 }
 

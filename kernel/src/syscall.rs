@@ -210,3 +210,19 @@ pub fn selftest() {
     let ok = SELFTEST_EXITED.load(Ordering::Acquire);
     kprintln!("THOS: syscall selftest {}", if ok { "ok (ring 3 -> SYS_WRITE -> SYS_EXIT)" } else { "FAILED" });
 }
+
+/// Enter a freshly loaded user program at `entry` with stack top `rsp`.
+/// Returns when the program issues `SYS_EXIT`.
+pub fn enter_user(entry: u64, rsp: u64) {
+    let s = gdt::selectors();
+    unsafe {
+        thos_enter_ring3(
+            entry,
+            rsp,
+            0,
+            0,
+            (s.user_code.0 | 3) as u64,
+            (s.user_data.0 | 3) as u64,
+        );
+    }
+}
