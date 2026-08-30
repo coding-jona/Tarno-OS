@@ -85,6 +85,13 @@ late.
     context-switched per thread and inherited across `fork` — musl deref's `%fs`
     constantly. (3) `fork` now copies PML4[0] (static-musl ELFs load at
     `0x400000`), not just the higher user half.
+  - SMP stress: `cargo xtask smp-test` boots at **24 vCPUs** (the target's 8P×2 +
+    8E) and runs `smp_stress_milestone` — 512 threads churning `yield`/`exit` in
+    overlapping waves, 48 threads blocking + being mass-woken on the wait queue,
+    4 real user `fork`/`wait4` processes — then asserts exact run counts (no lost
+    / double-run) and per-thread stack canaries (no thread ran on two CPUs at
+    once). Added `sched::reap()` to free exited threads' kernel stacks (they
+    leaked forever before).
 
 ## Phase 3 — NT personality (userspace level, still GOP graphics)
 

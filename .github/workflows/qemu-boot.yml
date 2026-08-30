@@ -80,3 +80,6 @@ jobs:
 
       - name: ext2 write end-to-end (kernel creates files; host e2fsck + debugfs verify)
         run: cargo xtask ext2-test
+
+      - name: SMP scheduler stress (24 vCPUs; hundreds of threads churn/block/fork)
+        run: cargo xtask smp-test

@@ -53,10 +53,15 @@ fn main() {
             let iso = build_iso();
             ext2_test(&iso);
         }
+        "smp-test" => {
+            build_kernel(&["stress"]);
+            let iso = build_iso();
+            smp_test(&iso);
+        }
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test|ext2-test] [--gui]"
+                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test|ext2-test|smp-test] [--gui]"
             );
             exit(2);
         }
@@ -522,14 +527,14 @@ fn bootpick_test() {
 
 /// Boot the non-interactive kernel with `disk` attached over AHCI, wait for a
 /// clean `ExitCode::Success` halt, and return the serial log. Exits on failure.
-fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path) -> String {
+fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String {
     use std::time::{Duration, Instant};
 
     let log = workspace_root().join(format!("target/{tag}-serial.log"));
     let _ = std::fs::remove_file(&log);
 
     let mut qemu = Command::new("qemu-system-x86_64");
-    qemu.args(["-M", "q35", "-m", "512M", "-smp", "4", "-cdrom", iso.to_str().unwrap()]);
+    qemu.args(["-M", "q35", "-m", "512M", "-smp", &smp.to_string(), "-cdrom", iso.to_str().unwrap()]);
     qemu.args([
         "-drive", &format!("id=disk0,if=none,format=raw,file={}", disk.to_str().unwrap()),
         "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0",
@@ -575,7 +580,7 @@ fn ahci_test(iso: &Path) {
     let _ = std::fs::remove_file(root.join("target/disk.img")); // fresh: scratch = zeros
     let disk = disk_image();
 
-    let serial = boot_kernel_headless("ahci", iso, &disk);
+    let serial = boot_kernel_headless("ahci", iso, &disk, 4);
     if !serial.contains("THOS: ahci write ok") {
         eprintln!("ahci-test: FAIL — no in-boot write/read-back marker\n{serial}");
         exit(1);
@@ -604,7 +609,7 @@ fn ext2_test(iso: &Path) {
     let _ = std::fs::remove_file(root.join("target/disk.img")); // start from a pristine fs
     let disk = disk_image();
 
-    let serial = boot_kernel_headless("ext2", iso, &disk);
+    let serial = boot_kernel_headless("ext2", iso, &disk, 4);
     if !serial.contains("THOS: ext2 write ok") {
         eprintln!("ext2-test: FAIL — no in-boot ext2-write marker\n{serial}");
         exit(1);
@@ -640,6 +645,21 @@ fn ext2_test(iso: &Path) {
         eprintln!("ext2-test: FAIL — created files not readable from the host");
         eprintln!("  /thos-created.txt   = {a:?}");
         eprintln!("  /thosdir/nested.txt = {b:?}");
+        exit(1);
+    }
+}
+
+/// Boot the `stress` kernel at a realistic CPU count (24 = the target's 8P×2 +
+/// 8E threads) and require its SMP scheduler stress milestone to pass.
+fn smp_test(iso: &Path) {
+    let _ = std::fs::remove_file(workspace_root().join("target/disk.img")); // pristine fs
+    let disk = disk_image();
+    let serial = boot_kernel_headless("smp", iso, &disk, 24);
+    if serial.contains("THOS: smp stress ok") {
+        let line = serial.lines().find(|l| l.contains("smp stress ok")).unwrap_or("");
+        println!("smp-test: OK — {}", line.trim());
+    } else {
+        eprintln!("smp-test: FAIL — stress milestone did not pass\n--- serial ---\n{serial}\n---");
         exit(1);
     }
 }

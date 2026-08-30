@@ -471,10 +471,11 @@ pub fn exit() -> ! {
         next.set_state(State::Running);
         let out = (next.ctx_ptr(), next.clone(), cpu, next.cr3(), next.kstack_top, next.fsbase());
         s.cpus[cpu].current = Some(next);
-        // Nothing to hand off: an exited thread is never resumed, so its stack
-        // can be reclaimed from the graveyard without waiting on `running`.
-        s.cpus[cpu].handoff = None;
-        s.graveyard.push(prev); // keep the stack alive until a reaper frees it
+        // Hand the corpse off like a blocking switch: `finish_switch` (running
+        // in `next`) clears its `running` flag once this CPU is fully off its
+        // stack, which is exactly when `reap()` may free it.
+        s.cpus[cpu].handoff = Some((prev.clone(), true));
+        s.graveyard.push(prev);
         out
     };
     apply_cpu_state(cpu, cr3, kstack_top, fsbase);
@@ -568,4 +569,21 @@ fn finish_switch() {
         s.ready.push_back(prev.clone());
     }
     prev.running.store(false, Ordering::Release);
+}
+
+/// Free the kernel stacks of exited threads. Safe to call from anywhere: a
+/// corpse is only dropped once no CPU is on its stack (`running` cleared by
+/// `finish_switch`) and nothing else still holds a reference.
+pub fn reap() {
+    let mut s = SCHED.lock();
+    let mut i = 0;
+    while i < s.graveyard.len() {
+        let dead =
+            !s.graveyard[i].running.load(Ordering::Acquire) && Arc::strong_count(&s.graveyard[i]) == 1;
+        if dead {
+            s.graveyard.swap_remove(i); // Arc drops -> the Box<[u8]> stack is freed
+        } else {
+            i += 1;
+        }
+    }
 }

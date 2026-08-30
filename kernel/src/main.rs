@@ -340,6 +340,152 @@ fn scheduler_milestone() {
     );
 }
 
+// --- SMP scheduler stress (feature = "stress", driven by `cargo xtask smp-test`) ---
+
+#[cfg(feature = "stress")]
+mod stress {
+    use super::*;
+
+    pub static SPAWNED: AtomicU64 = AtomicU64::new(0);
+    pub static EXITED: AtomicU64 = AtomicU64::new(0);
+    pub static RUNS: AtomicU64 = AtomicU64::new(0);
+    pub static BAD_CANARY: AtomicU64 = AtomicU64::new(0);
+
+    pub static PARK_Q: wait::WaitQueue = wait::WaitQueue::new();
+    pub static PARK_RUNS: AtomicU64 = AtomicU64::new(0);
+    pub static PARK_EXITED: AtomicU64 = AtomicU64::new(0);
+
+    pub const WAVES: u64 = 8;
+    pub const PER_WAVE: usize = 64;
+    pub const YIELDS: u64 = 60;
+    pub const PARKERS: usize = 48;
+    pub const WAKERS: usize = 4;
+    pub const PARK_CYCLES: u64 = 40;
+    pub const USER_INITS: u64 = 4;
+
+    /// Fill a stack buffer with a per-thread pattern, yield many times, then
+    /// check it survived. If the scheduler ever ran this thread on two CPUs at
+    /// once (kernel stack reused mid-flight) the yields would smash it.
+    fn canary_check(id: u64) -> bool {
+        let mut buf = [0u64; 96];
+        let seed = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(id.wrapping_add(1));
+        for (i, c) in buf.iter_mut().enumerate() {
+            *c = seed ^ i as u64;
+        }
+        for _ in 0..YIELDS {
+            RUNS.fetch_add(1, Ordering::Relaxed);
+            sched::yield_now();
+        }
+        buf.iter().enumerate().all(|(i, &c)| c == seed ^ i as u64)
+    }
+
+    pub extern "C" fn churn_worker(id: usize) -> ! {
+        if !canary_check(id as u64) {
+            BAD_CANARY.fetch_add(1, Ordering::Relaxed);
+        }
+        EXITED.fetch_add(1, Ordering::Relaxed);
+        sched::exit()
+    }
+
+    pub extern "C" fn parker(id: usize) -> ! {
+        let mut buf = [0u64; 64];
+        let seed = 0xA5A5_5A5Au64 ^ id as u64;
+        for (i, c) in buf.iter_mut().enumerate() {
+            *c = seed ^ i as u64;
+        }
+        for _ in 0..PARK_CYCLES {
+            PARK_Q.wait();
+            PARK_RUNS.fetch_add(1, Ordering::Relaxed);
+        }
+        if !buf.iter().enumerate().all(|(i, &c)| c == seed ^ i as u64) {
+            BAD_CANARY.fetch_add(1, Ordering::Relaxed);
+        }
+        PARK_EXITED.fetch_add(1, Ordering::Relaxed);
+        sched::exit()
+    }
+
+    pub extern "C" fn waker(_id: usize) -> ! {
+        while PARK_EXITED.load(Ordering::Relaxed) < PARKERS as u64 {
+            PARK_Q.wake_all();
+            sched::yield_now();
+        }
+        sched::exit()
+    }
+}
+
+/// Gate B: hammer the scheduler on every CPU — hundreds of threads churning
+/// `yield` / `exit`, a pool blocking and being mass-woken on the wait queue,
+/// and a few real user `fork`/`wait4` processes — then assert nothing was
+/// lost, double-run, or ran on two CPUs at once.
+#[cfg(feature = "stress")]
+fn smp_stress_milestone(init_bytes: &[u8]) {
+    use stress::*;
+
+    kprintln!(
+        "THOS: smp stress start {} CPUs; {} churn + {} parkers + {} user forks",
+        smp::cpu_count(),
+        WAVES as usize * PER_WAVE,
+        PARKERS,
+        USER_INITS,
+    );
+
+    let user_base = syscall::user_exits();
+    for i in 0..PARKERS {
+        sched::spawn("stress-park", parker, i);
+    }
+    for i in 0..WAKERS {
+        sched::spawn("stress-wake", waker, i);
+    }
+    for _ in 0..USER_INITS {
+        process::spawn_init(init_bytes, &["/init"], &["THOS=1"]);
+    }
+
+    for _ in 0..WAVES {
+        for i in 0..PER_WAVE {
+            SPAWNED.fetch_add(1, Ordering::Relaxed);
+            sched::spawn("stress-churn", churn_worker, i);
+        }
+        // Only let a wave half-drain before piling on the next, so create and
+        // destroy overlap across all CPUs the whole time.
+        let mark = EXITED.load(Ordering::Relaxed) + (PER_WAVE as u64 / 2);
+        while EXITED.load(Ordering::Relaxed) < mark {
+            sched::yield_now();
+        }
+        sched::reap(); // free exited stacks — the bootstrap heap is small
+    }
+
+    while EXITED.load(Ordering::Relaxed) < SPAWNED.load(Ordering::Relaxed)
+        || PARK_EXITED.load(Ordering::Relaxed) < PARKERS as u64
+        || syscall::user_exits() < user_base + USER_INITS * 2
+    {
+        sched::yield_now();
+        sched::reap();
+    }
+    sched::reap();
+
+    let spawned = SPAWNED.load(Ordering::Relaxed);
+    let runs = RUNS.load(Ordering::Relaxed);
+    let park_runs = PARK_RUNS.load(Ordering::Relaxed);
+    let bad = BAD_CANARY.load(Ordering::Relaxed);
+
+    assert_eq!(bad, 0, "SMP stress: {bad} threads saw a smashed stack canary");
+    assert_eq!(
+        runs,
+        spawned * YIELDS,
+        "SMP stress: churn run count {runs} != {spawned}*{YIELDS} (lost or double-run)"
+    );
+    assert_eq!(
+        park_runs,
+        PARKERS as u64 * PARK_CYCLES,
+        "SMP stress: parker run count {park_runs} != {PARKERS}*{PARK_CYCLES}"
+    );
+
+    kprintln!(
+        "THOS: smp stress ok    {spawned} churn + {PARKERS} parker threads clean; {runs}+{park_runs} runs, {} ctx switches",
+        sched::ctx_switches()
+    );
+}
+
 /// Phase 2 milestone: a VFS with an in-memory file opened through the handle
 /// table, and the AHCI driver reading real sectors off the SATA disk.
 fn storage_milestone() {
@@ -402,12 +548,18 @@ fn storage_milestone() {
         let fs = ext2::open().expect("remount ext2");
         let payload = b"ext2 write works on THOS\n";
         fs.write_path("/thos-created.txt", payload).expect("ext2 write_path");
-        fs.mkdir_path("/thosdir").expect("ext2 mkdir_path");
+        match fs.mkdir_path("/thosdir") {
+            Ok(()) | Err("already exists") => {} // idempotent: disk.img is reused
+            Err(e) => panic!("ext2 mkdir_path: {e}"),
+        }
         fs.write_path("/thosdir/nested.txt", b"nested ok\n").expect("ext2 nested write");
         assert!(fs.read_path("/thos-created.txt").as_deref() == Some(payload.as_slice()));
         assert!(fs.read_path("/thosdir/nested.txt").as_deref() == Some(b"nested ok\n".as_slice()));
         kprintln!("THOS: ext2 write ok    /thos-created.txt + /thosdir/nested.txt");
     }
+
+    #[cfg(feature = "stress")]
+    smp_stress_milestone(&init);
 
     // USB keyboard via xHCI -> the line-disciplined console -> fd 0.
     match xhci::init() {

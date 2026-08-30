@@ -23,3 +23,6 @@ x86_64 = "0.15"
 # `interactive`: kmain holds after the milestones instead of halting, so a
 # human (or `cargo xtask kbd-test`) can type on the USB keyboard.
 interactive = []
+# `stress`: run the SMP scheduler stress milestone (many threads churning
+# yield / block / wake / fork across every CPU). Driven by `cargo xtask smp-test`.
+stress = []
