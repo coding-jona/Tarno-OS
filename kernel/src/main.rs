@@ -150,9 +150,14 @@ extern "C" fn kmain() -> ! {
         process::set_session(&session.name, session.uid);
         kprintln!("THOS: session          {} (uid {})", session.name, session.uid);
 
-        let sh = fs.read_path("/sh").expect("read /sh from ext2");
-        kprintln!("THOS: shell            /sh = {} bytes", sh.len());
-        process::spawn_init(&sh, &["/sh"], &["PATH=/", "HOME=/"]);
+        // The interactive shell is stock BusyBox `sh` (ash).
+        let sh = fs.read_path("/busybox").expect("read /busybox from ext2");
+        kprintln!("THOS: shell            /busybox sh = {} bytes", sh.len());
+        process::spawn_init(
+            &sh,
+            &["sh"],
+            &["PATH=/", "HOME=/", "PWD=/", "TERM=dumb", "PS1=thos$ "],
+        );
 
         kprintln!("THOS: interactive hold — type on the USB keyboard");
         loop {

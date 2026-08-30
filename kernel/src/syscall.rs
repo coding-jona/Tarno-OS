@@ -68,6 +68,25 @@ const SYS_UNLINK: u64 = 87;
 const SYS_RMDIR: u64 = 84;
 const SYS_UNLINKAT: u64 = 263;
 const SYS_POLL: u64 = 7;
+const SYS_DUP: u64 = 32;
+const SYS_DUP2: u64 = 33;
+const SYS_DUP3: u64 = 292;
+const SYS_FCNTL: u64 = 72;
+const SYS_NANOSLEEP: u64 = 35;
+const SYS_CLOCK_NANOSLEEP: u64 = 230;
+const SYS_CHDIR: u64 = 80;
+const SYS_FCHDIR: u64 = 81;
+const SYS_GETPPID: u64 = 110;
+const SYS_GETPGRP: u64 = 111;
+const SYS_GETPGID: u64 = 121;
+const SYS_SETPGID: u64 = 109;
+const SYS_SETSID: u64 = 112;
+const SYS_SYSINFO: u64 = 99;
+const SYS_WAITID: u64 = 247;
+const SYS_CLONE: u64 = 56;
+const SYS_NEWFSTATAT: u64 = 262;
+const SYS_SETUID: u64 = 105;
+const SYS_SETGID: u64 = 106;
 const SYS_MPROTECT: u64 = 10;
 const SYS_MADVISE: u64 = 28;
 const SYS_MUNMAP: u64 = 11;
@@ -305,6 +324,72 @@ fn sys_fstat(fd: u64, buf: u64) -> i64 {
     0
 }
 
+/// Minimal terminal `ioctl`: report a canonical-mode line discipline with the
+/// terminal's own echo *off* (our line-disciplined console already echoes and
+/// edits), so BusyBox `sh` goes interactive — prompt on — but leaves line
+/// editing to us.
+fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
+    if cur_fd(fd).is_none() {
+        return EBADF;
+    }
+    match cmd {
+        0x5401 => unsafe {
+            // TCGETS — glibc passes a 36-byte `struct __kernel_termios`
+            // (__KERNEL_NCCS = 19), so never touch more than that.
+            core::ptr::write_bytes(arg as *mut u8, 0, 36);
+            *((arg) as *mut u32) = 0x0100; // c_iflag = ICRNL
+            *((arg + 4) as *mut u32) = 0x0005; // c_oflag = OPOST | ONLCR
+            *((arg + 8) as *mut u32) = 0x00bf; // c_cflag = B38400|CS8|CREAD|HUPCL
+            *((arg + 12) as *mut u32) = 0x0003; // c_lflag = ISIG | ICANON  (no ECHO)
+            let cc = (arg + 17) as *mut u8; // c_cc[19]
+            *cc.add(0) = 3; // VINTR
+            *cc.add(1) = 28; // VQUIT
+            *cc.add(2) = 0x7f; // VERASE
+            *cc.add(3) = 21; // VKILL
+            *cc.add(4) = 4; // VEOF
+            *cc.add(6) = 1; // VMIN
+            0
+        },
+        0x5402 | 0x5403 | 0x5404 => 0, // TCSETS / TCSETSW / TCSETSF
+        0x5413 => unsafe {
+            // TIOCGWINSZ
+            *(arg as *mut [u16; 4]) = [25, 80, 0, 0];
+            0
+        },
+        0x540f => unsafe {
+            // TIOCGPGRP
+            *(arg as *mut u32) = process::current_pid() as u32;
+            0
+        },
+        0x5410 => 0, // TIOCSPGRP
+        _ => ENOTTY,
+    }
+}
+
+/// `newfstatat(dirfd, path, statbuf, flags)` — absolute paths via ext2, plus
+/// `AT_EMPTY_PATH` fstat.
+fn sys_newfstatat(dirfd: u64, path_ptr: u64, buf: u64, flags: u64) -> i64 {
+    let path = user_cstr(path_ptr);
+    if path.is_empty() && flags & 0x1000 != 0 {
+        return sys_fstat(dirfd, buf);
+    }
+    if !path.starts_with('/') {
+        return ENOENT; // no per-process cwd yet
+    }
+    let Some(fs) = ext2::open().ok() else { return -5 /* EIO */ };
+    let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
+    let node = fs.read_inode(ino);
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, 144);
+        *((buf + 16) as *mut u64) = 1;
+        *((buf + 24) as *mut u32) = node.mode as u32;
+        *((buf + 48) as *mut i64) = node.size as i64;
+        *((buf + 56) as *mut i64) = 4096;
+        *((buf + 64) as *mut i64) = ((node.size + 511) / 512) as i64;
+    }
+    0
+}
+
 /// Read a NUL-terminated string from user memory (we're under the caller's CR3).
 fn user_cstr(ptr: u64) -> alloc::string::String {
     let mut s = alloc::vec::Vec::new();
@@ -407,13 +492,42 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         }
 
         SYS_GETPID | SYS_GETTID => process::current_pid() as i64,
+        SYS_GETPPID => process::current_ppid() as i64,
         SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => process::current_uid() as i64,
         SYS_SET_TID_ADDRESS => process::current_pid() as i64,
-        SYS_IOCTL => ENOTTY,
+        SYS_IOCTL => sys_ioctl(a1, a2, a3),
         SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_RT_SIGRETURN | SYS_SET_ROBUST_LIST
         | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MPROTECT | SYS_MADVISE | SYS_MUNMAP | SYS_FUTEX
-        | SYS_PRCTL => 0,
+        | SYS_PRCTL | SYS_CHDIR | SYS_FCHDIR | SYS_SETPGID | SYS_SETSID => 0,
         SYS_RSEQ => ENOSYS,
+
+        // No process groups; job-control shells just want a plausible answer.
+        SYS_GETPGRP | SYS_GETPGID => process::current_pid() as i64,
+
+        SYS_DUP => process::current_fd_dup(a1 as i32, 0) as i64,
+        SYS_DUP2 | SYS_DUP3 => process::current_fd_dup2(a1 as i32, a2 as i32) as i64,
+
+        // fcntl: enough for a shell's redirection / cloexec bookkeeping.
+        SYS_FCNTL => match a2 {
+            0 | 1030 => process::current_fd_dup(a1 as i32, a3 as i32) as i64, // F_DUPFD[_CLOEXEC]
+            3 => 0o2,                                                        // F_GETFL -> O_RDWR
+            1 | 2 | 4 => 0, // F_GETFD / F_SETFD / F_SETFL
+            _ => 0,
+        },
+
+        SYS_NANOSLEEP | SYS_CLOCK_NANOSLEEP => {
+            for _ in 0..1000 {
+                sched::yield_now();
+            }
+            0
+        }
+
+        SYS_SYSINFO => {
+            unsafe { core::ptr::write_bytes(a1 as *mut u8, 0, 112) };
+            0
+        }
+
+        SYS_WAITID => ECHILD,
 
         // poll: mark valid fds as "no events", invalid as POLLNVAL.
         SYS_POLL | SYS_PPOLL => {
@@ -468,6 +582,20 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         }
 
         SYS_FORK => process::fork(frame),
+
+        // glibc's fork() is clone(SIGCHLD | CHILD_{SET,CLEAR}TID, stack=0).
+        // A shared-VM clone (threads) isn't supported yet.
+        SYS_CLONE => {
+            const CLONE_VM: u64 = 0x100;
+            if a1 & CLONE_VM != 0 {
+                ENOSYS
+            } else {
+                process::fork(frame)
+            }
+        }
+
+        SYS_NEWFSTATAT => sys_newfstatat(a1, a2, a3, a4),
+        SYS_SETUID | SYS_SETGID => 0,
 
         SYS_EXECVE => {
             let path = user_cstr(a1);
