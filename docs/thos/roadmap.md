@@ -66,14 +66,18 @@ late.
   MSI/MSI-X, command list / FIS) → real root FS from the **Kingston A400 240 GB SATA
   SSD** (`sdc`). NVMe is Windows' disk and is never touched; an NVMe driver is
   out of scope for v1.
-  - Status: polled driver, single command slot. `READ`/`WRITE DMA EXT` +
-    `FLUSH CACHE EXT` + `IDENTIFY DEVICE` working. IDENTIFY gives the real
-    48-bit (fallback 28-bit) sector count and model string; `read`/`write`
-    bounds-check against it. `cargo xtask ahci-test` writes a pattern to a
-    scratch LBA, reads it back, checks from the host that it persisted, and
-    asserts the reported sector count equals the backing file exactly; the
-    milestone also proves a read one sector past the end is rejected. Next:
-    multi-slot / NCQ, MSI-X completion interrupts instead of polling.
+  - Status: 32-tag command list. `IDENTIFY DEVICE` gives the 48-bit (fallback
+    28-bit) sector count + model + NCQ support/depth; `read`/`write`
+    bounds-check the LBA. When the drive advertises NCQ, I/O goes through
+    `READ`/`WRITE FPDMA QUEUED` (write sets FUA for durability) issued via
+    `PxSACT`+`PxCI` — up to `queue depth` transfers outstanding, drive reorders
+    them; completion is polled from `PxSACT` and a waiting thread `yield`s
+    instead of spinning a core. Falls back to single-tag `DMA EXT` +
+    `FLUSH CACHE EXT` without NCQ. `cargo xtask ahci-test` verifies the sector
+    count against the backing file and a past-the-end read is rejected; the
+    boot milestone runs **8 threads doing concurrent read/write/verify** through
+    the NCQ path with no corruption. Next: MSI-X completion interrupts instead
+    of polling; NCQ error recovery (`READ LOG EXT` + port restart).
 - **xHCI driver** (Intel `8086:7a60`) + USB HID (keyboard/mouse). PS/2 only as a QEMU
   stopgap.
 - ELF loader; **POSIX personality**: syscall table (Linux ABI subset), signals, `futex`

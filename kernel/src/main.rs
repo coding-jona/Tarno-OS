@@ -555,7 +555,18 @@ fn storage_milestone() {
     let mut rbuf = [0u8; ahci::SECTOR];
     ahci::read(SCRATCH_LBA, &mut rbuf).expect("AHCI read-back");
     assert!(rbuf == wbuf, "AHCI write / read-back mismatch");
-    kprintln!("THOS: ahci write ok    LBA {} round-tripped + flushed", SCRATCH_LBA);
+    kprintln!("THOS: ahci write ok    LBA {} round-tripped (durable)", SCRATCH_LBA);
+
+    // Concurrent NCQ: 8 threads hammer distinct scratch regions at once, so
+    // several tags are outstanding and the drive reorders them.
+    for i in 0..8 {
+        sched::spawn("ncq-io", ncq_io_worker, i);
+    }
+    while NCQ_DONE.load(Ordering::Relaxed) < 8 {
+        sched::yield_now();
+    }
+    assert_eq!(NCQ_BAD.load(Ordering::Relaxed), 0, "concurrent NCQ I/O corrupted data");
+    kprintln!("THOS: ahci ncq ok      8 concurrent readers/writers verified (depth {})", ahci::queue_depth());
 
     // ext2 write: create a file + a dir + a nested file, read them back through
     // our own read path. `cargo xtask ext2-test` then e2fsck's the image and
@@ -599,6 +610,27 @@ fn storage_milestone() {
         }
         Err(e) => kprintln!("THOS: xhci             {}", e),
     }
+}
+
+// --- concurrent NCQ I/O check (storage_milestone) ---
+static NCQ_DONE: AtomicU64 = AtomicU64::new(0);
+static NCQ_BAD: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn ncq_io_worker(i: usize) -> ! {
+    let lba = 40_000 + i as u64; // a distinct scratch sector per worker, past the fs
+    let mut w = [0u8; ahci::SECTOR];
+    for (j, b) in w.iter_mut().enumerate() {
+        *b = (j as u8).wrapping_add((i as u8).wrapping_mul(17));
+    }
+    for _ in 0..16 {
+        let mut r = [0u8; ahci::SECTOR];
+        if ahci::write(lba, &w).is_err() || ahci::read(lba, &mut r).is_err() || r != w {
+            NCQ_BAD.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+    }
+    NCQ_DONE.fetch_add(1, Ordering::Relaxed);
+    sched::exit()
 }
 
 static XHCI: spin::Mutex<Option<xhci::Xhci>> = spin::Mutex::new(None);

@@ -682,7 +682,7 @@ fn ahci_test(iso: &Path) {
     let disk = disk_image();
 
     let serial = boot_kernel_headless("ahci", iso, &disk, 4);
-    for m in ["THOS: ahci ident", "THOS: ahci cap ok", "THOS: ahci write ok"] {
+    for m in ["THOS: ahci ident", "THOS: ahci cap ok", "THOS: ahci ncq ok", "THOS: ahci write ok"] {
         if !serial.contains(m) {
             eprintln!("ahci-test: FAIL — missing marker {m:?}\n{serial}");
             exit(1);
