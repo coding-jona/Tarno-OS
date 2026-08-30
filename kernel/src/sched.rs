@@ -27,7 +27,8 @@ use x86_64::structures::paging::PhysFrame;
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::gdt::MAX_CPUS;
-use crate::process::Process;
+use crate::process::Task;
+use crate::syscall::{thos_user_thread_resume, UserFrame};
 use crate::{gdt, smp, vmm};
 
 core::arch::global_asm!(
@@ -107,13 +108,16 @@ pub struct Thread {
     is_idle: bool,
     /// Physical PML4 base to load into CR3 for this thread (kernel PML4 for
     /// kernel threads; the process PML4 for user threads).
-    cr3: u64,
+    cr3: AtomicU64,
     /// Top of this thread's kernel stack — programmed into TSS.RSP0 and the
     /// syscall entry (`gs:[kernel_rsp]`) when it runs, so a ring transition
     /// from user lands here. `None` = never takes a ring transition.
     kstack_top: Option<u64>,
-    /// Held to keep the address space alive for the thread's lifetime.
-    proc: Option<Arc<Process>>,
+    /// Held to keep the task (and its address space) alive for the thread's
+    /// lifetime.
+    task: Option<Arc<Task>>,
+    /// Owned resume frame for a fork child (kept alive; `r12` points at it).
+    _uframe: Option<Box<UserFrame>>,
 }
 
 unsafe impl Send for Thread {}
@@ -140,9 +144,10 @@ impl Thread {
             ctx: UnsafeCell::new(0),
             _stack: None,
             is_idle,
-            cr3: vmm::kernel_pml4_phys(),
+            cr3: AtomicU64::new(vmm::kernel_pml4_phys()),
             kstack_top: None,
-            proc: None,
+            task: None,
+            _uframe: None,
         })
     }
 
@@ -182,14 +187,16 @@ impl Thread {
             ctx: UnsafeCell::new(sp),
             _stack: Some(stack),
             is_idle: false,
-            cr3: vmm::kernel_pml4_phys(),
+            cr3: AtomicU64::new(vmm::kernel_pml4_phys()),
             kstack_top: Some(top),
-            proc: None,
+            task: None,
+            _uframe: None,
         })
     }
 
-    fn spawned_user(id: u64, name: &'static str, proc: Arc<Process>, entry: u64, user_rsp: u64) -> Arc<Self> {
+    fn spawned_user(id: u64, name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64) -> Arc<Self> {
         let s = gdt::selectors();
+        let cr3 = task.space().pml4_phys();
         let (stack, sp, top) = Self::build_stack(
             thos_user_thread_start as *const () as u64,
             entry,
@@ -197,7 +204,6 @@ impl Thread {
             (s.user_code.0 | 3) as u64,
             (s.user_data.0 | 3) as u64,
         );
-        let cr3 = proc.pml4_phys();
         Arc::new(Self {
             id,
             name,
@@ -205,10 +211,40 @@ impl Thread {
             ctx: UnsafeCell::new(sp),
             _stack: Some(stack),
             is_idle: false,
-            cr3,
+            cr3: AtomicU64::new(cr3),
             kstack_top: Some(top),
-            proc: Some(proc),
+            task: Some(task),
+            _uframe: None,
         })
+    }
+
+    fn spawned_user_frame(id: u64, name: &'static str, task: Arc<Task>, frame: UserFrame) -> Arc<Self> {
+        let uframe = Box::new(frame);
+        let fptr = &*uframe as *const UserFrame as u64;
+        let cr3 = task.space().pml4_phys();
+        let (stack, sp, top) = Self::build_stack(
+            thos_user_thread_resume as *const () as u64,
+            fptr, // r12 = &UserFrame
+            0,
+            0,
+            0,
+        );
+        Arc::new(Self {
+            id,
+            name,
+            state: Mutex::new(State::Ready),
+            ctx: UnsafeCell::new(sp),
+            _stack: Some(stack),
+            is_idle: false,
+            cr3: AtomicU64::new(cr3),
+            kstack_top: Some(top),
+            task: Some(task),
+            _uframe: Some(uframe),
+        })
+    }
+
+    fn cr3(&self) -> u64 {
+        self.cr3.load(Ordering::Relaxed)
     }
 }
 
@@ -252,9 +288,22 @@ pub fn current() -> Arc<Thread> {
         .expect("current: no current thread")
 }
 
+impl Thread {
+    /// The task (process-tree node) this thread belongs to, if it is a user
+    /// thread.
+    pub fn task(&self) -> Option<Arc<Task>> {
+        self.task.clone()
+    }
+    /// Repoint this thread's CR3 (used by `execve` when it swaps the address
+    /// space).
+    pub fn set_cr3(&self, v: u64) {
+        self.cr3.store(v, Ordering::Relaxed);
+    }
+}
+
 /// The address space of the thread running on this CPU, if it is a user thread.
-pub fn current_proc() -> Option<Arc<Process>> {
-    current().proc.clone()
+pub fn current_proc() -> Option<Arc<crate::process::Process>> {
+    current().task().map(|t| t.space())
 }
 
 /// BSP: turn the current execution into thread 0 and give this CPU an idle
@@ -308,9 +357,18 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -
 
 /// Create a runnable *user* thread: it enters ring 3 at `entry` on `user_rsp`
 /// the first time it is scheduled, in `proc`'s address space.
-pub fn spawn_user(name: &'static str, proc: Arc<Process>, entry: u64, user_rsp: u64) -> u64 {
+pub fn spawn_user(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
-    let t = Thread::spawned_user(id, name, proc, entry, user_rsp);
+    let t = Thread::spawned_user(id, name, task, entry, user_rsp);
+    SCHED.lock().ready.push_back(t);
+    id
+}
+
+/// Create a runnable user thread that resumes from a full [`UserFrame`] (a
+/// fork child).
+pub fn spawn_user_frame(name: &'static str, task: Arc<Task>, frame: UserFrame) -> u64 {
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let t = Thread::spawned_user_frame(id, name, task, frame);
     SCHED.lock().ready.push_back(t);
     id
 }
@@ -368,7 +426,7 @@ pub fn exit() -> ! {
         prev.set_state(State::Exited);
         let next = pick_next(&mut s, cpu);
         next.set_state(State::Running);
-        let out = (next.ctx_ptr(), cpu, next.cr3, next.kstack_top);
+        let out = (next.ctx_ptr(), cpu, next.cr3(), next.kstack_top);
         s.cpus[cpu].current = Some(next);
         s.graveyard.push(prev); // keep the stack alive
         out
@@ -410,7 +468,7 @@ fn reschedule(block: bool) {
             s.ready.push_back(prev.clone());
         }
         next.set_state(State::Running);
-        let out = (prev.ctx_ptr(), next.ctx_ptr(), cpu, next.cr3, next.kstack_top);
+        let out = (prev.ctx_ptr(), next.ctx_ptr(), cpu, next.cr3(), next.kstack_top);
         s.cpus[cpu].current = Some(next.clone());
         out
         // `prev` / `next` locals drop here. `next` stays alive via

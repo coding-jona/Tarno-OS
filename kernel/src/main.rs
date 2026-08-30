@@ -338,29 +338,17 @@ fn storage_milestone() {
     kprintln!("THOS: ahci ok          LBA 2 read; ext2 magic {:#06x}", magic);
 
     let fs = ext2::open().expect("mount ext2");
-    let bytes = fs.read_path("/hello").expect("read /hello from ext2");
-    kprintln!("THOS: ext2 ok          /hello = {} bytes", bytes.len());
+    let init = fs.read_path("/init").expect("read /init from ext2");
+    kprintln!("THOS: ext2 ok          /init = {} bytes", init.len());
 
-    // Two instances of the same ELF, each in its own address space, running as
-    // real preemptible user threads. Each prints and then SYS_EXITs.
-    let want = 2;
-    for i in 0..want {
-        let proc = process::Process::new();
-        let img = elf::load(&*proc, &bytes).expect("load ELF");
-        if i == 0 {
-            kprintln!("THOS: elf ok           entry {:#x}", img.entry);
-        }
-        let stack_top = proc.new_user_stack();
-        let rsp = proc.init_stack(stack_top, &["/hello", "world"], &["THOS=1"], &img);
-        sched::spawn_user("hello", proc, img.entry, rsp);
-    }
-    while syscall::user_exits() < want {
+    // /init forks, the child execve's /child, /init wait4s and prints the exit
+    // code. Two user tasks exit in total.
+    let pid = process::spawn_init(&init, &["/init"], &["THOS=1"]);
+    kprintln!("THOS: init spawned     pid {}", pid);
+    while syscall::user_exits() < 2 {
         sched::yield_now();
     }
-    kprintln!(
-        "THOS: user process ok  {} procs, own address spaces, argv/auxv stack",
-        want
-    );
+    kprintln!("THOS: fork/exec/wait4  ok (init + child both exited)");
 }
 
 /// Fill the framebuffer with a recognizable gradient so a human at the target

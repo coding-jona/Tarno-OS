@@ -10,22 +10,24 @@
 //! No `fork` sharing / COW yet, no address-space teardown (a reaper frees the
 //! frames later) — this is here to give ELF programs real isolation.
 
+use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use x86_64::structures::paging::{PageTable, PageTableFlags};
+use spin::Mutex;
+use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
 use x86_64::PhysAddr;
 
-use crate::elf::Image;
+use crate::elf::{self, Image};
 use crate::mm::{hhdm_offset, phys_to_virt, FRAME_ALLOC};
-use crate::vmm;
+use crate::syscall::{self, UserFrame};
+use crate::{gdt, sched, vmm};
 
-static NEXT_PID: AtomicU64 = AtomicU64::new(1);
-
-#[allow(dead_code)] // pid consumed by SYS_GETPID soon
+/// One address space. Shared kernel half (by pointer) + private user half.
 pub struct Process {
-    pub pid: u64,
     pml4_phys: u64,
     /// Next free user virtual address for `mmap` / stacks.
     next_user_va: AtomicU64,
@@ -55,7 +57,6 @@ impl Process {
         }
 
         Arc::new(Self {
-            pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
             pml4_phys,
             next_user_va: AtomicU64::new(USER_ALLOC_BASE),
             brk: AtomicU64::new(BRK_BASE),
@@ -64,6 +65,56 @@ impl Process {
 
     pub fn pml4_phys(&self) -> u64 {
         self.pml4_phys
+    }
+
+    fn copy_alloc_state_from(&self, other: &Process) {
+        self.next_user_va
+            .store(other.next_user_va.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.brk.store(other.brk.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    /// Visit every present 4 KiB user page: `(virt, phys, writable, exec)`.
+    fn for_each_user_page(&self, mut f: impl FnMut(u64, u64, bool, bool)) {
+        let hhdm = hhdm_offset();
+        let tbl = |phys: u64| unsafe { &*((phys + hhdm) as *const PageTable) };
+        for i4 in 1..256u64 {
+            let e4 = &tbl(self.pml4_phys)[i4 as usize];
+            if !e4.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            for i3 in 0..512u64 {
+                let e3 = &tbl(e4.addr().as_u64())[i3 as usize];
+                if !e3.flags().contains(PageTableFlags::PRESENT)
+                    || e3.flags().contains(PageTableFlags::HUGE_PAGE)
+                {
+                    continue;
+                }
+                for i2 in 0..512u64 {
+                    let e2 = &tbl(e3.addr().as_u64())[i2 as usize];
+                    if !e2.flags().contains(PageTableFlags::PRESENT)
+                        || e2.flags().contains(PageTableFlags::HUGE_PAGE)
+                    {
+                        continue;
+                    }
+                    for i1 in 0..512u64 {
+                        let e1 = &tbl(e2.addr().as_u64())[i1 as usize];
+                        let fl = e1.flags();
+                        if !fl.contains(PageTableFlags::PRESENT)
+                            || !fl.contains(PageTableFlags::USER_ACCESSIBLE)
+                        {
+                            continue;
+                        }
+                        let virt = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                        f(
+                            virt,
+                            e1.addr().as_u64(),
+                            fl.contains(PageTableFlags::WRITABLE),
+                            !fl.contains(PageTableFlags::NO_EXECUTE),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Map one 4 KiB user page into this address space.
@@ -219,5 +270,170 @@ impl Process {
         }
         self.write_user(rsp, &block);
         rsp
+    }
+}
+
+// ===========================================================================
+//  Tasks — the process-tree layer (pid, parent, exit status). Threads point
+//  here; `Task` owns the (execve-swappable) address space.
+// ===========================================================================
+
+static NEXT_PID: AtomicU64 = AtomicU64::new(1);
+static TASKS: Mutex<BTreeMap<u64, Arc<Task>>> = Mutex::new(BTreeMap::new());
+
+pub struct Task {
+    pub pid: u64,
+    pub ppid: u64,
+    space: Mutex<Arc<Process>>,
+    exit_status: Mutex<Option<i32>>,
+    exited: AtomicBool,
+}
+
+impl Task {
+    fn new(ppid: u64, space: Arc<Process>) -> Arc<Self> {
+        let t = Arc::new(Self {
+            pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
+            ppid,
+            space: Mutex::new(space),
+            exit_status: Mutex::new(None),
+            exited: AtomicBool::new(false),
+        });
+        TASKS.lock().insert(t.pid, t.clone());
+        t
+    }
+
+    pub fn space(&self) -> Arc<Process> {
+        self.space.lock().clone()
+    }
+
+    fn set_space(&self, s: Arc<Process>) {
+        *self.space.lock() = s;
+    }
+}
+
+fn user_selectors() -> (u64, u64) {
+    let s = gdt::selectors();
+    ((s.user_code.0 | 3) as u64, (s.user_data.0 | 3) as u64)
+}
+
+pub fn current_pid() -> u64 {
+    sched::current().task().map(|t| t.pid).unwrap_or(0)
+}
+
+/// Record an exit status on the current task (called from `exit`/`exit_group`).
+pub fn set_exit_status(code: i32) {
+    if let Some(t) = sched::current().task() {
+        *t.exit_status.lock() = Some(code);
+        t.exited.store(true, Ordering::Release);
+    }
+}
+
+/// `spawn` the initial user program: build its address space + entry stack and
+/// hand it to the scheduler. Returns the pid.
+pub fn spawn_init(bytes: &[u8], argv: &[&str], envp: &[&str]) -> u64 {
+    let space = Process::new();
+    let img = elf::load(&space, bytes).expect("spawn_init: bad ELF");
+    let stack_top = space.new_user_stack();
+    let rsp = space.init_stack(stack_top, argv, envp, &img);
+    let task = Task::new(0, space);
+    sched::spawn_user("init", task.clone(), img.entry, rsp);
+    task.pid
+}
+
+/// `fork`: eager (non-COW) copy of the caller's address space; the child
+/// resumes at the same user instruction with `rax = 0`.
+pub fn fork(frame: &UserFrame) -> i64 {
+    let parent = sched::current().task().expect("fork: not a user task");
+    let pspace = parent.space();
+
+    let cspace = Process::new();
+    cspace.copy_alloc_state_from(&pspace);
+    pspace.for_each_user_page(|virt, phys, w, x| {
+        let f = FRAME_ALLOC.lock().alloc().expect("fork: no frame");
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                phys_to_virt(PhysAddr::new(phys)).as_ptr::<u8>(),
+                phys_to_virt(f.start_address()).as_mut_ptr::<u8>(),
+                4096,
+            );
+        }
+        cspace.map(virt, f.start_address().as_u64(), w, x);
+    });
+
+    let child = Task::new(parent.pid, cspace);
+    let (cs, ss) = user_selectors();
+    let mut cf = *frame;
+    cf.rax = 0;
+    cf.cs = cs;
+    cf.ss = ss;
+    sched::spawn_user_frame("fork-child", child.clone(), cf);
+    child.pid as i64
+}
+
+/// `execve`: replace the current task's image. Does not return on success.
+pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
+    let cur = sched::current();
+    let task = cur.task().expect("execve: not a user task");
+
+    let space = Process::new();
+    let img = elf::load(&space, bytes).expect("execve: bad ELF");
+    let stack_top = space.new_user_stack();
+    let av: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let ev: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
+    let rsp = space.init_stack(stack_top, &av, &ev, &img);
+
+    let new_cr3 = space.pml4_phys();
+    task.set_space(space);
+    cur.set_cr3(new_cr3);
+
+    let (cs, ss) = user_selectors();
+    let f = UserFrame {
+        rip: img.entry,
+        rsp,
+        rflags: 0x202,
+        cs,
+        ss,
+        ..Default::default()
+    };
+
+    unsafe {
+        Cr3::write(
+            PhysFrame::from_start_address(PhysAddr::new(new_cr3)).unwrap(),
+            Cr3Flags::empty(),
+        );
+        syscall::thos_user_resume(&f)
+    }
+}
+
+/// `wait4`: poll for a zombie child (poll + yield; blocking wait comes later).
+pub fn wait4(pid: i64, status_ptr: u64) -> i64 {
+    let me = current_pid();
+    loop {
+        {
+            let mut tasks = TASKS.lock();
+            let hit = tasks
+                .values()
+                .find(|t| {
+                    t.ppid == me
+                        && t.exited.load(Ordering::Acquire)
+                        && (pid == -1 || t.pid == pid as u64)
+                })
+                .map(|t| (t.pid, t.exit_status.lock().unwrap_or(0)));
+            if let Some((cpid, status)) = hit {
+                tasks.remove(&cpid);
+                drop(tasks);
+                if status_ptr != 0 {
+                    unsafe { *(status_ptr as *mut i32) = (status & 0xFF) << 8 };
+                }
+                return cpid as i64;
+            }
+            let has_children = tasks
+                .values()
+                .any(|t| t.ppid == me && (pid == -1 || t.pid == pid as u64));
+            if !has_children {
+                return -10; // ECHILD
+            }
+        }
+        sched::yield_now();
     }
 }

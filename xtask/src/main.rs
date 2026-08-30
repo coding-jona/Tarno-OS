@@ -112,46 +112,54 @@ fn copy(from: &Path, to: &Path) {
 /// `isa-debug-exit` port: `(0x10 << 1) | 1`.
 const QEMU_SUCCESS: i32 = 33;
 
-/// An ext2 (1 KiB block) disk image containing `/hello` — the compiled test ELF
-/// — attached over AHCI. Rebuilt when the ELF source or this xtask changes.
-/// Needs `as`, `ld`, `mke2fs`, `debugfs` on PATH.
+/// An ext2 (1 KiB block) disk image containing the compiled test programs
+/// `/init` and `/child`, attached over AHCI. Rebuilt when a source or this
+/// xtask changes. Needs `as`, `ld`, `mke2fs`, `debugfs` on PATH.
 fn disk_image() -> PathBuf {
     let root = workspace_root();
     let img = root.join("target/disk.img");
-    let src = root.join("xtask/testdata/hello.s");
+    let progs = ["init", "child"];
 
-    let fresh = img
-        .metadata()
-        .and_then(|a| Ok((a.modified()?, src.metadata()?.modified()?)))
-        .map(|(i, s)| i > s)
-        .unwrap_or(false);
+    let newest_src = progs
+        .iter()
+        .filter_map(|n| {
+            root.join(format!("xtask/testdata/{n}.s")).metadata().ok()?.modified().ok()
+        })
+        .max();
+    let fresh = match (img.metadata().and_then(|m| m.modified()), newest_src) {
+        (Ok(i), Some(s)) => i > s,
+        _ => false,
+    };
     if fresh {
         return img;
     }
 
-    let obj = root.join("target/hello.o");
-    let elf = root.join("target/hello");
     std::fs::create_dir_all(root.join("target")).ok();
+    let mut elfs = Vec::new();
+    for name in progs {
+        let src = root.join(format!("xtask/testdata/{name}.s"));
+        let obj = root.join(format!("target/{name}.o"));
+        let elf = root.join(format!("target/{name}"));
+        run(Command::new("as").args(["-64", "-o", obj.to_str().unwrap(), src.to_str().unwrap()]));
+        run(Command::new("ld").args([
+            "-static", "-nostdlib", "-Ttext=0x666600000000", "-e", "_start",
+            "-o", elf.to_str().unwrap(), obj.to_str().unwrap(),
+        ]));
+        elfs.push((name, elf));
+    }
 
-    run(Command::new("as").args([
-        "-64", "-o", obj.to_str().unwrap(), src.to_str().unwrap(),
-    ]));
-    run(Command::new("ld").args([
-        "-static", "-nostdlib", "-Ttext=0x666600000000", "-e", "_start",
-        "-o", elf.to_str().unwrap(), obj.to_str().unwrap(),
-    ]));
-
-    // 4 MiB, 1 KiB blocks, 128-byte inodes, no fancy features.
     let _ = std::fs::remove_file(&img);
     run(Command::new("mke2fs").args([
         "-q", "-F", "-t", "ext2", "-b", "1024", "-I", "128",
         "-O", "^resize_inode,^dir_index,^ext_attr",
         img.to_str().unwrap(), "4096",
     ]));
-    run(Command::new("debugfs").args([
-        "-w", "-R", &format!("write {} hello", elf.to_str().unwrap()),
-        img.to_str().unwrap(),
-    ]));
+    for (name, elf) in elfs {
+        run(Command::new("debugfs").args([
+            "-w", "-R", &format!("write {} {name}", elf.to_str().unwrap()),
+            img.to_str().unwrap(),
+        ]));
+    }
     img
 }
 
