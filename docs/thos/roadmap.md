@@ -102,15 +102,27 @@ late.
   file owner/mode bits (see *Identity, privilege & login* below).
 - **Milestone 2:** booted from the real SSD, interactive shell on a real keyboard,
   statically linked Linux `x86_64` ELF binaries (BusyBox) run unmodified.
-  - Status: interactive shell (`/sh`, static-musl Rust) reads the USB keyboard,
-    `fork`+`execve`+`wait4`s programs off ext2, reports exit status. Verified in
-    CI (`cargo xtask kbd-test` types `init` and checks it runs). Still on the QEMU
-    disk image, not the real SSD (no installer yet).
+  - Status: **the interactive login shell is now stock BusyBox `sh` (ash)** —
+    `/busybox` with `argv[0] = "sh"`, replacing the toy `/sh`. It reads the USB
+    keyboard, `fork`/`execve`/`wait4`s programs off ext2, reports exit status,
+    and shows the `thos$ ` prompt. Verified in CI (`cargo xtask kbd-test` types
+    `init` and checks it runs under the BusyBox banner). Still on the QEMU disk
+    image, not the real SSD (no installer yet).
+  - Getting ash interactive needed a minimal terminal `ioctl`: `TCGETS` reports
+    a canonical-mode termios with the terminal's own **ECHO off** (our
+    line-disciplined console already echoes + edits), so ash turns the prompt on
+    but leaves line editing to us. `TCGETS` writes only the 36-byte
+    `struct __kernel_termios` glibc's `tcgetattr()` passes — writing the full
+    60-byte userspace struct smashed its stack canary. Plus the syscalls ash
+    needs on the way up: `clone(SIGCHLD, stack=0)`→fork, `newfstatat`,
+    `dup`/`dup2`/`dup3`/`fcntl(F_DUPFD)`, `nanosleep`, `sysinfo`, `waitid`,
+    `getppid`, `getpgrp`, `setpgid`/`setsid`/`chdir` (no-ops), `setuid`/`setgid`.
   - **Stock static BusyBox runs unmodified** (`cargo xtask busybox-test`, from the
     `busybox-static` package): `busybox echo …` loads via the ELF loader and
     exits cleanly through the POSIX personality — the Milestone-2 "unmodified
-    Linux x86-64 binary" bar. Still `bbtest`-gated only to keep the default boot
-    log terse. Next: make BusyBox `sh` the login shell in place of `/sh`.
+    Linux x86-64 binary" bar. Next: applet symlinks / a coreutils set on the
+    disk image so `ls`, `cat`, `cd` work from the prompt; pipes (`pipe2`) for
+    `|` and `$(…)`.
   - Disk I/O is batched: `mm` reserves a 1 MiB contiguous DMA arena, AHCI gives
     each tag a 32 KiB bounce buffer and transfers up to 32 KiB per NCQ command,
     and `ext2::read_file` issues one read per run of consecutive blocks. The

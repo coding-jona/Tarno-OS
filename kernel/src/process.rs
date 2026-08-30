@@ -380,6 +380,42 @@ impl Task {
         }
     }
 
+    /// Duplicate `oldfd` to the lowest free descriptor at or above `min`.
+    pub fn fd_dup(&self, oldfd: i32, min: i32) -> i32 {
+        let mut fds = self.fds.lock();
+        let Some(Some(file)) = fds.get(oldfd as usize).cloned() else {
+            return -9; // EBADF
+        };
+        let min = min.max(0) as usize;
+        if let Some(i) = (min..fds.len()).find(|&i| fds[i].is_none()) {
+            fds[i] = Some(file);
+            return i as i32;
+        }
+        while fds.len() < min {
+            fds.push(None);
+        }
+        fds.push(Some(file));
+        (fds.len() - 1) as i32
+    }
+
+    /// `dup2`: force `newfd` to refer to `oldfd`'s file (closing whatever was
+    /// there). Returns `newfd`, or `-EBADF` if `oldfd` is invalid.
+    pub fn fd_dup2(&self, oldfd: i32, newfd: i32) -> i32 {
+        if oldfd == newfd {
+            return if self.fd_get(oldfd).is_some() { newfd } else { -9 };
+        }
+        let mut fds = self.fds.lock();
+        let Some(Some(file)) = fds.get(oldfd as usize).cloned() else {
+            return -9;
+        };
+        let n = newfd.max(0) as usize;
+        while fds.len() <= n {
+            fds.push(None);
+        }
+        fds[n] = Some(file);
+        newfd
+    }
+
     /// fork inherits the parent's open files (shared, like POSIX).
     fn clone_fds(&self) -> Vec<Fd> {
         self.fds.lock().clone()
@@ -393,6 +429,18 @@ fn user_selectors() -> (u64, u64) {
 
 pub fn current_pid() -> u64 {
     sched::current().task().map(|t| t.pid).unwrap_or(0)
+}
+
+pub fn current_ppid() -> u64 {
+    sched::current().task().map(|t| t.ppid).unwrap_or(0)
+}
+
+/// `dup` / `dup2` / `fcntl(F_DUPFD)` on the current task's fd table.
+pub fn current_fd_dup(oldfd: i32, min: i32) -> i32 {
+    sched::current().task().map(|t| t.fd_dup(oldfd, min)).unwrap_or(-9)
+}
+pub fn current_fd_dup2(oldfd: i32, newfd: i32) -> i32 {
+    sched::current().task().map(|t| t.fd_dup2(oldfd, newfd)).unwrap_or(-9)
 }
 
 /// Record an exit status on the current task (called from `exit`/`exit_group`).
