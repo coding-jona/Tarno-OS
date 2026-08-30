@@ -537,9 +537,9 @@ fn storage_milestone() {
     kprintln!("THOS: musl binary ok   (static Rust/musl ran to exit)");
 
     // AHCI write: round-trip a known pattern through a scratch sector past the
-    // ext2 image (LBA 20000 = ~10 MiB; the fs is the first 8 MiB). The host
+    // ext2 image (LBA 50000 = ~25 MiB; the fs is the first 16 MiB). The host
     // side of `cargo xtask ahci-test` re-checks this landed in the disk file.
-    const SCRATCH_LBA: u64 = 20_000;
+    const SCRATCH_LBA: u64 = 50_000;
     let mut wbuf = [0u8; ahci::SECTOR];
     for (i, b) in wbuf.iter_mut().enumerate() {
         *b = (i as u8) ^ 0xA5;
@@ -565,6 +565,19 @@ fn storage_milestone() {
         assert!(fs.read_path("/thos-created.txt").as_deref() == Some(payload.as_slice()));
         assert!(fs.read_path("/thosdir/nested.txt").as_deref() == Some(b"nested ok\n".as_slice()));
         kprintln!("THOS: ext2 write ok    /thos-created.txt + /thosdir/nested.txt");
+
+        // unlink / rmdir: make a throwaway file + dir, delete them, prove gone.
+        fs.write_path("/thos-temp.txt", b"delete me\n").expect("ext2 temp write");
+        let _ = fs.mkdir_path("/thos-tmpdir");
+        assert!(fs.rmdir_path("/thosdir") == Err("directory not empty"));
+        fs.unlink_path("/thosdir/nested.txt").expect("ext2 unlink nested");
+        fs.rmdir_path("/thosdir").expect("ext2 rmdir");
+        fs.unlink_path("/thos-temp.txt").expect("ext2 unlink");
+        fs.rmdir_path("/thos-tmpdir").expect("ext2 rmdir tmpdir");
+        assert!(fs.read_path("/thos-temp.txt").is_none());
+        assert!(fs.path_lookup("/thosdir").is_none());
+        assert!(fs.unlink_path("/thos-temp.txt") == Err("no such file"));
+        kprintln!("THOS: ext2 unlink ok   removed files + dirs, backups re-synced");
     }
 
     #[cfg(feature = "stress")]

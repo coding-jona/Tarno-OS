@@ -188,17 +188,19 @@ fn disk_image() -> PathBuf {
     }
 
     let _ = std::fs::remove_file(&img);
+    // 16384 1-KiB blocks = 2 block groups, so `sparse_super` puts a backup
+    // superblock + GDT in group 1 and the ext2 write path has to keep it synced.
     run(Command::new("mke2fs").args([
         "-q", "-F", "-t", "ext2", "-b", "1024", "-I", "128",
         "-O", "^resize_inode,^dir_index,^ext_attr",
-        img.to_str().unwrap(), "8192",
+        img.to_str().unwrap(), "16384",
     ]));
-    // Grow the backing file past the 8 MiB filesystem so there is scratch space
-    // for the AHCI write test (LBA 20000) that the fs never touches.
+    // Grow the backing file past the 16 MiB filesystem so there is scratch space
+    // for the AHCI write test (LBA 50000) that the fs never touches.
     std::fs::OpenOptions::new()
         .write(true)
         .open(&img)
-        .and_then(|f| f.set_len(16 * 1024 * 1024))
+        .and_then(|f| f.set_len(32 * 1024 * 1024))
         .expect("extend disk.img");
     for (name, elf) in elfs {
         run(Command::new("debugfs").args([
@@ -670,7 +672,7 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
 }
 
 /// Must match `SCRATCH_LBA` / the pattern in `kernel/src/main.rs`.
-const AHCI_SCRATCH_LBA: u64 = 20_000;
+const AHCI_SCRATCH_LBA: u64 = 50_000;
 
 fn ahci_test(iso: &Path) {
     use std::io::Read;
@@ -709,24 +711,31 @@ fn ext2_test(iso: &Path) {
     let disk = disk_image();
 
     let serial = boot_kernel_headless("ext2", iso, &disk, 4);
-    if !serial.contains("THOS: ext2 write ok") {
-        eprintln!("ext2-test: FAIL — no in-boot ext2-write marker\n{serial}");
-        exit(1);
+    for m in ["THOS: ext2 write ok", "THOS: ext2 unlink ok"] {
+        if !serial.contains(m) {
+            eprintln!("ext2-test: FAIL — missing marker {m:?}\n{serial}");
+            exit(1);
+        }
     }
 
-    // The filesystem must still be consistent after our writes.
-    let fsck = Command::new("e2fsck")
-        .args(["-fn", disk.to_str().unwrap()])
-        .output()
-        .expect("run e2fsck");
-    if !fsck.status.success() {
-        eprintln!(
-            "ext2-test: FAIL — e2fsck reported problems (exit {:?})\n{}\n{}",
-            fsck.status.code(),
-            String::from_utf8_lossy(&fsck.stdout),
-            String::from_utf8_lossy(&fsck.stderr),
-        );
-        exit(1);
+    // The filesystem must still be consistent after the writes + deletes, via
+    // the primary superblock and the group-1 backup (`sync_backups`).
+    for sb in [None, Some("8193")] {
+        let mut c = Command::new("e2fsck");
+        c.arg("-fn");
+        if let Some(b) = sb {
+            c.args(["-b", b]);
+        }
+        let out = c.arg(disk.to_str().unwrap()).output().expect("run e2fsck");
+        if !out.status.success() {
+            eprintln!(
+                "ext2-test: FAIL — e2fsck ({}) reported problems (exit {:?})\n{}",
+                sb.map_or("primary", |b| b),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout),
+            );
+            exit(1);
+        }
     }
 
     let cat = |path: &str| -> String {
@@ -736,14 +745,13 @@ fn ext2_test(iso: &Path) {
             .expect("run debugfs");
         String::from_utf8_lossy(&o.stdout).into_owned()
     };
-    let a = cat("/thos-created.txt");
-    let b = cat("/thosdir/nested.txt");
-    if a.contains("ext2 write works on THOS") && b.contains("nested ok") {
-        println!("ext2-test: OK — e2fsck clean; /thos-created.txt + /thosdir/nested.txt on disk");
+    // `/thos-created.txt` is never deleted; `/thos-temp.txt` + `/thosdir` are.
+    let survivor = cat("/thos-created.txt");
+    let deleted = cat("/thos-temp.txt");
+    if survivor.contains("ext2 write works on THOS") && !deleted.contains("delete me") {
+        println!("ext2-test: OK — e2fsck clean (primary + backup); create + unlink/rmdir verified");
     } else {
-        eprintln!("ext2-test: FAIL — created files not readable from the host");
-        eprintln!("  /thos-created.txt   = {a:?}");
-        eprintln!("  /thosdir/nested.txt = {b:?}");
+        eprintln!("ext2-test: FAIL — survivor={survivor:?} deleted-still-there={deleted:?}");
         exit(1);
     }
 }

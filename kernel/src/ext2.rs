@@ -3,11 +3,12 @@
 //!
 //! Mount the SATA disk, walk a path from the root inode, read a file's data
 //! blocks (12 direct + single + double indirect). Write side: block / inode
-//! bitmap allocators, `write_path` (create-or-overwrite a regular file) and
-//! `mkdir_path`, enough for an installer to lay a tree down. Still missing:
-//! htree dirs, growing a directory past 12 direct blocks, backup superblock /
-//! group-descriptor copies (fine for a single-group image, not for the real
-//! multi-group SSD yet), 64-bit sizes, journalling, timestamps.
+//! bitmap allocators, `write_path` (create-or-overwrite a regular file),
+//! `mkdir_path`, `unlink_path`, `rmdir_path`; the backup superblock + group
+//! descriptors are re-synced from the primary after each change (`sparse_super`
+//! honoured) so `e2fsck` stays clean on a multi-group filesystem. Still missing:
+//! htree dirs, growing a directory past 12 direct blocks, 64-bit sizes,
+//! journalling, timestamps, hard links.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -27,6 +28,9 @@ pub struct Ext2 {
     block_count: u32,
     /// `s_feature_incompat & FILETYPE` — dir entries carry a file-type byte.
     filetype: bool,
+    /// `s_feature_ro_compat & SPARSE_SUPER` — backup SB/GDT only in groups
+    /// 0, 1, and powers of 3/5/7, not every group.
+    sparse_super: bool,
 }
 
 #[allow(dead_code)] // mode used once we honour permissions / file types
@@ -75,7 +79,8 @@ pub fn open() -> Result<Ext2, &'static str> {
         first_data_block: le32(&sb[20..]),
         blocks_per_group: le32(&sb[32..]),
         block_count: le32(&sb[4..]),
-        filetype: le32(&sb[96..]) & 0x0002 != 0, // EXT2_FEATURE_INCOMPAT_FILETYPE
+        filetype: le32(&sb[96..]) & 0x0002 != 0,      // FEATURE_INCOMPAT_FILETYPE
+        sparse_super: le32(&sb[100..]) & 0x0001 != 0, // FEATURE_RO_COMPAT_SPARSE_SUPER
     })
 }
 
@@ -569,16 +574,17 @@ impl Ext2 {
                     let links = le16(&raw[26..]);
                     set_inode(raw, mode, data.len() as u64, links, blocks512, &block);
                 });
-                Ok(())
             }
             None => {
                 let ino = self.alloc_inode(false).ok_or("no free inode")?;
                 self.patch_inode(ino, |raw| {
                     set_inode(raw, 0o100_644, data.len() as u64, 1, blocks512, &block);
                 });
-                self.dir_insert(parent_ino, name, ino, false)
+                self.dir_insert(parent_ino, name, ino, false)?;
             }
         }
+        self.sync_backups();
+        Ok(())
     }
 
     /// Create directory `path`. The parent must exist; `path` must not.
@@ -614,6 +620,164 @@ impl Ext2 {
         });
         self.dir_insert(parent_ino, name, ino, true)?;
         self.bump_links(parent_ino, 1); // the child's ".."
+        self.sync_backups();
         Ok(())
+    }
+
+    /// Remove `name` from directory `dir_ino`: splice its record out (merge into
+    /// the previous entry, or tombstone it with `inode = 0` if it is first in
+    /// its block). Returns the child inode number.
+    fn dir_remove(&self, dir_ino: u32, name: &str) -> Option<u32> {
+        let bs = self.block_size as usize;
+        let dir = self.read_inode(dir_ino);
+        for slot in 0..12 {
+            let bno = dir.block[slot];
+            if bno == 0 {
+                continue;
+            }
+            let mut blk = self.block(bno);
+            let mut off = 0;
+            let mut prev: Option<usize> = None;
+            while off + 8 <= bs {
+                let ino = le32(&blk[off..]);
+                let rec_len = le16(&blk[off + 4..]) as usize;
+                let name_len = blk[off + 6] as usize;
+                if rec_len == 0 || off + rec_len > bs {
+                    break;
+                }
+                if ino != 0
+                    && name_len == name.len()
+                    && &blk[off + 8..off + 8 + name_len] == name.as_bytes()
+                {
+                    match prev {
+                        Some(p) => {
+                            let merged = le16(&blk[p + 4..]) as usize + rec_len;
+                            blk[p + 4..p + 6].copy_from_slice(&(merged as u16).to_le_bytes());
+                        }
+                        None => blk[off..off + 4].copy_from_slice(&0u32.to_le_bytes()),
+                    }
+                    self.write_block(bno, &blk);
+                    return Some(ino);
+                }
+                prev = Some(off);
+                off += rec_len;
+            }
+        }
+        None
+    }
+
+    /// Mark an inode free in the bitmap + counts, and stamp it deleted.
+    fn free_inode(&self, ino: u32, is_dir: bool) {
+        let g = (ino - 1) / self.inodes_per_group;
+        let i = ((ino - 1) % self.inodes_per_group) as usize;
+        let bmb = le32(&self.read_bgd(g)[4..]);
+        let mut bm = self.block(bmb);
+        if bm[i / 8] & (1 << (i % 8)) != 0 {
+            bm[i / 8] &= !(1 << (i % 8));
+            self.write_block(bmb, &bm);
+            self.bgd_add16(g, 14, 1); // free inodes ++
+            self.sb_add32(16, 1);
+            if is_dir {
+                self.bgd_add16(g, 16, -1); // used dirs --
+            }
+        }
+        self.patch_inode(ino, |raw| {
+            raw[26..28].copy_from_slice(&0u16.to_le_bytes()); // i_links_count
+            // i_dtime: a plausible timestamp (2025-01-01). A tiny value like 1
+            // is mistaken by e2fsck for an orphan-list "next inode" pointer.
+            raw[20..24].copy_from_slice(&1_735_689_600u32.to_le_bytes());
+            raw[28..32].copy_from_slice(&0u32.to_le_bytes()); // i_blocks
+        });
+    }
+
+    /// Unlink a regular file: drop its last link and free it.
+    pub fn unlink_path(&self, path: &str) -> Result<(), &'static str> {
+        let (parent, name) = split_parent(path).ok_or("bad path")?;
+        let parent_ino = self.path_lookup(parent).ok_or("parent dir missing")?;
+        let ino = self.lookup(parent_ino, name).ok_or("no such file")?;
+        let node = self.read_inode(ino);
+        if node.mode & 0xF000 == 0x4000 {
+            return Err("is a directory");
+        }
+        self.dir_remove(parent_ino, name).ok_or("dirent vanished")?;
+        let links = le16(&disk_range(self.inode_off(ino) + 26, 2)); // i_links_count @ 26
+        if links <= 1 {
+            self.free_all_blocks(&node);
+            self.free_inode(ino, false);
+        } else {
+            self.bump_links(ino, -1);
+        }
+        self.sync_backups();
+        Ok(())
+    }
+
+    /// Remove an empty directory.
+    pub fn rmdir_path(&self, path: &str) -> Result<(), &'static str> {
+        let (parent, name) = split_parent(path).ok_or("bad path")?;
+        let parent_ino = self.path_lookup(parent).ok_or("parent dir missing")?;
+        let ino = self.lookup(parent_ino, name).ok_or("no such directory")?;
+        let node = self.read_inode(ino);
+        if node.mode & 0xF000 != 0x4000 {
+            return Err("not a directory");
+        }
+        let data = self.read_file(&node);
+        let mut off = 0;
+        while off + 8 <= data.len() {
+            let e_ino = le32(&data[off..]);
+            let rl = le16(&data[off + 4..]) as usize;
+            let nl = data[off + 6] as usize;
+            if rl == 0 {
+                break;
+            }
+            let nm = &data[off + 8..(off + 8 + nl).min(data.len())];
+            if e_ino != 0 && nm != b"." && nm != b".." {
+                return Err("directory not empty");
+            }
+            off += rl;
+        }
+        self.dir_remove(parent_ino, name).ok_or("dirent vanished")?;
+        self.free_all_blocks(&node);
+        self.free_inode(ino, true);
+        self.bump_links(parent_ino, -1); // the child's ".." is gone
+        self.sync_backups();
+        Ok(())
+    }
+
+    /// Does group `g` (>= 1) hold a backup superblock + GDT? (`sparse_super`.)
+    fn has_backup(&self, g: u32) -> bool {
+        if !self.sparse_super || g <= 1 {
+            return true;
+        }
+        [3u32, 5, 7].iter().any(|&base| {
+            let mut p = base;
+            while p < g {
+                match p.checked_mul(base) {
+                    Some(v) => p = v,
+                    None => return false,
+                }
+            }
+            p == g
+        })
+    }
+
+    /// Re-write every backup superblock + group-descriptor table from the
+    /// primary, so `e2fsck` stays happy after a mutation on a multi-group fs.
+    fn sync_backups(&self) {
+        let groups = self.group_count();
+        if groups <= 1 {
+            return;
+        }
+        let sb = disk_range(SB_OFFSET, 1024);
+        let gdt = disk_range(self.bgd_off(0), groups as usize * 32);
+        for g in 1..groups {
+            if !self.has_backup(g) {
+                continue;
+            }
+            let sb_blk = self.first_data_block + g * self.blocks_per_group;
+            let mut sbc = sb.clone();
+            sbc[90..92].copy_from_slice(&(g as u16).to_le_bytes()); // s_block_group_nr
+            disk_write(sb_blk as u64 * self.block_size as u64, &sbc);
+            disk_write((sb_blk + 1) as u64 * self.block_size as u64, &gdt);
+        }
     }
 }

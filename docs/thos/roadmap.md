@@ -52,12 +52,16 @@ late.
   (read the ESP).
   - Status: ext2 read (12 direct + single + double indirect) and write —
     block/inode bitmap allocators, `write_path` (create or overwrite a regular
-    file), `mkdir_path`; superblock + group-descriptor counts kept in sync.
-    `cargo xtask ext2-test` has the kernel create a file, a dir and a nested
-    file, then the host runs `e2fsck -fn` (clean) and `debugfs cat` on the
-    result. Missing: `unlink`/`rmdir`, growing a dir past 12 direct blocks,
-    htree, backup superblock/GDT copies (needed before writing the multi-group
-    SSD), timestamps.
+    file), `mkdir_path`, `unlink_path`, `rmdir_path`; primary superblock +
+    group-descriptor counts kept in sync, and the **backup SB + GDT re-synced
+    from the primary after every mutation** (`sparse_super` honoured) so a
+    multi-group filesystem stays `e2fsck`-clean. `unlink`/`rmdir`/`unlinkat`
+    syscalls wired. `cargo xtask ext2-test` runs on a **2-block-group** image:
+    the kernel creates a file/dir/nested file, then deletes files + dirs
+    (rejecting a non-empty `rmdir`), and the host runs `e2fsck -fn` against
+    **both the primary and the group-1 backup superblock** (both clean).
+    Missing: growing a dir past 12 direct blocks, htree, timestamps, hard
+    links, 64-bit sizes, journalling.
 - **AHCI/SATA driver** (Intel `8086:7a62`, standard AHCI 1.3.1 register interface,
   MSI/MSI-X, command list / FIS) → real root FS from the **Kingston A400 240 GB SATA
   SSD** (`sdc`). NVMe is Windows' disk and is never touched; an NVMe driver is

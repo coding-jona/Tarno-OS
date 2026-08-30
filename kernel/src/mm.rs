@@ -22,9 +22,10 @@ use x86_64::{PhysAddr, VirtAddr};
 
 const FRAME_SIZE: u64 = 4096;
 
-/// Bootstrap heap: 8 MiB static arena. Enough through early Phase 2;
-/// bookkeeping; replaced by a page-backed heap once we own the page tables.
-const HEAP_SIZE: usize = 8 * 1024 * 1024;
+/// Bootstrap heap: 32 MiB static arena. Covers the SMP stress milestone's
+/// hundreds of 16 KiB kernel stacks with room to spare; replaced by a
+/// page-backed heap once the page tables are ours (they now are — TODO).
+const HEAP_SIZE: usize = 32 * 1024 * 1024;
 static mut HEAP_ARENA: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 #[global_allocator]

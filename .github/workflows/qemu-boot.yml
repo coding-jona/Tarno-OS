@@ -65,6 +65,7 @@ jobs:
           grep -q "THOS: musl binary ok" boot.log
           grep -q "THOS: ahci write ok" boot.log
           grep -q "THOS: ext2 write ok" boot.log
+          grep -q "THOS: ext2 unlink ok" boot.log
           grep -q "THOS: xhci ok" boot.log
           grep -q "THOS: wait primitive" boot.log
           grep -q "THOS: halting." boot.log
