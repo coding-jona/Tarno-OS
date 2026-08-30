@@ -96,35 +96,56 @@ impl Ext2 {
         }
     }
 
+    /// Append one data block (a `0` pointer is a hole → zeros).
+    fn feed_block(&self, out: &mut Vec<u8>, bn: u32) {
+        if bn == 0 {
+            let bs = self.block_size as usize;
+            out.resize(out.len() + bs, 0);
+        } else {
+            out.extend_from_slice(&self.block(bn));
+        }
+    }
+
+    /// Follow a single-indirect block: `bs/4` data-block pointers.
+    fn feed_indirect(&self, out: &mut Vec<u8>, ind_bn: u32, total: usize) {
+        if ind_bn == 0 {
+            let span = (self.block_size as usize / 4) * self.block_size as usize;
+            let n = span.min(total.saturating_sub(out.len()));
+            out.resize(out.len() + n, 0);
+            return;
+        }
+        let ind = self.block(ind_bn);
+        for c in ind.chunks_exact(4) {
+            if out.len() >= total {
+                return;
+            }
+            self.feed_block(out, le32(c));
+        }
+    }
+
     pub fn read_file(&self, inode: &Inode) -> Vec<u8> {
         let total = inode.size as usize;
-        let bs = self.block_size as usize;
         let mut out = Vec::with_capacity(total);
-
-        // A zero block pointer is a *hole* (reads as zeros), not end-of-file —
-        // debugfs writes ELFs with holes over the alignment padding.
-        let push = |out: &mut Vec<u8>, bn: u32| {
-            if bn == 0 {
-                out.resize(out.len() + bs, 0);
-            } else {
-                out.extend_from_slice(&self.block(bn));
-            }
-        };
 
         for i in 0..12 {
             if out.len() >= total {
                 break;
             }
-            push(&mut out, inode.block[i]);
+            self.feed_block(&mut out, inode.block[i]);
         }
 
-        if out.len() < total && inode.block[12] != 0 {
-            let ind = self.block(inode.block[12]);
-            for c in ind.chunks_exact(4) {
+        if out.len() < total {
+            self.feed_indirect(&mut out, inode.block[12], total);
+        }
+
+        // Double indirect: bs/4 single-indirect blocks.
+        if out.len() < total && inode.block[13] != 0 {
+            let dind = self.block(inode.block[13]);
+            for c in dind.chunks_exact(4) {
                 if out.len() >= total {
                     break;
                 }
-                push(&mut out, le32(c));
+                self.feed_indirect(&mut out, le32(c), total);
             }
         }
 

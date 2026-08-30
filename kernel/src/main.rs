@@ -28,6 +28,7 @@ extern crate alloc;
 mod acpi;
 mod ahci;
 mod apic;
+mod cpu;
 mod elf;
 mod ext2;
 mod file;
@@ -115,6 +116,7 @@ extern "C" fn kmain() -> ! {
         None => kprintln!("THOS: framebuffer request unanswered"),
     }
 
+    cpu::enable_sse();
     gdt::init(0);
     idt::init();
     kprintln!("THOS: GDT + IDT loaded");
@@ -350,6 +352,15 @@ fn storage_milestone() {
         sched::yield_now();
     }
     kprintln!("THOS: fork/exec/wait4  ok (init + child both exited)");
+
+    // A real statically-linked musl Rust binary.
+    let rs = fs.read_path("/rusthello").expect("read /rusthello from ext2");
+    kprintln!("THOS: ext2 ok          /rusthello = {} bytes", rs.len());
+    process::spawn_init(&rs, &["/rusthello", "arg1"], &["PATH=/", "THOS=1"]);
+    while syscall::user_exits() < 3 {
+        sched::yield_now();
+    }
+    kprintln!("THOS: musl binary ok   (static Rust/musl ran to exit)");
 }
 
 /// Fill the framebuffer with a recognizable gradient so a human at the target

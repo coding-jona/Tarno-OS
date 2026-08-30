@@ -47,14 +47,19 @@ impl Process {
         let frame = FRAME_ALLOC.lock().alloc().expect("no frame for process PML4");
         let pml4_phys = frame.start_address().as_u64();
 
-        // Copy every entry of the kernel PML4: kernel-half + HHDM + identity are
-        // then shared with this process; the user half starts empty.
+        // Copy every entry of the kernel PML4 so the kernel half + HHDM are
+        // shared with this process, then drop PML4[0] — the kernel's low-4 GiB
+        // identity map. Kernel-CR3 threads keep it; a process must have its
+        // entire low half free so an ELF (e.g. static musl at 0x400000) can map
+        // there without colliding with a 1 GiB identity huge page.
         unsafe {
+            let dst = phys_to_virt(PhysAddr::new(pml4_phys)).as_mut_ptr::<u8>();
             core::ptr::copy_nonoverlapping(
                 phys_to_virt(PhysAddr::new(vmm::kernel_pml4_phys())).as_ptr::<u8>(),
-                phys_to_virt(PhysAddr::new(pml4_phys)).as_mut_ptr::<u8>(),
+                dst,
                 4096,
             );
+            *(dst as *mut u64) = 0; // PML4[0]
         }
 
         Arc::new(Self {

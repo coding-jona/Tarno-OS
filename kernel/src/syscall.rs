@@ -28,6 +28,11 @@ pub fn user_exits() -> u64 {
     USER_EXITS.load(Ordering::Acquire)
 }
 
+/// Count a user thread that ended without `exit` (e.g. killed by a fault).
+pub fn note_user_exit() {
+    USER_EXITS.fetch_add(1, Ordering::Release);
+}
+
 // Linux x86-64 syscall numbers.
 const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
@@ -54,6 +59,24 @@ const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
 const SYS_RSEQ: u64 = 334;
 const SYS_OPENAT: u64 = 257;
+const SYS_POLL: u64 = 7;
+const SYS_MPROTECT: u64 = 10;
+const SYS_MADVISE: u64 = 28;
+const SYS_MUNMAP: u64 = 11;
+const SYS_KILL: u64 = 62;
+const SYS_UNAME: u64 = 63;
+const SYS_GETCWD: u64 = 79;
+const SYS_READLINK: u64 = 89;
+const SYS_RT_SIGRETURN: u64 = 15;
+const SYS_SIGALTSTACK: u64 = 131;
+const SYS_GETTID: u64 = 186;
+const SYS_FUTEX: u64 = 202;
+const SYS_SCHED_GETAFFINITY: u64 = 204;
+const SYS_TKILL: u64 = 200;
+const SYS_TGKILL: u64 = 234;
+const SYS_CLOCK_GETTIME: u64 = 228;
+const SYS_PPOLL: u64 = 271;
+const SYS_READLINKAT: u64 = 267;
 
 const ENOSYS: i64 = -38;
 const EBADF: i64 = -9;
@@ -351,11 +374,64 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             a2 as i64
         }
 
-        SYS_GETPID => process::current_pid() as i64,
+        SYS_GETPID | SYS_GETTID => process::current_pid() as i64,
         SYS_SET_TID_ADDRESS => process::current_pid() as i64,
         SYS_IOCTL => ENOTTY,
-        SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_SET_ROBUST_LIST | SYS_PRLIMIT64 => 0,
+        SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_RT_SIGRETURN | SYS_SET_ROBUST_LIST
+        | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MPROTECT | SYS_MADVISE | SYS_MUNMAP | SYS_FUTEX => 0,
         SYS_RSEQ => ENOSYS,
+
+        // poll: mark valid fds as "no events", invalid as POLLNVAL.
+        SYS_POLL | SYS_PPOLL => {
+            let n = a2 as usize;
+            let fds = unsafe { core::slice::from_raw_parts_mut(a1 as *mut [u8; 8], n) };
+            let mut ready = 0i64;
+            for pfd in fds.iter_mut() {
+                let fd = i32::from_le_bytes([pfd[0], pfd[1], pfd[2], pfd[3]]);
+                let revents: u16 = if cur_fd(fd as u64).is_some() { 0 } else { 0x20 /* POLLNVAL */ };
+                pfd[6] = revents as u8;
+                pfd[7] = (revents >> 8) as u8;
+                if revents != 0 {
+                    ready += 1;
+                }
+            }
+            ready
+        }
+
+        SYS_CLOCK_GETTIME => {
+            unsafe { core::ptr::write_bytes(a2 as *mut u8, 0, 16) };
+            0
+        }
+
+        SYS_SCHED_GETAFFINITY => {
+            // report the online CPUs as a bitmask
+            let len = (a2 as usize).min(8);
+            let mask = ((1u64 << smp::cpu_count().min(64)) - 1).to_le_bytes();
+            unsafe { core::ptr::copy_nonoverlapping(mask.as_ptr(), a3 as *mut u8, len) };
+            len as i64
+        }
+
+        SYS_KILL | SYS_TKILL | SYS_TGKILL => {
+            // deliver only fatal signals; everything else is a no-op for now
+            let sig = if nr == SYS_TGKILL { a3 } else { a2 };
+            if sig == 6 || sig == 9 || sig == 15 {
+                process::set_exit_status(128 + sig as i32);
+                USER_EXITS.fetch_add(1, Ordering::Release);
+                sched::exit()
+            }
+            0
+        }
+
+        SYS_GETCWD => {
+            let n = (a2 as usize).min(2);
+            unsafe { core::ptr::copy_nonoverlapping(b"/\0".as_ptr(), a1 as *mut u8, n) };
+            2
+        }
+        SYS_READLINK | SYS_READLINKAT => EINVAL,
+        SYS_UNAME => {
+            unsafe { core::ptr::write_bytes(a1 as *mut u8, 0, 6 * 65) };
+            0
+        }
 
         SYS_FORK => process::fork(frame),
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-name: qemu-boot (Phase 1-2: fork/exec/wait4, syscalls, ext2, ELF)
+name: qemu-boot (Phase 1-2: static musl binary runs)
 
 on:
   push:
@@ -20,6 +20,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install nightly --profile minimal
           rustup target add x86_64-unknown-none
           rustup component add rust-src llvm-tools
+          rustup target add x86_64-unknown-linux-musl
 
       - name: Install QEMU + xorriso + OVMF
         run: |
@@ -59,6 +60,8 @@ jobs:
           grep -q "parent done" boot.log
           grep -q "a file read via open" boot.log
           grep -q "THOS: fork/exec/wait4  ok" boot.log
+          grep -q "hello from a static musl Rust binary" boot.log
+          grep -q "THOS: musl binary ok" boot.log
           grep -q "THOS: user process ok" boot.log
           grep -q "THOS: wait primitive" boot.log
           grep -q "THOS: halting." boot.log

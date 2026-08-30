@@ -74,7 +74,9 @@ extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn nmi(frame: InterruptStackFrame) {
-    fatal("NMI", &frame, None);
+    kprintln!("THOS trap: NMI\n{:#?}", frame);
+    exit_qemu(ExitCode::Failed);
+    hcf();
 }
 
 extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, code: u64) {
@@ -86,29 +88,34 @@ extern "x86-interrupt" fn stack_segment_fault(frame: InterruptStackFrame, code: 
 }
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) -> ! {
-    fatal("#DF double fault", &frame, Some(code));
-}
-
-extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
-    let cr2 = x86_64::registers::control::Cr2::read_raw();
-    let rsp: u64;
-    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack)) };
-    kprintln!(
-        "THOS trap: #PF cr2={:#x} err={:?} rip={:#x} handler_rsp={:#x}",
-        cr2,
-        code,
-        frame.instruction_pointer.as_u64(),
-        rsp
-    );
-    kprintln!("{:#?}", frame);
+    kprintln!("THOS trap: #DF double fault (error {:#x})\n{:#?}", code, frame);
     exit_qemu(ExitCode::Failed);
     hcf();
 }
 
+extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
+    let cr2 = x86_64::registers::control::Cr2::read_raw();
+    kprintln!(
+        "THOS trap: #PF cr2={:#x} err={:?} rip={:#x}",
+        cr2,
+        code,
+        frame.instruction_pointer.as_u64()
+    );
+    fatal("#PF page fault", &frame, None);
+}
+
+/// A fault from ring 3 kills the process; a fault in the kernel is fatal.
 fn fatal(name: &str, frame: &InterruptStackFrame, code: Option<u64>) -> ! {
+    let from_user = frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
     match code {
-        Some(c) => kprintln!("THOS trap: {} (error {:#x})", name, c),
-        None => kprintln!("THOS trap: {}", name),
+        Some(c) => kprintln!("THOS trap: {} (error {:#x}){}", name, c, if from_user { " [user]" } else { "" }),
+        None => kprintln!("THOS trap: {}{}", name, if from_user { " [user]" } else { "" }),
+    }
+    if from_user {
+        kprintln!("  killed user rip={:#x}", frame.instruction_pointer.as_u64());
+        crate::process::set_exit_status(139); // 128 + SIGSEGV
+        crate::syscall::note_user_exit();
+        crate::sched::exit();
     }
     kprintln!("{:#?}", frame);
     exit_qemu(ExitCode::Failed);

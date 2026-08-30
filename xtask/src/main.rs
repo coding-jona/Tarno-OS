@@ -120,11 +120,12 @@ fn disk_image() -> PathBuf {
     let img = root.join("target/disk.img");
     let progs = ["init", "child"];
 
-    let newest_src = progs
-        .iter()
-        .filter_map(|n| {
-            root.join(format!("xtask/testdata/{n}.s")).metadata().ok()?.modified().ok()
-        })
+    let newest_src = std::fs::read_dir(root.join("xtask/testdata"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.metadata().ok()?.modified().ok())
+        .chain(root.join("xtask/src/main.rs").metadata().and_then(|m| m.modified()))
         .max();
     let fresh = match (img.metadata().and_then(|m| m.modified()), newest_src) {
         (Ok(i), Some(s)) => i > s,
@@ -152,7 +153,7 @@ fn disk_image() -> PathBuf {
     run(Command::new("mke2fs").args([
         "-q", "-F", "-t", "ext2", "-b", "1024", "-I", "128",
         "-O", "^resize_inode,^dir_index,^ext_attr",
-        img.to_str().unwrap(), "4096",
+        img.to_str().unwrap(), "8192",
     ]));
     for (name, elf) in elfs {
         run(Command::new("debugfs").args([
@@ -166,6 +167,23 @@ fn disk_image() -> PathBuf {
     std::fs::write(&msg, b"hello a file read via open+lseek+read\n").unwrap();
     run(Command::new("debugfs").args([
         "-w", "-R", &format!("write {} message", msg.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+
+    // A real static-musl Rust binary -> /rusthello.
+    let rs = root.join("xtask/testdata/rusthello.rs");
+    let rsbin = root.join("target/rusthello");
+    run(Command::new("rustc").args([
+        "--target", "x86_64-unknown-linux-musl",
+        "-C", "relocation-model=static",
+        "-C", "link-args=-no-pie",
+        "-C", "strip=symbols",
+        "-O",
+        "-o", rsbin.to_str().unwrap(),
+        rs.to_str().unwrap(),
+    ]));
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} rusthello", rsbin.to_str().unwrap()),
         img.to_str().unwrap(),
     ]));
     img

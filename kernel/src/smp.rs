@@ -113,6 +113,7 @@ pub fn init(mp: &MpResponse) {
 unsafe extern "C" fn ap_entry(_info: &MpInfo) -> ! {
     // Move off Limine's page tables onto the shared kernel tables first.
     crate::vmm::activate();
+    crate::cpu::enable_sse();
 
     let index = NEXT_INDEX.fetch_add(1, Ordering::Relaxed);
     assert!((index as usize) < MAX_CPUS, "more CPUs than MAX_CPUS");
