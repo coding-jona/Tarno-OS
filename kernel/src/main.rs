@@ -28,11 +28,14 @@ extern crate alloc;
 mod acpi;
 mod ahci;
 mod apic;
+mod elf;
+mod ext2;
 mod gdt;
 mod idt;
 mod mm;
 mod object;
 mod pci;
+mod process;
 mod sched;
 mod serial;
 mod smp;
@@ -125,7 +128,6 @@ extern "C" fn kmain() -> ! {
     smp::init(mp);
 
     syscall::init_cpu(0);
-    syscall::selftest();
 
     scheduler_milestone();
     storage_milestone();
@@ -329,20 +331,24 @@ fn storage_milestone() {
     vfs::close(h);
     kprintln!("THOS: vfs ok           /hello {} bytes; entries {:?}", n, vfs::list());
 
-    match ahci::init() {
-        Ok(()) => {
-            let mut s0 = [0u8; ahci::SECTOR];
-            let mut s100 = [0u8; ahci::SECTOR];
-            ahci::read(0, &mut s0).expect("AHCI read LBA 0");
-            ahci::read(100, &mut s100).expect("AHCI read LBA 100");
-            kprintln!(
-                "THOS: ahci ok          LBA0=\"{}\" LBA100=\"{}\"",
-                core::str::from_utf8(&s0[..16]).unwrap_or("?"),
-                core::str::from_utf8(&s100[..16]).unwrap_or("?"),
-            );
-        }
-        Err(e) => kprintln!("THOS: ahci FAILED      {}", e),
+    ahci::init().expect("AHCI init");
+    let mut sb = [0u8; ahci::SECTOR];
+    ahci::read(2, &mut sb).expect("AHCI read LBA 2");
+    let magic = u16::from_le_bytes([sb[56], sb[57]]);
+    kprintln!("THOS: ahci ok          LBA 2 read; ext2 magic {:#06x}", magic);
+
+    let fs = ext2::open().expect("mount ext2");
+    let init = fs.read_path("/init").expect("read /init from ext2");
+    kprintln!("THOS: ext2 ok          /init = {} bytes", init.len());
+
+    // /init forks, the child execve's /child, /init wait4s and prints the exit
+    // code. Two user tasks exit in total.
+    let pid = process::spawn_init(&init, &["/init"], &["THOS=1"]);
+    kprintln!("THOS: init spawned     pid {}", pid);
+    while syscall::user_exits() < 2 {
+        sched::yield_now();
     }
+    kprintln!("THOS: fork/exec/wait4  ok (init + child both exited)");
 }
 
 /// Fill the framebuffer with a recognizable gradient so a human at the target

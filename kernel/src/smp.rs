@@ -35,19 +35,8 @@ static mut PER_CPU: [PerCpu; MAX_CPUS] = [const {
     PerCpu { self_ptr: 0, cpu_index: 0, lapic_id: 0, kernel_rsp: 0, user_scratch: 0 }
 }; MAX_CPUS];
 
-const SYSCALL_STACK_SIZE: usize = 16 * 1024;
-#[repr(align(16))]
-#[allow(dead_code)]
-struct SyscallStack([u8; SYSCALL_STACK_SIZE]);
-static mut SYSCALL_STACKS: [SyscallStack; MAX_CPUS] =
-    [const { SyscallStack([0; SYSCALL_STACK_SIZE]) }; MAX_CPUS];
-
-/// Top of this CPU's dedicated `syscall` entry stack.
-pub fn syscall_stack_top(cpu: usize) -> u64 {
-    assert!(cpu < MAX_CPUS);
-    unsafe { core::ptr::addr_of!(SYSCALL_STACKS[cpu]) as u64 + SYSCALL_STACK_SIZE as u64 }
-}
-
+/// Set the kernel stack the `syscall` entry stub loads (`gs:[kernel_rsp]`).
+/// The scheduler points this at the running user thread's kernel stack.
 pub fn set_kernel_rsp(cpu: usize, rsp: u64) {
     assert!(cpu < MAX_CPUS);
     unsafe { (*core::ptr::addr_of_mut!(PER_CPU[cpu])).kernel_rsp = rsp }

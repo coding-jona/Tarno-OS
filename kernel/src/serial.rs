@@ -67,6 +67,14 @@ pub fn print(s: &str) {
     write_str(&port, s);
 }
 
+/// Write raw bytes verbatim (no CR translation) — used by `write`/`writev`.
+pub fn write_bytes(bytes: &[u8]) {
+    let port = PORT.lock();
+    for &b in bytes {
+        port.write_byte(b);
+    }
+}
+
 fn write_str(port: &Uart, s: &str) {
     for byte in s.bytes() {
         if byte == b'\n' {

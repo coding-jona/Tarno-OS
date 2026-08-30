@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-name: qemu-boot (Phase 1-2: + syscall, VFS, AHCI)
+name: qemu-boot (Phase 1-2: fork/exec/wait4, syscalls, ext2, ELF)
 
 on:
   push:
@@ -24,7 +24,7 @@ jobs:
       - name: Install QEMU + xorriso + OVMF
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 xorriso ovmf
+          sudo apt-get install -y qemu-system-x86 xorriso ovmf e2fsprogs binutils
 
       - name: Build Limine
         run: make -C third_party/limine
@@ -50,10 +50,14 @@ jobs:
           grep -qE "THOS: SMP +4/4 CPUs online" boot.log
           grep -q "THOS: sched ok" boot.log
           grep -q "THOS: own page tables" boot.log
-          grep -q "hello from ring 3 via syscall" boot.log
-          grep -q "THOS: syscall selftest ok" boot.log
           grep -q "hello from the ram fs" boot.log
           grep -q "THOS: vfs ok" boot.log
-          grep -q 'THOS: ahci ok .*LBA0="THOS-AHCI-LBA0' boot.log
+          grep -q "THOS: ahci ok" boot.log
+          grep -q "THOS: ext2 ok" boot.log
+          grep -q "THOS: elf ok" boot.log
+          grep -q "child ran" boot.log
+          grep -q "parent done" boot.log
+          grep -q "THOS: fork/exec/wait4  ok" boot.log
+          grep -q "THOS: user process ok" boot.log
           grep -q "THOS: wait primitive" boot.log
           grep -q "THOS: halting." boot.log
