@@ -268,10 +268,26 @@ late.
     forwarder RVAs. `pe-test` does `LoadLibraryA("kernel32.dll")` →
     `GetProcAddress(h,"WriteFile")` → calls the resolved pointer
     (`PE GetProcAddress OK`).
-  - **Next:** a proper `ntdll` boundary, then real PE-built DLLs from a
-    `C:\Windows\System32` tree (loader recursion, real IAT binding against
-    on-disk exports); then process isolation / integrity for the security
-    phase.
+  - **`ntdll` boundary:** `nt::dispatch` is now two personalities over one set
+    of cores. `dispatch_ntdll` is the native `Nt*`/`Ldr*` layer — NTSTATUS
+    returns, `IO_STATUS_BLOCK` out-params, in-out pointers: `NtClose`,
+    `NtWriteFile`, `NtReadFile`, `NtAllocateVirtualMemory`,
+    `NtFree`/`ProtectVirtualMemory`, `NtTerminateProcess`,
+    `LdrGetProcedureAddress`, `LdrLoadDll`. `dispatch_kernel32` is the Win32
+    shim (BOOL / `LastError` / fd-as-HANDLE) and now *calls* the shared cores
+    (`file_write_core` / `file_read_core` / `handle_close_core` /
+    `mem_alloc_core` / `proc_terminate`). Selector bit `NT_NTDLL_FLAG` in a
+    stub's index routes between them. A second synthetic module `ntdll.dll`
+    (one page, `map_synth_dll`) is threaded into the `Ldr` lists as the third
+    `LDR_DATA_TABLE_ENTRY`. The standalone stub page is gone — `resolve_import`
+    returns the trampoline VA inside the owning module page, so a bound IAT
+    slot and a `GetProcAddress` result agree. `pe-test`:
+    `GetModuleHandleA("ntdll.dll")` → `GetProcAddress(h,"NtWriteFile")` → a
+    real 9-arg NT call (`PE ntdll OK`).
+  - **Next:** real PE-built DLLs from a `C:\Windows\System32` tree — an on-disk
+    `ntdll` / `kernel32` whose `Nt*` stubs are the syscall and whose `Rtl*` /
+    CRT code is real, loader recursion, IAT binding against on-disk exports;
+    then process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
