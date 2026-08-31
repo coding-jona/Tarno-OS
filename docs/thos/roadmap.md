@@ -336,7 +336,11 @@ late.
       and queues its callbacks. `map_teb_peb` sets `TEB+0x58`; the ring-3
       bootstrap runs TLS callbacks before `DllMain`s. `pe-test` verifies via
       `gs:[0x58]` (`PE TLS OK`). Still static-only — no `TlsAlloc`, one thread.
-    - honour a `FALSE` from `DllMain`.
+    - **`DllMain` returning `FALSE`** — *done.* The bootstrap loop tests `eax`
+      after each `DllMain` (not TLS callbacks) and, on `FALSE`, calls
+      `ExitProcess(0x135)` inline instead of jumping to the exe entry.
+      `pe-test`'s `failcrt.dll` aborts init so `pe-dllfail.exe`'s entry never
+      runs (`THOS: pe dllfail ok`).
   - **Then:** the real `ntdll` lower boundary (the `__wine_unix_call` seam +
     a wineserver-equivalent on the executive) so Wine's PE DLLs can sit on
     THOS; process isolation / integrity for the security phase.
