@@ -316,10 +316,22 @@ late.
     `thoscrt.dll` has a real `DllMain` that gates `thos_add` behind a sentinel,
     so `thos_add(40,2) == 42` now also proves `DllMain` ran first. Return value
     not yet acted on.
-  - **Next:** swap the hand-built test DLLs for **Wine-sourced** PE `kernel32` /
-    `ntdll` / `user32` … (dropped into `C:\Windows\System32`, the loader pulls
-    them); honour a `FALSE` from `DllMain`; then process isolation / integrity
-    for the security phase.
+  - **Toward real (Wine-sourced) DLLs.** Dropping a real `kernel32` / `ntdll` /
+    `user32` into `C:\Windows\System32` needs loader features that the
+    hand-built test DLLs don't exercise; each lands with its own synthetic
+    test:
+    - **import by ordinal** — *done.* `LoadedModule` now models the export
+      table (`eat` by `ordinal - ord_base`, `names` → index); a thunk with the
+      ordinal flag resolves via `by_ordinal`. `pe-test` imports
+      `thoscrt!thos_mul` by ordinal 2 (`PE dll ordinal OK`).
+    - **forwarder exports** — `kernel32` forwards hundreds of names as
+      `"NTDLL.RtlXxx"` strings; resolve them recursively.
+    - **TLS directory** (data dir 9) — allocate the TLS block, wire
+      `TEB.ThreadLocalStoragePointer`, run `AddressOfCallBacks`.
+    - honour a `FALSE` from `DllMain`.
+  - **Then:** the real `ntdll` lower boundary (the `__wine_unix_call` seam +
+    a wineserver-equivalent on the executive) so Wine's PE DLLs can sit on
+    THOS; process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
