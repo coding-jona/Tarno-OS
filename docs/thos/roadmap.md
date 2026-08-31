@@ -307,9 +307,19 @@ late.
     System32 DLLs, not just the synthetic ones — `pe-test` looks up
     `thoscrt!thos_add` at runtime and calls it (`PE dll Ldr OK`). Capped at 12
     file DLLs (multi-page region later).
-  - **Next:** run `DllMain(DLL_PROCESS_ATTACH)` for file DLLs; then swap the
-    hand-built test DLLs for **Wine-sourced** PE `kernel32` / `ntdll` /
-    `user32` …; then process isolation / integrity for the security phase.
+  - **`DllMain` before the exe entry:** when a loaded DLL has an entry point,
+    `load` builds a one-page ring-3 **process-bootstrap** (`PE_BOOTSTRAP_ADDR`)
+    and starts the thread there — a small loop that calls each
+    `DllMain(hinst, DLL_PROCESS_ATTACH, 1)` in dependency order, then jumps to
+    the real exe entry (Windows does this in `LdrpInitializeProcess`; THOS has
+    no user-mode loader yet, so the kernel emits the shim). `pe-test`'s
+    `thoscrt.dll` has a real `DllMain` that gates `thos_add` behind a sentinel,
+    so `thos_add(40,2) == 42` now also proves `DllMain` ran first. Return value
+    not yet acted on.
+  - **Next:** swap the hand-built test DLLs for **Wine-sourced** PE `kernel32` /
+    `ntdll` / `user32` … (dropped into `C:\Windows\System32`, the loader pulls
+    them); honour a `FALSE` from `DllMain`; then process isolation / integrity
+    for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
