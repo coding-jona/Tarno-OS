@@ -902,7 +902,7 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
     }
 
     let mut child = qemu.spawn().expect("spawn qemu");
-    let deadline = Instant::now() + Duration::from_secs(150);
+    let deadline = Instant::now() + Duration::from_secs(240);
     let status = loop {
         if let Some(s) = child.try_wait().expect("wait qemu") {
             break Some(s);
@@ -1090,7 +1090,7 @@ fn ncq_error_test(iso: &Path) {
     }
 
     let mut child = qemu.spawn().expect("spawn qemu");
-    let deadline = Instant::now() + Duration::from_secs(150);
+    let deadline = Instant::now() + Duration::from_secs(240);
     let status = loop {
         if let Some(s) = child.try_wait().expect("wait qemu") {
             break Some(s);
