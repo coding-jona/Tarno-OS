@@ -332,34 +332,46 @@ Phasing:
 - **Milestone 5:** a real Windows game (D3D11, no anti-cheat, statically resolvable)
   starts and is playable; a native Linux workload runs on the same cores concurrently.
 
-### Security architecture — enforce in the kernel, scan in userspace
+### Security architecture — a full antivirus, enforced in the kernel, scanning in userspace
 
-If THOS is ever a daily driver, security is a first-class subsystem, not a
-bolted-on package — but the **scanner never runs in the kernel**. A bug in a
-YARA rule or a PE analyser must not be able to panic the box.
+THOS ships a **full-featured antivirus / anti-malware capability** — this is a
+committed deliverable, not an optional add-on (*user, 2026-08-31*). What is
+deliberate is *where* it lives: the **scanner never runs in the kernel**. A bug
+in a YARA rule or a PE analyser must not be able to panic the box. "Full" means
+real detection coverage (signatures, heuristics, static analysis, quarantine,
+on-access + on-exec + on-demand scanning), delivered as the isolated userspace
+Security Service below — not "pick the strongest off-the-shelf AV and staple it
+into ring 0."
 
 - **Security Core (kernel):** the hard boundaries only — measured / secure boot,
   process isolation, the capability policy (already the identity model's
   direction), W^X + memory protection, file-integrity baselines. Small, auditable,
   no parsing of untrusted formats beyond what the loaders already do (now
   hostile-input hardened).
-- **Security Service (isolated userspace):** the scanners — file scanner
-  (YARA / open-source signatures), exec scanner (PE/ELF static analysis, reusing
-  `pe.rs` / `elf.rs`), network firewall / IDS. Talks to the Security Core over a
-  narrow capability-gated interface; a crash there degrades to a policy default,
-  it does not take the kernel down.
+- **Security Service (isolated userspace) — the full AV:** real-time (on-access
+  + on-exec) and on-demand scanning; file scanner (YARA + open-source signature
+  sets, e.g. ClamAV-style DBs); exec scanner (PE/ELF static analysis, reusing
+  `pe.rs` / `elf.rs` — import table, section entropy, packer detection);
+  heuristics; quarantine store; update mechanism for rules/signatures; network
+  firewall / IDS. Talks to the Security Core over a narrow capability-gated
+  interface; a crash there degrades to a policy default, it does not take the
+  kernel down.
+- **Milestone (Security):** a known-malicious EICAR-class test PE and ELF are
+  caught by the exec gate before their first instruction runs, quarantined, and
+  logged — with the scanner process killable and restartable without touching
+  the kernel.
 - **The native-exec gate** (unique to the hybrid design): every program entering
   the system — PE *or* ELF — passes one pipeline before it is allowed to run:
   `format detect → parse headers → hash / signature check → YARA / static
   analysis → policy engine → ALLOW | QUARANTINE`. Because both container formats
   execute natively, this gate covers the whole system with one mechanism instead
   of two half-measures.
-- **Not** "pick the strongest off-the-shelf AV and embed it." Composed from
-  open-source malware scanning + YARA + THOS's own PE/ELF analysis + integrity
-  checking.
-
-Deliberately **after** the kernel and Windows compatibility are real — noted here
-so it is designed in, not retrofitted.
+Sequencing: the AV is a firm requirement, but it is built **after** the NT
+personality (PE imports / `Nt*` dispatch / process isolation) is real — a
+scanner has nothing to protect until Windows binaries actually run, and the
+exec gate reuses the loader internals that are being built now. Designed in
+from the start (loaders already hostile-input hardened; identity model already
+capability-shaped), implemented as its own phase once M3 lands.
 
 ## Phase 6 — Research track: real `.sys` drivers (after M5)
 
