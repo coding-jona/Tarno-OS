@@ -62,6 +62,17 @@ late.
     **both the primary and the group-1 backup superblock** (both clean).
     Missing: growing a dir past 12 direct blocks, htree, timestamps, hard
     links, 64-bit sizes, journalling.
+  - Status: **read the ESP** — `gpt.rs` finds a partition by type GUID (the
+    `C12A7328-…` EFI System Partition) in a GPT whose LBA 0 is at an arbitrary
+    base; `fat.rs` reads FAT16 / FAT32 (BPB → FAT-width by cluster count → FAT
+    chain → 8.3 directory walk, VFAT long-name entries skipped).
+    `cargo xtask fat-test` splices a self-contained GPT image (protective MBR +
+    one ESP holding a FAT32 volume) into a hole past the ext2 image (LBA 51000);
+    the kernel does `gpt::find_esp(51000)` → `fat::Fat::open(esp_lba)` →
+    `read_path("/EFI/THOS/HELLO.TXT")` and prints it. Missing: FAT12, FAT
+    writes, long names, and mounting the ext2 root from a GPT partition rather
+    than raw LBA 0 (the "one real disk layout" migration — tied to the
+    installer).
 - **AHCI/SATA driver** (Intel `8086:7a62`, standard AHCI 1.3.1 register interface,
   MSI/MSI-X, command list / FIS) → real root FS from the **Kingston A400 240 GB SATA
   SSD** (`sdc`). NVMe is Windows' disk and is never touched; an NVMe driver is
@@ -120,9 +131,41 @@ late.
   - **Stock static BusyBox runs unmodified** (`cargo xtask busybox-test`, from the
     `busybox-static` package): `busybox echo …` loads via the ELF loader and
     exits cleanly through the POSIX personality — the Milestone-2 "unmodified
-    Linux x86-64 binary" bar. Next: applet symlinks / a coreutils set on the
-    disk image so `ls`, `cat`, `cd` work from the prompt; pipes (`pipe2`) for
-    `|` and `$(…)`.
+    Linux x86-64 binary" bar.
+  - **BusyBox applets from the prompt.** The disk image lays down `/bin/<applet>`
+    as **hard links** to the single `/busybox` inode (`debugfs ln` + an explicit
+    `links_count` so `e2fsck` stays clean); the shell's `PATH` is `/bin:/` and
+    BusyBox dispatches on `basename(argv[0])`. `ls` needed real directory reads,
+    which the kernel did not have: `ext2::read_dir` (entry filetype → Linux
+    `DT_*`), a `file::DirFile` that pre-renders `linux_dirent64` records, and the
+    `getdents64` syscall; `open` on a directory now returns a `DirFile`. `cat`
+    uses the existing `MemFile` path (plus a real `sendfile` so it takes its
+    fast path). `time` is stubbed to a fixed epoch (no RTC yet).
+  - **Per-process cwd.** `Task` carries a normalised absolute `cwd`;
+    `process::resolve_path` folds `.` / `..` / relative paths against it and is
+    applied at every path syscall (`open`/`openat`, `execve`, `newfstatat`,
+    `unlink`/`rmdir`). `chdir` verifies the target is an ext2 directory before
+    storing; `getcwd` returns the real string; `fork` inherits it, `execve`
+    keeps it. `cargo xtask kbd-test` now does `cd /bin` then a bare `ls` / `pwd`
+    and checks they act on `/bin`.
+  - **Pipes.** `pipe` / `pipe2` back a bounded (64 KiB) in-memory byte stream
+    with two typed `FileOps` endpoints; `read` blocks (yield) until data or all
+    write ends drop (EOF), `write` blocks until space or all read ends drop
+    (`EPIPE`). Endpoint counts track distinct endpoint objects, so an fd shared
+    by `fork`/`dup` counts once. Descriptors now carry a **close-on-exec** flag
+    (`FdEntry`): `O_CLOEXEC` on `pipe2`/`dup3`, `fcntl(F_GETFD/F_SETFD)`, and
+    `execve` drops the marked fds. A zombie task's fd table is cleared at
+    `exit` so the far end of a pipe sees EOF before `wait4` reaps it.
+    `cargo xtask pipe-test` boots BusyBox `sh -c` with a `|` and two `$(…)` and
+    checks the exact output.
+  - **Real blocking waits.** `WaitQueue::wait_if(pred)` closes the condvar
+    lost-wakeup race (queue lock held across predicate + enqueue). The three hot
+    spin loops now sleep instead of `yield`ing: pipe read/write on the pipe's
+    own `WaitQueue`, `wait4` on a global `CHILD_EXIT` queue woken at `exit`, and
+    fd-0 reads on a console `INPUT_WQ` woken by the keyboard poll thread — an
+    idle shell prompt no longer pins a core. Still missing: `fchdir` (no
+    fd→path), writing through `/bin/*` links, `nanosleep` (still a yield spin —
+    needs a timer wheel).
   - Disk I/O is batched: `mm` reserves a 1 MiB contiguous DMA arena, AHCI gives
     each tag a 32 KiB bounce buffer and transfers up to 32 KiB per NCQ command,
     and `ext2::read_file` issues one read per run of consecutive blocks. The

@@ -33,6 +33,24 @@ impl WaitQueue {
         });
     }
 
+    /// Condition-variable wait, race-free against a concurrent wake: the queue
+    /// lock is held across `should_block()` + the enqueue, and every `wake_*`
+    /// takes that same lock, so a wake can't slip between the check and the
+    /// sleep. A wake landing after the enqueue but before the actual block is
+    /// still safe — the thread just resumes early (callers must re-check their
+    /// condition in a loop, as with any condvar).
+    pub fn wait_if<F: FnOnce() -> bool>(&self, should_block: F) {
+        interrupts::without_interrupts(|| {
+            let mut w = self.waiters.lock();
+            if !should_block() {
+                return;
+            }
+            w.push_back(sched::current());
+            drop(w);
+            sched::block_current();
+        });
+    }
+
     /// Wake one blocked thread, if any. Returns whether one was woken.
     pub fn wake_one(&self) -> bool {
         match self.waiters.lock().pop_front() {

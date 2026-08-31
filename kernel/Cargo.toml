@@ -37,3 +37,6 @@ faulttest = []
 # `cargo xtask busybox-test`. Off by default — reading the 2 MiB binary a
 # block at a time slows every boot.
 bbtest = []
+# `pipetest`: run a BusyBox `sh -c` line with `|` and `$(…)` in
+# storage_milestone. Driven by `cargo xtask pipe-test`.
+pipetest = []

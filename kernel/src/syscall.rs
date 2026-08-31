@@ -71,6 +71,8 @@ const SYS_POLL: u64 = 7;
 const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
 const SYS_DUP3: u64 = 292;
+const SYS_PIPE: u64 = 22;
+const SYS_PIPE2: u64 = 293;
 const SYS_FCNTL: u64 = 72;
 const SYS_NANOSLEEP: u64 = 35;
 const SYS_CLOCK_NANOSLEEP: u64 = 230;
@@ -85,6 +87,9 @@ const SYS_SYSINFO: u64 = 99;
 const SYS_WAITID: u64 = 247;
 const SYS_CLONE: u64 = 56;
 const SYS_NEWFSTATAT: u64 = 262;
+const SYS_GETDENTS64: u64 = 217;
+const SYS_TIME: u64 = 201;
+const SYS_SENDFILE: u64 = 40;
 const SYS_SETUID: u64 = 105;
 const SYS_SETGID: u64 = 106;
 const SYS_MPROTECT: u64 = 10;
@@ -283,8 +288,26 @@ fn sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
     }
 }
 
+/// `pipe(fds)` / `pipe2(fds, flags)` — bounded in-memory pipe, two fresh fds
+/// written to `fds[0]` (read) and `fds[1]` (write). `O_CLOEXEC` (0o2000000) in
+/// `flags` marks both fds close-on-exec.
+fn sys_pipe(fds_ptr: u64, flags: u64) -> i64 {
+    let Some(task) = sched::current().task() else { return EBADF };
+    let cloexec = flags & 0o2000000 != 0;
+    let (r, w) = crate::file::pipe();
+    let rf: alloc::sync::Arc<dyn crate::file::FileOps> = r;
+    let wf: alloc::sync::Arc<dyn crate::file::FileOps> = w;
+    let rfd = task.fd_alloc_flags(rf, cloexec);
+    let wfd = task.fd_alloc_flags(wf, cloexec);
+    unsafe {
+        *(fds_ptr as *mut i32) = rfd;
+        *((fds_ptr + 4) as *mut i32) = wfd;
+    }
+    0
+}
+
 fn sys_unlink(path_ptr: u64, dir: bool) -> i64 {
-    let path = user_cstr(path_ptr);
+    let path = process::resolve_path(&user_cstr(path_ptr));
     let Some(fs) = ext2::open().ok() else { return EIO };
     let r = if dir { fs.rmdir_path(&path) } else { fs.unlink_path(&path) };
     match r {
@@ -298,13 +321,20 @@ fn sys_unlink(path_ptr: u64, dir: bool) -> i64 {
 }
 
 fn sys_open(path_ptr: u64) -> i64 {
-    let path = user_cstr(path_ptr);
+    let path = process::resolve_path(&user_cstr(path_ptr));
     let Some(task) = sched::current().task() else {
         return EBADF;
     };
-    match ext2::open().ok().and_then(|fs| fs.read_path(&path)) {
-        Some(bytes) => task.fd_alloc(crate::file::MemFile::new(bytes)) as i64,
-        None => ENOENT,
+    let Some(fs) = ext2::open().ok() else { return EIO };
+    let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
+    let node = fs.read_inode(ino);
+    if node.mode & 0xF000 == 0x4000 {
+        // A directory: hand back a `getdents64`-able stream.
+        let entries: alloc::vec::Vec<(u64, u8, alloc::string::String)> =
+            fs.read_dir(ino).into_iter().map(|(i, t, n)| (i as u64, t, n)).collect();
+        task.fd_alloc(crate::file::DirFile::new(&entries)) as i64
+    } else {
+        task.fd_alloc(crate::file::MemFile::new(fs.read_file(&node))) as i64
     }
 }
 
@@ -366,16 +396,64 @@ fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
     }
 }
 
-/// `newfstatat(dirfd, path, statbuf, flags)` — absolute paths via ext2, plus
+/// `sendfile(out_fd, in_fd, off_ptr, count)` — copy `count` bytes from `in_fd`
+/// to `out_fd` through a small bounce buffer. If `off_ptr` is non-NULL it names
+/// the start offset in `in_fd` and receives the new offset; `in_fd`'s own file
+/// position is otherwise used.
+fn sys_sendfile(out_fd: u64, in_fd: u64, off_ptr: u64, count: u64) -> i64 {
+    let (Some(src), Some(dst)) = (cur_fd(in_fd), cur_fd(out_fd)) else {
+        return EBADF;
+    };
+    if off_ptr != 0 {
+        let start = unsafe { *(off_ptr as *const i64) };
+        if src.seek(start, crate::file::SEEK_SET) < 0 {
+            return EINVAL;
+        }
+    }
+    let mut buf = [0u8; 4096];
+    let mut left = count as usize;
+    let mut total: i64 = 0;
+    while left > 0 {
+        let want = left.min(buf.len());
+        let n = src.read(&mut buf[..want]);
+        if n <= 0 {
+            if n < 0 && total == 0 {
+                return n;
+            }
+            break;
+        }
+        let n = n as usize;
+        let w = dst.write(&buf[..n]);
+        if w < 0 {
+            if total == 0 {
+                return w;
+            }
+            break;
+        }
+        total += w;
+        left -= w as usize;
+        if (w as usize) < n {
+            break;
+        }
+    }
+    if off_ptr != 0 {
+        let cur = src.seek(0, crate::file::SEEK_CUR);
+        if cur >= 0 {
+            unsafe { *(off_ptr as *mut i64) = cur };
+        }
+    }
+    total
+}
+
+/// `newfstatat(dirfd, path, statbuf, flags)` — path resolved against the task
+/// cwd (a real `dirfd` other than `AT_FDCWD` is not honoured), plus
 /// `AT_EMPTY_PATH` fstat.
 fn sys_newfstatat(dirfd: u64, path_ptr: u64, buf: u64, flags: u64) -> i64 {
-    let path = user_cstr(path_ptr);
-    if path.is_empty() && flags & 0x1000 != 0 {
+    let raw = user_cstr(path_ptr);
+    if raw.is_empty() && flags & 0x1000 != 0 {
         return sys_fstat(dirfd, buf);
     }
-    if !path.starts_with('/') {
-        return ENOENT; // no per-process cwd yet
-    }
+    let path = process::resolve_path(&raw);
     let Some(fs) = ext2::open().ok() else { return -5 /* EIO */ };
     let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
     let node = fs.read_inode(ino);
@@ -461,6 +539,28 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             }
         }
         SYS_LSEEK => cur_fd(a1).map(|f| f.seek(a2 as i64, a3 as u32)).unwrap_or(EBADF),
+
+        // time(2): seconds since the epoch. No RTC yet — a fixed plausible value
+        // keeps `ls` and friends from tripping the unhandled-syscall path.
+        SYS_TIME => {
+            let t: i64 = 1_735_689_600; // 2025-01-01
+            if a1 != 0 {
+                unsafe { *(a1 as *mut i64) = t };
+            }
+            t
+        }
+
+        // sendfile(out, in, *offset, count): plain copy loop through a bounce
+        // buffer. Lets `cat` / `cp` use their fast path instead of falling back.
+        SYS_SENDFILE => sys_sendfile(a1, a2, a3, a4),
+
+        SYS_GETDENTS64 => match cur_fd(a1) {
+            Some(f) => {
+                let buf = unsafe { core::slice::from_raw_parts_mut(a2 as *mut u8, a3 as usize) };
+                f.getdents64(buf)
+            }
+            None => EBADF,
+        },
         SYS_FSTAT => sys_fstat(a1, a2),
 
         SYS_ARCH_PRCTL => match a1 {
@@ -498,20 +598,56 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_IOCTL => sys_ioctl(a1, a2, a3),
         SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_RT_SIGRETURN | SYS_SET_ROBUST_LIST
         | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MPROTECT | SYS_MADVISE | SYS_MUNMAP | SYS_FUTEX
-        | SYS_PRCTL | SYS_CHDIR | SYS_FCHDIR | SYS_SETPGID | SYS_SETSID => 0,
+        | SYS_PRCTL | SYS_FCHDIR | SYS_SETPGID | SYS_SETSID => 0,
         SYS_RSEQ => ENOSYS,
+
+        // chdir: normalise against the cwd, verify it names a directory in ext2.
+        SYS_CHDIR => {
+            let path = process::resolve_path(&user_cstr(a1));
+            match ext2::open().ok().and_then(|fs| {
+                fs.path_lookup(&path).map(|ino| fs.read_inode(ino).mode)
+            }) {
+                Some(mode) if mode & 0xF000 == 0x4000 => {
+                    process::set_current_cwd(path);
+                    0
+                }
+                Some(_) => ENOTDIR,
+                None => ENOENT,
+            }
+        }
 
         // No process groups; job-control shells just want a plausible answer.
         SYS_GETPGRP | SYS_GETPGID => process::current_pid() as i64,
 
-        SYS_DUP => process::current_fd_dup(a1 as i32, 0) as i64,
-        SYS_DUP2 | SYS_DUP3 => process::current_fd_dup2(a1 as i32, a2 as i32) as i64,
+        SYS_PIPE => sys_pipe(a1, 0),
+        SYS_PIPE2 => sys_pipe(a1, a2),
 
-        // fcntl: enough for a shell's redirection / cloexec bookkeeping.
+        SYS_DUP => process::current_fd_dup(a1 as i32, 0) as i64,
+        SYS_DUP2 => process::current_fd_dup2(a1 as i32, a2 as i32) as i64,
+        // dup3(old, new, flags): flags bit O_CLOEXEC (0o2000000); old==new is EINVAL.
+        SYS_DUP3 => {
+            if a1 == a2 {
+                EINVAL
+            } else {
+                process::current_fd_dup3(a1 as i32, a2 as i32, a3 & 0o2000000 != 0) as i64
+            }
+        }
+
+        // fcntl: F_DUPFD(0) / F_DUPFD_CLOEXEC(1030), F_GETFD(1) / F_SETFD(2),
+        // F_GETFL(3) / F_SETFL(4). FD_CLOEXEC is bit 0 of the F_*FD arg.
         SYS_FCNTL => match a2 {
-            0 | 1030 => process::current_fd_dup(a1 as i32, a3 as i32) as i64, // F_DUPFD[_CLOEXEC]
-            3 => 0o2,                                                        // F_GETFL -> O_RDWR
-            1 | 2 | 4 => 0, // F_GETFD / F_SETFD / F_SETFL
+            0 => process::current_fd_dup(a1 as i32, a3 as i32) as i64,
+            1030 => {
+                let fd = process::current_fd_dup(a1 as i32, a3 as i32);
+                if fd >= 0 {
+                    process::current_fd_set_cloexec(fd, true);
+                }
+                fd as i64
+            }
+            1 => process::current_fd_get_cloexec(a1 as i32) as i64,
+            2 => process::current_fd_set_cloexec(a1 as i32, a3 & 1 != 0) as i64,
+            3 => 0o2, // F_GETFL -> O_RDWR
+            4 => 0,   // F_SETFL
             _ => 0,
         },
 
@@ -570,10 +706,19 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             0
         }
 
+        // getcwd(buf, size): write the path + NUL, return its length incl. NUL.
         SYS_GETCWD => {
-            let n = (a2 as usize).min(2);
-            unsafe { core::ptr::copy_nonoverlapping(b"/\0".as_ptr(), a1 as *mut u8, n) };
-            2
+            let cwd = process::current_cwd();
+            let need = cwd.len() + 1;
+            if a1 == 0 || (a2 as usize) < need {
+                -34 // ERANGE
+            } else {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(cwd.as_ptr(), a1 as *mut u8, cwd.len());
+                    *((a1 + cwd.len() as u64) as *mut u8) = 0;
+                }
+                need as i64
+            }
         }
         SYS_READLINK | SYS_READLINKAT => EINVAL,
         SYS_UNAME => {
@@ -598,7 +743,7 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_SETUID | SYS_SETGID => 0,
 
         SYS_EXECVE => {
-            let path = user_cstr(a1);
+            let path = process::resolve_path(&user_cstr(a1));
             let argv = user_cstr_array(a2);
             let envp = user_cstr_array(a3);
             match ext2::open().ok().and_then(|fs| fs.read_path(&path)) {

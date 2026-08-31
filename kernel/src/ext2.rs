@@ -259,6 +259,41 @@ impl Ext2 {
         None
     }
 
+    /// Every live entry of a directory as `(inode, d_type, name)` with `d_type`
+    /// already translated to the Linux `DT_*` namespace (`getdents64`). Falls
+    /// back to the entry inode's `i_mode` when the on-disk filetype byte is 0.
+    pub fn read_dir(&self, dir_ino: u32) -> Vec<(u32, u8, alloc::string::String)> {
+        let data = self.read_file(&self.read_inode(dir_ino));
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off + 8 <= data.len() {
+            let ino = le32(&data[off..]);
+            let rec_len = le16(&data[off + 4..]) as usize;
+            let name_len = data[off + 6] as usize;
+            let ftype = data[off + 7];
+            if rec_len == 0 {
+                break;
+            }
+            if ino != 0 && off + 8 + name_len <= data.len() {
+                if let Ok(name) = core::str::from_utf8(&data[off + 8..off + 8 + name_len]) {
+                    let dt = match ftype {
+                        1 => 8,  // reg
+                        2 => 4,  // dir
+                        3 => 2,  // chr
+                        4 => 6,  // blk
+                        5 => 1,  // fifo
+                        6 => 12, // sock
+                        7 => 10, // symlink
+                        _ => (self.read_inode(ino).mode >> 12) as u8,
+                    };
+                    out.push((ino, dt, name.into()));
+                }
+            }
+            off += rec_len;
+        }
+        out
+    }
+
     pub fn path_lookup(&self, path: &str) -> Option<u32> {
         let mut ino = ROOT_INO;
         for comp in path.split('/').filter(|s| !s.is_empty()) {

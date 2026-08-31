@@ -12,8 +12,11 @@ use alloc::collections::VecDeque;
 use spin::Mutex;
 
 use crate::serial;
+use crate::wait::WaitQueue;
 
 static QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
+/// Woken when a byte lands in `QUEUE` — a blocked `read` on fd 0 sleeps on it.
+static INPUT_WQ: WaitQueue = WaitQueue::new();
 static PREV: Mutex<[u8; 6]> = Mutex::new([0; 6]);
 /// Bytes on the current line not yet consumed by a reader — for backspace.
 static LINE_LEN: Mutex<usize> = Mutex::new(0);
@@ -95,6 +98,7 @@ pub fn feed_report(rpt: &[u8; 8]) {
     let altgr = rpt[0] & 0b0100_0000 != 0; // Right Alt (AltGr)
     let keys = [rpt[2], rpt[3], rpt[4], rpt[5], rpt[6], rpt[7]];
     let mut prev = PREV.lock();
+    let mut pushed = false;
 
     for &k in &keys {
         if k == 0 || prev.contains(&k) {
@@ -117,6 +121,7 @@ pub fn feed_report(rpt: &[u8; 8]) {
             }
         } else {
             QUEUE.lock().push_back(c);
+            pushed = true;
             let mut ll = LINE_LEN.lock();
             if c == b'\n' {
                 *ll = 0;
@@ -131,6 +136,10 @@ pub fn feed_report(rpt: &[u8; 8]) {
         }
     }
     *prev = keys;
+    drop(prev);
+    if pushed {
+        INPUT_WQ.wake_all();
+    }
 }
 
 /// Non-blocking read into `buf`; returns bytes moved.
@@ -141,6 +150,11 @@ pub fn read(buf: &mut [u8]) -> usize {
         *b = q.pop_front().unwrap();
     }
     n
+}
+
+/// Block the current thread until at least one byte is available for `read`.
+pub fn wait_for_input() {
+    INPUT_WQ.wait_if(|| QUEUE.lock().is_empty());
 }
 
 #[allow(dead_code)] // used by an interactive line-reader

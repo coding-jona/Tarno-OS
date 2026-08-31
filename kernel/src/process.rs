@@ -289,6 +289,9 @@ impl Process {
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static TASKS: Mutex<BTreeMap<u64, Arc<Task>>> = Mutex::new(BTreeMap::new());
+/// Woken whenever any task records its exit status — `wait4` sleeps on it
+/// instead of polling.
+static CHILD_EXIT: crate::wait::WaitQueue = crate::wait::WaitQueue::new();
 
 /// The logged-in session identity, stamped onto every task created after login.
 /// `(uid, name)`. Grows into the executive `Principal`.
@@ -307,7 +310,14 @@ pub fn current_uid() -> u32 {
     sched::current().task().map(|t| t.uid).unwrap_or(0)
 }
 
-type Fd = Option<Arc<dyn FileOps>>;
+/// One open descriptor: the shared file object plus its close-on-exec flag
+/// (the flag is per-descriptor, not per open-file-description).
+#[derive(Clone)]
+pub struct FdEntry {
+    pub file: Arc<dyn FileOps>,
+    pub cloexec: bool,
+}
+type Fd = Option<FdEntry>;
 
 pub struct Task {
     pub pid: u64,
@@ -318,12 +328,15 @@ pub struct Task {
     exited: AtomicBool,
     /// File descriptor table. 0/1/2 seeded with the console.
     fds: Mutex<Vec<Fd>>,
+    /// Current working directory, always a normalised absolute path.
+    cwd: Mutex<String>,
 }
 
 fn seed_fds() -> Vec<Fd> {
     let stdin: Arc<dyn FileOps> = Arc::new(KeyboardFile);
     let out: Arc<dyn FileOps> = Arc::new(ConsoleFile { writable: true });
-    alloc::vec![Some(stdin), Some(out.clone()), Some(out)]
+    let e = |file: Arc<dyn FileOps>| Some(FdEntry { file, cloexec: false });
+    alloc::vec![e(stdin), e(out.clone()), e(out)]
 }
 
 impl Task {
@@ -336,6 +349,7 @@ impl Task {
             exit_status: Mutex::new(None),
             exited: AtomicBool::new(false),
             fds: Mutex::new(seed_fds()),
+            cwd: Mutex::new(String::from("/")),
         });
         TASKS.lock().insert(t.pid, t.clone());
         t
@@ -351,19 +365,24 @@ impl Task {
 
     pub fn fd_get(&self, fd: i32) -> Option<Arc<dyn FileOps>> {
         let fds = self.fds.lock();
-        fds.get(fd as usize).and_then(|f| f.clone())
+        fds.get(fd as usize).and_then(|f| f.as_ref()).map(|e| e.file.clone())
     }
 
     pub fn fd_alloc(&self, file: Arc<dyn FileOps>) -> i32 {
+        self.fd_alloc_flags(file, false)
+    }
+
+    /// Install `file` at the lowest free descriptor, with the given cloexec flag.
+    pub fn fd_alloc_flags(&self, file: Arc<dyn FileOps>, cloexec: bool) -> i32 {
         let mut fds = self.fds.lock();
-        let slot = fds.iter().position(|f| f.is_none());
-        match slot {
+        let entry = Some(FdEntry { file, cloexec });
+        match fds.iter().position(|f| f.is_none()) {
             Some(i) => {
-                fds[i] = Some(file);
+                fds[i] = entry;
                 i as i32
             }
             None => {
-                fds.push(Some(file));
+                fds.push(entry);
                 (fds.len() - 1) as i32
             }
         }
@@ -380,39 +399,73 @@ impl Task {
         }
     }
 
-    /// Duplicate `oldfd` to the lowest free descriptor at or above `min`.
+    /// `F_GETFD` / `F_SETFD` on the close-on-exec flag. Returns `0`/`1`, or
+    /// `-EBADF`.
+    pub fn fd_get_cloexec(&self, fd: i32) -> i32 {
+        match self.fds.lock().get(fd as usize).and_then(|f| f.as_ref()) {
+            Some(e) => e.cloexec as i32,
+            None => -9,
+        }
+    }
+    pub fn fd_set_cloexec(&self, fd: i32, on: bool) -> i32 {
+        match self.fds.lock().get_mut(fd as usize).and_then(|f| f.as_mut()) {
+            Some(e) => {
+                e.cloexec = on;
+                0
+            }
+            None => -9,
+        }
+    }
+
+    /// execve: drop every descriptor marked close-on-exec.
+    fn close_on_exec(&self) {
+        for slot in self.fds.lock().iter_mut() {
+            if slot.as_ref().map_or(false, |e| e.cloexec) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Duplicate `oldfd` to the lowest free descriptor at or above `min`. The
+    /// new descriptor never inherits close-on-exec (`F_DUPFD` semantics).
     pub fn fd_dup(&self, oldfd: i32, min: i32) -> i32 {
         let mut fds = self.fds.lock();
-        let Some(Some(file)) = fds.get(oldfd as usize).cloned() else {
+        let Some(Some(mut entry)) = fds.get(oldfd as usize).cloned() else {
             return -9; // EBADF
         };
+        entry.cloexec = false;
         let min = min.max(0) as usize;
         if let Some(i) = (min..fds.len()).find(|&i| fds[i].is_none()) {
-            fds[i] = Some(file);
+            fds[i] = Some(entry);
             return i as i32;
         }
         while fds.len() < min {
             fds.push(None);
         }
-        fds.push(Some(file));
+        fds.push(Some(entry));
         (fds.len() - 1) as i32
     }
 
-    /// `dup2`: force `newfd` to refer to `oldfd`'s file (closing whatever was
-    /// there). Returns `newfd`, or `-EBADF` if `oldfd` is invalid.
+    /// `dup2` / `dup3`: force `newfd` to refer to `oldfd`'s file (closing
+    /// whatever was there). `cloexec` sets the new descriptor's flag (always
+    /// `false` for `dup2`). Returns `newfd`, or `-EBADF` if `oldfd` is invalid.
     pub fn fd_dup2(&self, oldfd: i32, newfd: i32) -> i32 {
-        if oldfd == newfd {
-            return if self.fd_get(oldfd).is_some() { newfd } else { -9 };
-        }
+        self.fd_dup3(oldfd, newfd, false)
+    }
+    pub fn fd_dup3(&self, oldfd: i32, newfd: i32, cloexec: bool) -> i32 {
         let mut fds = self.fds.lock();
-        let Some(Some(file)) = fds.get(oldfd as usize).cloned() else {
+        let Some(Some(mut entry)) = fds.get(oldfd as usize).cloned() else {
             return -9;
         };
+        if oldfd == newfd {
+            return newfd; // POSIX: dup2 no-op keeps the fd (dup3 would EINVAL)
+        }
+        entry.cloexec = cloexec;
         let n = newfd.max(0) as usize;
         while fds.len() <= n {
             fds.push(None);
         }
-        fds[n] = Some(file);
+        fds[n] = Some(entry);
         newfd
     }
 
@@ -420,6 +473,50 @@ impl Task {
     fn clone_fds(&self) -> Vec<Fd> {
         self.fds.lock().clone()
     }
+
+    pub fn cwd(&self) -> String {
+        self.cwd.lock().clone()
+    }
+    pub fn set_cwd(&self, path: String) {
+        *self.cwd.lock() = path;
+    }
+}
+
+/// The current task's working directory (`"/"` if there is no task).
+pub fn current_cwd() -> String {
+    sched::current().task().map(|t| t.cwd()).unwrap_or_else(|| String::from("/"))
+}
+
+/// Store an already-normalised absolute path as the current task's cwd.
+pub fn set_current_cwd(path: String) {
+    if let Some(t) = sched::current().task() {
+        t.set_cwd(path);
+    }
+}
+
+/// Resolve `path` against the current task's cwd into a clean absolute path:
+/// `.` is dropped, `..` pops a component (never past `/`), and repeated or
+/// trailing slashes collapse. No symlink following (we have no symlinks).
+pub fn resolve_path(path: &str) -> String {
+    let base = if path.starts_with('/') { String::new() } else { current_cwd() };
+    let mut comps: Vec<&str> = Vec::new();
+    for part in base.split('/').chain(path.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                comps.pop();
+            }
+            p => comps.push(p),
+        }
+    }
+    let mut out = String::from("/");
+    for (i, c) in comps.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(c);
+    }
+    out
 }
 
 fn user_selectors() -> (u64, u64) {
@@ -435,20 +532,51 @@ pub fn current_ppid() -> u64 {
     sched::current().task().map(|t| t.ppid).unwrap_or(0)
 }
 
-/// `dup` / `dup2` / `fcntl(F_DUPFD)` on the current task's fd table.
+/// `dup` / `dup2` / `dup3` / `fcntl` on the current task's fd table.
 pub fn current_fd_dup(oldfd: i32, min: i32) -> i32 {
     sched::current().task().map(|t| t.fd_dup(oldfd, min)).unwrap_or(-9)
 }
 pub fn current_fd_dup2(oldfd: i32, newfd: i32) -> i32 {
     sched::current().task().map(|t| t.fd_dup2(oldfd, newfd)).unwrap_or(-9)
 }
+pub fn current_fd_dup3(oldfd: i32, newfd: i32, cloexec: bool) -> i32 {
+    sched::current().task().map(|t| t.fd_dup3(oldfd, newfd, cloexec)).unwrap_or(-9)
+}
+pub fn current_fd_get_cloexec(fd: i32) -> i32 {
+    sched::current().task().map(|t| t.fd_get_cloexec(fd)).unwrap_or(-9)
+}
+pub fn current_fd_set_cloexec(fd: i32, on: bool) -> i32 {
+    sched::current().task().map(|t| t.fd_set_cloexec(fd, on)).unwrap_or(-9)
+}
 
 /// Record an exit status on the current task (called from `exit`/`exit_group`).
+///
+/// A zombie holds no open files: drop the fd table now so the other end of any
+/// pipe sees EOF/`EPIPE` immediately, instead of only once `wait4` reaps the
+/// `Task` out of the `TASKS` map.
 pub fn set_exit_status(code: i32) {
     if let Some(t) = sched::current().task() {
         *t.exit_status.lock() = Some(code);
+        t.fds.lock().clear();
         t.exited.store(true, Ordering::Release);
     }
+    CHILD_EXIT.wake_all(); // an interested parent may be blocked in wait4
+}
+
+/// Predicate for `wait4` to sleep on: this task has a matching live child and
+/// none of its matching children has exited yet.
+fn should_block_in_wait4(me: u64, pid: i64) -> bool {
+    let tasks = TASKS.lock();
+    let mut has_child = false;
+    for t in tasks.values() {
+        if t.ppid == me && (pid == -1 || t.pid == pid as u64) {
+            has_child = true;
+            if t.exited.load(Ordering::Acquire) {
+                return false;
+            }
+        }
+    }
+    has_child
 }
 
 /// `spawn` the initial user program: build its address space + entry stack and
@@ -485,6 +613,7 @@ pub fn fork(frame: &UserFrame) -> i64 {
 
     let child = Task::new(parent.pid, cspace);
     *child.fds.lock() = parent.clone_fds();
+    child.set_cwd(parent.cwd());
     let (cs, ss) = user_selectors();
     let mut cf = *frame;
     cf.rax = 0;
@@ -508,6 +637,8 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
     let av: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
     let ev: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
     let rsp = space.init_stack(stack_top, &av, &ev, &img);
+
+    task.close_on_exec(); // drop O_CLOEXEC fds before the new image sees them
 
     let new_cr3 = space.pml4_phys();
     task.set_space(space);
@@ -535,6 +666,14 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
 }
 
 /// `wait4`: poll for a zombie child (poll + yield; blocking wait comes later).
+/// Has task `pid` exited? (`true` also if it has already been reaped away.)
+/// For kernel-side milestones that spawn a process and want to await *that*
+/// process, not just the first user thread to exit.
+#[allow(dead_code)] // only the `pipetest` milestone calls this
+pub fn pid_exited(pid: u64) -> bool {
+    TASKS.lock().get(&pid).map_or(true, |t| t.exited.load(Ordering::Acquire))
+}
+
 pub fn wait4(pid: i64, status_ptr: u64) -> i64 {
     let me = current_pid();
     loop {
@@ -563,6 +702,6 @@ pub fn wait4(pid: i64, status_ptr: u64) -> i64 {
                 return -10; // ECHILD
             }
         }
-        sched::yield_now();
+        CHILD_EXIT.wait_if(|| should_block_in_wait4(me, pid));
     }
 }

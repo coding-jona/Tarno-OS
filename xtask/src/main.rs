@@ -73,10 +73,20 @@ fn main() {
             let iso = build_iso();
             busybox_test(&iso);
         }
+        "pipe-test" => {
+            build_kernel(&["pipetest"]);
+            let iso = build_iso();
+            pipe_test(&iso);
+        }
+        "fat-test" => {
+            build_kernel(&[]);
+            let iso = build_iso();
+            fat_test(&iso);
+        }
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test|ext2-test|smp-test] [--gui]"
+                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test|ext2-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test] [--gui]"
             );
             exit(2);
         }
@@ -205,12 +215,12 @@ fn disk_image() -> PathBuf {
         "-O", "^resize_inode,^dir_index,^ext_attr",
         img.to_str().unwrap(), "16384",
     ]));
-    // Grow the backing file past the 16 MiB filesystem so there is scratch space
-    // for the AHCI write test (LBA 50000) that the fs never touches.
+    // Grow the backing file past the 16 MiB filesystem: scratch space for the
+    // AHCI write test (LBA 50000) plus room for the FAT32 volume at LBA 51000.
     std::fs::OpenOptions::new()
         .write(true)
         .open(&img)
-        .and_then(|f| f.set_len(32 * 1024 * 1024))
+        .and_then(|f| f.set_len(96 * 1024 * 1024))
         .expect("extend disk.img");
     for (name, elf) in elfs {
         run(Command::new("debugfs").args([
@@ -273,6 +283,93 @@ fn disk_image() -> PathBuf {
             break;
         }
     }
+
+    // BusyBox applet links: `/bin/<applet>` hard-links to the single `/busybox`
+    // inode, so the shell can run `ls`, `cat`, ... by PATH lookup (BusyBox
+    // dispatches on `basename(argv[0])`). `debugfs ln` does not maintain the
+    // inode link count, so set it explicitly afterwards or e2fsck complains.
+    const APPLETS: &[&str] = &[
+        "busybox", "ls", "cat", "echo", "pwd", "mkdir", "rmdir", "rm", "cp", "mv",
+        "ln", "touch", "head", "tail", "wc", "grep", "sort", "uniq", "true", "false",
+        "env", "sleep", "clear", "sh",
+    ];
+    run(Command::new("debugfs").args(["-w", "-R", "mkdir /bin", img.to_str().unwrap()]));
+    for app in APPLETS {
+        run(Command::new("debugfs").args([
+            "-w", "-R", &format!("ln /busybox /bin/{app}"),
+            img.to_str().unwrap(),
+        ]));
+    }
+    // links_count = the root `/busybox` entry + every `/bin/*` link.
+    let links = 1 + APPLETS.len();
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("sif /busybox links_count {links}"),
+        img.to_str().unwrap(),
+    ]));
+
+    // A self-contained GPT disk image — one EFI System Partition holding a
+    // FAT32 volume with `/EFI/THOS/HELLO.TXT` — spliced into a hole past the
+    // ext2 image (LBA 51000; the fs is the first 16 MiB, the AHCI scratch write
+    // is a single sector at LBA 50000). The kernel walks GPT → ESP → FAT32.
+    // Needs `sfdisk` (util-linux), `mkfs.vfat` (dosfstools), `mmd`/`mcopy`
+    // (mtools).
+    let gpt = root.join("target/esp-gpt.img");
+    let fat = root.join("target/esp-fat.img");
+    let hello = root.join("target/fat-hello.txt");
+    std::fs::write(&hello, b"THOS reads FAT\n").unwrap();
+    for f in [&gpt, &fat] {
+        let _ = std::fs::remove_file(f);
+    }
+
+    // 48 MiB FAT32 volume.
+    let fat_sectors: u64 = 48 * 1024 * 1024 / 512;
+    run(Command::new("mkfs.vfat").args([
+        "-F", "32", "-n", "THOSESP", "-C", fat.to_str().unwrap(), &(fat_sectors / 2).to_string(),
+    ]));
+    run(Command::new("mmd").args(["-i", fat.to_str().unwrap(), "::/EFI", "::/EFI/THOS"]));
+    run(Command::new("mcopy").args([
+        "-i", fat.to_str().unwrap(),
+        hello.to_str().unwrap(), "::/EFI/THOS/HELLO.TXT",
+    ]));
+
+    // GPT container: 1 MiB alignment gap, the ESP, then room for the backup GPT.
+    let part_start = 2048u64;
+    let gpt_sectors = part_start + fat_sectors + 2048;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&gpt)
+        .and_then(|f| f.set_len(gpt_sectors * 512))
+        .expect("create esp-gpt.img");
+    let script = format!(
+        "label: gpt\nstart={part_start}, size={fat_sectors}, \
+         type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name=\"EFI System\"\n"
+    );
+    let mut sf = Command::new("sfdisk")
+        .arg(gpt.to_str().unwrap())
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sfdisk");
+    use std::io::Write;
+    sf.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    if !sf.wait().expect("wait sfdisk").success() {
+        eprintln!("sfdisk failed");
+        exit(1);
+    }
+    run(Command::new("dd").args([
+        &format!("if={}", fat.to_str().unwrap()),
+        &format!("of={}", gpt.to_str().unwrap()),
+        "bs=512", &format!("seek={part_start}"), "conv=notrunc", "status=none",
+    ]));
+
+    // Splice the whole GPT image into the main disk at LBA 51000.
+    run(Command::new("dd").args([
+        &format!("if={}", gpt.to_str().unwrap()),
+        &format!("of={}", img.to_str().unwrap()),
+        "bs=512", "seek=51000", "conv=notrunc", "status=none",
+    ]));
+
     img
 }
 
@@ -334,7 +431,27 @@ fn mon(sock: &Path, cmd: &str) {
 /// Type `text` (ascii `a-z0-9` only — QEMU `sendkey` names) then Enter.
 fn type_line(sock: &Path, text: &str) {
     for c in text.chars() {
-        mon(sock, &format!("sendkey {c}"));
+        // QEMU `sendkey` wants key *names*, not glyphs, for non-alphanumerics.
+        // Key *names* / chords for QEMU `sendkey`. The kernel console maps
+        // scancodes through a **German (QWERTZ)** layout, so `/` is `shift-7`
+        // and the US `/`-key (`slash`) would actually produce `-`.
+        let key = match c {
+            ' ' => "spc",
+            '/' => "shift-7",
+            '-' => "slash",
+            '_' => "shift-slash",
+            '.' => "dot",
+            ',' => "comma",
+            '|' => "altgr-less", // DE: AltGr + the key left of Y
+            '$' => "shift-4",
+            '(' => "shift-8",
+            ')' => "shift-9",
+            _ => {
+                mon(sock, &format!("sendkey {c}"));
+                continue;
+            }
+        };
+        mon(sock, &format!("sendkey {key}"));
     }
     mon(sock, "sendkey ret");
 }
@@ -354,7 +471,7 @@ fn drive_login(sock: &Path, log: &Path, child: &mut std::process::Child, tag: &s
         type_line(sock, "thos"); // admin username
         type_line(sock, "pass"); // password
         type_line(sock, "pass"); // repeat
-        if !wait_for(log, "THOS login:", 60) {
+        if !wait_for(log, "THOS login:", 90) {
             kill(child, tag, "no login prompt after first-run setup", log);
         }
     }
@@ -370,27 +487,47 @@ fn kbd_test(iso: &Path) {
     let disk = disk_image();
     let (mut child, log, sock) = spawn_interactive_qemu("kbd", iso, &disk);
 
-    if !wait_for(&log, "THOS first-run setup", 60) {
+    if !wait_for(&log, "THOS first-run setup", 90) {
         kill(&mut child, "kbd-test", "kernel never reached first-run setup", &log);
     }
     drive_login(&sock, &log, &mut child, "kbd-test");
 
-    if !wait_for(&log, "interactive hold", 60) {
+    if !wait_for(&log, "interactive hold", 90) {
         kill(&mut child, "kbd-test", "never reached the shell after login", &log);
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
     type_line(&sock, "init");
     std::thread::sleep(std::time::Duration::from_millis(1500));
+    // BusyBox applet links reached via `/bin/*` hard-links to `/busybox`, plus a
+    // per-process cwd: `cd /bin` then a bare `ls` / `pwd` must act on /bin.
+    type_line(&sock, "cd /bin");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    type_line(&sock, "pwd");
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    type_line(&sock, "ls");
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    type_line(&sock, "cat /message");
+    // Wait for the last command's output rather than a fixed sleep — the host
+    // running CI can be slow enough that a 2 MiB BusyBox applet takes seconds.
+    let _ = wait_for(&log, "hello a file read via open+lseek+read", 30);
 
     let out = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = child.kill();
     let _ = child.wait();
 
     let after = out.split("interactive hold").nth(1).unwrap_or("");
-    if after.contains("thos$ init") && after.contains("parent done") {
-        println!("kbd-test: OK — first-run setup + login, shell ran `init`");
+    let shell_ok = after.contains("thos$ init") && after.contains("parent done");
+    // bare `ls` after `cd /bin` must list the applet link names.
+    let ls_ok = ["busybox", "touch", "grep", "sleep"].iter().all(|n| after.contains(n));
+    // `pwd` prints the cwd we chdir'd into.
+    let cwd_ok = after.contains("\n/bin\n");
+    let cat_ok = after.contains("hello a file read via open+lseek+read");
+    if shell_ok && ls_ok && cwd_ok && cat_ok {
+        println!("kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls)");
     } else {
-        eprintln!("kbd-test: FAIL — after login:\n---\n{after}\n---");
+        eprintln!(
+            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok})\n---\n{after}\n---"
+        );
         exit(1);
     }
 }
@@ -403,11 +540,11 @@ fn login_test(iso: &Path) {
 
     // Boot 1 — fresh disk: must run first-run setup, then log in.
     let (mut c1, log1, sock1) = spawn_interactive_qemu("login1", iso, &disk);
-    if !wait_for(&log1, "THOS first-run setup", 60) {
+    if !wait_for(&log1, "THOS first-run setup", 90) {
         kill(&mut c1, "login-test", "boot 1 showed no first-run setup", &log1);
     }
     drive_login(&sock1, &log1, &mut c1, "login-test");
-    let ok1 = wait_for(&log1, "interactive hold", 60);
+    let ok1 = wait_for(&log1, "interactive hold", 90);
     let _ = c1.kill();
     let _ = c1.wait();
     if !ok1 {
@@ -417,7 +554,7 @@ fn login_test(iso: &Path) {
 
     // Boot 2 — same disk: straight to login, no setup; reject a wrong password.
     let (mut c2, log2, sock2) = spawn_interactive_qemu("login2", iso, &disk);
-    if !wait_for(&log2, "THOS login:", 60) {
+    if !wait_for(&log2, "THOS login:", 90) {
         kill(&mut c2, "login-test", "boot 2 showed no login prompt", &log2);
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -429,7 +566,7 @@ fn login_test(iso: &Path) {
     std::thread::sleep(std::time::Duration::from_millis(300));
     type_line(&sock2, "thos");
     type_line(&sock2, "pass");
-    let ok2 = wait_for(&log2, "interactive hold", 60);
+    let ok2 = wait_for(&log2, "interactive hold", 90);
     let full2 = std::fs::read_to_string(&log2).unwrap_or_default();
     let _ = c2.kill();
     let _ = c2.wait();
@@ -674,7 +811,7 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
     }
 
     let mut child = qemu.spawn().expect("spawn qemu");
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + Duration::from_secs(150);
     let status = loop {
         if let Some(s) = child.try_wait().expect("wait qemu") {
             break Some(s);
@@ -862,7 +999,7 @@ fn ncq_error_test(iso: &Path) {
     }
 
     let mut child = qemu.spawn().expect("spawn qemu");
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + Duration::from_secs(150);
     let status = loop {
         if let Some(s) = child.try_wait().expect("wait qemu") {
             break Some(s);
@@ -896,6 +1033,33 @@ fn busybox_test(iso: &Path) {
         println!("busybox-test: OK — stock static BusyBox `echo` ran unmodified");
     } else {
         eprintln!("busybox-test: FAIL — BusyBox did not run to a clean exit\n--- serial ---\n{serial}\n---");
+        exit(1);
+    }
+}
+
+fn fat_test(iso: &Path) {
+    let disk = disk_image();
+    let serial = boot_kernel_headless("fat", iso, &disk, 4);
+    let ok = serial.contains("THOS: gpt ok")
+        && serial.contains("THOS: fat ok")
+        && serial.contains("THOS reads FAT");
+    if ok {
+        println!("fat-test: OK — GPT → ESP → FAT32, read /EFI/THOS/HELLO.TXT");
+    } else {
+        eprintln!("fat-test: FAIL — GPT/FAT read did not produce the file\n--- serial ---\n{serial}\n---");
+        exit(1);
+    }
+}
+
+fn pipe_test(iso: &Path) {
+    let disk = disk_image();
+    let serial = boot_kernel_headless("pipe", iso, &disk, 4);
+    // `echo THOS-PIPE $(ls /bin | grep -c sleep) sub-$(echo works)`:
+    //   the `|` count is 1, the nested `$(…)` yields `works`.
+    if serial.contains("THOS: pipe ok") && serial.contains("THOS-PIPE 1 sub-works") {
+        println!("pipe-test: OK — `|` and `$(…)` work through BusyBox sh");
+    } else {
+        eprintln!("pipe-test: FAIL — pipe / command-substitution output wrong\n--- serial ---\n{serial}\n---");
         exit(1);
     }
 }

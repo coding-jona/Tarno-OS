@@ -57,6 +57,8 @@ jobs:
           grep -q "THOS: ahci ident" boot.log
           grep -q "THOS: ahci ok" boot.log
           grep -q "THOS: ahci cap ok" boot.log
+          grep -q "THOS: gpt ok" boot.log
+          grep -q "THOS: fat ok" boot.log
           grep -q "THOS: ahci ncq ok" boot.log
           grep -qE "THOS: ahci irq +MSI" boot.log
           grep -q "THOS: ext2 ok" boot.log
@@ -97,3 +99,9 @@ jobs:
 
       - name: Stock BusyBox runs unmodified (Milestone 2)
         run: cargo xtask busybox-test
+
+      - name: Pipes and command substitution (`|` + `$(…)` through BusyBox sh)
+        run: cargo xtask pipe-test
+
+      - name: Read the ESP (GPT → EFI System Partition → FAT32 → file)
+        run: cargo xtask fat-test

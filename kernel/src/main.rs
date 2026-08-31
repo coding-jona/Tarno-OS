@@ -34,8 +34,10 @@ mod cpu;
 mod cred;
 mod elf;
 mod ext2;
+mod fat;
 mod file;
 mod gdt;
+mod gpt;
 mod idt;
 #[cfg(feature = "interactive")]
 mod login;
@@ -156,7 +158,7 @@ extern "C" fn kmain() -> ! {
         process::spawn_init(
             &sh,
             &["sh"],
-            &["PATH=/", "HOME=/", "PWD=/", "TERM=dumb", "PS1=thos$ "],
+            &["PATH=/bin:/", "HOME=/", "PWD=/", "TERM=dumb", "PS1=thos$ "],
         );
 
         kprintln!("THOS: interactive hold — type on the USB keyboard");
@@ -526,6 +528,26 @@ fn storage_milestone() {
     assert!(ahci::read(cap, &mut [0u8; ahci::SECTOR]).is_err(), "read past EOD not rejected");
     kprintln!("THOS: ahci cap ok      {} sectors; out-of-range read rejected", cap);
 
+    // GPT + FAT: a self-contained GPT image (protective MBR, one ESP holding a
+    // FAT32 volume) is spliced in at LBA 51000, past the ext2 image (see xtask
+    // `disk_image`). Find the ESP by type GUID, mount it, read a known file —
+    // the full "read the ESP" path: GPT → partition → BPB → FAT chain → 8.3.
+    match gpt::find_esp(51_000) {
+        Some(esp_lba) => {
+            kprintln!("THOS: gpt ok           ESP at LBA {}", esp_lba);
+            match fat::Fat::open(esp_lba).and_then(|v| {
+                v.read_path("/EFI/THOS/HELLO.TXT").ok_or("file not found")
+            }) {
+                Ok(b) => {
+                    kprintln!("THOS: fat ok           /EFI/THOS/HELLO.TXT = {} bytes", b.len());
+                    serial::write_bytes(&b);
+                }
+                Err(e) => kprintln!("THOS: fat FAIL         {}", e),
+            }
+        }
+        None => kprintln!("THOS: gpt FAIL         no ESP found at LBA 51000"),
+    }
+
     let fs = ext2::open().expect("mount ext2");
     let init = fs.read_path("/init").expect("read /init from ext2");
     kprintln!("THOS: ext2 ok          /init = {} bytes", init.len());
@@ -564,6 +586,26 @@ fn storage_milestone() {
             sched::yield_now();
         }
         kprintln!("THOS: busybox ok       stock static BusyBox ran unmodified");
+    }
+
+    // Pipes + command substitution: BusyBox `sh -c` with a `|` and two `$(…)`.
+    // `pipe2` + O_CLOEXEC + pipe EOF all have to work for this exact line.
+    #[cfg(feature = "pipetest")]
+    {
+        let bb = fs.read_path("/busybox").expect("read /busybox from ext2");
+        let pid = process::spawn_init(
+            &bb,
+            &[
+                "sh",
+                "-c",
+                "echo THOS-PIPE $(ls /bin | grep -c sleep) sub-$(echo works)",
+            ],
+            &["PATH=/bin:/", "HOME=/"],
+        );
+        while !process::pid_exited(pid) {
+            sched::yield_now();
+        }
+        kprintln!("THOS: pipe ok          `|` and `$(…)` through BusyBox sh");
     }
 
     // AHCI write: round-trip a known pattern through a scratch sector past the
