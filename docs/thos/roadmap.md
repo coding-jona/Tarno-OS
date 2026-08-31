@@ -268,10 +268,42 @@ late.
     forwarder RVAs. `pe-test` does `LoadLibraryA("kernel32.dll")` →
     `GetProcAddress(h,"WriteFile")` → calls the resolved pointer
     (`PE GetProcAddress OK`).
-  - **Next:** a proper `ntdll` boundary, then real PE-built DLLs from a
-    `C:\Windows\System32` tree (loader recursion, real IAT binding against
-    on-disk exports); then process isolation / integrity for the security
-    phase.
+  - **`ntdll` boundary:** `nt::dispatch` is now two personalities over one set
+    of cores. `dispatch_ntdll` is the native `Nt*`/`Ldr*` layer — NTSTATUS
+    returns, `IO_STATUS_BLOCK` out-params, in-out pointers: `NtClose`,
+    `NtWriteFile`, `NtReadFile`, `NtAllocateVirtualMemory`,
+    `NtFree`/`ProtectVirtualMemory`, `NtTerminateProcess`,
+    `LdrGetProcedureAddress`, `LdrLoadDll`. `dispatch_kernel32` is the Win32
+    shim (BOOL / `LastError` / fd-as-HANDLE) and now *calls* the shared cores
+    (`file_write_core` / `file_read_core` / `handle_close_core` /
+    `mem_alloc_core` / `proc_terminate`). Selector bit `NT_NTDLL_FLAG` in a
+    stub's index routes between them. A second synthetic module `ntdll.dll`
+    (one page, `map_synth_dll`) is threaded into the `Ldr` lists as the third
+    `LDR_DATA_TABLE_ENTRY`. The standalone stub page is gone — `resolve_import`
+    returns the trampoline VA inside the owning module page, so a bound IAT
+    slot and a `GetProcAddress` result agree. `pe-test`:
+    `GetModuleHandleA("ntdll.dll")` → `GetProcAddress(h,"NtWriteFile")` → a
+    real 9-arg NT call (`PE ntdll OK`).
+  - **Real on-disk DLLs from `C:\Windows\System32`:** `pe.rs` is built around a
+    per-`load()` `Loader`. `stage_image(file, want_base)` parses + materialises
+    + relocates one image (exe or DLL) without mapping or binding. The
+    `Loader` seeds the two synthetic modules with their export maps, owns a
+    bump arena of VA space (`PE_DLL_ARENA`), and resolves imports:
+    `resolve_module` = synthetic hit / already-loaded / read
+    `/Windows/System32/<name>` from ext2 and `load_dll` it; `load_dll` stages
+    into the arena, `parse_exports` from the image, registers **before**
+    recursing (so an import cycle terminates), binds its own imports, then
+    maps its segments; `bind_imports` walks the IDT and patches each IAT slot
+    with the real export VA (synthetic trampoline **or** on-disk `.text`),
+    depth-capped. `pe-test` ships a real PE32+ `thoscrt.dll` (exports
+    `thos_add`, itself imports `KERNEL32!GetLastError`) at
+    `C:\Windows\System32`; the exe imports `thoscrt!thos_add`, calls it, and
+    asserts `42` (`PE dll thos_add=42`). `DllMain` is not run yet.
+  - **Next:** thread file DLLs into the PEB `Ldr` lists (so runtime
+    `GetModuleHandleA` / `GetProcAddress` / `LoadLibraryA` see them) and run
+    `DllMain`; then swap the hand-built test DLLs for **Wine-sourced** PE
+    `kernel32` / `ntdll` / `user32` …; then process isolation / integrity for
+    the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
@@ -281,6 +313,36 @@ late.
 - **Milestone 3:** a statically linked Win32 **console** `.exe` (`CreateFile`,
   `WriteFile(stdout)`, `WaitForSingleObject`) runs through the THOS NT path — **with no
   wine process in the tree**. ELF and PE processes appear in one `ps` output.
+
+### Product goal — "download it and it runs", zero user config
+
+The compatibility layers are a **first-class part of the OS**, not something the
+user installs or configures. The loader inspects the binary and picks the
+runtime itself — no "select Proton", no config file, no per-title tweaking.
+The model is **Rosetta on macOS**: the translation/compat path is invisible.
+
+| Input | Loader routes to | User does |
+|---|---|---|
+| ELF (Linux) | native Linux personality | nothing |
+| PE `.exe` / `.dll` | native NT personality + Wine-sourced DLLs in `C:\Windows\System32` | nothing |
+| Steam / Direct3D title | Proton profile (Wine + DXVK / vkd3d) auto-applied | nothing |
+| `.apk` | Android profile (Waydroid-class: `binder` + Bionic + ART on the Linux personality) | nothing |
+
+**"Download → runs, zero setup" is the target for:** native Linux binaries;
+Win32 apps; **games without kernel anti-cheat** (the bulk of Steam);
+EAC / BattlEye titles where the developer enabled the vendor's Proton mode.
+
+**Honest boundary — kernel anti-cheat / device attestation.** THOS can deliver
+the *zero-setup* half for these (bundle the vendor runtime, auto-configure the
+environment). Whether the game then *runs* is decided by a third party,
+server-side: EAC / BattlEye / ACE (NTE) / Vanguard / Ricochet / EA Javelin
+attest the environment and can reject or ban. Best realistic case for the
+"Running" tier (e.g. NTE via ACE): works *while the vendor's checks tolerate
+the environment*, and can break with any anti-cheat patch — never a guaranteed
+"just works". **No circumvention of attestation** — the vendor-sanctioned
+Proton mode or nothing (see the anti-cheat notes in [`feasibility.md`](feasibility.md)).
+Vanguard-class (kernel driver required at boot, no Proton mode) stays fully
+out of scope pending vendor cooperation.
 
 ### 32-bit Windows apps — WOW64 thunks, not code translation
 

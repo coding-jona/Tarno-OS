@@ -1,32 +1,304 @@
-# Tarno OS → THOS
+# THOS — Tarno Hybrid OS
 
-> **⚠️ The project has pivoted.** Tarno OS is now **THOS**, a **clean-slate hybrid
-> kernel** that runs native ELF/POSIX **and** native PE/Win32 programs side by side on
-> one target machine — no Linux fork, no virtualization. Motivation: end the split
-> between separate Windows and Linux environments.
+**THOS is a clean-slate operating-system kernel, written in Rust, that runs native
+ELF/POSIX programs and native PE/Win32 programs side by side** — no Linux fork, no
+Wine process in the tree, no virtualization. One codebase, one machine, both worlds.
+
+> **Status: pre-alpha, single developer.** The executive core and the POSIX
+> personality boot and run real unmodified Linux binaries today; the NT personality
+> loads and runs real PE executables and on-disk DLLs. There is no graphics stack yet
+> and no release. See [Current status](#current-status) for exactly what works.
 >
-> - Architecture — [`docs/thos/architecture.md`](docs/thos/architecture.md)
-> - Roadmap & milestones — [`docs/thos/roadmap.md`](docs/thos/roadmap.md)
-> - Honest feasibility — [`docs/thos/feasibility.md`](docs/thos/feasibility.md)
-> - Target hardware — [`docs/thos/hw-target.md`](docs/thos/hw-target.md)
-> - Licensing — [`docs/thos/licensing.md`](docs/thos/licensing.md)
->
-> The Devuan-distro work is frozen ([`FROZEN.md`](FROZEN.md)); its roadmap is at
-> [`docs/legacy-roadmap-devuan.md`](docs/legacy-roadmap-devuan.md).
+> This repo also contains the **frozen** previous project — a Devuan-based Linux
+> distribution — kept for history under a `<details>` block at the bottom and
+> [`FROZEN.md`](FROZEN.md).
 
-## THOS quickstart
+---
 
-```sh
-make toolchain              # rustup target + rust-src + llvm-tools
-git submodule update --init # third_party/limine (v9.x-binary, pinned in .gitmodules)
-make -C third_party/limine  # build the limine host tool
-make run                    # build kernel + ISO, boot in QEMU, serial on stdout
+## Contents
+
+- [Why](#why)
+- [The idea in one paragraph](#the-idea-in-one-paragraph)
+- [Architecture](#architecture)
+- [Current status](#current-status)
+- [Repository layout](#repository-layout)
+- [Build & run](#build--run)
+- [Test suite](#test-suite)
+- [Roadmap at a glance](#roadmap-at-a-glance)
+- [The "download it and it runs" goal — and its limits](#the-download-it-and-it-runs-goal--and-its-limits)
+- [Target hardware](#target-hardware)
+- [Licensing](#licensing)
+- [Contributing & legal boundaries](#contributing--legal-boundaries)
+- [Documentation index](#documentation-index)
+
+---
+
+## Why
+
+Running Windows software and Linux software on the same machine today means a
+dual-boot, a VM, or a translation layer bolted onto a foreign kernel. THOS asks what a
+kernel looks like if **both ABIs are first-class from the start** and everything below
+them is designed fresh for one known set of hardware.
+
+The compatibility contracts are fixed and non-negotiable — they *are* the product:
+
+- **PE** (`MZ`) executables, the Microsoft x64 calling convention, the Win32/NT API surface
+- **ELF** executables, the System V AMD64 ABI, the Linux syscall ABI (a growing subset)
+
+Everything under those contracts — kernel, scheduler, memory manager, object model,
+IPC, driver model, boot path — is written from scratch.
+
+## The idea in one paragraph
+
+A POSIX `futex`, an NT dispatcher object (`KEVENT`), and a Win32 `HANDLE` to an event
+are **three views of one executive object**. Waiting, signalling and reference counting
+are implemented once, in the executive core. POSIX signal delivery and NT APC delivery
+share one asynchronous-delivery mechanism. A process picks its personality from its
+image header (`ELF` → POSIX, `MZ`/`PE` → NT) and keeps it for life; cross-personality
+work happens only through shared executive objects (files, pipes, sockets, shared
+memory, events), never by one personality calling the other's syscall table. That is
+what makes THOS structurally hybrid rather than an emulator: **neither personality is a
+guest of the other.**
+
+Full write-up: [`docs/thos/architecture.md`](docs/thos/architecture.md).
+
+## Architecture
+
+```
++---------------------------------------------------------------+
+|  USER SPACE                                                   |
+|   ELF/POSIX processes        PE/Win32 processes               |
+|   musl libc (ported)         ntdll / kernelbase / kernel32    |
+|                              + DXVK / vkd3d (D3D9-12 → Vulkan)|
+|                              + RADV (Mesa Vulkan userspace)   |
++---------------------------------------------------------------+
+|  PERSONALITIES  (per process, selected by binary format)      |
+|   POSIX subsystem            NT subsystem                     |
+|   Linux syscalls, signals,   NT syscall dispatch, APCs, SEH,  |
+|   futex, /proc view          Ob/Ps/Io/Se, \Device namespace,  |
+|                              registry view                    |
++---------------------------------------------------------------+
+|  EXECUTIVE CORE  (one set of primitives; both personalities)  |
+|   Handle/Object Manager | Scheduler (P/E-core aware) | VMM    |
+|   VFS | one Wait/Sync primitive | IPC/Ports | Timer | IRQ     |
++---------------------------------------------------------------+
+|  HAL + DRIVERS  (this machine only)                           |
+|   APIC/x2APIC, IOAPIC, MSI-X | ACPI | PCIe | TSC/APIC timer   |
+|   AHCI/SATA (NCQ) | xHCI (HID) | GPU: Navi 23 (planned)       |
++---------------------------------------------------------------+
+|  BOOT: UEFI + Limine → long mode, GOP framebuffer, memory map |
++---------------------------------------------------------------+
 ```
 
-Milestone 0: the kernel comes up under Limine, writes to COM1 **and** paints the GOP
-framebuffer, then halts. Milestone 1a: it ingests the Limine memory map, stands up the
-physical frame allocator and a bootstrap heap. CI:
-[`.github/workflows/qemu-boot.yml`](.github/workflows/qemu-boot.yml).
+- **Kernel & drivers:** Rust nightly (`x86_64-unknown-none`, `#![no_std]`), toolchain
+  pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
+- **Written fresh:** executive core, object model, scheduler, both personalities, the
+  `ntdll` lower boundary, VMM, VFS, HAL, AHCI/xHCI drivers, boot path.
+- **Vendored / to be ported (isolated under `third_party/`):** Limine (boot), later
+  ACPICA, Mesa/RADV, Wine PE-built DLLs, possibly `amdgpu` KMS.
+
+## Current status
+
+What actually runs today (`cargo xtask` + QEMU/OVMF, verified in CI and the
+`*-test` suite):
+
+**Boot & executive core**
+- UEFI + Limine → long mode, GOP framebuffer, serial; ingests the Limine memory map.
+- Physical frame allocator + bootstrap heap; THOS's own page tables (HHDM + W^X kernel).
+- GDT/TSS with IST stacks, IDT, trap handlers.
+- **SMP**: all CPUs up (24 on the target; 4 in the QEMU tests), per-CPU run queues.
+- Preemptive kernel-thread scheduler, P/E-core classes from `CPUID.1AH`.
+- One executive object + handle manager; one wait/sync primitive; APIC-timer subsystem.
+
+**Storage & filesystems**
+- **AHCI/SATA** driver with NCQ (queue depth 32), MSI-X completion IRQs, error recovery;
+  concurrent-I/O stress-tested.
+- **ext2** read **and** write (create/unlink files + dirs, backup superblocks re-synced;
+  images pass `e2fsck`).
+- **FAT16/FAT32** read; **GPT** parse → find the EFI System Partition.
+
+**POSIX personality**
+- ELF64 loader; Linux syscall dispatch (`syscall`/`sysretq` fast path).
+- `fork` / `execve` / `wait4`, per-process CWD, real blocking waits (no yield-spin).
+- **Unmodified static Linux binaries run as-is**: a static-musl Rust program, and stock
+  static **BusyBox** as the login shell with applet symlinks (`ls`, `cat`, …).
+- Pipes (`|`) and command substitution (`$(…)`) through BusyBox `sh`.
+
+**NT personality (in progress)**
+- Hardened **PE32+ loader**: every input treated as hostile, malformed PEs rejected
+  without a panic; base relocations; import resolution.
+- Two **synthetic system modules** built in-kernel — `kernel32.dll` and `ntdll.dll` —
+  each a one-page PE image with a real export directory of syscall trampolines, threaded
+  into the PEB `Ldr` lists.
+- **NT syscall dispatch** split into a Win32 layer (`kernel32`: BOOL / `LastError` /
+  fd-as-HANDLE) and a native `Nt*` layer (`ntdll`: NTSTATUS / `IO_STATUS_BLOCK`), sharing
+  one set of cores.
+- PEB/TEB with a real per-thread `%gs` base, `RTL_USER_PROCESS_PARAMETERS`, `PEB->Ldr`.
+- Implemented so far: `GetStdHandle`, `WriteFile`/`ReadFile`, `CreateFileA`,
+  `CloseHandle`, `Get`/`SetLastError`, `GetCommandLineA`, `GetModuleHandleA`,
+  `GetProcAddress`, `LoadLibraryA`, `VirtualAlloc`/`Free`/`Protect`,
+  `GetProcessHeap`/`HeapAlloc`/`HeapFree`, `ExitProcess`; `NtClose`, `NtWriteFile`,
+  `NtReadFile`, `NtAllocateVirtualMemory`, `NtTerminateProcess`,
+  `LdrGetProcedureAddress`, `LdrLoadDll`.
+- **Real on-disk DLL loading from `C:\Windows\System32`**: a per-load `Loader` stages
+  each dependency into a VA arena (parse → relocate → parse exports → recurse into its
+  imports → map) and binds the IAT to real export addresses. Import cycles terminate.
+- A hand-built PE `.exe` runs to exit doing raw syscalls, Win32 file I/O, memory
+  allocation, `GetProcAddress`/`LoadLibraryA`, a 9-argument `NtWriteFile`, and a call
+  into a real on-disk `thoscrt.dll` (which itself imports `kernel32!GetLastError`).
+
+**Not yet**: `DllMain`, Wine-sourced DLLs, a registry, SEH, WOW64 (32-bit PE),
+any GPU driver / real graphics (GOP framebuffer only), NTFS, the security subsystem.
+
+## Repository layout
+
+```
+kernel/                 the THOS kernel (Rust, no_std)
+  src/main.rs            boot + milestone sequence
+  src/{mm,vmm}.rs        frame allocator, heap, page tables
+  src/{sched,smp,wait}.rs  scheduler, SMP bring-up, wait/sync primitive
+  src/{object,process}.rs  executive object/handle manager, process/address space
+  src/syscall.rs         syscall fast path + Linux-ABI dispatcher
+  src/{elf,pe}.rs        ELF64 and PE32+ loaders
+  src/nt.rs              NT-personality syscall surface (kernel32 + ntdll layers)
+  src/{vfs,file,ext2,fat,gpt}.rs  VFS, descriptors, filesystems
+  src/{acpi,apic,pci,ahci,xhci,smp,gdt,idt,cpu}.rs  HAL + drivers
+  src/{cred,login,console,serial}.rs  identity stub, console, serial
+xtask/                  build + ISO + QEMU test orchestrator (run via `cargo xtask …`)
+  testdata/             test programs (init.s, child.s, rusthello.rs, sh.rs)
+loaders/thos-boot/      the multi-boot OS picker (chainloads Windows / Linux / THOS)
+boot/limine.conf        Limine boot configuration
+docs/thos/              architecture, roadmap, feasibility, hw-target, licensing
+third_party/limine/     vendored bootloader (git submodule, BSD-2-Clause)
+FROZEN.md + Devuan dirs  the frozen previous project
+```
+
+## Build & run
+
+Needs a Linux host with: the pinned Rust nightly (rustup reads
+`rust-toolchain.toml` automatically), `qemu-system-x86_64`, OVMF firmware
+(`/usr/share/OVMF/OVMF_CODE.fd`), and the build tools `as`, `ld`, `mke2fs`,
+`debugfs` (e2fsprogs), plus `sfdisk`, `mkfs.vfat`, `mtools` for the FAT test.
+
+```sh
+make toolchain                 # rustup target + rust-src + llvm-tools
+git submodule update --init     # third_party/limine (pinned binary release)
+make -C third_party/limine      # build the limine host tool
+
+make run                        # build kernel + ISO, boot in QEMU, serial on stdout
+make run-gui                    # same, with a QEMU display window
+```
+
+`cargo xtask <cmd>` is the entry point for everything (`make` targets just wrap it):
+
+```sh
+cargo xtask build               # build the kernel ELF
+cargo xtask iso                 # build target/thos.iso (BIOS + UEFI bootable)
+cargo xtask run [--gui]         # build ISO + boot in QEMU
+```
+
+## Test suite
+
+Each test builds the kernel with a feature flag, boots it headless in QEMU with a
+prepared disk image, and asserts on the serial log. Serial is streamed live to your
+terminal, prefixed per run.
+
+| Command | What it proves |
+|---|---|
+| `cargo xtask smp-test` | scheduler + wait primitive across all CPUs, tens of thousands of context switches clean |
+| `cargo xtask ahci-test` | AHCI identify + LBA read, out-of-range rejection |
+| `cargo xtask ncq-error-test` | NCQ error path + device recovery |
+| `cargo xtask ext2-test` | ext2 read/write; the image then passes host `e2fsck` |
+| `cargo xtask fat-test` | GPT → ESP → FAT32, reads `/EFI/THOS/HELLO.TXT` |
+| `cargo xtask busybox-test` | stock static BusyBox runs unmodified |
+| `cargo xtask pipe-test` | `|` and `$(…)` through BusyBox `sh` |
+| `cargo xtask pe-test` | PE loader: relocations, imports, TEB/PEB, Win32 file I/O + memory, `GetProcAddress`, the `ntdll` boundary, and a real DLL from `C:\Windows\System32` |
+| `cargo xtask kbd-test` / `login-test` | USB-HID keyboard + first-run login (interactive build) |
+| `cargo xtask bootpick-test` | the multi-boot OS picker enumerates disks and chainloads |
+
+CI runs the boot test in [`.github/workflows/qemu-boot.yml`](.github/workflows/qemu-boot.yml).
+
+## Roadmap at a glance
+
+Full detail with milestones in [`docs/thos/roadmap.md`](docs/thos/roadmap.md); honest
+cost/risk in [`docs/thos/feasibility.md`](docs/thos/feasibility.md).
+
+| Phase | Scope | State |
+|---|---|---|
+| 0 | Foundation, hardware inventory, boot to long mode | done |
+| 1 | Executive core: SMP, scheduler, objects, wait primitive, timers | done |
+| 2 | VFS, AHCI, ext2/FAT/GPT, **POSIX personality**, shell | done (install-to-SSD deferred) |
+| 3 | **NT personality** at userspace level: PE loader, `ntdll` boundary, Wine DLLs, registry, SEH, WOW64 | in progress |
+| 4 | **Real graphics** — the GPU driver for Navi 23 (the hard one) | not started |
+| 5 | Hardening + a real app; the security / antivirus subsystem | not started |
+| 6 | Research track: loading real `.sys` drivers (NDIS proof of concept) | not started |
+| 7 | Hardware breadth beyond the one target machine | last |
+
+## The "download it and it runs" goal — and its limits
+
+The compatibility layers are meant to be a **first-class part of the OS**, not
+something the user installs or configures. The loader inspects the binary and picks the
+runtime itself — ELF → Linux personality, PE → NT personality + Wine-sourced DLLs,
+Steam/Direct3D title → Proton profile (Wine + DXVK/vkd3d), `.apk` → an Android profile
+on the Linux personality. The model is Rosetta on macOS: invisible.
+
+**"Download → runs, zero setup" is the target for** native Linux binaries, Win32 apps,
+and **games without kernel anti-cheat** (the bulk of Steam), plus EAC/BattlEye titles
+where the developer enabled the vendor's Proton mode.
+
+**It is *not* achievable for kernel anti-cheat / device-attestation titles**
+(Vanguard, ACE/NTE, recent Ricochet, EA Javelin, …). Those decide, server-side,
+whether an environment is genuine; THOS will not forge attestation. See the
+[anti-cheat / attestation section in `feasibility.md`](docs/thos/feasibility.md) for
+the full analysis and the honest boundary.
+
+## Target hardware
+
+THOS targets **exactly one machine**, which is what keeps the driver surface finite:
+
+| Part | Value |
+|---|---|
+| Board | ASRock B760M-HDV/M.2 D4 (AMI UEFI) |
+| CPU | Intel Core i7-13700KF — 8 P-cores + 8 E-cores, 24 threads, no iGPU |
+| GPU | AMD Radeon RX 6600 (Navi 23, RDNA2) — behind an on-card PCIe switch |
+| Boot disk | SATA SSD (THOS boots from SATA, not the NVMe) |
+
+Full inventory and driver implications: [`docs/thos/hw-target.md`](docs/thos/hw-target.md).
+
+## Licensing
+
+The THOS kernel tree (`kernel/ loaders/ xtask/` + build files) is
+**GPL-2.0-or-later**. The frozen Devuan components keep **AGPL-3.0**. Vendored code
+under `third_party/` keeps its upstream license. Every source file carries an
+`SPDX-License-Identifier`. Rationale, the compatibility matrix, and the `amdgpu`
+(GPL-2.0-only) question: [`docs/thos/licensing.md`](docs/thos/licensing.md).
+
+## Contributing & legal boundaries
+
+Early days, single developer — issues and discussion welcome. If you contribute code,
+the project keeps a hard **clean-room** rule so it stays distributable:
+
+- **No Microsoft binaries or their disassembly** as a reference for THOS code — not
+  `ntdll.dll`, not `.sys` drivers, not "just to study how it works". Reading the
+  disassembly and then implementing the equivalent produces a derivative work.
+- **No leaked proprietary source** (Windows, or anything else), ever.
+- Reimplement Windows behaviour **only** from: clean-room projects (**Wine**,
+  **ReactOS** — LGPL/GPL, built for reuse), public documentation (Microsoft Learn, the
+  WDK headers, *Windows Internals*), and black-box observation of **programs** (not OS
+  internals).
+
+This is the same rule Wine and ReactOS enforce, for the same reason.
+
+## Documentation index
+
+| Doc | Contents |
+|---|---|
+| [`docs/thos/architecture.md`](docs/thos/architecture.md) | design principle, layer diagram, personality selection, reuse |
+| [`docs/thos/roadmap.md`](docs/thos/roadmap.md) | phased build order, every milestone, the compat-layer product goal, identity/age-gate design, security architecture |
+| [`docs/thos/feasibility.md`](docs/thos/feasibility.md) | honest tiers, the GPU pole, `.sys` blockers, anti-cheat / attestation limits |
+| [`docs/thos/hw-target.md`](docs/thos/hw-target.md) | exact hardware inventory + per-chip driver notes |
+| [`docs/thos/licensing.md`](docs/thos/licensing.md) | the GPL-2.0 ↔ LGPL/AGPL decision and matrix |
+| [`FROZEN.md`](FROZEN.md) | what the pivot froze and why |
 
 ---
 

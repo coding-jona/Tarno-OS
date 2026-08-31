@@ -46,6 +46,41 @@ Go/No-Go gate before Phase 6. Known blockers:
   person-years. Phase 6 is therefore hard-limited to **NDIS networking** as a proof of
   concept; GPU/storage/USB via `.sys` are out of scope permanently.
 
+## Anti-cheat / device attestation — the hard external limit
+
+Not an engineering problem THOS can solve alone; a third party decides.
+
+- **Wine/Proton cannot load kernel drivers.** EAC and BattlEye ship a
+  **Proton-compatible mode** (userspace runtime, `easyanticheat_x64.so` +
+  the Steam "Proton EasyAntiCheat Runtime" depot) — but the **game developer
+  must opt in** (EAC: a few clicks in the EOS portal; BattlEye: an email).
+  Without opt-in the anti-cheat tries to load its Windows kernel driver under
+  Proton, fails, and the game refuses to launch.
+- **Environment attestation is the real wall.** Even the userspace AC runtime
+  probes `/proc`, `/proc/modules`, ptrace semantics, kernel version, syscall
+  fingerprints — it is built to detect a non-genuine environment. **FreeBSD,
+  with a mature 20-year Linux syscall layer + Steam + Proton, still cannot run
+  EAC/BattlEye games** for this reason. Matching the Linux ABI is necessary,
+  nowhere near sufficient.
+- **Tiers (from areweanticheatyet, 2026): ~17 % Supported, ~24 % Running,
+  ~55 % Broken, ~5 % Denied.** "Running" = works via a community Proton build,
+  fragile, can break with any patch (e.g. NTE / Anti-Cheat Expert). "Denied" =
+  the developer actively forbids it.
+- **Vanguard (Riot), and increasingly Ricochet / EA Javelin:** kernel driver
+  required at boot, no Proton mode, plus TPM 2.0 + Secure Boot + measured-boot
+  attestation. **Fully out of scope pending vendor cooperation** — Riot has
+  refused even Linux.
+- **THOS's position:** deliver the *zero-setup* half (bundle the vendor
+  runtime, present a genuine Linux personality, auto-configure). Do **not**
+  forge attestation / spoof a certified environment — that is circumvention of
+  a protection measure (§95a UrhG / DMCA §1201), violates the anti-cheat
+  EULA, and in practice triggers fingerprint blocklisting and mass account
+  bans. The only fully-clean paths are the vendor's sanctioned Proton mode, or
+  the vendor whitelisting THOS.
+- **Research task before relying on any of this:** `strace`/`ltrace` the EAC
+  and BattlEye Linux runtimes on real Linux, document every syscall + `/proc`
+  access — that list is the spec the THOS Linux personality must meet.
+
 ## What "done" means per milestone
 
 See [`roadmap.md`](roadmap.md). Each milestone has a concrete, automatable pass/fail
