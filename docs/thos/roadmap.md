@@ -255,10 +255,23 @@ late.
     for now), **`GetProcessHeap` / `HeapAlloc` / `HeapFree`** (one anon mapping
     per alloc — a real allocator comes later). `pe-test` `VirtualAlloc`s a page
     and `HeapAlloc`s a block and writes to both (`PE VirtualAlloc+Heap OK`).
-  - **Next:** a proper `ntdll` boundary + a synthetic `kernel32` module with an
-    export table so `GetProcAddress` / `LoadLibrary` resolve, then real
-    PE-built DLLs from a `C:\Windows\System32` tree; then process isolation /
-    integrity for the security phase.
+  - **Synthetic `kernel32.dll` + dynamic resolution:** a one-page PE32+ image at
+    `NT_STUB_BASE+0x4000` — minimal headers, a second copy of the NT
+    trampolines, and a real `IMAGE_EXPORT_DIRECTORY` whose
+    `AddressOfFunctions[i]` is trampoline `i` and `AddressOfNames[i]` is
+    `nt::NT_EXPORTS[i]` (the one list `resolve_import` also indexes, so imports
+    and exports cannot drift). It is threaded into all three `PEB->Ldr` module
+    lists as a second `LDR_DATA_TABLE_ENTRY` (`BaseDllName` `KERNEL32.DLL`).
+    `GetModuleHandleA(name)` / `LoadLibraryA` walk `Ldr` (`ldr_find`,
+    case-insensitive, `.dll` implied); `GetProcAddress` parses any module's
+    export directory (`ExportDir::parse`) by name or ordinal, rejecting
+    forwarder RVAs. `pe-test` does `LoadLibraryA("kernel32.dll")` →
+    `GetProcAddress(h,"WriteFile")` → calls the resolved pointer
+    (`PE GetProcAddress OK`).
+  - **Next:** a proper `ntdll` boundary, then real PE-built DLLs from a
+    `C:\Windows\System32` tree (loader recursion, real IAT binding against
+    on-disk exports); then process isolation / integrity for the security
+    phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
