@@ -213,9 +213,20 @@ late.
     now loads its message pointer from an **absolute** slot patched by a DIR64
     fixup — a wrong delta would fault or misprint, so the exact-string check is
     the relocation test.
-  - **Next (P1):** **Imports** — resolve data directory 1 against loaded DLLs
-    (`kernel32` / `ntdll` / `user32`); this is where the NT personality proper
-    begins (SSDT dispatch, `Nt*` core, PEB/TEB + `gs` base).
+  - **Imports — first cut done (P1):** `pe::load` walks the Import Directory
+    Table, resolves each by-name thunk against a builtin resolver, and patches
+    the IAT in place (post-relocation). A **shared NT stub page** is mapped into
+    every PE process at a fixed high address; each resolved import points at a
+    tiny trampoline there that enters the kernel via `syscall`. Right now the
+    only stub is `KERNEL32.dll!ExitProcess` → `SYS_exit`; anything unresolved is
+    rejected (logged as `dll!func`), not left dangling. The `pe-test` `.exe`
+    imports `ExitProcess` and calls it through the IAT — a bad patch would fault
+    on the indirect `call`. **This is the seed of the NT personality.**
+  - **Next:** grow the stub table with real arg marshalling
+    (`GetStdHandle`/`WriteFile` → `write`), PEB/TEB + `gs` base, a distinct
+    `Nt*` syscall number space and dispatch, then real PE-built DLLs from a
+    `C:\Windows\System32` tree; then process isolation / integrity for the
+    security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a

@@ -11,6 +11,7 @@
 //! **Every input is treated as hostile.** A malformed header, an out-of-range
 //! offset, an overflowing size — all produce `Err`, never a slice panic.
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -37,6 +38,29 @@ const ALT_BASE_SHIFT: u64 = 0x1000_0000;
 
 const MAX_IMAGE_SIZE: u64 = 256 * 1024 * 1024;
 const MAX_SECTIONS: usize = 96;
+
+/// The builtin "NT stub" page mapped into every PE process. Each imported Win32
+/// function resolves to one of these tiny trampolines, which enter the THOS
+/// kernel via `syscall`. This is the seed of the NT personality — real `ntdll`
+/// and per-call arg marshalling grow from here.
+const NT_STUB_BASE: u64 = 0x0000_7FF0_0000_0000;
+const STUB_EXITPROCESS: u64 = 0x00;
+/// `mov rax, 60 (SYS_exit); mov rdi, rcx (Win64 arg0); syscall`
+const NT_STUB_BLOB: &[u8] = &[
+    0x48, 0xC7, 0xC0, 60, 0, 0, 0, // mov rax, 60
+    0x48, 0x89, 0xCF, // mov rdi, rcx
+    0x0F, 0x05, // syscall
+];
+
+/// Address of the stub that implements `dll!func`, or `None` if THOS does not
+/// provide it yet (the loader then rejects the PE rather than mislinking).
+fn resolve_import(dll: &str, func: &str) -> Option<u64> {
+    let dll = dll.trim_end_matches(|c| c == '\0');
+    match (dll.to_ascii_lowercase().as_str(), func) {
+        ("kernel32.dll", "ExitProcess") => Some(NT_STUB_BASE + STUB_EXITPROCESS),
+        _ => None,
+    }
+}
 
 fn rd_u16(img: &[u8], off: usize) -> Result<u16, &'static str> {
     img.get(off..off + 2)
@@ -108,12 +132,10 @@ pub fn load(proc: &Process, file: &[u8]) -> Result<PeImage, &'static str> {
         }
         Ok((rd_u32(file, dirs + i * 8)?, rd_u32(file, dirs + i * 8 + 4)?))
     };
-    if dir(1)?.1 != 0 {
-        return Err("PE: imports not supported yet");
-    }
     if dir(9)?.1 != 0 {
         return Err("PE: TLS directory not supported yet");
     }
+    let (import_rva, import_size) = dir(1)?;
     let (reloc_rva, reloc_size) = dir(5)?;
 
     // --- materialise the full image at RVA 0, then relocate, then map ---
@@ -173,11 +195,18 @@ pub fn load(proc: &Process, file: &[u8]) -> Result<PeImage, &'static str> {
         return Err("PE: needs relocation but has no .reloc");
     }
 
+    // Resolve the import table against THOS's builtin NT stubs and patch the
+    // IAT in place (post-relocation). No real DLL files yet.
+    if import_size != 0 {
+        resolve_imports(&mut img, import_rva as u64, size_of_image)?;
+    }
+
     // --- map the finished image (headers first, sections win on any overlap) ---
     map_seg(proc, &img, load_base, 0, hdr_n as u64, false)?;
     for (rva, mem_size, exec) in segs {
         map_seg(proc, &img, load_base + rva, rva, mem_size, exec)?;
     }
+    map_stub_page(proc)?;
 
     Ok(PeImage {
         entry: load_base + entry_rva,
@@ -227,6 +256,80 @@ fn apply_relocs(
         }
         p += block_size;
     }
+    Ok(())
+}
+
+/// A NUL-terminated ASCII string at `img[off..]`, capped at 256 bytes.
+fn cstr_at(img: &[u8], off: u64) -> Result<&str, &'static str> {
+    let off = off as usize;
+    let slice = img.get(off..(off + 256).min(img.len())).ok_or("PE: string out of range")?;
+    let end = slice.iter().position(|&b| b == 0).ok_or("PE: unterminated string")?;
+    core::str::from_utf8(&slice[..end]).map_err(|_| "PE: non-UTF8 import name")
+}
+
+/// Walk the Import Directory Table, resolve each thunk against `resolve_import`,
+/// and overwrite its IAT slot with the stub address. Rejects any import THOS
+/// does not provide (rather than leaving a dangling IAT entry).
+fn resolve_imports(img: &mut [u8], import_rva: u64, size_of_image: u64) -> Result<(), &'static str> {
+    let mut idt = import_rva as usize;
+    loop {
+        let end = idt + 20;
+        if end as u64 > size_of_image || end > img.len() {
+            return Err("PE: import table truncated");
+        }
+        let ilt_rva = u32::from_le_bytes(img[idt..idt + 4].try_into().unwrap()) as u64;
+        let name_rva = u32::from_le_bytes(img[idt + 12..idt + 16].try_into().unwrap()) as u64;
+        let iat_rva = u32::from_le_bytes(img[idt + 16..idt + 20].try_into().unwrap()) as u64;
+        if name_rva == 0 && iat_rva == 0 {
+            return Ok(()); // null terminator
+        }
+        let dll = String::from(cstr_at(img, name_rva)?); // owned — img is mutated below
+
+        // The ILT holds the by-name/ordinal descriptors; the IAT is what we
+        // patch. If the ILT is absent, the IAT still holds them pre-load.
+        let names_rva = if ilt_rva != 0 { ilt_rva } else { iat_rva };
+        let mut i = 0u64;
+        loop {
+            let t_off = (names_rva + i * 8) as usize;
+            let p_off = (iat_rva + i * 8) as usize;
+            if (t_off + 8) as u64 > size_of_image || t_off + 8 > img.len() {
+                return Err("PE: import thunk out of range");
+            }
+            let thunk = u64::from_le_bytes(img[t_off..t_off + 8].try_into().unwrap());
+            if thunk == 0 {
+                break;
+            }
+            let addr = if thunk & 0x8000_0000_0000_0000 != 0 {
+                // import by ordinal — no ordinal tables yet
+                return Err("PE: import by ordinal not supported yet");
+            } else {
+                let hint_name_rva = thunk & 0x7FFF_FFFF;
+                let func = cstr_at(img, hint_name_rva + 2)?; // skip the 2-byte hint
+                match resolve_import(&dll, func) {
+                    Some(a) => a,
+                    None => {
+                        crate::kprintln!("THOS: pe unresolved    {}!{}", dll.as_str(), func);
+                        return Err("PE: unresolved import");
+                    }
+                }
+            };
+            img[p_off..p_off + 8].copy_from_slice(&addr.to_le_bytes());
+            i += 1;
+        }
+        idt += 20;
+    }
+}
+
+/// Map the shared NT stub page into `proc` at [`NT_STUB_BASE`] (exec, read-only).
+fn map_stub_page(proc: &Process) -> Result<(), &'static str> {
+    let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (stub page)")?;
+    let phys = frame.start_address();
+    let dst = phys_to_virt(phys).as_mut_ptr::<u8>();
+    unsafe {
+        core::ptr::write_bytes(dst, 0, 4096);
+        core::ptr::copy_nonoverlapping(NT_STUB_BLOB.as_ptr(), dst, NT_STUB_BLOB.len());
+    }
+    proc.map(NT_STUB_BASE, phys.as_u64(), false, true);
     Ok(())
 }
 
