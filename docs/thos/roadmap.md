@@ -310,6 +310,53 @@ instead of bolting Unix and Windows identity side by side.
 - **Auth**: `argon2id` password hashes in a THOS-native credential store
   (SAM/shadow-shaped but our own format), not `/etc/shadow`.
 
+#### Age declaration & content restriction (family-safety)
+
+THOS ships a built-in maturity gate so an under-age operator is protected by
+default — the same feature class as Windows Family Safety / iOS Screen Time /
+Android parental controls, wired into the principal model rather than bolted on
+(*user requirement, 2026-08-31*).
+
+- **At first-run setup**, before the admin session exists, the operator declares
+  a **birthdate**. It is stored in the credential store next to the admin cred
+  and yields a per-principal `maturity` attribute (`adult` / `minor`, with the
+  exact age retained for finer thresholds later). This is a *declaration*, not
+  cryptographic proof — see the limits below.
+- **Default-deny for adult content.** Until a principal is `adult`, the policy
+  engine (the same one the exec-gate and Security Service already run) denies:
+  launching apps/packages carrying an `18+` age rating; installs from stores
+  above the principal's rating; and network access to domain categories
+  (adult / gambling / …) via the Security Service's category blocklist. A
+  `minor` principal cannot lift its own restriction — only the **admin
+  principal** can change a `maturity` attribute, through the trusted-path
+  elevation prompt.
+- **Enforcement points** already exist in the design: the native-exec gate adds
+  an age-rating check to its `policy engine` step; the Security Service's
+  network firewall/IDS does the domain-category filtering; the package/store
+  layer checks the rating at install time.
+- **Optional external verifier hook.** A pluggable interface lets a real
+  age-verification provider (an eID applet, a bank check, an operator-supplied
+  attestation) upgrade a declaration to a verified claim. THOS ships none by
+  default and never phones home; strong verification is the deployer's choice.
+
+Honest limits:
+- A *declared* birthdate that only the admin can change is what every mainstream
+  OS actually does — there is no local, offline, privacy-respecting way to
+  *prove* an age without an external identity/biometric provider, and THOS will
+  not ship ID scanning or on-device biometric age estimation.
+- **CSAM is not a content-filter feature and THOS will not implement a CSAM
+  scanner.** Such material is illegal to possess irrespective of any filter, and
+  detection is a specialised legal/reporting domain (hash databases, mandated
+  reporting) that a from-scratch OS must not reinvent. What the design *does*
+  provide against it is incidental: the Security Service already blocks
+  known-malicious/known-bad domains from threat-intel feeds, so hosts on those
+  feeds are blocked by the same mechanism as malware C2 — no dedicated
+  subsystem, no content inspection.
+
+Sequencing: designed in now (the `maturity` attribute rides the principal model
+being built), enforced once the policy engine / exec-gate / network filter land
+in the security phase — after the NT personality.
+
 Phasing:
 - **Phase 2 (stub):** the `Principal` object exists; a console `login` runs before
   the shell and sets the session's principal; files carry an owner + mode bits;
