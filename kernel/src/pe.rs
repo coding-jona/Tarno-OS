@@ -20,6 +20,8 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use x86_64::PhysAddr;
+
 use crate::mm::{phys_to_virt, FRAME_ALLOC};
 use crate::process::Process;
 
@@ -105,6 +107,14 @@ const PE_BOOTSTRAP_ADDR: u64 = NT_STUB_BASE + 0x7000;
 const BOOTSTRAP_LIST_OFF: usize = 0x400; // {base,entry} u64 pairs, {0,0}-terminated
 const BOOTSTRAP_ENTRY_OFF: usize = 0x800; // real exe entry VA
 
+/// One page holding static-TLS storage: a `ThreadLocalStoragePointer` array
+/// (`TEB+0x58` points here), then one zeroed+templated TLS block per module
+/// with a `.tls` section. Enough for the exe + a few DLLs; one thread per PE
+/// process, no dynamic `TlsAlloc` yet.
+const PE_TLS_ADDR: u64 = NT_STUB_BASE + 0x8000;
+const MAX_TLS_MODS: usize = 24;
+const TLS_BLOCKS_OFF: usize = 0x100; // blocks start here; ptr array is [0, 0x100)
+
 /// Synthetic system DLLs: one page each carrying a minimal PE32+ header, a
 /// copy of the NT trampolines, and a real `IMAGE_EXPORT_DIRECTORY` naming
 /// each. Both are present in the PEB `Ldr` lists so `GetModuleHandleA` /
@@ -159,14 +169,33 @@ struct LoadedModule {
     is_file: bool,
 }
 
-/// Per-`load()` DLL resolver: owns the dependency graph and the VA arena the
-/// on-disk DLLs map into.
+/// A module's parsed `IMAGE_TLS_DIRECTORY` (fields are runtime VAs — already
+/// fixed up by `apply_relocs` in the staged image).
+struct TlsInfo {
+    raw_start_va: u64, // template data [raw_start, raw_end)
+    raw_end_va: u64,
+    index_ptr_va: u64, // DWORD the loader writes the module's TLS index into
+    callbacks_va: u64, // NULL-terminated array of PIMAGE_TLS_CALLBACK
+    zero_fill: u32,
+}
+
+/// Static-TLS accumulation across the exe + its DLLs during one `load()`.
+struct TlsBuild {
+    frame_phys: u64, // 0 = the TLS page has not been allocated
+    n_mods: usize,   // = next TLS index
+    blk_next: usize, // next free offset within the TLS page
+}
+
+/// Per-`load()` DLL resolver: owns the dependency graph, the VA arena the
+/// on-disk DLLs map into, and the static-TLS layout.
 struct Loader<'a> {
     proc: &'a Process,
     fs: Option<crate::ext2::Ext2>,
     arena_next: u64,
     mods: Vec<LoadedModule>,
     depth: u32,
+    tls: TlsBuild,
+    tls_cbs: Vec<(u64, u64)>, // (module base, callback VA) run at process start
 }
 
 impl<'a> Loader<'a> {
@@ -197,7 +226,77 @@ impl<'a> Loader<'a> {
                 is_file: false,
             });
         }
-        Loader { proc, fs: None, arena_next: PE_DLL_ARENA, mods, depth: 0 }
+        Loader {
+            proc,
+            fs: None,
+            arena_next: PE_DLL_ARENA,
+            mods,
+            depth: 0,
+            tls: TlsBuild { frame_phys: 0, n_mods: 0, blk_next: TLS_BLOCKS_OFF },
+            tls_cbs: Vec::new(),
+        }
+    }
+
+    /// Give one module (exe or DLL) its static-TLS block: allocate a per-thread
+    /// copy of the template, record it in the `ThreadLocalStoragePointer`
+    /// array, patch the module's `AddressOfIndex` DWORD in `img` (before it is
+    /// mapped), and queue its TLS callbacks. `img` is the staged image, `base`
+    /// its load address.
+    fn tls_add_module(
+        &mut self,
+        base: u64,
+        img: &mut [u8],
+        t: &TlsInfo,
+    ) -> Result<(), &'static str> {
+        if self.tls.frame_phys == 0 {
+            let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (TLS)")?;
+            let phys = frame.start_address();
+            unsafe { core::ptr::write_bytes(phys_to_virt(phys).as_mut_ptr::<u8>(), 0, 4096) };
+            self.tls.frame_phys = phys.as_u64();
+        }
+        if self.tls.n_mods >= MAX_TLS_MODS {
+            return Err("PE: too many TLS modules");
+        }
+        let raw_off = t.raw_start_va.checked_sub(base).ok_or("PE: TLS data before base")? as usize;
+        let raw_len = t.raw_end_va.checked_sub(t.raw_start_va).ok_or("PE: bad TLS range")? as usize;
+        let total = raw_len + t.zero_fill as usize;
+        let blk = self.tls.blk_next;
+        if blk + total > 4096 {
+            return Err("PE: static TLS overflows its page");
+        }
+        let src = img.get(raw_off..raw_off + raw_len).ok_or("PE: TLS template out of range")?;
+        let page = phys_to_virt(PhysAddr::new(self.tls.frame_phys)).as_mut_ptr::<u8>();
+        let idx = self.tls.n_mods;
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), page.add(blk), raw_len);
+            // ptr array entry: ThreadLocalStoragePointer[idx] = block VA
+            *(page.add(idx * 8) as *mut u64) = PE_TLS_ADDR + blk as u64;
+        }
+        // the module's __tls_index
+        let ix_off = t.index_ptr_va.checked_sub(base).ok_or("PE: TLS index ptr before base")? as usize;
+        img.get_mut(ix_off..ix_off + 4)
+            .ok_or("PE: TLS index ptr out of range")?
+            .copy_from_slice(&(idx as u32).to_le_bytes());
+
+        // TLS callbacks — an array of fn VAs at callbacks_va, NUL-terminated.
+        if t.callbacks_va != 0 {
+            let mut off = t.callbacks_va.checked_sub(base).ok_or("PE: TLS callbacks before base")? as usize;
+            for _ in 0..64 {
+                let fnva = match img.get(off..off + 8) {
+                    Some(b) => u64::from_le_bytes(b.try_into().unwrap()),
+                    None => break,
+                };
+                if fnva == 0 {
+                    break;
+                }
+                self.tls_cbs.push((base, fnva));
+                off += 8;
+            }
+        }
+
+        self.tls.n_mods += 1;
+        self.tls.blk_next = (blk + total + 15) & !15;
+        Ok(())
     }
 
     fn fs(&mut self) -> Result<&crate::ext2::Ext2, &'static str> {
@@ -259,6 +358,9 @@ impl<'a> Loader<'a> {
 
         if staged.import_size != 0 {
             self.bind_imports(&mut staged.img, staged.import_rva as u64, staged.size_of_image)?;
+        }
+        if let Some(t) = staged.tls.take() {
+            self.tls_add_module(base, &mut staged.img, &t)?;
         }
         map_seg(self.proc, &staged.img, base, 0, staged.hdr_n, false)?;
         for &(rva, mem_size, exec) in &staged.segs {
@@ -467,6 +569,7 @@ struct StagedImage {
     import_size: u32,
     export_rva: u32,
     export_size: u32,
+    tls: Option<TlsInfo>,
 }
 
 /// Parse + materialise + relocate `file`. `want_base` fixes the load address
@@ -526,9 +629,7 @@ fn stage_image(file: &[u8], want_base: Option<u64>) -> Result<StagedImage, &'sta
         }
         Ok((rd_u32(file, dirs + i * 8)?, rd_u32(file, dirs + i * 8 + 4)?))
     };
-    if dir(9)?.1 != 0 {
-        return Err("PE: TLS directory not supported yet");
-    }
+    let (tls_rva, tls_size) = dir(9)?;
     let (export_rva, export_size) = dir(0)?;
     let (import_rva, import_size) = dir(1)?;
     let (reloc_rva, reloc_size) = dir(5)?;
@@ -590,6 +691,24 @@ fn stage_image(file: &[u8], want_base: Option<u64>) -> Result<StagedImage, &'sta
         apply_relocs(&mut img, reloc_rva as u64, reloc_size as u64, delta, size_of_image)?;
     }
 
+    // The TLS directory's address fields are VAs — read them *after* relocation,
+    // so they already hold runtime addresses.
+    let tls = if tls_size != 0 {
+        let d = tls_rva as usize;
+        if d + 40 > img.len() {
+            return Err("PE: TLS directory out of range");
+        }
+        Some(TlsInfo {
+            raw_start_va: rd_u64(&img, d)?,
+            raw_end_va: rd_u64(&img, d + 8)?,
+            index_ptr_va: rd_u64(&img, d + 16)?,
+            callbacks_va: rd_u64(&img, d + 24)?,
+            zero_fill: rd_u32(&img, d + 32)?,
+        })
+    } else {
+        None
+    };
+
     Ok(StagedImage {
         load_base,
         size_of_image,
@@ -601,6 +720,7 @@ fn stage_image(file: &[u8], want_base: Option<u64>) -> Result<StagedImage, &'sta
         import_size,
         export_rva,
         export_size,
+        tls,
     })
 }
 
@@ -622,6 +742,9 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     if staged.import_size != 0 {
         ldr.bind_imports(&mut staged.img, staged.import_rva as u64, staged.size_of_image)?;
     }
+    if let Some(t) = staged.tls.take() {
+        ldr.tls_add_module(staged.load_base, &mut staged.img, &t)?;
+    }
 
     // Map the exe (headers first, sections win on any overlap).
     map_seg(proc, &staged.img, staged.load_base, 0, staged.hdr_n, false)?;
@@ -630,6 +753,15 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     }
     map_kernel32_page(proc)?;
     map_ntdll_page(proc)?;
+
+    // Static-TLS page (if any module used `.tls`); TEB.ThreadLocalStoragePointer
+    // gets its VA below.
+    let tls_ptr = if ldr.tls.frame_phys != 0 {
+        proc.map(PE_TLS_ADDR, ldr.tls.frame_phys, true, false); // rw, no-exec
+        PE_TLS_ADDR
+    } else {
+        0
+    };
 
     let file_mods: Vec<LdrFileMod> = ldr
         .mods
@@ -651,20 +783,25 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
         staged.size_of_image,
         stack_top,
         &file_mods,
+        tls_ptr,
     )?;
 
-    // DLLs that ship a `DllMain`, dependency order (a DLL is registered before
-    // its own file-DLL imports, so reverse of load order is deps-first).
-    let dllmains: Vec<(u64, u64)> = file_mods
-        .iter()
-        .rev()
-        .filter(|m| m.entry != 0)
-        .map(|m| (m.base, m.entry))
-        .collect();
-    let entry = if dllmains.is_empty() {
+    // Ring-3 process init, in order: every TLS callback, then every `DllMain`
+    // (dependency order — a DLL is registered before its own file-DLL imports,
+    // so reverse of load order is deps-first). All share the
+    // `(hinst, DLL_PROCESS_ATTACH, 1)` signature.
+    let mut init: Vec<(u64, u64)> = ldr.tls_cbs.clone();
+    init.extend(
+        file_mods
+            .iter()
+            .rev()
+            .filter(|m| m.entry != 0)
+            .map(|m| (m.base, m.entry)),
+    );
+    let entry = if init.is_empty() {
         staged.entry
     } else {
-        map_bootstrap(proc, &dllmains, staged.entry)?;
+        map_bootstrap(proc, &init, staged.entry)?;
         PE_BOOTSTRAP_ADDR
     };
 
@@ -677,11 +814,12 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
 }
 
 /// Build the ring-3 process-bootstrap page: a small loop that calls every
-/// `DllMain(hinst, DLL_PROCESS_ATTACH=1, lpvReserved=1)` then jumps to
-/// `exe_entry`. Mapped exec + read-only at [`PE_BOOTSTRAP_ADDR`].
+/// `init` entry as `fn(module_base, DLL_PROCESS_ATTACH=1, lpvReserved=1)` —
+/// TLS callbacks then `DllMain`s — and then jumps to `exe_entry`. Mapped exec
+/// + read-only at [`PE_BOOTSTRAP_ADDR`].
 fn map_bootstrap(
     proc: &Process,
-    dllmains: &[(u64, u64)],
+    init: &[(u64, u64)],
     exe_entry: u64,
 ) -> Result<(), &'static str> {
     let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (bootstrap)")?;
@@ -694,7 +832,7 @@ fn map_bootstrap(
 
     // {base, entry} pairs then a {0,0} terminator.
     let mut o = BOOTSTRAP_LIST_OFF;
-    for &(base, ent) in dllmains {
+    for &(base, ent) in init {
         page[o..o + 8].copy_from_slice(&base.to_le_bytes());
         page[o + 8..o + 16].copy_from_slice(&ent.to_le_bytes());
         o += 16;
@@ -767,6 +905,7 @@ fn map_teb_peb(
     size_of_image: u64,
     stack_top: u64,
     file_mods: &[LdrFileMod],
+    tls_ptr: u64,
 ) -> Result<(), &'static str> {
     let n_file = file_mods.len().min(MAX_FILE_LDR_MODS);
     // The LIST_ENTRY VAs for list `i` (0=InLoadOrder, 1=InMemoryOrder,
@@ -805,6 +944,7 @@ fn map_teb_peb(
         put(t, 0x08, stack_top); // NT_TIB.StackBase
         put(t, 0x10, stack_top.saturating_sub(64 * 1024)); // NT_TIB.StackLimit
         put(t, 0x30, PE_TEB_ADDR); // NT_TIB.Self
+        put(t, 0x58, tls_ptr); // ThreadLocalStoragePointer (0 = no static TLS)
         put(t, 0x60, PE_PEB_ADDR); // ProcessEnvironmentBlock
     })?;
     w(PE_PEB_ADDR, &|p| {

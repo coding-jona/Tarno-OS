@@ -566,6 +566,8 @@ fn write_pe_hello(path: &Path) {
     let msg_dll_ldr_tag = u32::MAX - 21;
     let msg_ord_tag = u32::MAX - 22;
     let msg_fwd_tag = u32::MAX - 23;
+    let tls_index_tag = u32::MAX - 24;
+    let msg_tls_tag = u32::MAX - 25;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -858,11 +860,48 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2r) TLS. The loader gave this module a static-TLS block, wrote its
+    //     __tls_index, pointed TEB.ThreadLocalStoragePointer at the array, and
+    //     queued `tls_cb` (emitted after block 3, out of the fall-through path)
+    //     to run at process start. tls_cb writes a magic into *this thread's*
+    //     TLS block; the check below reaches the block via gs:[0x58] and
+    //     verifies the copied template word AND the magic.
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]); // mov rax, gs:[0x58]
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    code.extend_from_slice(&[0x74, 0x1D]); // jz .tlsfail
+    rel!([0x8B, 0x0D, 0, 0, 0, 0], tls_index_tag); // mov ecx, [rip+tls_index]
+    code.extend_from_slice(&[0x48, 0x8B, 0x04, 0xC8]); // mov rax, [rax+rcx*8]
+    code.extend_from_slice(&[0x81, 0x38, 0xEF, 0xBE, 0xAD, 0xDE]); // cmp dword [rax], 0xDEADBEEF
+    code.extend_from_slice(&[0x75, 0x0B]); // jne .tlsfail
+    code.extend_from_slice(&[0x81, 0x78, 0x04, 0x5A, 0x5A, 0x5A, 0x5A]); // cmp dword [rax+4], 0x5A5A5A5A
+    code.extend_from_slice(&[0x75, 0x02]); // jne .tlsfail
+    code.extend_from_slice(&[0xEB, 0x01]); // jmp .tlsok
+    code.extend_from_slice(&[0xCC]); // .tlsfail: int3
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // .tlsok: mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_tls_tag); // lea rdx, [rip+msg_tls]
+    let tls_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 3) ExitProcess(0)
     code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_exit); // call [rip+iat_ExitProcess]
     code.extend_from_slice(&[0xCC]); // int3
+
+    // tls_cb — reached only through the pointer the loader queued, never fallen
+    // into. void tls_cb(PVOID hinst, DWORD reason, PVOID reserved).
+    let tls_cb_off = code.len();
+    code.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1  (DLL_PROCESS_ATTACH)
+    code.extend_from_slice(&[0x75, 0x1A]); // jne .cbret
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]); // mov rax, gs:[0x58]
+    rel!([0x8B, 0x0D, 0, 0, 0, 0], tls_index_tag); // mov ecx, [rip+tls_index]
+    code.extend_from_slice(&[0x48, 0x8B, 0x04, 0xC8]); // mov rax, [rax+rcx*8]  (block VA)
+    code.extend_from_slice(&[0xC7, 0x40, 0x04, 0x5A, 0x5A, 0x5A, 0x5A]); // mov dword [rax+4], 0x5A5A5A5A
+    code.extend_from_slice(&[0xC3]); // .cbret: ret
 
     // --- data slots at the end of .text ---
     while code.len() % 8 != 0 {
@@ -897,6 +936,18 @@ fn write_pe_hello(path: &Path) {
     }
     let iosb_off = code.len();
     code.extend_from_slice(&[0u8; 16]); // IO_STATUS_BLOCK { NTSTATUS; ULONG_PTR }
+    let tls_dir_off = code.len();
+    code.extend_from_slice(&[0u8; 40]); // IMAGE_TLS_DIRECTORY64 (fields filled + DIR64-relocated)
+    let tls_raw_off = code.len();
+    code.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // TLS template word 0
+    code.extend_from_slice(&[0u8; 12]); // rest of the 16-byte template
+    let tls_index_off = code.len();
+    code.extend_from_slice(&[0u8; 4]); // loader writes __tls_index here
+    while code.len() % 8 != 0 {
+        code.push(0);
+    }
+    let tls_cbs_off = code.len();
+    code.extend_from_slice(&[0u8; 16]); // PIMAGE_TLS_CALLBACK[] = { &tls_cb, NULL }
     let msg1_off = code.len();
     code.extend_from_slice(msg1);
     let msg2_off = code.len();
@@ -927,7 +978,11 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(msg_ord);
     let msg_fwd_off = code.len();
     code.extend_from_slice(msg_fwd);
+    let msg_tls: &[u8] = b"PE TLS OK\n";
+    let msg_tls_off = code.len();
+    code.extend_from_slice(msg_tls);
 
+    code[tls_r8..tls_r8 + 4].copy_from_slice(&(msg_tls.len() as u32).to_le_bytes());
     code[dll_r8..dll_r8 + 4].copy_from_slice(&(msg_dll.len() as u32).to_le_bytes());
     code[dll_ldr_r8..dll_ldr_r8 + 4].copy_from_slice(&(msg_dll_ldr.len() as u32).to_le_bytes());
     code[ord_r8..ord_r8 + 4].copy_from_slice(&(msg_ord.len() as u32).to_le_bytes());
@@ -938,6 +993,18 @@ fn write_pe_hello(path: &Path) {
     code[gpa_r8..gpa_r8 + 4].copy_from_slice(&(msg_gpa.len() as u32).to_le_bytes());
     code[ptr_off..ptr_off + 8]
         .copy_from_slice(&(IMAGE_BASE + text_rva as u64 + msg1_off as u64).to_le_bytes());
+
+    // IMAGE_TLS_DIRECTORY64 fields (preferred-base VAs; DIR64-relocated at load).
+    let ib = IMAGE_BASE + text_rva as u64;
+    code[tls_dir_off..tls_dir_off + 8].copy_from_slice(&(ib + tls_raw_off as u64).to_le_bytes());
+    code[tls_dir_off + 8..tls_dir_off + 16]
+        .copy_from_slice(&(ib + tls_raw_off as u64 + 16).to_le_bytes());
+    code[tls_dir_off + 16..tls_dir_off + 24]
+        .copy_from_slice(&(ib + tls_index_off as u64).to_le_bytes());
+    code[tls_dir_off + 24..tls_dir_off + 32]
+        .copy_from_slice(&(ib + tls_cbs_off as u64).to_le_bytes());
+    code[tls_cbs_off..tls_cbs_off + 8].copy_from_slice(&(ib + tls_cb_off as u64).to_le_bytes());
+
     for (pos, target) in fixups {
         let target_rva = match target {
             t if t == ptr_slot_tag => text_rva + ptr_off as u32,
@@ -964,19 +1031,42 @@ fn write_pe_hello(path: &Path) {
             t if t == thosaddname_tag => text_rva + thosaddname_off as u32,
             t if t == msg_ord_tag => text_rva + msg_ord_off as u32,
             t if t == msg_fwd_tag => text_rva + msg_fwd_off as u32,
+            t if t == tls_index_tag => text_rva + tls_index_off as u32,
+            t if t == msg_tls_tag => text_rva + msg_tls_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
         code[pos..pos + 4].copy_from_slice(&((target_rva as i64 - next_rva) as i32).to_le_bytes());
     }
-    let ptr_reloc_rva = text_rva + ptr_off as u32;
-
-    // --- .reloc: one block, one DIR64 fixup for the msg1 pointer slot ---
+    // --- .reloc: DIR64 fixups for the msg1 pointer slot and the five TLS VA
+    //     fields, grouped into one block per 4 KiB page. ---
+    let mut dir64: Vec<u32> = vec![
+        text_rva + ptr_off as u32,
+        text_rva + tls_dir_off as u32,      // StartAddressOfRawData
+        text_rva + tls_dir_off as u32 + 8,  // EndAddressOfRawData
+        text_rva + tls_dir_off as u32 + 16, // AddressOfIndex
+        text_rva + tls_dir_off as u32 + 24, // AddressOfCallBacks
+        text_rva + tls_cbs_off as u32,      // callback[0]
+    ];
+    dir64.sort_unstable();
     let mut reloc: Vec<u8> = Vec::new();
-    reloc.extend_from_slice(&(ptr_reloc_rva & !0xFFF).to_le_bytes()); // PageRVA
-    reloc.extend_from_slice(&12u32.to_le_bytes()); // BlockSize
-    reloc.extend_from_slice(&((10u16 << 12) | (ptr_reloc_rva & 0xFFF) as u16).to_le_bytes());
-    reloc.extend_from_slice(&0u16.to_le_bytes()); // ABSOLUTE padding
+    let mut i = 0;
+    while i < dir64.len() {
+        let page = dir64[i] & !0xFFF;
+        let mut ents: Vec<u16> = Vec::new();
+        while i < dir64.len() && dir64[i] & !0xFFF == page {
+            ents.push((10u16 << 12) | (dir64[i] & 0xFFF) as u16);
+            i += 1;
+        }
+        if ents.len() % 2 != 0 {
+            ents.push(0); // ABSOLUTE pad -> 4-align the block
+        }
+        reloc.extend_from_slice(&page.to_le_bytes());
+        reloc.extend_from_slice(&(8 + ents.len() as u32 * 2).to_le_bytes());
+        for e in ents {
+            reloc.extend_from_slice(&e.to_le_bytes());
+        }
+    }
 
     // --- PE32+ container ---
     let text_vsize = code.len() as u32;
@@ -1024,6 +1114,10 @@ fn write_pe_hello(path: &Path) {
     // data directory 5 = BASE_RELOC
     pe[opt + 112 + 5 * 8..opt + 112 + 5 * 8 + 4].copy_from_slice(&reloc_rva.to_le_bytes());
     pe[opt + 112 + 5 * 8 + 4..opt + 112 + 5 * 8 + 8].copy_from_slice(&reloc_vsize.to_le_bytes());
+    // data directory 9 = TLS
+    pe[opt + 112 + 9 * 8..opt + 112 + 9 * 8 + 4]
+        .copy_from_slice(&(text_rva + tls_dir_off as u32).to_le_bytes());
+    pe[opt + 112 + 9 * 8 + 4..opt + 112 + 9 * 8 + 8].copy_from_slice(&40u32.to_le_bytes());
     // data directory 12 = IAT
     pe[opt + 112 + 12 * 8..opt + 112 + 12 * 8 + 4].copy_from_slice(&iat_exit.to_le_bytes());
     pe[opt + 112 + 12 * 8 + 4..opt + 112 + 12 * 8 + 8]
@@ -2014,6 +2108,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
         && serial.contains("PE dll forward OK") // forwarder export (thoscrt -> KERNEL32.GetProcessHeap)
+        && serial.contains("PE TLS OK") // static TLS: block copied, __tls_index written, callback ran
         && serial.contains("THOS: pe reject ok");
     if ok {
         println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll/System32-DLL (in Ldr)");
