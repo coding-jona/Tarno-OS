@@ -406,6 +406,8 @@ fn disk_image() -> PathBuf {
 fn write_pe_hello(path: &Path) {
     let msg1: &[u8] = b"PE on THOS via native loader\n";
     let msg2: &[u8] = b"PE via WriteFile\n";
+    let msg_ntdll: &[u8] = b"PE ntdll OK\n";
+    let msg_ntdll_len = msg_ntdll.len();
     const IMAGE_BASE: u64 = 0x1_4000_0000;
     const SECT_ALIGN: u32 = 0x1000;
     const FILE_ALIGN: u32 = 0x200;
@@ -496,6 +498,10 @@ fn write_pe_hello(path: &Path) {
     let msg_gpa_tag = u32::MAX - 11;
     let k32name_tag = u32::MAX - 12;
     let wfname_tag = u32::MAX - 13;
+    let ntdllname_tag = u32::MAX - 14;
+    let ntwritename_tag = u32::MAX - 15;
+    let iosb_tag = u32::MAX - 16;
+    let msg_ntdll_tag = u32::MAX - 17;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -669,6 +675,37 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0xFF, 0xD6]); // call rsi
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
 
+    // 2m) the ntdll boundary: GetModuleHandleA("ntdll.dll") ->
+    //     GetProcAddress(h, "NtWriteFile") -> call it with a real 9-arg NT
+    //     signature (Event/Apc/IoStatusBlock/ByteOffset/Key), IO_STATUS_BLOCK
+    //     out-param. Prints via the resolved NtWriteFile itself.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag); // lea rcx, [rip+ntdllname]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh); // call [rip+iat_GetModuleHandleA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (hNtdll)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], ntwritename_tag); // lea rdx, [rip+ntwritename]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa); // call [rip+iat_GetProcAddress]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax  (NtWriteFile)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], stdout_slot_tag); // mov rcx, [rip+stdout_slot]
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx  (Event)
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (ApcRoutine)
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d  (ApcContext)
+    rel!([0x48, 0x8D, 0x3D, 0, 0, 0, 0], iosb_tag); // lea rdi, [rip+iosb]
+    rel!([0x48, 0x8D, 0x1D, 0, 0, 0, 0], msg_ntdll_tag); // lea rbx, [rip+msg_ntdll]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x58]); // sub rsp, 0x58
+    code.extend_from_slice(&[0x48, 0x89, 0x7C, 0x24, 0x20]); // mov [rsp+0x20], rdi  (IoStatusBlock)
+    code.extend_from_slice(&[0x48, 0x89, 0x5C, 0x24, 0x28]); // mov [rsp+0x28], rbx  (Buffer)
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x30]);
+    code.extend_from_slice(&(msg_ntdll_len as u32).to_le_bytes()); // mov qword [rsp+0x30], len
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x38, 0, 0, 0, 0]); // [rsp+0x38]=0 ByteOffset
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x40, 0, 0, 0, 0]); // [rsp+0x40]=0 Key
+    code.extend_from_slice(&[0xFF, 0xD6]); // call rsi
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x58]); // add rsp, 0x58
+
     // 3) ExitProcess(0)
     code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
@@ -695,9 +732,15 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"kernel32.dll\0");
     let wfname_off = code.len();
     code.extend_from_slice(b"WriteFile\0");
+    let ntdllname_off = code.len();
+    code.extend_from_slice(b"ntdll.dll\0");
+    let ntwritename_off = code.len();
+    code.extend_from_slice(b"NtWriteFile\0");
     while code.len() % 8 != 0 {
         code.push(0);
     }
+    let iosb_off = code.len();
+    code.extend_from_slice(&[0u8; 16]); // IO_STATUS_BLOCK { NTSTATUS; ULONG_PTR }
     let msg1_off = code.len();
     code.extend_from_slice(msg1);
     let msg2_off = code.len();
@@ -714,6 +757,8 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(msg_va);
     let msg_gpa_off = code.len();
     code.extend_from_slice(msg_gpa);
+    let msg_ntdll_off = code.len();
+    code.extend_from_slice(msg_ntdll);
 
     code[pp_r8..pp_r8 + 4].copy_from_slice(&(msg_pp.len() as u32).to_le_bytes());
     code[ldr_r8..ldr_r8 + 4].copy_from_slice(&(msg_ldr.len() as u32).to_le_bytes());
@@ -737,6 +782,10 @@ fn write_pe_hello(path: &Path) {
             t if t == msg_gpa_tag => text_rva + msg_gpa_off as u32,
             t if t == k32name_tag => text_rva + k32name_off as u32,
             t if t == wfname_tag => text_rva + wfname_off as u32,
+            t if t == ntdllname_tag => text_rva + ntdllname_off as u32,
+            t if t == ntwritename_tag => text_rva + ntwritename_off as u32,
+            t if t == iosb_tag => text_rva + iosb_off as u32,
+            t if t == msg_ntdll_tag => text_rva + msg_ntdll_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -1567,9 +1616,10 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE argv0 pe-hello.exe") // GetCommandLineA
         && serial.contains("PE VirtualAlloc+Heap OK") // VirtualAlloc + GetProcessHeap + HeapAlloc
         && serial.contains("PE GetProcAddress OK") // LoadLibraryA + synthetic kernel32 export table
+        && serial.contains("PE ntdll OK") // ntdll boundary: GetModuleHandleA + GetProcAddress + 9-arg NtWriteFile
         && serial.contains("THOS: pe reject ok");
     if ok {
-        println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress");
+        println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll");
     } else {
         eprintln!("pe-test: FAIL — the PE did not run to exit\n--- serial ---\n{serial}\n---");
         exit(1);
