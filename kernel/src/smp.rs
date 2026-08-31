@@ -29,11 +29,33 @@ pub struct PerCpu {
     pub lapic_id: u32,     // 12
     pub kernel_rsp: u64,   // 16 — kernel stack loaded by `syscall`
     pub user_scratch: u64, // 24 — user rsp stashed across `syscall`
+    /// The value currently programmed into `IA32_KERNEL_GS_BASE` for this CPU
+    /// (= the ring-3 `%gs` base after the exit `swapgs`). The per-CPU pointer
+    /// for POSIX/kernel threads; a PE thread's TEB while one is scheduled. Lets
+    /// `apply_cpu_state` skip the `wrmsr` on the common POSIX→POSIX switch.
+    pub user_gs: u64, // 32
 }
 
 static mut PER_CPU: [PerCpu; MAX_CPUS] = [const {
-    PerCpu { self_ptr: 0, cpu_index: 0, lapic_id: 0, kernel_rsp: 0, user_scratch: 0 }
+    PerCpu {
+        self_ptr: 0,
+        cpu_index: 0,
+        lapic_id: 0,
+        kernel_rsp: 0,
+        user_scratch: 0,
+        user_gs: 0,
+    }
 }; MAX_CPUS];
+
+/// `IA32_KERNEL_GS_BASE` currently programmed for `cpu`.
+pub fn user_gs(cpu: usize) -> u64 {
+    assert!(cpu < MAX_CPUS);
+    unsafe { (*core::ptr::addr_of!(PER_CPU[cpu])).user_gs }
+}
+pub fn set_user_gs(cpu: usize, v: u64) {
+    assert!(cpu < MAX_CPUS);
+    unsafe { (*core::ptr::addr_of_mut!(PER_CPU[cpu])).user_gs = v }
+}
 
 /// Set the kernel stack the `syscall` entry stub loads (`gs:[kernel_rsp]`).
 /// The scheduler points this at the running user thread's kernel stack.
@@ -62,6 +84,17 @@ pub fn this_cpu() -> u32 {
     }
 }
 
+/// This CPU's per-CPU block pointer (`gs:0`). Only read while `gs` is the
+/// kernel per-CPU base (kernel context) — used to fill `KERNEL_GS_BASE` for a
+/// POSIX/kernel thread on a context switch.
+pub fn this_cpu_ptr() -> u64 {
+    unsafe {
+        let p: u64;
+        core::arch::asm!("mov {}, gs:0", out(reg) p, options(nostack, preserves_flags));
+        p
+    }
+}
+
 pub fn online() -> usize {
     CPUS_ONLINE.load(Ordering::Relaxed)
 }
@@ -75,8 +108,9 @@ unsafe fn install_percpu(index: u32, lapic_id: u32) {
     (*pc).self_ptr = pc as usize;
     (*pc).cpu_index = index;
     (*pc).lapic_id = lapic_id;
+    (*pc).user_gs = pc as u64;
     // Both bases point at the per-CPU block, so the `swapgs` in the syscall
-    // entry stub is a no-op value-wise until userspace installs its own TLS.
+    // entry stub is a no-op value-wise until a PE thread installs its TEB.
     GsBase::write(VirtAddr::new(pc as u64));
     KernelGsBase::write(VirtAddr::new(pc as u64));
 }

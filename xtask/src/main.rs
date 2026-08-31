@@ -466,6 +466,12 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&(msg1.len() as u32).to_le_bytes()); // mov rdx, len1
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
 
+    // 1b) touch the TEB / PEB via %gs — faults here if gs-base / TEB / PEB are
+    //     wrong, so the WriteFile line below never prints.
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0, 0, 0]); // mov rax, gs:[0x30]  (TEB self)
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x60]); // mov rax, [rax+0x60]  (PEB via TEB)
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x10]); // mov rax, [rax+0x10]  (ImageBaseAddress)
+
     // 2) WriteFile(GetStdHandle(-11), msg2, len2, &written, NULL)
     code.extend_from_slice(&[0xB9, 0xF5, 0xFF, 0xFF, 0xFF]); // mov ecx, -11
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28

@@ -20,6 +20,8 @@ use crate::process::Process;
 
 pub struct PeImage {
     pub entry: u64,
+    /// Win64 TEB virtual address — becomes the thread's `%gs` base.
+    pub teb: u64,
     #[allow(dead_code)]
     pub base: u64,
     #[allow(dead_code)]
@@ -55,6 +57,13 @@ const MAX_SECTIONS: usize = 96;
 const NT_STUB_BASE: u64 = 0x0000_7FF0_0000_0000;
 const NT_STUB_STRIDE: u64 = 16;
 
+/// Win64 TEB / PEB, one page each, just past the stub page. `%gs` points at the
+/// TEB for a PE thread. Minimal fill — enough that a CRT's early
+/// `gs:[0x30]` (self), `gs:[0x60]` (PEB), stack-bound and `LastError` reads do
+/// not fault.
+const PE_TEB_ADDR: u64 = NT_STUB_BASE + 0x1000;
+const PE_PEB_ADDR: u64 = NT_STUB_BASE + 0x2000;
+
 /// Index of the stub implementing `dll!func`, or `None` if THOS does not
 /// provide it yet (the loader then rejects the PE rather than mislinking).
 fn resolve_import(dll: &str, func: &str) -> Option<u16> {
@@ -84,7 +93,7 @@ fn rd_u64(img: &[u8], off: usize) -> Result<u64, &'static str> {
         .ok_or("PE: truncated (u64)")
 }
 
-pub fn load(proc: &Process, file: &[u8]) -> Result<PeImage, &'static str> {
+pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'static str> {
     if file.get(0..2) != Some(b"MZ") {
         return Err("PE: not an MZ image");
     }
@@ -213,12 +222,46 @@ pub fn load(proc: &Process, file: &[u8]) -> Result<PeImage, &'static str> {
         map_seg(proc, &img, load_base + rva, rva, mem_size, exec)?;
     }
     map_stub_page(proc)?;
+    map_teb_peb(proc, load_base, stack_top)?;
 
     Ok(PeImage {
         entry: load_base + entry_rva,
+        teb: PE_TEB_ADDR,
         base: load_base,
         size: size_of_image,
     })
+}
+
+/// Allocate + map the TEB and PEB pages and fill the few fields a Win64 entry /
+/// CRT touches immediately.
+fn map_teb_peb(proc: &Process, image_base: u64, stack_top: u64) -> Result<(), &'static str> {
+    let w = |addr: u64, fill: &dyn Fn(&mut [u8])| -> Result<(), &'static str> {
+        let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (TEB/PEB)")?;
+        let phys = frame.start_address();
+        let page = unsafe {
+            let p = phys_to_virt(phys).as_mut_ptr::<u8>();
+            core::ptr::write_bytes(p, 0, 4096);
+            core::slice::from_raw_parts_mut(p, 4096)
+        };
+        fill(page);
+        proc.map(addr, phys.as_u64(), true, false); // rw, no-exec
+        Ok(())
+    };
+    let put = |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+
+    w(PE_TEB_ADDR, &|t| {
+        put(t, 0x08, stack_top); // NT_TIB.StackBase
+        put(t, 0x10, stack_top.saturating_sub(64 * 1024)); // NT_TIB.StackLimit
+        put(t, 0x30, PE_TEB_ADDR); // NT_TIB.Self
+        put(t, 0x60, PE_PEB_ADDR); // ProcessEnvironmentBlock
+                                   // 0x68 LastErrorValue stays 0
+    })?;
+    w(PE_PEB_ADDR, &|p| {
+        // 0x02 BeingDebugged stays 0
+        put(p, 0x10, image_base); // ImageBaseAddress
+                                  // 0x18 Ldr, 0x20 ProcessParameters stay NULL (no loader data yet)
+    })?;
+    Ok(())
 }
 
 /// Walk the `.reloc` blocks and add `delta` to every `DIR64` target. Rejects

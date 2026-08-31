@@ -213,6 +213,17 @@ late.
     now loads its message pointer from an **absolute** slot patched by a DIR64
     fixup — a wrong delta would fault or misprint, so the exact-string check is
     the relocation test.
+  - **PEB / TEB + `gs` base done.** `pe::load` allocates + maps a TEB and PEB
+    page for the process (`gs:[0x30]` self, `gs:[0x60]` PEB, `NT_TIB` stack
+    bounds, `PEB.ImageBaseAddress`); the thread carries the TEB as its `%gs`
+    base. `apply_cpu_state` programs `IA32_KERNEL_GS_BASE` per thread (per-CPU
+    pointer for POSIX/kernel threads, the TEB for a PE thread) and skips the
+    `wrmsr` when the value is unchanged — a POSIX→POSIX switch costs nothing, so
+    the existing `swapgs`/`gs:0` per-CPU discipline is untouched. PE threads are
+    **cooperatively scheduled for now** (`IF=0` in ring 3) so a ring-3 IRQ
+    `swapgs` shim isn't needed yet. `pe-test` reads `gs:[0x30]→[+0x60]→[+0x10]`
+    (TEB → PEB → ImageBaseAddress) before its `WriteFile` line, so a broken `gs`
+    / TEB / PEB would fault it.
   - **Imports + NT syscall surface done (P1):** `pe::load` walks the Import
     Directory Table, resolves each by-name thunk against a builtin resolver, and
     patches the IAT in place (post-relocation); unresolved names / ordinals are

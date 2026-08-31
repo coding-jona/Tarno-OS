@@ -604,12 +604,12 @@ pub fn spawn_init(bytes: &[u8], argv: &[&str], envp: &[&str]) -> u64 {
 #[allow(dead_code)] // only the `petest` milestone calls this so far
 pub fn spawn_pe(bytes: &[u8]) -> Result<u64, &'static str> {
     let space = Process::new();
-    let img = crate::pe::load(&space, bytes)?; // malformed .exe -> Err, never panic
     let stack_top = space.new_user_stack();
+    let img = crate::pe::load(&space, bytes, stack_top)?; // malformed .exe -> Err, never panic
     // MS x64 ABI: at the entry instruction RSP+8 must be 16-aligned.
     let rsp = (stack_top & !0xF) - 8;
     let task = Task::new(0, space);
-    sched::spawn_user("pe", task.clone(), img.entry, rsp);
+    sched::spawn_user_pe("pe", task.clone(), img.entry, rsp, img.teb);
     Ok(task.pid)
 }
 

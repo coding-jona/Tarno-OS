@@ -73,6 +73,20 @@ thos_user_thread_start:
     push r12
     swapgs
     iretq
+
+// Same, but IF=0: the thread is *not* timer-preemptible in user mode. Used for
+// PE threads so the ring-3 `swapgs` discipline stays trivial (a preempted PE
+// thread would need a ring-3 IRQ swapgs shim — a later item).
+.globl thos_user_thread_start_coop
+thos_user_thread_start_coop:
+    call thos_finish_switch
+    push r15
+    push r13
+    push 0x002          // RFLAGS with IF=0
+    push r14
+    push r12
+    swapgs
+    iretq
 "#
 );
 
@@ -80,6 +94,7 @@ extern "C" {
     fn thos_ctx_switch(save_to: *mut u64, load_from: *const u64);
     fn thos_thread_trampoline() -> !;
     fn thos_user_thread_start() -> !;
+    fn thos_user_thread_start_coop() -> !;
 }
 
 #[no_mangle]
@@ -130,6 +145,11 @@ pub struct Thread {
     /// constantly. 0 for kernel threads and for a fresh image before its
     /// first `arch_prctl(SET_FS)`.
     fsbase: AtomicU64,
+    /// User `%gs` base (the Win64 TEB pointer for PE threads). `0` = use the
+    /// per-CPU pointer, i.e. behave exactly as a POSIX/kernel thread. Loaded
+    /// into `IA32_KERNEL_GS_BASE` on every switch in, so the exit `swapgs`
+    /// brings it live for ring 3.
+    gsbase: AtomicU64,
 }
 
 unsafe impl Send for Thread {}
@@ -162,6 +182,7 @@ impl Thread {
             _uframe: None,
             running: AtomicBool::new(true), // it is running right now
             fsbase: AtomicU64::new(0),
+            gsbase: AtomicU64::new(0),
         })
     }
 
@@ -207,14 +228,28 @@ impl Thread {
             _uframe: None,
             running: AtomicBool::new(false),
             fsbase: AtomicU64::new(0),
+            gsbase: AtomicU64::new(0),
         })
     }
 
-    fn spawned_user(id: u64, name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64) -> Arc<Self> {
+    fn spawned_user(
+        id: u64,
+        name: &'static str,
+        task: Arc<Task>,
+        entry: u64,
+        user_rsp: u64,
+        cooperative: bool,
+        gsbase: u64,
+    ) -> Arc<Self> {
         let s = gdt::selectors();
         let cr3 = task.space().pml4_phys();
+        let trampoline = if cooperative {
+            thos_user_thread_start_coop as *const () as u64
+        } else {
+            thos_user_thread_start as *const () as u64
+        };
         let (stack, sp, top) = Self::build_stack(
-            thos_user_thread_start as *const () as u64,
+            trampoline,
             entry,
             user_rsp,
             (s.user_code.0 | 3) as u64,
@@ -233,6 +268,7 @@ impl Thread {
             _uframe: None,
             running: AtomicBool::new(false),
             fsbase: AtomicU64::new(0),
+            gsbase: AtomicU64::new(gsbase),
         })
     }
 
@@ -266,6 +302,7 @@ impl Thread {
             _uframe: Some(uframe),
             running: AtomicBool::new(false),
             fsbase: AtomicU64::new(fsbase),
+            gsbase: AtomicU64::new(0),
         })
     }
 
@@ -337,6 +374,10 @@ impl Thread {
     pub fn set_fsbase(&self, v: u64) {
         self.fsbase.store(v, Ordering::Relaxed);
     }
+    /// This thread's user `%gs` base (Win64 TEB pointer, `0` for non-PE).
+    pub fn gsbase(&self) -> u64 {
+        self.gsbase.load(Ordering::Relaxed)
+    }
 }
 
 /// The address space of the thread running on this CPU, if it is a user thread.
@@ -397,7 +438,16 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -
 /// the first time it is scheduled, in `proc`'s address space.
 pub fn spawn_user(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
-    let t = Thread::spawned_user(id, name, task, entry, user_rsp);
+    let t = Thread::spawned_user(id, name, task, entry, user_rsp, false, 0);
+    SCHED.lock().ready.push_back(t);
+    id
+}
+
+/// A user thread for a native PE image: cooperatively scheduled (IF=0 in ring 3)
+/// and carrying `teb` as its `%gs` base.
+pub fn spawn_user_pe(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64, teb: u64) -> u64 {
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let t = Thread::spawned_user(id, name, task, entry, user_rsp, true, teb);
     SCHED.lock().ready.push_back(t);
     id
 }
@@ -413,8 +463,8 @@ pub fn spawn_user_frame(name: &'static str, task: Arc<Task>, frame: UserFrame, f
 
 /// Point CR3 + the ring-transition stacks at the thread we're about to run.
 /// Runs with interrupts disabled, right before `thos_ctx_switch`.
-fn apply_cpu_state(cpu: usize, cr3: u64, kstack_top: Option<u64>, fsbase: u64) {
-    use x86_64::registers::model_specific::FsBase;
+fn apply_cpu_state(cpu: usize, cr3: u64, kstack_top: Option<u64>, fsbase: u64, gsbase: u64) {
+    use x86_64::registers::model_specific::{FsBase, KernelGsBase};
     let cur = Cr3::read().0.start_address().as_u64();
     if cr3 != cur {
         let frame = PhysFrame::from_start_address(PhysAddr::new(cr3)).expect("cr3 aligned");
@@ -424,6 +474,16 @@ fn apply_cpu_state(cpu: usize, cr3: u64, kstack_top: Option<u64>, fsbase: u64) {
     // threads). Cheap wrmsr; without it a forked musl child runs on the
     // parent's — or a stale — `%fs` and faults on its first TLS access.
     FsBase::write(VirtAddr::new(fsbase));
+    // The thread's user `%gs` base goes into KERNEL_GS_BASE; the exit `swapgs`
+    // makes it live for ring 3. `0` = the per-CPU pointer, so POSIX/kernel
+    // threads keep `gs` == per-CPU. Skip the `wrmsr` unless the value actually
+    // changes — the common POSIX→POSIX switch then costs nothing (and behaves
+    // exactly as before PE support).
+    let want = if gsbase != 0 { gsbase } else { smp::this_cpu_ptr() };
+    if smp::user_gs(cpu) != want {
+        KernelGsBase::write(VirtAddr::new(want));
+        smp::set_user_gs(cpu, want);
+    }
     if let Some(top) = kstack_top {
         gdt::set_kernel_stack(cpu, VirtAddr::new(top));
         smp::set_kernel_rsp(cpu, top);
@@ -462,14 +522,22 @@ pub fn unblock(t: Arc<Thread>) {
 /// Terminate the current thread. Never returns.
 pub fn exit() -> ! {
     interrupts::disable();
-    let (load, next, cpu, cr3, kstack_top, fsbase) = {
+    let (load, next, cpu, cr3, kstack_top, fsbase, gsbase) = {
         let mut s = SCHED.lock();
         let cpu = smp::this_cpu() as usize;
         let prev = s.cpus[cpu].current.take().expect("exit: no current thread");
         prev.set_state(State::Exited);
         let next = pick_next(&mut s, cpu);
         next.set_state(State::Running);
-        let out = (next.ctx_ptr(), next.clone(), cpu, next.cr3(), next.kstack_top, next.fsbase());
+        let out = (
+            next.ctx_ptr(),
+            next.clone(),
+            cpu,
+            next.cr3(),
+            next.kstack_top,
+            next.fsbase(),
+            next.gsbase(),
+        );
         s.cpus[cpu].current = Some(next);
         // Hand the corpse off like a blocking switch: `finish_switch` (running
         // in `next`) clears its `running` flag once this CPU is fully off its
@@ -478,7 +546,7 @@ pub fn exit() -> ! {
         s.graveyard.push(prev);
         out
     };
-    apply_cpu_state(cpu, cr3, kstack_top, fsbase);
+    apply_cpu_state(cpu, cr3, kstack_top, fsbase, gsbase);
     while next.running.swap(true, Ordering::Acquire) {
         core::hint::spin_loop();
     }
@@ -496,7 +564,7 @@ fn pick_next(s: &mut Inner, cpu: usize) -> Arc<Thread> {
 /// The core switch. `block` = don't return the current thread to the ready
 /// queue (it is going to sleep). Must run with interrupts disabled.
 fn reschedule(block: bool) {
-    let (save, load, next, cpu, cr3, kstack_top, fsbase) = {
+    let (save, load, next, cpu, cr3, kstack_top, fsbase, gsbase) = {
         let mut s = SCHED.lock();
         let cpu = smp::this_cpu() as usize;
 
@@ -530,12 +598,13 @@ fn reschedule(block: bool) {
             next.cr3(),
             next.kstack_top,
             next.fsbase(),
+            next.gsbase(),
         );
         s.cpus[cpu].current = Some(next.clone());
         out
     };
 
-    apply_cpu_state(cpu, cr3, kstack_top, fsbase);
+    apply_cpu_state(cpu, cr3, kstack_top, fsbase, gsbase);
     CTX_SWITCHES.fetch_add(1, Ordering::Relaxed);
 
     // Claim `next`'s stack: wait out any CPU still unwinding off it.
