@@ -314,6 +314,36 @@ late.
   `WriteFile(stdout)`, `WaitForSingleObject`) runs through the THOS NT path — **with no
   wine process in the tree**. ELF and PE processes appear in one `ps` output.
 
+### Product goal — "download it and it runs", zero user config
+
+The compatibility layers are a **first-class part of the OS**, not something the
+user installs or configures. The loader inspects the binary and picks the
+runtime itself — no "select Proton", no config file, no per-title tweaking.
+The model is **Rosetta on macOS**: the translation/compat path is invisible.
+
+| Input | Loader routes to | User does |
+|---|---|---|
+| ELF (Linux) | native Linux personality | nothing |
+| PE `.exe` / `.dll` | native NT personality + Wine-sourced DLLs in `C:\Windows\System32` | nothing |
+| Steam / Direct3D title | Proton profile (Wine + DXVK / vkd3d) auto-applied | nothing |
+| `.apk` | Android profile (Waydroid-class: `binder` + Bionic + ART on the Linux personality) | nothing |
+
+**"Download → runs, zero setup" is the target for:** native Linux binaries;
+Win32 apps; **games without kernel anti-cheat** (the bulk of Steam);
+EAC / BattlEye titles where the developer enabled the vendor's Proton mode.
+
+**Honest boundary — kernel anti-cheat / device attestation.** THOS can deliver
+the *zero-setup* half for these (bundle the vendor runtime, auto-configure the
+environment). Whether the game then *runs* is decided by a third party,
+server-side: EAC / BattlEye / ACE (NTE) / Vanguard / Ricochet / EA Javelin
+attest the environment and can reject or ban. Best realistic case for the
+"Running" tier (e.g. NTE via ACE): works *while the vendor's checks tolerate
+the environment*, and can break with any anti-cheat patch — never a guaranteed
+"just works". **No circumvention of attestation** — the vendor-sanctioned
+Proton mode or nothing (see the anti-cheat notes in [`feasibility.md`](feasibility.md)).
+Vanguard-class (kernel driver required at boot, no Proton mode) stays fully
+out of scope pending vendor cooperation.
+
 ### 32-bit Windows apps — WOW64 thunks, not code translation
 
 An x86-64 CPU runs 32-bit code natively (long mode's compatibility sub-mode), so
