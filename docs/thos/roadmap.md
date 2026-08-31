@@ -324,8 +324,11 @@ late.
       table (`eat` by `ordinal - ord_base`, `names` → index); a thunk with the
       ordinal flag resolves via `by_ordinal`. `pe-test` imports
       `thoscrt!thos_mul` by ordinal 2 (`PE dll ordinal OK`).
-    - **forwarder exports** — `kernel32` forwards hundreds of names as
-      `"NTDLL.RtlXxx"` strings; resolve them recursively.
+    - **forwarder exports** — *done.* `LoadedModule.eat` is `Vec<Export>`
+      (`Empty` / `Addr` / `Forward("Dll.Func")`); `Loader::resolve_export_idx`
+      follows a forwarder (`resolve_module` → recurse), and `nt.rs`'s
+      `resolve_slot` does the same at runtime for `GetProcAddress`. `pe-test`'s
+      `thoscrt!thos_fwd` forwards to `KERNEL32.GetProcessHeap` (`PE dll forward OK`).
     - **TLS directory** (data dir 9) — allocate the TLS block, wire
       `TEB.ThreadLocalStoragePointer`, run `AddressOfCallBacks`.
     - honour a `FALSE` from `DllMain`.
