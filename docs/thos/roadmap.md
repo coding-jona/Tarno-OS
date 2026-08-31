@@ -355,6 +355,28 @@ Android parental controls, wired into the principal model rather than bolted on
   Residual gap even with the chip: it proves the *document* is genuine, not that
   the person at the keyboard is its holder. That needs `DG2` + a live camera
   face match — a separate subsystem THOS does not ship by default.
+
+  **Optical / camera document check (front + back scan, hologram-tilt).** This is
+  a real technique — commercial remote-ID-verification products capture a tilt
+  sequence to see the diffractive (OVD / kinegram) features move, cross-check the
+  MRZ against the printed VIZ, look for tamper edges, and detect screen /
+  photocopy recapture. But those are large ML systems, trained per document type
+  and version on labelled genuine-vs-forged corpora, cloud-hosted and
+  continuously retrained; their output is a *probability*, not a proof.
+  A from-scratch OS with no camera driver, no ML runtime, no reference corpus
+  and no update pipeline cannot build this to a trustworthy level — a hand-rolled
+  version would be **security theatre**: it would look like it verifies while
+  passing competent forgeries and failing on lighting, which for a child-safety
+  gate is worse than an honest weaker gate. ("You see tampering immediately" is
+  true for a trained human examiner with the card in hand, not for naïve software
+  on a webcam frame.) So THOS's optical path, if built, is an explicitly
+  **weak heuristic** layer (`assurance = optical-weak`): capture front + back +
+  a short tilt clip, run cheap checks (OVD motion present at all, MRZ↔VIZ DOB
+  match, portrait present, obvious screen-recapture), raise the bar against lazy
+  attempts — and the policy engine must **not** grant `adult` on `optical-weak`
+  alone. A genuine "the document is authentic" result comes only from the chip,
+  or from integrating a third-party verification service (which is not local and
+  is the deployer's choice, not a THOS default).
 - **Default-deny for adult content.** Until a principal is `adult`, the policy
   engine (the same one the exec-gate and Security Service already run) denies:
   launching apps/packages carrying an `18+` age rating; installs from stores
@@ -368,9 +390,10 @@ Android parental controls, wired into the principal model rather than bolted on
   network firewall/IDS does the domain-category filtering; the package/store
   layer checks the rating at install time.
 - **`age-verify` module** outputs `(age, assurance)` and never persists the
-  source material — the decode / APDU buffers are zeroed the moment the age is
-  extracted, nothing touches disk. `assurance ∈ { declared, chip-verified }`;
-  the policy engine decides which is enough to grant `adult`.
+  source material — the decode / APDU / frame buffers are zeroed the moment the
+  age is extracted, nothing touches disk.
+  `assurance ∈ { declared, optical-weak, chip-verified }`; the policy engine
+  decides which is enough to grant `adult` (default: only `chip-verified`).
 
 Engineering reality — the chip path is a substantial, security-critical module:
 - **USB PC/SC (CCID) reader driver** — a new device class for THOS.
