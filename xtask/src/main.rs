@@ -317,6 +317,22 @@ fn disk_image() -> PathBuf {
         img.to_str().unwrap(),
     ]));
 
+    // DllMain-returns-FALSE test: failcrt.dll aborts init; pe-dllfail.exe's
+    // entry (which prints a line) must therefore never run.
+    let failcrt = root.join("target/failcrt.dll");
+    write_failcrt_dll(&failcrt);
+    run(Command::new("debugfs").args([
+        "-w", "-R",
+        &format!("write {} /Windows/System32/failcrt.dll", failcrt.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+    let pedllfail = root.join("target/pe-dllfail.exe");
+    write_pe_dllfail(&pedllfail);
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} pe-dllfail.exe", pedllfail.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+
     // BusyBox applet links: `/bin/<applet>` hard-links to the single `/busybox`
     // inode, so the shell can run `ls`, `cat`, ... by PATH lookup (BusyBox
     // dispatches on `basename(argv[0])`). `debugfs ln` does not maintain the
@@ -444,9 +460,10 @@ fn write_pe_hello(path: &Path) {
         b"GetProcAddress",   // 16
         b"LoadLibraryA",     // 17
     ];
+    // A func spelled `#N` is imported by ordinal N instead of by name.
     let imports: [(&[u8], &[&[u8]]); 2] = [
         (b"KERNEL32.dll", k32_funcs),
-        (b"thoscrt.dll", &[b"thos_add"]),
+        (b"thoscrt.dll", &[b"thos_add", b"#2", b"thos_fwd"]),
     ];
     let n_imp = imports.len();
     let import_dir_size = ((n_imp + 1) * 20) as u32;
@@ -469,17 +486,23 @@ fn write_pe_hello(path: &Path) {
         iat_at[d] = idata.len() as u32;
         idata.resize(idata.len() + (imports[d].1.len() + 1) * 8, 0);
     }
-    // Hint/name entries.
-    let mut hn_rvas: Vec<Vec<u32>> = vec![Vec::new(); n_imp];
+    // Thunk value per import: an ORDINAL_FLAG|ordinal for `#N`, else the RVA of
+    // a freshly emitted hint/name entry.
+    let mut thunks: Vec<Vec<u64>> = vec![Vec::new(); n_imp];
     for d in 0..n_imp {
         for f in imports[d].1 {
-            if idata.len() % 2 != 0 {
+            if let Some(ord) = f.strip_prefix(b"#") {
+                let n: u16 = std::str::from_utf8(ord).unwrap().parse().unwrap();
+                thunks[d].push(0x8000_0000_0000_0000u64 | n as u64);
+            } else {
+                if idata.len() % 2 != 0 {
+                    idata.push(0);
+                }
+                thunks[d].push((idata_rva + idata.len() as u32) as u64);
+                idata.extend_from_slice(&[0, 0]); // hint
+                idata.extend_from_slice(f);
                 idata.push(0);
             }
-            hn_rvas[d].push(idata_rva + idata.len() as u32);
-            idata.extend_from_slice(&[0, 0]); // hint
-            idata.extend_from_slice(f);
-            idata.push(0);
         }
     }
     // DLL name strings.
@@ -502,8 +525,8 @@ fn write_pe_hello(path: &Path) {
         put32(&mut idata, e + 12, dllname_rva[d]); // Name
         put32(&mut idata, e + 16, idata_rva + iat_at[d]); // FirstThunk
         for k in 0..imports[d].1.len() as u32 {
-            put64(&mut idata, ilt_at[d] + k * 8, hn_rvas[d][k as usize] as u64);
-            put64(&mut idata, iat_at[d] + k * 8, hn_rvas[d][k as usize] as u64);
+            put64(&mut idata, ilt_at[d] + k * 8, thunks[d][k as usize]);
+            put64(&mut idata, iat_at[d] + k * 8, thunks[d][k as usize]);
         }
     }
 
@@ -520,7 +543,9 @@ fn write_pe_hello(path: &Path) {
     let iat_ha = iat0 + 80; // HeapAlloc
     let iat_gpa = iat0 + 88; // GetProcAddress
     let iat_ll = iat0 + 96; // LoadLibraryA
-    let iat_add = idata_rva + iat_at[1]; // thoscrt!thos_add
+    let iat_add = idata_rva + iat_at[1]; // thoscrt!thos_add  (by name)
+    let iat_mul = idata_rva + iat_at[1] + 8; // thoscrt!thos_mul (by ordinal 2)
+    let iat_fwd = idata_rva + iat_at[1] + 16; // thoscrt!thos_fwd (forwarded to KERNEL32.GetProcessHeap)
 
     // --- entry machine code (x86-64) ---
     // Deferred RIP-relative fixups: (disp32 position in `code`, target RVA).
@@ -552,6 +577,13 @@ fn write_pe_hello(path: &Path) {
     let iosb_tag = u32::MAX - 16;
     let msg_ntdll_tag = u32::MAX - 17;
     let msg_dll_tag = u32::MAX - 18;
+    let thoscrtname_tag = u32::MAX - 19;
+    let thosaddname_tag = u32::MAX - 20;
+    let msg_dll_ldr_tag = u32::MAX - 21;
+    let msg_ord_tag = u32::MAX - 22;
+    let msg_fwd_tag = u32::MAX - 23;
+    let tls_index_tag = u32::MAX - 24;
+    let msg_tls_tag = u32::MAX - 25;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -776,11 +808,116 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2o) thoscrt.dll is now in the PEB Ldr list: resolve thos_add at runtime
+    //     via GetModuleHandleA + GetProcAddress (not the static IAT), call it,
+    //     trap unless 42, print.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], thoscrtname_tag); // lea rcx, [rip+thoscrtname]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh); // call [rip+iat_GetModuleHandleA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (hThoscrt)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], thosaddname_tag); // lea rdx, [rip+thosaddname]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa); // call [rip+iat_GetProcAddress]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax  (resolved thos_add)
+    code.extend_from_slice(&[0xB9, 40, 0, 0, 0]); // mov ecx, 40
+    code.extend_from_slice(&[0xBA, 2, 0, 0, 0]); // mov edx, 2
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    code.extend_from_slice(&[0xFF, 0xD6]); // call rsi
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x83, 0xF8, 0x2A]); // cmp eax, 42
+    code.extend_from_slice(&[0x74, 0x01]); // je +1
+    code.extend_from_slice(&[0xCC]); // int3
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_dll_ldr_tag); // lea rdx, [rip+msg_dll_ldr]
+    let dll_ldr_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2p) thos_mul is imported from thoscrt.dll BY ORDINAL (2), not by name.
+    //     Call it (6*7), trap unless 42, print.
+    code.extend_from_slice(&[0xB9, 6, 0, 0, 0]); // mov ecx, 6
+    code.extend_from_slice(&[0xBA, 7, 0, 0, 0]); // mov edx, 7
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_mul); // call [rip+iat_thos_mul]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x83, 0xF8, 0x2A]); // cmp eax, 42
+    code.extend_from_slice(&[0x74, 0x01]); // je +1
+    code.extend_from_slice(&[0xCC]); // int3
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_ord_tag); // lea rdx, [rip+msg_ord]
+    let ord_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2q) thos_fwd is a forwarder export (thoscrt -> KERNEL32.GetProcessHeap).
+    //     After the loader follows it, calling thos_fwd() is calling
+    //     GetProcessHeap() -> a fixed non-zero handle. Trap on 0, else print.
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_fwd); // call [rip+iat_thos_fwd]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    code.extend_from_slice(&[0x75, 0x01]); // jne +1
+    code.extend_from_slice(&[0xCC]); // int3
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_fwd_tag); // lea rdx, [rip+msg_fwd]
+    let fwd_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2r) TLS. The loader gave this module a static-TLS block, wrote its
+    //     __tls_index, pointed TEB.ThreadLocalStoragePointer at the array, and
+    //     queued `tls_cb` (emitted after block 3, out of the fall-through path)
+    //     to run at process start. tls_cb writes a magic into *this thread's*
+    //     TLS block; the check below reaches the block via gs:[0x58] and
+    //     verifies the copied template word AND the magic.
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]); // mov rax, gs:[0x58]
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    code.extend_from_slice(&[0x74, 0x1D]); // jz .tlsfail
+    rel!([0x8B, 0x0D, 0, 0, 0, 0], tls_index_tag); // mov ecx, [rip+tls_index]
+    code.extend_from_slice(&[0x48, 0x8B, 0x04, 0xC8]); // mov rax, [rax+rcx*8]
+    code.extend_from_slice(&[0x81, 0x38, 0xEF, 0xBE, 0xAD, 0xDE]); // cmp dword [rax], 0xDEADBEEF
+    code.extend_from_slice(&[0x75, 0x0B]); // jne .tlsfail
+    code.extend_from_slice(&[0x81, 0x78, 0x04, 0x5A, 0x5A, 0x5A, 0x5A]); // cmp dword [rax+4], 0x5A5A5A5A
+    code.extend_from_slice(&[0x75, 0x02]); // jne .tlsfail
+    code.extend_from_slice(&[0xEB, 0x01]); // jmp .tlsok
+    code.extend_from_slice(&[0xCC]); // .tlsfail: int3
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // .tlsok: mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_tls_tag); // lea rdx, [rip+msg_tls]
+    let tls_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 3) ExitProcess(0)
     code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_exit); // call [rip+iat_ExitProcess]
     code.extend_from_slice(&[0xCC]); // int3
+
+    // tls_cb — reached only through the pointer the loader queued, never fallen
+    // into. void tls_cb(PVOID hinst, DWORD reason, PVOID reserved).
+    let tls_cb_off = code.len();
+    code.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1  (DLL_PROCESS_ATTACH)
+    code.extend_from_slice(&[0x75, 0x1A]); // jne .cbret
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]); // mov rax, gs:[0x58]
+    rel!([0x8B, 0x0D, 0, 0, 0, 0], tls_index_tag); // mov ecx, [rip+tls_index]
+    code.extend_from_slice(&[0x48, 0x8B, 0x04, 0xC8]); // mov rax, [rax+rcx*8]  (block VA)
+    code.extend_from_slice(&[0xC7, 0x40, 0x04, 0x5A, 0x5A, 0x5A, 0x5A]); // mov dword [rax+4], 0x5A5A5A5A
+    code.extend_from_slice(&[0xC3]); // .cbret: ret
 
     // --- data slots at the end of .text ---
     while code.len() % 8 != 0 {
@@ -806,11 +943,27 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"ntdll.dll\0");
     let ntwritename_off = code.len();
     code.extend_from_slice(b"NtWriteFile\0");
+    let thoscrtname_off = code.len();
+    code.extend_from_slice(b"thoscrt.dll\0");
+    let thosaddname_off = code.len();
+    code.extend_from_slice(b"thos_add\0");
     while code.len() % 8 != 0 {
         code.push(0);
     }
     let iosb_off = code.len();
     code.extend_from_slice(&[0u8; 16]); // IO_STATUS_BLOCK { NTSTATUS; ULONG_PTR }
+    let tls_dir_off = code.len();
+    code.extend_from_slice(&[0u8; 40]); // IMAGE_TLS_DIRECTORY64 (fields filled + DIR64-relocated)
+    let tls_raw_off = code.len();
+    code.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // TLS template word 0
+    code.extend_from_slice(&[0u8; 12]); // rest of the 16-byte template
+    let tls_index_off = code.len();
+    code.extend_from_slice(&[0u8; 4]); // loader writes __tls_index here
+    while code.len() % 8 != 0 {
+        code.push(0);
+    }
+    let tls_cbs_off = code.len();
+    code.extend_from_slice(&[0u8; 16]); // PIMAGE_TLS_CALLBACK[] = { &tls_cb, NULL }
     let msg1_off = code.len();
     code.extend_from_slice(msg1);
     let msg2_off = code.len();
@@ -819,7 +972,10 @@ fn write_pe_hello(path: &Path) {
     let msg_ldr: &[u8] = b"PE Ldr OK\n";
     let msg_va: &[u8] = b"PE VirtualAlloc+Heap OK\n";
     let msg_gpa: &[u8] = b"PE GetProcAddress OK\n";
-    let msg_dll: &[u8] = b"PE dll thos_add=42\n";
+    let msg_dll: &[u8] = b"PE dll thos_add=42 (DllMain ran)\n";
+    let msg_dll_ldr: &[u8] = b"PE dll Ldr OK\n";
+    let msg_ord: &[u8] = b"PE dll ordinal OK\n";
+    let msg_fwd: &[u8] = b"PE dll forward OK\n";
     let msg_pp_off = code.len();
     code.extend_from_slice(msg_pp);
     let msg_ldr_off = code.len();
@@ -832,14 +988,39 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(msg_ntdll);
     let msg_dll_off = code.len();
     code.extend_from_slice(msg_dll);
+    let msg_dll_ldr_off = code.len();
+    code.extend_from_slice(msg_dll_ldr);
+    let msg_ord_off = code.len();
+    code.extend_from_slice(msg_ord);
+    let msg_fwd_off = code.len();
+    code.extend_from_slice(msg_fwd);
+    let msg_tls: &[u8] = b"PE TLS OK\n";
+    let msg_tls_off = code.len();
+    code.extend_from_slice(msg_tls);
 
+    code[tls_r8..tls_r8 + 4].copy_from_slice(&(msg_tls.len() as u32).to_le_bytes());
     code[dll_r8..dll_r8 + 4].copy_from_slice(&(msg_dll.len() as u32).to_le_bytes());
+    code[dll_ldr_r8..dll_ldr_r8 + 4].copy_from_slice(&(msg_dll_ldr.len() as u32).to_le_bytes());
+    code[ord_r8..ord_r8 + 4].copy_from_slice(&(msg_ord.len() as u32).to_le_bytes());
+    code[fwd_r8..fwd_r8 + 4].copy_from_slice(&(msg_fwd.len() as u32).to_le_bytes());
     code[pp_r8..pp_r8 + 4].copy_from_slice(&(msg_pp.len() as u32).to_le_bytes());
     code[ldr_r8..ldr_r8 + 4].copy_from_slice(&(msg_ldr.len() as u32).to_le_bytes());
     code[va_r8..va_r8 + 4].copy_from_slice(&(msg_va.len() as u32).to_le_bytes());
     code[gpa_r8..gpa_r8 + 4].copy_from_slice(&(msg_gpa.len() as u32).to_le_bytes());
     code[ptr_off..ptr_off + 8]
         .copy_from_slice(&(IMAGE_BASE + text_rva as u64 + msg1_off as u64).to_le_bytes());
+
+    // IMAGE_TLS_DIRECTORY64 fields (preferred-base VAs; DIR64-relocated at load).
+    let ib = IMAGE_BASE + text_rva as u64;
+    code[tls_dir_off..tls_dir_off + 8].copy_from_slice(&(ib + tls_raw_off as u64).to_le_bytes());
+    code[tls_dir_off + 8..tls_dir_off + 16]
+        .copy_from_slice(&(ib + tls_raw_off as u64 + 16).to_le_bytes());
+    code[tls_dir_off + 16..tls_dir_off + 24]
+        .copy_from_slice(&(ib + tls_index_off as u64).to_le_bytes());
+    code[tls_dir_off + 24..tls_dir_off + 32]
+        .copy_from_slice(&(ib + tls_cbs_off as u64).to_le_bytes());
+    code[tls_cbs_off..tls_cbs_off + 8].copy_from_slice(&(ib + tls_cb_off as u64).to_le_bytes());
+
     for (pos, target) in fixups {
         let target_rva = match target {
             t if t == ptr_slot_tag => text_rva + ptr_off as u32,
@@ -861,19 +1042,47 @@ fn write_pe_hello(path: &Path) {
             t if t == iosb_tag => text_rva + iosb_off as u32,
             t if t == msg_ntdll_tag => text_rva + msg_ntdll_off as u32,
             t if t == msg_dll_tag => text_rva + msg_dll_off as u32,
+            t if t == msg_dll_ldr_tag => text_rva + msg_dll_ldr_off as u32,
+            t if t == thoscrtname_tag => text_rva + thoscrtname_off as u32,
+            t if t == thosaddname_tag => text_rva + thosaddname_off as u32,
+            t if t == msg_ord_tag => text_rva + msg_ord_off as u32,
+            t if t == msg_fwd_tag => text_rva + msg_fwd_off as u32,
+            t if t == tls_index_tag => text_rva + tls_index_off as u32,
+            t if t == msg_tls_tag => text_rva + msg_tls_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
         code[pos..pos + 4].copy_from_slice(&((target_rva as i64 - next_rva) as i32).to_le_bytes());
     }
-    let ptr_reloc_rva = text_rva + ptr_off as u32;
-
-    // --- .reloc: one block, one DIR64 fixup for the msg1 pointer slot ---
+    // --- .reloc: DIR64 fixups for the msg1 pointer slot and the five TLS VA
+    //     fields, grouped into one block per 4 KiB page. ---
+    let mut dir64: Vec<u32> = vec![
+        text_rva + ptr_off as u32,
+        text_rva + tls_dir_off as u32,      // StartAddressOfRawData
+        text_rva + tls_dir_off as u32 + 8,  // EndAddressOfRawData
+        text_rva + tls_dir_off as u32 + 16, // AddressOfIndex
+        text_rva + tls_dir_off as u32 + 24, // AddressOfCallBacks
+        text_rva + tls_cbs_off as u32,      // callback[0]
+    ];
+    dir64.sort_unstable();
     let mut reloc: Vec<u8> = Vec::new();
-    reloc.extend_from_slice(&(ptr_reloc_rva & !0xFFF).to_le_bytes()); // PageRVA
-    reloc.extend_from_slice(&12u32.to_le_bytes()); // BlockSize
-    reloc.extend_from_slice(&((10u16 << 12) | (ptr_reloc_rva & 0xFFF) as u16).to_le_bytes());
-    reloc.extend_from_slice(&0u16.to_le_bytes()); // ABSOLUTE padding
+    let mut i = 0;
+    while i < dir64.len() {
+        let page = dir64[i] & !0xFFF;
+        let mut ents: Vec<u16> = Vec::new();
+        while i < dir64.len() && dir64[i] & !0xFFF == page {
+            ents.push((10u16 << 12) | (dir64[i] & 0xFFF) as u16);
+            i += 1;
+        }
+        if ents.len() % 2 != 0 {
+            ents.push(0); // ABSOLUTE pad -> 4-align the block
+        }
+        reloc.extend_from_slice(&page.to_le_bytes());
+        reloc.extend_from_slice(&(8 + ents.len() as u32 * 2).to_le_bytes());
+        for e in ents {
+            reloc.extend_from_slice(&e.to_le_bytes());
+        }
+    }
 
     // --- PE32+ container ---
     let text_vsize = code.len() as u32;
@@ -921,6 +1130,10 @@ fn write_pe_hello(path: &Path) {
     // data directory 5 = BASE_RELOC
     pe[opt + 112 + 5 * 8..opt + 112 + 5 * 8 + 4].copy_from_slice(&reloc_rva.to_le_bytes());
     pe[opt + 112 + 5 * 8 + 4..opt + 112 + 5 * 8 + 8].copy_from_slice(&reloc_vsize.to_le_bytes());
+    // data directory 9 = TLS
+    pe[opt + 112 + 9 * 8..opt + 112 + 9 * 8 + 4]
+        .copy_from_slice(&(text_rva + tls_dir_off as u32).to_le_bytes());
+    pe[opt + 112 + 9 * 8 + 4..opt + 112 + 9 * 8 + 8].copy_from_slice(&40u32.to_le_bytes());
     // data directory 12 = IAT
     pe[opt + 112 + 12 * 8..opt + 112 + 12 * 8 + 4].copy_from_slice(&iat_exit.to_le_bytes());
     pe[opt + 112 + 12 * 8 + 4..opt + 112 + 12 * 8 + 8]
@@ -988,21 +1201,33 @@ fn write_thoscrt_dll(path: &Path) {
     let iat_dir_rva = rdata_rva + iat_off;
     let iat_gle_rva = rdata_rva + iat_off; // the one imported slot
 
+    // Three exports: thos_add (ord 1, by name), thos_mul (ord 2 — pe-hello
+    // imports it *by ordinal*), thos_fwd (ord 3 — a **forwarder** to
+    // KERNEL32.GetProcessHeap). EAT[1] is back-patched once thos_mul's .text
+    // offset is known.
     let exp_dir_off = rdata.len() as u32;
     rdata.resize(rdata.len() + 40, 0); // IMAGE_EXPORT_DIRECTORY
     let eat_off = rdata.len() as u32;
-    rdata.resize(rdata.len() + 4, 0); // AddressOfFunctions[1]
+    rdata.resize(rdata.len() + 12, 0); // AddressOfFunctions[3]
     let enpt_off = rdata.len() as u32;
-    rdata.resize(rdata.len() + 4, 0); // AddressOfNames[1]
+    rdata.resize(rdata.len() + 12, 0); // AddressOfNames[3]
     let ord_off = rdata.len() as u32;
-    rdata.resize(rdata.len() + 2, 0); // AddressOfNameOrdinals[1]
+    rdata.resize(rdata.len() + 6, 0); // AddressOfNameOrdinals[3]
     if rdata.len() % 2 != 0 {
         rdata.push(0);
     }
     let expname_off = rdata.len() as u32;
     rdata.extend_from_slice(b"thos_add\0");
+    let expname2_off = rdata.len() as u32;
+    rdata.extend_from_slice(b"thos_mul\0");
+    let expname3_off = rdata.len() as u32;
+    rdata.extend_from_slice(b"thos_fwd\0");
     let expmod_off = rdata.len() as u32;
     rdata.extend_from_slice(b"thoscrt.dll\0");
+    // The forwarder target string, placed *inside* the export-directory span so
+    // the loader recognises EAT[2] as a forwarder RVA.
+    let fwd_str_off = rdata.len() as u32;
+    rdata.extend_from_slice(b"KERNEL32.GetProcessHeap\0");
     while rdata.len() % 4 != 0 {
         rdata.push(0);
     }
@@ -1010,17 +1235,34 @@ fn write_thoscrt_dll(path: &Path) {
     let export_dir_size = rdata.len() as u32 - exp_dir_off;
     p32(&mut rdata, exp_dir_off as usize + 0x0C, rdata_rva + expmod_off); // Name
     p32(&mut rdata, exp_dir_off as usize + 0x10, 1); // Base (ordinal base)
-    p32(&mut rdata, exp_dir_off as usize + 0x14, 1); // NumberOfFunctions
-    p32(&mut rdata, exp_dir_off as usize + 0x18, 1); // NumberOfNames
+    p32(&mut rdata, exp_dir_off as usize + 0x14, 3); // NumberOfFunctions
+    p32(&mut rdata, exp_dir_off as usize + 0x18, 3); // NumberOfNames
     p32(&mut rdata, exp_dir_off as usize + 0x1C, rdata_rva + eat_off);
     p32(&mut rdata, exp_dir_off as usize + 0x20, rdata_rva + enpt_off);
     p32(&mut rdata, exp_dir_off as usize + 0x24, rdata_rva + ord_off);
-    p32(&mut rdata, eat_off as usize, text_rva); // thos_add == start of .text
+    p32(&mut rdata, eat_off as usize, text_rva); // EAT[0] = thos_add = start of .text
+    p32(&mut rdata, eat_off as usize + 8, rdata_rva + fwd_str_off); // EAT[2] = forwarder RVA
     p32(&mut rdata, enpt_off as usize, rdata_rva + expname_off);
-    rdata[ord_off as usize..ord_off as usize + 2].copy_from_slice(&0u16.to_le_bytes());
+    p32(&mut rdata, enpt_off as usize + 4, rdata_rva + expname2_off);
+    p32(&mut rdata, enpt_off as usize + 8, rdata_rva + expname3_off);
+    rdata[ord_off as usize..ord_off as usize + 2].copy_from_slice(&0u16.to_le_bytes()); // name[0] -> EAT[0]
+    rdata[ord_off as usize + 2..ord_off as usize + 4].copy_from_slice(&1u16.to_le_bytes()); // name[1] -> EAT[1]
+    rdata[ord_off as usize + 4..ord_off as usize + 6].copy_from_slice(&2u16.to_le_bytes()); // name[2] -> EAT[2]
 
-    // --- .text: thos_add(rcx=a, rdx=b) — call imported GetLastError, ret a+b -
+    // A writable slot DllMain(DLL_PROCESS_ATTACH) sets to 1; thos_add refuses
+    // to compute unless it is set, so `thos_add(40,2) == 42` also proves the
+    // loader ran DllMain before the exe entry.
+    while rdata.len() % 4 != 0 {
+        rdata.push(0);
+    }
+    let sentinel_rva = rdata_rva + rdata.len() as u32;
+    rdata.resize(rdata.len() + 4, 0);
+
+    // --- .text: thos_add first (its RVA is the exported address), then DllMain.
     let mut code: Vec<u8> = Vec::new();
+
+    // thos_add(rcx=a, rdx=b): call imported GetLastError, then — only if the
+    // DllMain sentinel is set — return a+b, else return 0.
     code.extend_from_slice(&[0x51]); // push rcx
     code.extend_from_slice(&[0x52]); // push rdx
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
@@ -1031,8 +1273,33 @@ fn write_thoscrt_dll(path: &Path) {
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
     code.extend_from_slice(&[0x5A]); // pop rdx
     code.extend_from_slice(&[0x59]); // pop rcx
+    let cmp_pos = code.len();
+    code.extend_from_slice(&[0x83, 0x3D, 0, 0, 0, 0, 0x00]); // cmp dword [rip+sentinel], 0
+    let cmp_disp = sentinel_rva as i64 - (text_rva as i64 + cmp_pos as i64 + 7);
+    code[cmp_pos + 2..cmp_pos + 6].copy_from_slice(&(cmp_disp as i32).to_le_bytes());
+    code.extend_from_slice(&[0x74, 0x04]); // je .fail (+4)
     code.extend_from_slice(&[0x8D, 0x04, 0x11]); // lea eax, [rcx+rdx]
     code.extend_from_slice(&[0xC3]); // ret
+    code.extend_from_slice(&[0x31, 0xC0]); // .fail: xor eax, eax
+    code.extend_from_slice(&[0xC3]); // ret
+
+    // DllMain(rcx=hinst, edx=fdwReason, r8=lpvReserved) -> BOOL
+    let dllmain_off = code.len() as u32;
+    code.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1  (DLL_PROCESS_ATTACH)
+    code.extend_from_slice(&[0x75, 0x0A]); // jne .skip (+10)
+    let movm_pos = code.len();
+    code.extend_from_slice(&[0xC7, 0x05, 0, 0, 0, 0, 0x01, 0, 0, 0]); // mov dword [rip+sentinel], 1
+    let movm_disp = sentinel_rva as i64 - (text_rva as i64 + movm_pos as i64 + 10);
+    code[movm_pos + 2..movm_pos + 6].copy_from_slice(&(movm_disp as i32).to_le_bytes());
+    code.extend_from_slice(&[0xB8, 0x01, 0, 0, 0]); // .skip: mov eax, 1  (TRUE)
+    code.extend_from_slice(&[0xC3]); // ret
+
+    // thos_mul(rcx=a, rdx=b) -> a*b — pe-hello imports this one by ordinal (2).
+    let thos_mul_off = code.len() as u32;
+    code.extend_from_slice(&[0x89, 0xC8]); // mov eax, ecx
+    code.extend_from_slice(&[0x0F, 0xAF, 0xC2]); // imul eax, edx
+    code.extend_from_slice(&[0xC3]); // ret
+    p32(&mut rdata, (eat_off + 4) as usize, text_rva + thos_mul_off); // EAT[1] = thos_mul
 
     // --- .reloc: one header-only block — no fixups, but its presence makes
     //     the loader take the DLL relocation path. ---
@@ -1066,7 +1333,7 @@ fn write_thoscrt_dll(path: &Path) {
     pe[coff + 18..coff + 20].copy_from_slice(&0x2022u16.to_le_bytes()); // EXECUTABLE|LAA|DLL
     let opt = coff + 20;
     pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
-    pe[opt + 16..opt + 20].copy_from_slice(&0u32.to_le_bytes()); // AddressOfEntryPoint = 0 (no DllMain)
+    pe[opt + 16..opt + 20].copy_from_slice(&(text_rva + dllmain_off).to_le_bytes()); // AddressOfEntryPoint = DllMain
     pe[opt + 20..opt + 24].copy_from_slice(&text_rva.to_le_bytes());
     pe[opt + 24..opt + 32].copy_from_slice(&IMAGE_BASE.to_le_bytes());
     pe[opt + 32..opt + 36].copy_from_slice(&SECT_ALIGN.to_le_bytes());
@@ -1104,6 +1371,228 @@ fn write_thoscrt_dll(path: &Path) {
     pe[rdata_raw_ptr as usize..rdata_raw_ptr as usize + rdata.len()].copy_from_slice(&rdata);
     pe[reloc_raw_ptr as usize..reloc_raw_ptr as usize + reloc.len()].copy_from_slice(&reloc);
     std::fs::write(path, &pe).expect("write thoscrt.dll");
+}
+
+/// Assemble a minimal PE32+ (`.exe` or `.dll`) from parts. `sections` are
+/// `(name, rva, characteristics, bytes)`; `dirs` are `(index, rva, size)` data
+/// directory entries. With `reloc_stub`, a header-only `.reloc` section +
+/// `DYNAMIC_BASE` are appended (0 fixups — the caller's content must be
+/// position-independent), so the loader will accept the image at any base.
+fn write_min_pe(
+    path: &Path,
+    is_dll: bool,
+    image_base: u64,
+    entry_rva: u32,
+    sections: &[(&[u8], u32, u32, &[u8])],
+    dirs: &[(usize, u32, u32)],
+    reloc_stub: bool,
+) {
+    const SECT_ALIGN: u32 = 0x1000;
+    const FILE_ALIGN: u32 = 0x200;
+
+    let text_rva = sections[0].1;
+    let reloc_rva = sections
+        .iter()
+        .map(|(_, rva, _, d)| rva + (d.len() as u32).div_ceil(SECT_ALIGN) * SECT_ALIGN)
+        .max()
+        .unwrap_or(SECT_ALIGN);
+    let reloc_body: Vec<u8> = {
+        let mut v = Vec::new();
+        v.extend_from_slice(&text_rva.to_le_bytes()); // PageRVA
+        v.extend_from_slice(&8u32.to_le_bytes()); // BlockSize (header only)
+        v
+    };
+    let mut secs: Vec<(&[u8], u32, u32, &[u8])> = sections.to_vec();
+    if reloc_stub {
+        secs.push((b".reloc", reloc_rva, 0x4200_0040, &reloc_body));
+    }
+    let sections = &secs[..];
+
+    let opt_size = 0xF0usize;
+    let hdr = 0x40 + 4 + 20 + opt_size + sections.len() * 40;
+    let size_of_headers = (hdr as u32).div_ceil(FILE_ALIGN) * FILE_ALIGN;
+
+    let mut raw_ptr = size_of_headers;
+    let mut layout: Vec<(u32, u32, u32)> = Vec::new(); // (raw_ptr, raw_size, vsize)
+    for (_, _, _, data) in sections {
+        let rs = (data.len() as u32).div_ceil(FILE_ALIGN) * FILE_ALIGN;
+        layout.push((raw_ptr, rs, data.len() as u32));
+        raw_ptr += rs;
+    }
+    let size_of_image = sections
+        .iter()
+        .map(|(_, rva, _, d)| rva + (d.len() as u32).div_ceil(SECT_ALIGN) * SECT_ALIGN)
+        .max()
+        .unwrap_or(SECT_ALIGN);
+
+    let mut pe = vec![0u8; raw_ptr as usize];
+    pe[0..2].copy_from_slice(b"MZ");
+    pe[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+    let o = 0x40usize;
+    pe[o..o + 4].copy_from_slice(b"PE\0\0");
+    let coff = o + 4;
+    pe[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes());
+    pe[coff + 2..coff + 4].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+    pe[coff + 16..coff + 18].copy_from_slice(&(opt_size as u16).to_le_bytes());
+    let chars: u16 = if is_dll { 0x2022 } else { 0x0022 }; // EXECUTABLE|LAA (+DLL)
+    pe[coff + 18..coff + 20].copy_from_slice(&chars.to_le_bytes());
+    let opt = coff + 20;
+    pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes());
+    pe[opt + 16..opt + 20].copy_from_slice(&entry_rva.to_le_bytes());
+    pe[opt + 24..opt + 32].copy_from_slice(&image_base.to_le_bytes());
+    pe[opt + 32..opt + 36].copy_from_slice(&SECT_ALIGN.to_le_bytes());
+    pe[opt + 36..opt + 40].copy_from_slice(&FILE_ALIGN.to_le_bytes());
+    pe[opt + 40..opt + 42].copy_from_slice(&6u16.to_le_bytes());
+    pe[opt + 48..opt + 50].copy_from_slice(&6u16.to_le_bytes());
+    pe[opt + 56..opt + 60].copy_from_slice(&size_of_image.to_le_bytes());
+    pe[opt + 60..opt + 64].copy_from_slice(&size_of_headers.to_le_bytes());
+    pe[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes()); // Subsystem
+    if reloc_stub {
+        pe[opt + 70..opt + 72].copy_from_slice(&0x0040u16.to_le_bytes()); // DYNAMIC_BASE
+    }
+    pe[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+    let mut dirs = dirs.to_vec();
+    if reloc_stub {
+        dirs.push((5, reloc_rva, reloc_body.len() as u32));
+    }
+    for &(idx, rva, size) in &dirs {
+        pe[opt + 112 + idx * 8..opt + 112 + idx * 8 + 4].copy_from_slice(&rva.to_le_bytes());
+        pe[opt + 112 + idx * 8 + 4..opt + 112 + idx * 8 + 8].copy_from_slice(&size.to_le_bytes());
+    }
+    for (i, (name, rva, sc, data)) in sections.iter().enumerate() {
+        let h = opt + opt_size + i * 40;
+        pe[h..h + name.len()].copy_from_slice(name);
+        pe[h + 8..h + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        pe[h + 12..h + 16].copy_from_slice(&rva.to_le_bytes());
+        pe[h + 16..h + 20].copy_from_slice(&layout[i].1.to_le_bytes());
+        pe[h + 20..h + 24].copy_from_slice(&layout[i].0.to_le_bytes());
+        pe[h + 36..h + 40].copy_from_slice(&sc.to_le_bytes());
+        pe[layout[i].0 as usize..layout[i].0 as usize + data.len()].copy_from_slice(data);
+    }
+    std::fs::write(path, &pe).expect("write min pe");
+}
+
+/// `failcrt.dll` — exports `fc_dummy`, and its `DllMain(DLL_PROCESS_ATTACH)`
+/// returns **FALSE**. Loaded at its preferred base (no relocations).
+fn write_failcrt_dll(path: &Path) {
+    const IB: u64 = 0x1_9000_0000;
+    let text_rva = 0x1000u32;
+    let rdata_rva = 0x2000u32;
+    let p32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+
+    // .text: fc_dummy at 0, DllMain after it.
+    let mut text: Vec<u8> = Vec::new();
+    text.extend_from_slice(&[0x31, 0xC0, 0xC3]); // fc_dummy: xor eax,eax ; ret
+    let dllmain_off = text.len() as u32;
+    text.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1
+    text.extend_from_slice(&[0x75, 0x03]); // jne .ok
+    text.extend_from_slice(&[0x31, 0xC0, 0xC3]); // xor eax,eax ; ret   (FALSE)
+    text.extend_from_slice(&[0xB8, 0x01, 0, 0, 0]); // .ok: mov eax, 1
+    text.extend_from_slice(&[0xC3]); // ret
+
+    // .rdata: export directory with one name, fc_dummy -> EAT[0] = text_rva.
+    let mut rd = vec![0u8; 40];
+    let eat_off = rd.len() as u32;
+    rd.extend_from_slice(&[0u8; 4]);
+    let enpt_off = rd.len() as u32;
+    rd.extend_from_slice(&[0u8; 4]);
+    let ord_off = rd.len() as u32;
+    rd.extend_from_slice(&[0u8; 2]);
+    let name_off = rd.len() as u32;
+    rd.extend_from_slice(b"fc_dummy\0");
+    let mod_off = rd.len() as u32;
+    rd.extend_from_slice(b"failcrt.dll\0");
+    while rd.len() % 4 != 0 {
+        rd.push(0);
+    }
+    p32(&mut rd, 0x0C, rdata_rva + mod_off);
+    p32(&mut rd, 0x10, 1);
+    p32(&mut rd, 0x14, 1);
+    p32(&mut rd, 0x18, 1);
+    p32(&mut rd, 0x1C, rdata_rva + eat_off);
+    p32(&mut rd, 0x20, rdata_rva + enpt_off);
+    p32(&mut rd, 0x24, rdata_rva + ord_off);
+    p32(&mut rd, eat_off as usize, text_rva);
+    p32(&mut rd, enpt_off as usize, rdata_rva + name_off);
+    let exp_size = rd.len() as u32;
+
+    write_min_pe(
+        path,
+        true,
+        IB,
+        text_rva + dllmain_off,
+        &[
+            (b".text", text_rva, 0x6000_0020, &text),
+            (b".rdata", rdata_rva, 0x4000_0040, &rd),
+        ],
+        &[(0, rdata_rva, exp_size)],
+        true,
+    );
+}
+
+/// `pe-dllfail.exe` — imports `failcrt.dll!fc_dummy` (so the DLL loads and its
+/// FALSE `DllMain` runs). Its entry prints "PE DLLFAIL REACHED ENTRY" via raw
+/// Linux syscalls and exits — the line only appears if init was *not* aborted.
+fn write_pe_dllfail(path: &Path) {
+    const IB: u64 = 0x1_4000_0000;
+    let text_rva = 0x1000u32;
+    let idata_rva = 0x2000u32;
+    let p32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let p64 = |b: &mut [u8], at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+
+    // .idata: one IMPORT_DESCRIPTOR for failcrt.dll, one thunk (fc_dummy).
+    let mut id = vec![0u8; 40]; // IDT[0] + null
+    let ilt_off = id.len() as u32;
+    id.extend_from_slice(&[0u8; 16]);
+    let iat_off = id.len() as u32;
+    id.extend_from_slice(&[0u8; 16]);
+    let hint_off = id.len() as u32;
+    id.extend_from_slice(&[0, 0]);
+    id.extend_from_slice(b"fc_dummy\0");
+    if id.len() % 2 != 0 {
+        id.push(0);
+    }
+    let dll_off = id.len() as u32;
+    id.extend_from_slice(b"failcrt.dll\0");
+    while id.len() % 4 != 0 {
+        id.push(0);
+    }
+    p32(&mut id, 0, idata_rva + ilt_off);
+    p32(&mut id, 12, idata_rva + dll_off);
+    p32(&mut id, 16, idata_rva + iat_off);
+    p64(&mut id, ilt_off as usize, (idata_rva + hint_off) as u64);
+    p64(&mut id, iat_off as usize, (idata_rva + hint_off) as u64);
+
+    // .text: write(1, msg, len) ; exit_group(0)  — RIP-relative, no relocs.
+    let msg: &[u8] = b"PE DLLFAIL REACHED ENTRY\n";
+    let mut text: Vec<u8> = Vec::new();
+    text.extend_from_slice(&[0xB8, 1, 0, 0, 0]); // mov eax, 1  (write)
+    text.extend_from_slice(&[0xBF, 1, 0, 0, 0]); // mov edi, 1
+    let lea_at = text.len();
+    text.extend_from_slice(&[0x48, 0x8D, 0x35, 0, 0, 0, 0]); // lea rsi, [rip+msg]
+    text.extend_from_slice(&[0xBA]);
+    text.extend_from_slice(&(msg.len() as u32).to_le_bytes()); // mov edx, len
+    text.extend_from_slice(&[0x0F, 0x05]); // syscall
+    text.extend_from_slice(&[0xB8, 231, 0, 0, 0]); // mov eax, 231 (exit_group)
+    text.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+    text.extend_from_slice(&[0x0F, 0x05]); // syscall
+    let msg_off = text.len();
+    text.extend_from_slice(msg);
+    let disp = msg_off as i64 - (lea_at as i64 + 7);
+    text[lea_at + 3..lea_at + 7].copy_from_slice(&(disp as i32).to_le_bytes());
+
+    write_min_pe(
+        path,
+        false,
+        IB,
+        text_rva,
+        &[
+            (b".text", text_rva, 0x6000_0020, &text),
+            (b".idata", idata_rva, 0xC000_0040, &id),
+        ],
+        &[(1, idata_rva, 40)],
+        false,
+    );
 }
 
 // --- shared plumbing for the interactive (monitor-driven) QEMU tests ---
@@ -1853,10 +2342,16 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE VirtualAlloc+Heap OK") // VirtualAlloc + GetProcessHeap + HeapAlloc
         && serial.contains("PE GetProcAddress OK") // LoadLibraryA + synthetic kernel32 export table
         && serial.contains("PE ntdll OK") // ntdll boundary: GetModuleHandleA + GetProcAddress + 9-arg NtWriteFile
-        && serial.contains("PE dll thos_add=42") // real DLL from C:\Windows\System32 + recursive imports
+        && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
+        && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
+        && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
+        && serial.contains("PE dll forward OK") // forwarder export (thoscrt -> KERNEL32.GetProcessHeap)
+        && serial.contains("PE TLS OK") // static TLS: block copied, __tls_index written, callback ran
+        && serial.contains("THOS: pe dllfail ok") // a DllMain returning FALSE aborted process init
+        && !serial.contains("PE DLLFAIL REACHED ENTRY") // ...so the exe entry never ran
         && serial.contains("THOS: pe reject ok");
     if ok {
-        println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll/System32-DLL");
+        println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll/System32-DLL (in Ldr)");
     } else {
         eprintln!("pe-test: FAIL — the PE did not run to exit\n--- serial ---\n{serial}\n---");
         exit(1);

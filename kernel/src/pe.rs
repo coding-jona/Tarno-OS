@@ -20,6 +20,8 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use x86_64::PhysAddr;
+
 use crate::mm::{phys_to_virt, FRAME_ALLOC};
 use crate::process::Process;
 
@@ -89,6 +91,30 @@ const ENV_OFF: u64 = 0x500; // environment block (empty)
 const MOD2_OFF: u64 = 0x600; // LDR_DATA_TABLE_ENTRY (synthetic kernel32)
 const MOD3_OFF: u64 = 0x700; // LDR_DATA_TABLE_ENTRY (synthetic ntdll)
 
+/// A dedicated page for the `LDR_DATA_TABLE_ENTRY`s of DLLs loaded from disk
+/// (the params page is full). Entries grow up from 0; their UTF-16 names live
+/// in the back half. Enough for a first cut; a multi-page region comes later.
+const PE_LDRDATA_ADDR: u64 = NT_STUB_BASE + 0x6000;
+const LDR_ENTRY_STRIDE: u64 = 0x80;
+const LDRDATA_STR_OFF: usize = 0x800;
+const MAX_FILE_LDR_MODS: usize = 12;
+
+/// A ring-3 process-bootstrap page. When any file DLL has an entry point, the
+/// PE thread starts here instead of at the exe entry: it calls each
+/// `DllMain(base, DLL_PROCESS_ATTACH, 1)` in dependency order, then jumps to
+/// the real exe entry. This is the loader's job on Windows (`LdrpInitializeProcess`).
+const PE_BOOTSTRAP_ADDR: u64 = NT_STUB_BASE + 0x7000;
+const BOOTSTRAP_LIST_OFF: usize = 0x400; // {base,entry} u64 pairs, {0,0}-terminated
+const BOOTSTRAP_ENTRY_OFF: usize = 0x800; // real exe entry VA
+
+/// One page holding static-TLS storage: a `ThreadLocalStoragePointer` array
+/// (`TEB+0x58` points here), then one zeroed+templated TLS block per module
+/// with a `.tls` section. Enough for the exe + a few DLLs; one thread per PE
+/// process, no dynamic `TlsAlloc` yet.
+const PE_TLS_ADDR: u64 = NT_STUB_BASE + 0x8000;
+const MAX_TLS_MODS: usize = 24;
+const TLS_BLOCKS_OFF: usize = 0x100; // blocks start here; ptr array is [0, 0x100)
+
 /// Synthetic system DLLs: one page each carrying a minimal PE32+ header, a
 /// copy of the NT trampolines, and a real `IMAGE_EXPORT_DIRECTORY` naming
 /// each. Both are present in the PEB `Ldr` lists so `GetModuleHandleA` /
@@ -118,32 +144,58 @@ fn normalize_dll_name(raw: &str) -> String {
     s
 }
 
+/// One `AddressOfFunctions` slot of a module's export table.
+enum Export {
+    Empty,
+    Addr(u64),       // resolved absolute VA
+    Forward(String), // "TargetDll.TargetFunc" or "TargetDll.#123"
+}
+
 /// A module already resolved for the process: a synthetic system DLL or a real
-/// file loaded from System32. `exports` maps each exported name to its final
-/// virtual address, so an importer binds without touching mapped memory.
+/// file loaded from System32. `eat` holds each export indexed by
+/// `ordinal - ord_base`; `names` maps an export name to that index. An importer
+/// binds by name or by ordinal without touching mapped memory; forwarders are
+/// followed through [`Loader::resolve_export_idx`].
 struct LoadedModule {
     name: String, // lowercase base name incl. ".dll"
     #[allow(dead_code)]
     full: String, // "C:\\Windows\\System32\\NAME"
-    #[allow(dead_code)]
     base: u64,
-    #[allow(dead_code)]
     size: u64,
-    #[allow(dead_code)]
     entry: u64, // 0 = none / not run
-    exports: BTreeMap<String, u64>,
-    #[allow(dead_code)]
+    eat: Vec<Export>,
+    ord_base: u32,
+    names: BTreeMap<String, usize>,
     is_file: bool,
 }
 
-/// Per-`load()` DLL resolver: owns the dependency graph and the VA arena the
-/// on-disk DLLs map into.
+/// A module's parsed `IMAGE_TLS_DIRECTORY` (fields are runtime VAs — already
+/// fixed up by `apply_relocs` in the staged image).
+struct TlsInfo {
+    raw_start_va: u64, // template data [raw_start, raw_end)
+    raw_end_va: u64,
+    index_ptr_va: u64, // DWORD the loader writes the module's TLS index into
+    callbacks_va: u64, // NULL-terminated array of PIMAGE_TLS_CALLBACK
+    zero_fill: u32,
+}
+
+/// Static-TLS accumulation across the exe + its DLLs during one `load()`.
+struct TlsBuild {
+    frame_phys: u64, // 0 = the TLS page has not been allocated
+    n_mods: usize,   // = next TLS index
+    blk_next: usize, // next free offset within the TLS page
+}
+
+/// Per-`load()` DLL resolver: owns the dependency graph, the VA arena the
+/// on-disk DLLs map into, and the static-TLS layout.
 struct Loader<'a> {
     proc: &'a Process,
     fs: Option<crate::ext2::Ext2>,
     arena_next: u64,
     mods: Vec<LoadedModule>,
     depth: u32,
+    tls: TlsBuild,
+    tls_cbs: Vec<(u64, u64)>, // (module base, callback VA) run at process start
 }
 
 impl<'a> Loader<'a> {
@@ -155,12 +207,12 @@ impl<'a> Loader<'a> {
             ("kernel32.dll", PE_KERNEL32_ADDR, &crate::nt::NT_EXPORTS[..]),
             ("ntdll.dll", PE_NTDLL_ADDR, &crate::nt::NTDLL_EXPORTS[..]),
         ] {
-            let mut exports = BTreeMap::new();
+            // Matches `map_synth_dll`'s export directory: Base 1, EAT[i] = stub i.
+            let mut eat = Vec::with_capacity(table.len());
+            let mut names = BTreeMap::new();
             for (i, &fname) in table.iter().enumerate() {
-                exports.insert(
-                    String::from(fname),
-                    base + SYNTH_STUBS_OFF + i as u64 * NT_STUB_STRIDE,
-                );
+                eat.push(Export::Addr(base + SYNTH_STUBS_OFF + i as u64 * NT_STUB_STRIDE));
+                names.insert(String::from(fname), i);
             }
             mods.push(LoadedModule {
                 full: format!("C:\\Windows\\System32\\{}", name.to_ascii_uppercase()),
@@ -168,11 +220,83 @@ impl<'a> Loader<'a> {
                 base,
                 size: 0x1000,
                 entry: 0,
-                exports,
+                eat,
+                ord_base: 1,
+                names,
                 is_file: false,
             });
         }
-        Loader { proc, fs: None, arena_next: PE_DLL_ARENA, mods, depth: 0 }
+        Loader {
+            proc,
+            fs: None,
+            arena_next: PE_DLL_ARENA,
+            mods,
+            depth: 0,
+            tls: TlsBuild { frame_phys: 0, n_mods: 0, blk_next: TLS_BLOCKS_OFF },
+            tls_cbs: Vec::new(),
+        }
+    }
+
+    /// Give one module (exe or DLL) its static-TLS block: allocate a per-thread
+    /// copy of the template, record it in the `ThreadLocalStoragePointer`
+    /// array, patch the module's `AddressOfIndex` DWORD in `img` (before it is
+    /// mapped), and queue its TLS callbacks. `img` is the staged image, `base`
+    /// its load address.
+    fn tls_add_module(
+        &mut self,
+        base: u64,
+        img: &mut [u8],
+        t: &TlsInfo,
+    ) -> Result<(), &'static str> {
+        if self.tls.frame_phys == 0 {
+            let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (TLS)")?;
+            let phys = frame.start_address();
+            unsafe { core::ptr::write_bytes(phys_to_virt(phys).as_mut_ptr::<u8>(), 0, 4096) };
+            self.tls.frame_phys = phys.as_u64();
+        }
+        if self.tls.n_mods >= MAX_TLS_MODS {
+            return Err("PE: too many TLS modules");
+        }
+        let raw_off = t.raw_start_va.checked_sub(base).ok_or("PE: TLS data before base")? as usize;
+        let raw_len = t.raw_end_va.checked_sub(t.raw_start_va).ok_or("PE: bad TLS range")? as usize;
+        let total = raw_len + t.zero_fill as usize;
+        let blk = self.tls.blk_next;
+        if blk + total > 4096 {
+            return Err("PE: static TLS overflows its page");
+        }
+        let src = img.get(raw_off..raw_off + raw_len).ok_or("PE: TLS template out of range")?;
+        let page = phys_to_virt(PhysAddr::new(self.tls.frame_phys)).as_mut_ptr::<u8>();
+        let idx = self.tls.n_mods;
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), page.add(blk), raw_len);
+            // ptr array entry: ThreadLocalStoragePointer[idx] = block VA
+            *(page.add(idx * 8) as *mut u64) = PE_TLS_ADDR + blk as u64;
+        }
+        // the module's __tls_index
+        let ix_off = t.index_ptr_va.checked_sub(base).ok_or("PE: TLS index ptr before base")? as usize;
+        img.get_mut(ix_off..ix_off + 4)
+            .ok_or("PE: TLS index ptr out of range")?
+            .copy_from_slice(&(idx as u32).to_le_bytes());
+
+        // TLS callbacks — an array of fn VAs at callbacks_va, NUL-terminated.
+        if t.callbacks_va != 0 {
+            let mut off = t.callbacks_va.checked_sub(base).ok_or("PE: TLS callbacks before base")? as usize;
+            for _ in 0..64 {
+                let fnva = match img.get(off..off + 8) {
+                    Some(b) => u64::from_le_bytes(b.try_into().unwrap()),
+                    None => break,
+                };
+                if fnva == 0 {
+                    break;
+                }
+                self.tls_cbs.push((base, fnva));
+                off += 8;
+            }
+        }
+
+        self.tls.n_mods += 1;
+        self.tls.blk_next = (blk + total + 15) & !15;
+        Ok(())
     }
 
     fn fs(&mut self) -> Result<&crate::ext2::Ext2, &'static str> {
@@ -214,7 +338,8 @@ impl<'a> Loader<'a> {
     fn load_dll(&mut self, name: &str, bytes: &[u8]) -> Result<usize, &'static str> {
         let base = self.arena_alloc(peek_size_of_image(bytes)?)?;
         let mut staged = stage_image(bytes, Some(base))?;
-        let exports = parse_exports(&staged.img, base, staged.export_rva, staged.export_size)?;
+        let (eat, ord_base, names) =
+            parse_export_table(&staged.img, base, staged.export_rva, staged.export_size)?;
 
         // Register before recursing so an import cycle terminates; the export
         // VAs are final already (arena base + RVA), no mapping needed to bind.
@@ -225,12 +350,17 @@ impl<'a> Loader<'a> {
             base,
             size: staged.size_of_image,
             entry: if staged.entry != base { staged.entry } else { 0 },
-            exports,
+            eat,
+            ord_base,
+            names,
             is_file: true,
         });
 
         if staged.import_size != 0 {
             self.bind_imports(&mut staged.img, staged.import_rva as u64, staged.size_of_image)?;
+        }
+        if let Some(t) = staged.tls.take() {
+            self.tls_add_module(base, &mut staged.img, &t)?;
         }
         map_seg(self.proc, &staged.img, base, 0, staged.hdr_n, false)?;
         for &(rva, mem_size, exec) in &staged.segs {
@@ -277,21 +407,74 @@ impl<'a> Loader<'a> {
                 if thunk == 0 {
                     break;
                 }
-                if thunk & 0x8000_0000_0000_0000 != 0 {
-                    return Err("PE: import by ordinal not supported yet");
-                }
-                let func = cstr_at(img, (thunk & 0x7FFF_FFFF) + 2)?; // skip the 2-byte hint
-                let addr = match self.mods[midx].exports.get(func) {
-                    Some(&a) => a,
-                    None => {
+                let addr = if thunk & 0x8000_0000_0000_0000 != 0 {
+                    let ord = (thunk & 0xFFFF) as u16;
+                    self.resolve_export_ordinal(midx, ord, 0).map_err(|e| {
+                        crate::kprintln!("THOS: pe unresolved    {}#{}", dll.as_str(), ord);
+                        e
+                    })?
+                } else {
+                    let func = cstr_at(img, (thunk & 0x7FFF_FFFF) + 2)?; // skip the 2-byte hint
+                    self.resolve_export_name(midx, func, 0).map_err(|e| {
                         crate::kprintln!("THOS: pe unresolved    {}!{}", dll.as_str(), func);
-                        return Err("PE: unresolved import");
-                    }
+                        e
+                    })?
                 };
                 img[p_off..p_off + 8].copy_from_slice(&addr.to_le_bytes());
                 i += 1;
             }
             idt += 20;
+        }
+    }
+
+    /// Absolute VA of `mods[midx]`'s export `name`, following forwarders.
+    fn resolve_export_name(
+        &mut self,
+        midx: usize,
+        name: &str,
+        depth: u32,
+    ) -> Result<u64, &'static str> {
+        let idx = *self.mods[midx].names.get(name).ok_or("PE: name not exported")?;
+        self.resolve_export_idx(midx, idx, depth)
+    }
+
+    /// Absolute VA of `mods[midx]`'s export with ordinal `ord`, following forwarders.
+    fn resolve_export_ordinal(
+        &mut self,
+        midx: usize,
+        ord: u16,
+        depth: u32,
+    ) -> Result<u64, &'static str> {
+        let i = (ord as u32)
+            .checked_sub(self.mods[midx].ord_base)
+            .ok_or("PE: ordinal below Base")? as usize;
+        self.resolve_export_idx(midx, i, depth)
+    }
+
+    fn resolve_export_idx(
+        &mut self,
+        midx: usize,
+        i: usize,
+        depth: u32,
+    ) -> Result<u64, &'static str> {
+        if depth > 8 {
+            return Err("PE: forwarder chain too deep");
+        }
+        match self.mods[midx].eat.get(i).ok_or("PE: ordinal out of range")? {
+            Export::Addr(a) => Ok(*a),
+            Export::Empty => Err("PE: empty export slot"),
+            Export::Forward(s) => {
+                let s = s.clone(); // about to mutate self.mods
+                let (tgt_dll, tgt_fn) = s.rsplit_once('.').ok_or("PE: bad forwarder")?;
+                let tmidx = self.resolve_module(tgt_dll)?;
+                match tgt_fn.strip_prefix('#') {
+                    Some(n) => {
+                        let ord = n.parse::<u16>().map_err(|_| "PE: bad forwarder ordinal")?;
+                        self.resolve_export_ordinal(tmidx, ord, depth + 1)
+                    }
+                    None => self.resolve_export_name(tmidx, tgt_fn, depth + 1),
+                }
+            }
         }
     }
 }
@@ -309,37 +492,52 @@ fn peek_size_of_image(file: &[u8]) -> Result<u64, &'static str> {
     Ok(soi)
 }
 
-/// Parse an `IMAGE_EXPORT_DIRECTORY` out of a materialised image, yielding
-/// `name -> absolute VA` (`base + function RVA`). Forwarder RVAs are skipped.
-fn parse_exports(
+/// Parse an `IMAGE_EXPORT_DIRECTORY` out of a materialised image. Returns
+/// `(eat, ord_base, names)`: `eat[i]` is the export with ordinal `ord_base + i`
+/// (an [`Export::Addr`], an [`Export::Forward`] string when the RVA points back
+/// inside the export directory, or [`Export::Empty`]); `names` maps an export
+/// name to its `eat` index.
+#[allow(clippy::type_complexity)]
+fn parse_export_table(
     img: &[u8],
     base: u64,
     export_rva: u32,
     export_size: u32,
-) -> Result<BTreeMap<String, u64>, &'static str> {
-    let mut map = BTreeMap::new();
+) -> Result<(Vec<Export>, u32, BTreeMap<String, usize>), &'static str> {
+    let mut names = BTreeMap::new();
     if export_rva == 0 {
-        return Ok(map);
+        return Ok((Vec::new(), 1, names));
     }
     let ed = export_rva as usize;
-    let n_funcs = rd_u32(img, ed + 0x14)?;
+    let ord_base = rd_u32(img, ed + 0x10)?;
+    let n_funcs = rd_u32(img, ed + 0x14)? as usize;
     let n_names = rd_u32(img, ed + 0x18)? as usize;
-    let eat = rd_u32(img, ed + 0x1C)? as usize;
-    let enpt = rd_u32(img, ed + 0x20)? as usize;
-    let ords = rd_u32(img, ed + 0x24)? as usize;
-    for i in 0..n_names {
-        let name = String::from(cstr_at(img, rd_u32(img, enpt + i * 4)? as u64)?);
-        let ord = rd_u16(img, ords + i * 2)? as u32;
-        if ord >= n_funcs {
-            continue;
-        }
-        let frva = rd_u32(img, eat + ord as usize * 4)? as u64;
-        if frva == 0 || (frva >= export_rva as u64 && frva < (export_rva + export_size) as u64) {
-            continue; // empty slot or forwarder (unsupported)
-        }
-        map.insert(name, base + frva);
+    let eat_rva = rd_u32(img, ed + 0x1C)? as usize;
+    let enpt_rva = rd_u32(img, ed + 0x20)? as usize;
+    let ords_rva = rd_u32(img, ed + 0x24)? as usize;
+    if n_funcs > 64 * 1024 {
+        return Err("PE: absurd export count");
     }
-    Ok(map)
+
+    let mut eat = Vec::with_capacity(n_funcs);
+    for i in 0..n_funcs {
+        let frva = rd_u32(img, eat_rva + i * 4)? as u64;
+        eat.push(if frva == 0 {
+            Export::Empty
+        } else if frva >= export_rva as u64 && frva < export_rva as u64 + export_size as u64 {
+            Export::Forward(String::from(cstr_at(img, frva)?))
+        } else {
+            Export::Addr(base + frva)
+        });
+    }
+    for i in 0..n_names {
+        let name = String::from(cstr_at(img, rd_u32(img, enpt_rva + i * 4)? as u64)?);
+        let idx = rd_u16(img, ords_rva + i * 2)? as usize;
+        if idx < eat.len() {
+            names.insert(name, idx);
+        }
+    }
+    Ok((eat, ord_base, names))
 }
 
 fn rd_u16(img: &[u8], off: usize) -> Result<u16, &'static str> {
@@ -371,6 +569,7 @@ struct StagedImage {
     import_size: u32,
     export_rva: u32,
     export_size: u32,
+    tls: Option<TlsInfo>,
 }
 
 /// Parse + materialise + relocate `file`. `want_base` fixes the load address
@@ -430,9 +629,7 @@ fn stage_image(file: &[u8], want_base: Option<u64>) -> Result<StagedImage, &'sta
         }
         Ok((rd_u32(file, dirs + i * 8)?, rd_u32(file, dirs + i * 8 + 4)?))
     };
-    if dir(9)?.1 != 0 {
-        return Err("PE: TLS directory not supported yet");
-    }
+    let (tls_rva, tls_size) = dir(9)?;
     let (export_rva, export_size) = dir(0)?;
     let (import_rva, import_size) = dir(1)?;
     let (reloc_rva, reloc_size) = dir(5)?;
@@ -494,6 +691,24 @@ fn stage_image(file: &[u8], want_base: Option<u64>) -> Result<StagedImage, &'sta
         apply_relocs(&mut img, reloc_rva as u64, reloc_size as u64, delta, size_of_image)?;
     }
 
+    // The TLS directory's address fields are VAs — read them *after* relocation,
+    // so they already hold runtime addresses.
+    let tls = if tls_size != 0 {
+        let d = tls_rva as usize;
+        if d + 40 > img.len() {
+            return Err("PE: TLS directory out of range");
+        }
+        Some(TlsInfo {
+            raw_start_va: rd_u64(&img, d)?,
+            raw_end_va: rd_u64(&img, d + 8)?,
+            index_ptr_va: rd_u64(&img, d + 16)?,
+            callbacks_va: rd_u64(&img, d + 24)?,
+            zero_fill: rd_u32(&img, d + 32)?,
+        })
+    } else {
+        None
+    };
+
     Ok(StagedImage {
         load_base,
         size_of_image,
@@ -505,18 +720,30 @@ fn stage_image(file: &[u8], want_base: Option<u64>) -> Result<StagedImage, &'sta
         import_size,
         export_rva,
         export_size,
+        tls,
     })
 }
 
 /// Load a Win64 `.exe`: stage it, resolve its imports (pulling in synthetic
 /// system modules and real DLLs from `C:\Windows\System32`), map everything,
 /// and lay out the TEB / PEB.
+/// A DLL loaded from disk, as the PEB `Ldr` list needs it.
+struct LdrFileMod {
+    base: u64,
+    entry: u64,
+    size: u64,
+    name: String, // lowercase base name incl. ".dll"
+}
+
 pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'static str> {
     let mut ldr = Loader::new(proc);
     let mut staged = stage_image(file, None)?;
 
     if staged.import_size != 0 {
         ldr.bind_imports(&mut staged.img, staged.import_rva as u64, staged.size_of_image)?;
+    }
+    if let Some(t) = staged.tls.take() {
+        ldr.tls_add_module(staged.load_base, &mut staged.img, &t)?;
     }
 
     // Map the exe (headers first, sections win on any overlap).
@@ -526,25 +753,202 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     }
     map_kernel32_page(proc)?;
     map_ntdll_page(proc)?;
-    map_teb_peb(proc, staged.load_base, staged.entry, staged.size_of_image, stack_top)?;
+
+    // Static-TLS page (if any module used `.tls`); TEB.ThreadLocalStoragePointer
+    // gets its VA below.
+    let tls_ptr = if ldr.tls.frame_phys != 0 {
+        proc.map(PE_TLS_ADDR, ldr.tls.frame_phys, true, false); // rw, no-exec
+        PE_TLS_ADDR
+    } else {
+        0
+    };
+
+    let file_mods: Vec<LdrFileMod> = ldr
+        .mods
+        .iter()
+        .filter(|m| m.is_file)
+        .map(|m| LdrFileMod { base: m.base, entry: m.entry, size: m.size, name: m.name.clone() })
+        .collect();
+    if file_mods.len() > MAX_FILE_LDR_MODS {
+        crate::kprintln!(
+            "THOS: pe warn          {} file DLLs, only {} land in the Ldr list",
+            file_mods.len(),
+            MAX_FILE_LDR_MODS
+        );
+    }
+    map_teb_peb(
+        proc,
+        staged.load_base,
+        staged.entry,
+        staged.size_of_image,
+        stack_top,
+        &file_mods,
+        tls_ptr,
+    )?;
+
+    // Ring-3 process init, in order: every TLS callback, then every `DllMain`
+    // (dependency order — a DLL is registered before its own file-DLL imports,
+    // so reverse of load order is deps-first). All share the
+    // `(hinst, DLL_PROCESS_ATTACH, 1)` signature.
+    let n_tls = ldr.tls_cbs.len();
+    let mut init: Vec<(u64, u64)> = ldr.tls_cbs.clone();
+    init.extend(
+        file_mods
+            .iter()
+            .rev()
+            .filter(|m| m.entry != 0)
+            .map(|m| (m.base, m.entry)),
+    );
+    let entry = if init.is_empty() {
+        staged.entry
+    } else {
+        map_bootstrap(proc, &init, n_tls, staged.entry)?;
+        PE_BOOTSTRAP_ADDR
+    };
 
     Ok(PeImage {
-        entry: staged.entry,
+        entry,
         teb: PE_TEB_ADDR,
         base: staged.load_base,
         size: staged.size_of_image,
     })
 }
 
+/// Build the ring-3 process-bootstrap page: a small loop that calls every
+/// `init` entry as `fn(module_base, DLL_PROCESS_ATTACH=1, lpvReserved=1)` —
+/// TLS callbacks then `DllMain`s — and then jumps to `exe_entry`. Mapped exec
+/// + read-only at [`PE_BOOTSTRAP_ADDR`].
+fn map_bootstrap(
+    proc: &Process,
+    init: &[(u64, u64)],
+    n_tls: usize,
+    exe_entry: u64,
+) -> Result<(), &'static str> {
+    let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (bootstrap)")?;
+    let phys = frame.start_address();
+    let page = unsafe {
+        let p = phys_to_virt(phys).as_mut_ptr::<u8>();
+        core::ptr::write_bytes(p, 0, 4096);
+        core::slice::from_raw_parts_mut(p, 4096)
+    };
+
+    // {base, entry} pairs then a {0,0} terminator. The first `n_tls` are TLS
+    // callbacks (return value ignored); the rest are DllMains (a `FALSE`
+    // return aborts process init).
+    let mut o = BOOTSTRAP_LIST_OFF;
+    for &(base, ent) in init {
+        page[o..o + 8].copy_from_slice(&base.to_le_bytes());
+        page[o + 8..o + 16].copy_from_slice(&ent.to_le_bytes());
+        o += 16;
+    }
+    if o + 16 > BOOTSTRAP_ENTRY_OFF {
+        return Err("PE: too many init routines for the bootstrap page");
+    }
+    page[BOOTSTRAP_ENTRY_OFF..BOOTSTRAP_ENTRY_OFF + 8].copy_from_slice(&exe_entry.to_le_bytes());
+
+    // code @ offset 0:
+    //   rbx = &list; r13 = n_tls; r14 = index
+    //   loop: base = [rbx]; if base == 0 -> jmp exe_entry
+    //         call [rbx+8](base, DLL_PROCESS_ATTACH, 1)
+    //         if r14 >= r13 && eax == 0 -> ExitProcess(STATUS-ish)
+    //         r14++; rbx += 16; loop
+    let mut c: Vec<u8> = Vec::new();
+    c.extend_from_slice(&[0x48, 0xBB]); // mov rbx, imm64  (list)
+    c.extend_from_slice(&(PE_BOOTSTRAP_ADDR + BOOTSTRAP_LIST_OFF as u64).to_le_bytes());
+    c.extend_from_slice(&[0x41, 0xBD]); // mov r13d, imm32  (n_tls)
+    c.extend_from_slice(&(n_tls as u32).to_le_bytes());
+    c.extend_from_slice(&[0x45, 0x31, 0xF6]); // xor r14d, r14d  (index)
+    let loop_start = c.len();
+    c.extend_from_slice(&[0x48, 0x8B, 0x03]); // mov rax, [rbx]
+    c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    let jz_at = c.len();
+    c.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]); // jz .done
+    c.extend_from_slice(&[0x48, 0x89, 0xC1]); // mov rcx, rax
+    c.extend_from_slice(&[0xBA, 1, 0, 0, 0]); // mov edx, 1
+    c.extend_from_slice(&[0x41, 0xB8, 1, 0, 0, 0]); // mov r8d, 1
+    c.extend_from_slice(&[0x48, 0x8B, 0x73, 0x08]); // mov rsi, [rbx+8]
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    c.extend_from_slice(&[0xFF, 0xD6]); // call rsi
+    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    c.extend_from_slice(&[0x45, 0x39, 0xEE]); // cmp r14d, r13d
+    c.extend_from_slice(&[0x72, 0x04]); // jb .next   (index < n_tls: a TLS callback, ignore eax)
+    c.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+    c.extend_from_slice(&[0x74, 0x0C]); // jz .fail   (DllMain returned FALSE -> 12 bytes to .fail)
+    // .next:
+    c.extend_from_slice(&[0x41, 0xFF, 0xC6]); // inc r14d
+    c.extend_from_slice(&[0x48, 0x83, 0xC3, 0x10]); // add rbx, 16
+    let jmp_at = c.len();
+    c.extend_from_slice(&[0xE9, 0, 0, 0, 0]); // jmp .loop
+    c[jmp_at + 1..jmp_at + 5]
+        .copy_from_slice(&((loop_start as i64 - (jmp_at as i64 + 5)) as i32).to_le_bytes());
+    // .fail: ExitProcess(0x135) via the NT_EXITPROCESS selector, inline.
+    c.extend_from_slice(&[0xB9, 0x35, 0x01, 0, 0]); // mov ecx, 0x135  (exit code)
+    let sel = (crate::nt::NT_BASE | crate::nt::NT_EXITPROCESS as u64) as u32;
+    c.extend_from_slice(&[0xB8]); // mov eax, imm32
+    c.extend_from_slice(&sel.to_le_bytes());
+    c.extend_from_slice(&[0x49, 0x89, 0xCA]); // mov r10, rcx
+    c.extend_from_slice(&[0x0F, 0x05]); // syscall
+    c.extend_from_slice(&[0x0F, 0x0B]); // ud2  (unreachable)
+    // .done:
+    let done_at = c.len();
+    c[jz_at + 2..jz_at + 6]
+        .copy_from_slice(&((done_at as i64 - (jz_at as i64 + 6)) as i32).to_le_bytes());
+    let mov_at = c.len();
+    c.extend_from_slice(&[0x48, 0x8B, 0x05, 0, 0, 0, 0]); // mov rax, [rip+exe_entry_slot]
+    c[mov_at + 3..mov_at + 7]
+        .copy_from_slice(&((BOOTSTRAP_ENTRY_OFF as i64 - (mov_at as i64 + 7)) as i32).to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+
+    if c.len() > BOOTSTRAP_LIST_OFF {
+        return Err("PE: bootstrap code overflow");
+    }
+    page[..c.len()].copy_from_slice(&c);
+
+    proc.map(PE_BOOTSTRAP_ADDR, phys.as_u64(), false, true); // r-x
+    Ok(())
+}
+
+/// Write a circular doubly-linked `LIST_ENTRY` ring (`Flink` at +0, `Blink` at
+/// +8) for the nodes whose VA falls inside `[page_base, page_base+0x1000)`.
+/// `nodes[0]` is the list head; the ring closes back to it.
+fn link_ring(page: &mut [u8], page_base: u64, nodes: &[u64]) {
+    let n = nodes.len();
+    for (p, &va) in nodes.iter().enumerate() {
+        if va < page_base || va >= page_base + 4096 {
+            continue;
+        }
+        let off = (va - page_base) as usize;
+        page[off..off + 8].copy_from_slice(&nodes[(p + 1) % n].to_le_bytes());
+        page[off + 8..off + 16].copy_from_slice(&nodes[(p + n - 1) % n].to_le_bytes());
+    }
+}
+
 /// Allocate + map the TEB and PEB pages and fill the few fields a Win64 entry /
-/// CRT touches immediately.
+/// CRT touches immediately, plus the `PEB->Ldr` module list (exe, the two
+/// synthetic modules, then every DLL loaded from `C:\Windows\System32`).
 fn map_teb_peb(
     proc: &Process,
     image_base: u64,
     entry: u64,
     size_of_image: u64,
     stack_top: u64,
+    file_mods: &[LdrFileMod],
+    tls_ptr: u64,
 ) -> Result<(), &'static str> {
+    let n_file = file_mods.len().min(MAX_FILE_LDR_MODS);
+    // The LIST_ENTRY VAs for list `i` (0=InLoadOrder, 1=InMemoryOrder,
+    // 2=InInitOrder): head, exe, kernel32, ntdll, then each file DLL.
+    let nodes_for = |i: u64| -> Vec<u64> {
+        let mut v = Vec::with_capacity(4 + n_file);
+        v.push(PE_PARAMS_ADDR + LDR_OFF + 0x10 + i * 0x10); // head
+        v.push(PE_PARAMS_ADDR + MOD_OFF + i * 0x10); // exe
+        v.push(PE_PARAMS_ADDR + MOD2_OFF + i * 0x10); // kernel32
+        v.push(PE_PARAMS_ADDR + MOD3_OFF + i * 0x10); // ntdll
+        for k in 0..n_file {
+            v.push(PE_LDRDATA_ADDR + k as u64 * LDR_ENTRY_STRIDE + i * 0x10);
+        }
+        v
+    };
     let w = |addr: u64, fill: &dyn Fn(&mut [u8])| -> Result<(), &'static str> {
         let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (TEB/PEB)")?;
         let phys = frame.start_address();
@@ -568,6 +972,7 @@ fn map_teb_peb(
         put(t, 0x08, stack_top); // NT_TIB.StackBase
         put(t, 0x10, stack_top.saturating_sub(64 * 1024)); // NT_TIB.StackLimit
         put(t, 0x30, PE_TEB_ADDR); // NT_TIB.Self
+        put(t, 0x58, tls_ptr); // ThreadLocalStoragePointer (0 = no static TLS)
         put(t, 0x60, PE_PEB_ADDR); // ProcessEnvironmentBlock
     })?;
     w(PE_PEB_ADDR, &|p| {
@@ -618,27 +1023,16 @@ fn map_teb_peb(
         put(b, PARAMS_OFF + 0x78, cmd_buf);
         put(b, PARAMS_OFF + 0x80, PE_PARAMS_ADDR + ENV_OFF); // Environment (empty: two NUL words)
 
-        // --- PEB_LDR_DATA @ LDR_OFF: three circular elements — exe, then the
-        //     synthetic kernel32 and ntdll. Each of the three lists threads
-        //     head -> exe -> kernel32 -> ntdll -> head. The head LIST_ENTRYs
-        //     sit at LDR_OFF+0x10/0x20/0x30; an entry's are at MODx_OFF+0/0x10/
-        //     0x20 (list i). ---
-        let mod_offs = [MOD_OFF, MOD2_OFF, MOD3_OFF];
+        // --- PEB_LDR_DATA @ LDR_OFF. The three lists each thread
+        //     head -> exe -> kernel32 -> ntdll -> file DLLs -> head. The head
+        //     LIST_ENTRYs sit at LDR_OFF+0x10/0x20/0x30; an entry's own three
+        //     are at its base +0x00/0x10/0x20. `link_ring` writes the links for
+        //     whichever page each node lives in; the file-DLL entries and their
+        //     links are filled in the separate PE_LDRDATA page below. ---
         put(b, LDR_OFF + 0x00, 0x58); // Length
         b[(LDR_OFF + 0x04) as usize] = 1; // Initialized
         for i in 0..3u64 {
-            let head_off = LDR_OFF + 0x10 + i * 0x10;
-            let head_va = PE_PARAMS_ADDR + head_off;
-            let link_va = |k: usize| PE_PARAMS_ADDR + mod_offs[k] + i * 0x10;
-            put(b, head_off, link_va(0)); // head.Flink -> first module
-            put(b, head_off + 8, link_va(mod_offs.len() - 1)); // head.Blink -> last
-            for k in 0..mod_offs.len() {
-                let off = mod_offs[k] + i * 0x10;
-                let flink = if k + 1 == mod_offs.len() { head_va } else { link_va(k + 1) };
-                let blink = if k == 0 { head_va } else { link_va(k - 1) };
-                put(b, off, flink);
-                put(b, off + 8, blink);
-            }
+            link_ring(b, PE_PARAMS_ADDR, &nodes_for(i));
         }
         put(b, MOD_OFF + 0x30, image_base); // DllBase
         put(b, MOD_OFF + 0x38, entry); // EntryPoint
@@ -675,6 +1069,44 @@ fn map_teb_peb(
             .copy_from_slice(ANSI_CMDLINE);
         // ENV_OFF: leave the two NUL words already zeroed
     })?;
+
+    // --- PE_LDRDATA page: one LDR_DATA_TABLE_ENTRY per on-disk DLL, plus its
+    //     UTF-16 names, plus this page's share of the three ring links. ---
+    if n_file != 0 {
+        w(PE_LDRDATA_ADDR, &|d| {
+            let mut scur = LDRDATA_STR_OFF;
+            let mut wput = |d: &mut [u8], s: &str| -> (u64, u16) {
+                let va = PE_LDRDATA_ADDR + scur as u64;
+                let mut n = 0usize;
+                for u in s.encode_utf16() {
+                    d[scur + n..scur + n + 2].copy_from_slice(&u.to_le_bytes());
+                    n += 2;
+                }
+                d[scur + n..scur + n + 2].copy_from_slice(&[0, 0]);
+                scur += n + 2;
+                scur = (scur + 1) & !1;
+                (va, n as u16)
+            };
+            for (k, m) in file_mods.iter().take(n_file).enumerate() {
+                let e = k * LDR_ENTRY_STRIDE as usize;
+                let (full_buf, full_len) =
+                    wput(d, &alloc::format!("C:\\Windows\\System32\\{}", m.name));
+                let (base_buf, base_len) = wput(d, &m.name);
+                d[e + 0x30..e + 0x38].copy_from_slice(&m.base.to_le_bytes()); // DllBase
+                d[e + 0x38..e + 0x40].copy_from_slice(&m.entry.to_le_bytes()); // EntryPoint
+                d[e + 0x40..e + 0x48].copy_from_slice(&(m.size & 0xFFFF_FFFF).to_le_bytes());
+                d[e + 0x48..e + 0x4A].copy_from_slice(&full_len.to_le_bytes()); // FullDllName
+                d[e + 0x4A..e + 0x4C].copy_from_slice(&(full_len + 2).to_le_bytes());
+                d[e + 0x50..e + 0x58].copy_from_slice(&full_buf.to_le_bytes());
+                d[e + 0x58..e + 0x5A].copy_from_slice(&base_len.to_le_bytes()); // BaseDllName
+                d[e + 0x5A..e + 0x5C].copy_from_slice(&(base_len + 2).to_le_bytes());
+                d[e + 0x60..e + 0x68].copy_from_slice(&base_buf.to_le_bytes());
+            }
+            for i in 0..3u64 {
+                link_ring(d, PE_LDRDATA_ADDR, &nodes_for(i));
+            }
+        })?;
+    }
     Ok(())
 }
 

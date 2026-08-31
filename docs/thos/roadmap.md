@@ -299,11 +299,51 @@ late.
     `thos_add`, itself imports `KERNEL32!GetLastError`) at
     `C:\Windows\System32`; the exe imports `thoscrt!thos_add`, calls it, and
     asserts `42` (`PE dll thos_add=42`). `DllMain` is not run yet.
-  - **Next:** thread file DLLs into the PEB `Ldr` lists (so runtime
-    `GetModuleHandleA` / `GetProcAddress` / `LoadLibraryA` see them) and run
-    `DllMain`; then swap the hand-built test DLLs for **Wine-sourced** PE
-    `kernel32` / `ntdll` / `user32` …; then process isolation / integrity for
-    the security phase.
+  - **DLLs in the PEB `Ldr` lists:** `map_teb_peb` now writes a real
+    `LDR_DATA_TABLE_ENTRY` for every on-disk DLL into all three module lists
+    (after the exe and the synthetic pair), in a dedicated `PE_LDRDATA` page;
+    a `link_ring` helper threads each circular list across both pages. Runtime
+    `GetModuleHandleA` / `LoadLibraryA` / `GetProcAddress` resolve against
+    System32 DLLs, not just the synthetic ones — `pe-test` looks up
+    `thoscrt!thos_add` at runtime and calls it (`PE dll Ldr OK`). Capped at 12
+    file DLLs (multi-page region later).
+  - **`DllMain` before the exe entry:** when a loaded DLL has an entry point,
+    `load` builds a one-page ring-3 **process-bootstrap** (`PE_BOOTSTRAP_ADDR`)
+    and starts the thread there — a small loop that calls each
+    `DllMain(hinst, DLL_PROCESS_ATTACH, 1)` in dependency order, then jumps to
+    the real exe entry (Windows does this in `LdrpInitializeProcess`; THOS has
+    no user-mode loader yet, so the kernel emits the shim). `pe-test`'s
+    `thoscrt.dll` has a real `DllMain` that gates `thos_add` behind a sentinel,
+    so `thos_add(40,2) == 42` now also proves `DllMain` ran first. Return value
+    not yet acted on.
+  - **Toward real (Wine-sourced) DLLs.** Dropping a real `kernel32` / `ntdll` /
+    `user32` into `C:\Windows\System32` needs loader features that the
+    hand-built test DLLs don't exercise; each lands with its own synthetic
+    test:
+    - **import by ordinal** — *done.* `LoadedModule` now models the export
+      table (`eat` by `ordinal - ord_base`, `names` → index); a thunk with the
+      ordinal flag resolves via `by_ordinal`. `pe-test` imports
+      `thoscrt!thos_mul` by ordinal 2 (`PE dll ordinal OK`).
+    - **forwarder exports** — *done.* `LoadedModule.eat` is `Vec<Export>`
+      (`Empty` / `Addr` / `Forward("Dll.Func")`); `Loader::resolve_export_idx`
+      follows a forwarder (`resolve_module` → recurse), and `nt.rs`'s
+      `resolve_slot` does the same at runtime for `GetProcAddress`. `pe-test`'s
+      `thoscrt!thos_fwd` forwards to `KERNEL32.GetProcessHeap` (`PE dll forward OK`).
+    - **TLS directory** (data dir 9) — *done.* `stage_image` reads the
+      `IMAGE_TLS_DIRECTORY` post-reloc; `Loader::tls_add_module` copies each
+      module's TLS template into a per-thread block on the `PE_TLS_ADDR` page,
+      writes `ThreadLocalStoragePointer[idx]` + the module's `AddressOfIndex`,
+      and queues its callbacks. `map_teb_peb` sets `TEB+0x58`; the ring-3
+      bootstrap runs TLS callbacks before `DllMain`s. `pe-test` verifies via
+      `gs:[0x58]` (`PE TLS OK`). Still static-only — no `TlsAlloc`, one thread.
+    - **`DllMain` returning `FALSE`** — *done.* The bootstrap loop tests `eax`
+      after each `DllMain` (not TLS callbacks) and, on `FALSE`, calls
+      `ExitProcess(0x135)` inline instead of jumping to the exe entry.
+      `pe-test`'s `failcrt.dll` aborts init so `pe-dllfail.exe`'s entry never
+      runs (`THOS: pe dllfail ok`).
+  - **Then:** the real `ntdll` lower boundary (the `__wine_unix_call` seam +
+    a wineserver-equivalent on the executive) so Wine's PE DLLs can sit on
+    THOS; process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a

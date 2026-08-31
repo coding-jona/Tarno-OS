@@ -623,6 +623,16 @@ fn storage_milestone() {
         }
         kprintln!("THOS: pe exited        native PE64 ran to exit");
 
+        // A DLL whose DllMain(DLL_PROCESS_ATTACH) returns FALSE must abort
+        // process init — the exe entry (which prints "PE DLLFAIL REACHED
+        // ENTRY") never runs. `cargo xtask pe-test` asserts that line is absent.
+        let df = fs.read_path("/pe-dllfail.exe").expect("read /pe-dllfail.exe from ext2");
+        let dpid = process::spawn_pe(&df).expect("spawn_pe: /pe-dllfail.exe rejected");
+        while !process::pid_exited(dpid) {
+            sched::yield_now();
+        }
+        kprintln!("THOS: pe dllfail ok    DllMain FALSE aborted init");
+
         // Hostile input: a truncated / garbage PE must be rejected cleanly, not
         // panic the kernel.
         let mut junk = Vec::from(&exe[..exe.len().min(200)]);
