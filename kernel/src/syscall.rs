@@ -321,7 +321,12 @@ fn sys_unlink(path_ptr: u64, dir: bool) -> i64 {
 }
 
 fn sys_open(path_ptr: u64) -> i64 {
-    let path = process::resolve_path(&user_cstr(path_ptr));
+    open_resolved(&process::resolve_path(&user_cstr(path_ptr)))
+}
+
+/// Open an already-resolved absolute path, returning a new fd (or `-errno`).
+/// Shared by `open`/`openat` and the NT personality's `CreateFileA`.
+pub fn open_resolved(path: &str) -> i64 {
     let Some(task) = sched::current().task() else {
         return EBADF;
     };
@@ -759,6 +764,9 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             USER_EXITS.fetch_add(1, Ordering::Release);
             sched::exit()
         }
+
+        // NT-personality calls from a PE's import stubs.
+        n if n & !0xFFFF == crate::nt::NT_BASE => crate::nt::dispatch((n & 0xFFFF) as u16, frame),
 
         n => {
             kprintln!("THOS: unhandled syscall {}", n);

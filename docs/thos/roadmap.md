@@ -197,8 +197,68 @@ late.
     hand-assembled statically linked Win64 `.exe` (`write(1,…)` + `exit(0)` via
     `syscall` — the CPU runs `syscall` from any ring-3 code regardless of
     container) into ext2 and checks it prints + exits. ELF and PE processes run
-    in the same boot on the same kernel. Next: base relocations, then PEB/TEB +
-    `gs` base, then the `Nt*` dispatch + `ntdll` lower boundary.
+    in the same boot on the same kernel.
+  - **Hardening done (P0):** `pe.rs` treats every input as hostile — bounds-
+    checked LE reads, sane limits on `SizeOfImage` / `NumberOfSections` /
+    `ImageBase`, overflow-checked arithmetic, section data clamped to what the
+    file holds. A malformed `.exe` returns `Err`, never a slice panic;
+    `spawn_pe` returns `Result`. `pe-test` also feeds it a truncated / bad-
+    `e_lfanew` blob and asserts the kernel rejects it and stays alive.
+  - **Base relocations done (P1):** `pe::load` materialises the full image at
+    RVA 0, then walks data directory 5 — `IMAGE_REL_BASED_DIR64` targets get
+    `delta` added, `ABSOLUTE` is padding, any other type is rejected. A PE with
+    `DYNAMIC_BASE` + a `.reloc` section is loaded at an alternative base
+    (fixed non-zero shift for now; a real availability check / ASLR comes with
+    the DLL loader) so the fixup path is actually exercised. The `pe-test` `.exe`
+    now loads its message pointer from an **absolute** slot patched by a DIR64
+    fixup — a wrong delta would fault or misprint, so the exact-string check is
+    the relocation test.
+  - **PEB / TEB + `gs` base done.** `pe::load` allocates + maps a TEB and PEB
+    page for the process (`gs:[0x30]` self, `gs:[0x60]` PEB, `NT_TIB` stack
+    bounds, `PEB.ImageBaseAddress`); the thread carries the TEB as its `%gs`
+    base. `apply_cpu_state` programs `IA32_KERNEL_GS_BASE` per thread (per-CPU
+    pointer for POSIX/kernel threads, the TEB for a PE thread) and skips the
+    `wrmsr` when the value is unchanged — a POSIX→POSIX switch costs nothing, so
+    the existing `swapgs`/`gs:0` per-CPU discipline is untouched. PE threads are
+    **cooperatively scheduled for now** (`IF=0` in ring 3) so a ring-3 IRQ
+    `swapgs` shim isn't needed yet. `pe-test` reads `gs:[0x30]→[+0x60]→[+0x10]`
+    (TEB → PEB → ImageBaseAddress) before its `WriteFile` line, so a broken `gs`
+    / TEB / PEB would fault it.
+  - **Imports + NT syscall surface done (P1):** `pe::load` walks the Import
+    Directory Table, resolves each by-name thunk against a builtin resolver, and
+    patches the IAT in place (post-relocation); unresolved names / ordinals are
+    rejected, not left dangling. A **shared NT stub page** is mapped into every
+    PE process at a fixed high address — one 16-byte trampoline per NT call
+    (`mov eax, NT_BASE|idx; mov r10, rcx; syscall; ret`). `rax` values in the
+    `NT_BASE` (`0x4E540000`) range route to **`nt::dispatch`** (`nt.rs`), which
+    reads the Win64 arg registers (`r10`=former `rcx`, `rdx`, `r8`, `r9`, then
+    the stack) off the `UserFrame` and marshals onto THOS objects.
+  - **`kernel32` file I/O implemented:** `GetStdHandle`, `WriteFile`,
+    `ReadFile`, `CreateFileA` (read-only `OPEN_EXISTING`; a Windows path is
+    mapped `X:\a\b` → `/a/b`), `CloseHandle`, `GetLastError` / `SetLastError`
+    (`TEB.LastErrorValue` at `gs:[0x68]`, reached through the thread's saved
+    `%gs` base), `ExitProcess`. Win64 stack args are read at `[rsp+0x28]`+ off
+    the stub frame; `nt::dispatch` marshals all of them onto THOS's fd table +
+    ext2. The `pe-test` `.exe` prints line 1 via a raw `syscall` (DIR64-relocated
+    absolute pointer), line 2 via `WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),…)`,
+    then **opens `C:\pe-read.txt` with `CreateFileA`, reads it with `ReadFile`,
+    and echoes it with `WriteFile`** — a PE process doing real Win32 file I/O on
+    THOS objects — then `ExitProcess(0)`, all through the IAT.
+  - **PEB `Ldr` + `ProcessParameters` + memory:** a parameter page per PE
+    process holds `RTL_USER_PROCESS_PARAMETERS` (std handles, `ImagePathName` /
+    `CommandLine` / `CurrentDirectory` as `UNICODE_STRING`s, an empty
+    environment) and a `PEB_LDR_DATA` + one circular `LDR_DATA_TABLE_ENTRY` for
+    the exe (`DllBase` / `EntryPoint` / `SizeOfImage` / names), wired at
+    `PEB+0x20` / `PEB+0x18`. `PEB+0x30` = `ProcessHeap`. Stubs:
+    `GetCommandLineA`, `GetModuleHandleA(NULL)`→ImageBase, **`VirtualAlloc`** /
+    `VirtualFree` / `VirtualProtect` (anon zeroed mapping via `mmap_anon`; RWX
+    for now), **`GetProcessHeap` / `HeapAlloc` / `HeapFree`** (one anon mapping
+    per alloc — a real allocator comes later). `pe-test` `VirtualAlloc`s a page
+    and `HeapAlloc`s a block and writes to both (`PE VirtualAlloc+Heap OK`).
+  - **Next:** a proper `ntdll` boundary + a synthetic `kernel32` module with an
+    export table so `GetProcAddress` / `LoadLibrary` resolve, then real
+    PE-built DLLs from a `C:\Windows\System32` tree; then process isolation /
+    integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
@@ -276,6 +336,121 @@ instead of bolting Unix and Windows identity side by side.
 - **Auth**: `argon2id` password hashes in a THOS-native credential store
   (SAM/shadow-shaped but our own format), not `/etc/shadow`.
 
+#### Age declaration & content restriction (family-safety)
+
+THOS ships a built-in maturity gate so an under-age operator is protected by
+default — the same feature class as Windows Family Safety / iOS Screen Time /
+Android parental controls, wired into the principal model rather than bolted on
+(*user requirement, 2026-08-31*).
+
+- **Not at setup — triggered on demand.** THOS installs and runs without any age
+  check. The `age-verify` flow fires only when a principal that is not currently
+  `adult-verified` tries to reach **18+ content** (an app/site/package the policy
+  engine rates adult). The result is cached on the principal and reused; it
+  **expires after ~14 days of account inactivity** (and a hard max regardless),
+  after which the next 18+ access re-runs the flow. A `minor` account never hits
+  this — the admin sets `minor` directly and only the admin can lift it.
+
+  **The decided flow** (*user, 2026-08-31*), fully local, buffers zeroed
+  immediately, nothing written to disk:
+  1. **Capture front + back of a national ID card** (webcam, or uploaded stills
+     if the machine has no camera) — the whole card legible.
+  2. **Pull the data** — MRZ / VIZ OCR → date of birth (+ cross-check MRZ↔VIZ,
+     check digits); derive the age.
+  3. **Face match** — one webcam photo of the operator; an algorithm compares
+     the ID portrait against the live face (+ a basic liveness check so it isn't
+     a photo of a photo). **Skipped if there is no webcam.**
+  4. Grant `adult-verified` with a timestamp; discard the images and OCR crops.
+
+  Why an ID card and not a chip reader: THOS **does not assume an NFC reader
+  exists**. It does assume that anyone entitled to 18+ content is ≥ 18 and that
+  adults reliably hold a national ID card, while minors often do not — so
+  requiring the card as the artefact is itself a real filter, and the face match
+  stops a minor simply presenting a parent's card. This is `assurance = optical`
+  (with-face) / `optical-doc-only` (no webcam): it **deters**, it is not a
+  cryptographic proof. The NFC-chip path (PACE → Passive + Chip Authentication
+  against a CSCA master list) stays specified as an **optional high-assurance
+  upgrade** for deployers who want `chip-verified`, not a default requirement.
+- **Default-deny for adult content.** Until a principal is `adult`, the policy
+  engine (the same one the exec-gate and Security Service already run) denies:
+  launching apps/packages carrying an `18+` age rating; installs from stores
+  above the principal's rating; and network access to domain categories
+  (adult / gambling / …) via the Security Service's category blocklist. A
+  `minor` principal cannot lift its own restriction — only the **admin
+  principal** can change a `maturity` attribute, through the trusted-path
+  elevation prompt.
+- **Enforcement points** already exist in the design: the native-exec gate adds
+  an age-rating check to its `policy engine` step; the Security Service's
+  network firewall/IDS does the domain-category filtering; the package/store
+  layer checks the rating at install time.
+- **`age-verify` module** outputs `(age, assurance, verified_at)` and never
+  persists the source material — camera / OCR / APDU buffers are zeroed the
+  moment the age is extracted, nothing touches disk.
+  `assurance ∈ { declared, optical-doc-only, optical, chip-verified }`; the
+  policy engine decides which clears the 18+ gate (default: `optical` and up,
+  since the real backstop is the admin-lock + default-deny filter, not the
+  proof strength) and how long a grant lasts before the inactivity re-scan.
+
+Engineering reality:
+- **Primary (optical) path:** a UVC camera driver (a large item on its own),
+  MRZ / OCR-B recognition (a purpose-built recogniser, not a full OCR port), a
+  face-detect + face-embedding compare with a basic liveness check, all on
+  device. OCR is noisy (~80 % on clear MRZ) — hence `optical`, not proof.
+- **Optional chip upgrade — a substantial, security-critical module:**
+  **USB PC/SC (CCID) reader driver** — a new device class for THOS.
+- **PACE** is password-authenticated EC Diffie-Hellman (domain params, the
+  generic-mapping step, mutual auth); BAC is the older 3DES fallback. Getting
+  this wrong makes the gate worthless, so it needs real review.
+- **Passive Authentication** — CMS/PKCS#7 `SOD` signature verification, X.509
+  path building to a `CSCA`, per-DG hash checks. Ship + periodically refresh the
+  CSCA master list (out-of-band; not a phone-home).
+- **Active / Chip Authentication** — RSA or ECDSA challenge-response.
+- Hardware assumptions become real: the operator needs a contactless reader and
+  an ID with an ICAO-9303 chip (all EU eIDs and biometric passports have one;
+  some older / non-EU documents do not — hence the admin-permitted declaration
+  fallback).
+
+Open-source building blocks (2026-08 survey — reuse, don't reinvent):
+- **eMRTD chip protocol, in Rust:** `worldfnd/icao-9303` — pure-Rust eMRTD core
+  with BAC, **PACE (ECDH-GM P-256)**, LDS parsing, secure messaging. This is the
+  biggest win — the hard crypto already exists to vendor / port. Cross-check
+  against **JMRTD** (Java, the reference implementation) and **pypassport**
+  (Python: BAC + partial PACE + Passive + Active Auth).
+- **MRZ parse + check digits:** the `mrz` crate (zero deps, `wasm`-clean → very
+  likely `no_std`-portable), or `mrtd` (`asmarques/mrtd`). Trivial to vendor;
+  the *parse* is easy, the OCR that feeds it is the weak link.
+- **PC/SC + CCID:** `pcsc-lite` + `libccid` as the reference for a THOS
+  USB-CCID class driver (the CCID spec is small).
+- **CSCA trust anchors:** the ICAO PKD **master list** (LDIF, signed by the UN
+  CSCA). ⚠ its terms are **non-commercial only** — for a distributed THOS use
+  national master lists (e.g. German BSI) instead. Ship + refresh out-of-band.
+- **MRZ OCR (optical path):** PassportEye (Tesseract, ~80 % precision —
+  confirms OCR is noisy and why `optical` is `deters`, not `proves`),
+  `mrz-scanner` (fully-offline PWA) as UX reference.
+- **Face compare / age (optical path):** `BetterAgeVerify` (privacy-first OSS,
+  on-device, images deleted immediately) and general OSS face-embedding models
+  as references for the ID-portrait ↔ live-face match + a photo-of-photo
+  liveness check.
+- **Content-category domain lists (policy-engine network filter):**
+  `StevenBlack/hosts` (porn / gambling extensions), **HaGeZi dns-blocklists**
+  (NSFW + gambling categories), `blocklistproject/Lists`, `aegis-blocklist`
+  (child-safety, VPN/proxy bypass-prevention). The Security Service just ingests
+  these — no list to author.
+- **Malware scanning (AV):** `yara-x` (pure-Rust YARA), ClamAV signature DBs.
+
+Hard limit — **CSAM is not a content-filter feature and THOS will not implement
+a CSAM scanner.** Such material is illegal to possess irrespective of any
+filter, and detection is a specialised legal/reporting domain (hash databases,
+mandated reporting) that a from-scratch OS must not reinvent. The only coverage
+the design gives is incidental: the Security Service already blocks
+known-malicious / known-bad domains from threat-intel feeds, so hosts on those
+feeds are blocked by the same mechanism as malware C2 — no dedicated subsystem,
+no content inspection.
+
+Sequencing: designed in now (the `maturity` attribute rides the principal model
+being built), enforced once the policy engine / exec-gate / network filter land
+in the security phase — after the NT personality.
+
 Phasing:
 - **Phase 2 (stub):** the `Principal` object exists; a console `login` runs before
   the shell and sets the session's principal; files carry an owner + mode bits;
@@ -314,6 +489,47 @@ Phasing:
 - Scheduler: real Thread-Director HFI feedback for P/E placement.
 - **Milestone 5:** a real Windows game (D3D11, no anti-cheat, statically resolvable)
   starts and is playable; a native Linux workload runs on the same cores concurrently.
+
+### Security architecture — a full antivirus, enforced in the kernel, scanning in userspace
+
+THOS ships a **full-featured antivirus / anti-malware capability** — this is a
+committed deliverable, not an optional add-on (*user, 2026-08-31*). What is
+deliberate is *where* it lives: the **scanner never runs in the kernel**. A bug
+in a YARA rule or a PE analyser must not be able to panic the box. "Full" means
+real detection coverage (signatures, heuristics, static analysis, quarantine,
+on-access + on-exec + on-demand scanning), delivered as the isolated userspace
+Security Service below — not "pick the strongest off-the-shelf AV and staple it
+into ring 0."
+
+- **Security Core (kernel):** the hard boundaries only — measured / secure boot,
+  process isolation, the capability policy (already the identity model's
+  direction), W^X + memory protection, file-integrity baselines. Small, auditable,
+  no parsing of untrusted formats beyond what the loaders already do (now
+  hostile-input hardened).
+- **Security Service (isolated userspace) — the full AV:** real-time (on-access
+  + on-exec) and on-demand scanning; file scanner (YARA + open-source signature
+  sets, e.g. ClamAV-style DBs); exec scanner (PE/ELF static analysis, reusing
+  `pe.rs` / `elf.rs` — import table, section entropy, packer detection);
+  heuristics; quarantine store; update mechanism for rules/signatures; network
+  firewall / IDS. Talks to the Security Core over a narrow capability-gated
+  interface; a crash there degrades to a policy default, it does not take the
+  kernel down.
+- **Milestone (Security):** a known-malicious EICAR-class test PE and ELF are
+  caught by the exec gate before their first instruction runs, quarantined, and
+  logged — with the scanner process killable and restartable without touching
+  the kernel.
+- **The native-exec gate** (unique to the hybrid design): every program entering
+  the system — PE *or* ELF — passes one pipeline before it is allowed to run:
+  `format detect → parse headers → hash / signature check → YARA / static
+  analysis → policy engine → ALLOW | QUARANTINE`. Because both container formats
+  execute natively, this gate covers the whole system with one mechanism instead
+  of two half-measures.
+Sequencing: the AV is a firm requirement, but it is built **after** the NT
+personality (PE imports / `Nt*` dispatch / process isolation) is real — a
+scanner has nothing to protect until Windows binaries actually run, and the
+exec gate reuses the loader internals that are being built now. Designed in
+from the start (loaders already hostile-input hardened; identity model already
+capability-shaped), implemented as its own phase once M3 lands.
 
 ## Phase 6 — Research track: real `.sys` drivers (after M5)
 

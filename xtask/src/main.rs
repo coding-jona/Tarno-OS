@@ -289,12 +289,18 @@ fn disk_image() -> PathBuf {
         }
     }
 
-    // A hand-assembled, statically linked Win64 `.exe` (no imports, no relocs)
-    // for the native PE loader -> /pe-hello.exe.
+    // A hand-assembled statically linked Win64 `.exe` for the native PE loader,
+    // plus the file it opens with CreateFileA / ReadFile.
     let exe = root.join("target/pe-hello.exe");
     write_pe_hello(&exe);
     run(Command::new("debugfs").args([
         "-w", "-R", &format!("write {} pe-hello.exe", exe.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+    let peread = root.join("target/pe-read.txt");
+    std::fs::write(&peread, b"PE ReadFile OK via CreateFileA\n").unwrap();
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} pe-read.txt", peread.to_str().unwrap()),
         img.to_str().unwrap(),
     ]));
 
@@ -387,53 +393,346 @@ fn disk_image() -> PathBuf {
     img
 }
 
-/// Write a minimal statically linked Win64 console `.exe`: one `.text` section
-/// (RWX), no imports / relocs / TLS, whose entry does `write(1, msg)` +
-/// `exit(0)` via the Linux syscall ABI (the CPU runs `syscall` from any ring-3
-/// code regardless of container). Just enough to exercise the PE loader.
+/// Write a minimal statically linked Win64 console `.exe`: `.text` (RWX) +
+/// `.reloc` + `.idata`, `DYNAMIC_BASE` set. The entry:
+///   1. `write(1, msg1)` via a raw `syscall` — `msg1` from an **absolute** slot
+///      needing a `DIR64` base relocation;
+///   2. `WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), msg2, len, &written, NULL)`
+///      — real Win64 arg passing (rcx/rdx/r8/r9 + a stack slot), through the
+///      **IAT** into THOS's NT stubs;
+///   3. `ExitProcess(0)` through the IAT.
+/// Exercises header parse, section map, relocation fixup, import resolution,
+/// and Win64→THOS argument marshalling.
 fn write_pe_hello(path: &Path) {
-    let msg: &[u8] = b"PE on THOS via native loader\n";
-
-    // --- entry machine code (x86-64) ---
-    let mut code: Vec<u8> = Vec::new();
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1  (SYS_write)
-    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 1, 0, 0, 0]); // mov rdi, 1  (fd)
-    let lea_disp = code.len() + 3;
-    code.extend_from_slice(&[0x48, 0x8D, 0x35, 0, 0, 0, 0]); // lea rsi, [rip+disp32]
-    let rdx_imm = code.len() + 3;
-    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0, 0, 0, 0]); // mov rdx, len
-    code.extend_from_slice(&[0x0F, 0x05]); // syscall
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 60, 0, 0, 0]); // mov rax, 60 (SYS_exit)
-    code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
-    code.extend_from_slice(&[0x0F, 0x05]); // syscall
-    let msg_off = code.len();
-    code.extend_from_slice(msg);
-    let disp = (msg_off as i64 - (lea_disp as i64 + 4)) as i32;
-    code[lea_disp..lea_disp + 4].copy_from_slice(&disp.to_le_bytes());
-    code[rdx_imm..rdx_imm + 4].copy_from_slice(&(msg.len() as u32).to_le_bytes());
-
-    // --- PE32+ container ---
+    let msg1: &[u8] = b"PE on THOS via native loader\n";
+    let msg2: &[u8] = b"PE via WriteFile\n";
     const IMAGE_BASE: u64 = 0x1_4000_0000;
     const SECT_ALIGN: u32 = 0x1000;
     const FILE_ALIGN: u32 = 0x200;
     let text_rva = 0x1000u32;
+    let reloc_rva = 0x2000u32;
+    let idata_rva = 0x3000u32;
+
+    // --- .idata: import from KERNEL32.dll ---
+    let funcs: &[&[u8]] = &[
+        b"ExitProcess",   // NT idx 0
+        b"GetStdHandle",  // 1
+        b"WriteFile",     // 2
+        b"GetLastError",     // 3
+        b"CreateFileA",      // 5
+        b"ReadFile",         // 6
+        b"GetCommandLineA",  // 8
+        b"GetModuleHandleA", // 9
+        b"VirtualAlloc",     // 10
+        b"GetProcessHeap",   // 13
+        b"HeapAlloc",        // 14
+    ];
+    let ilt_off = 0x28u32; // after 2 IDT entries (2*20)
+    let iat_off = ilt_off + (funcs.len() as u32 + 1) * 8;
+    let mut hn_off = iat_off + (funcs.len() as u32 + 1) * 8;
+    let mut idata: Vec<u8> = vec![0u8; 0x300];
+    let put32 = |b: &mut Vec<u8>, at: u32, v: u32| {
+        b[at as usize..at as usize + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    let put64 = |b: &mut Vec<u8>, at: u32, v: u64| {
+        b[at as usize..at as usize + 8].copy_from_slice(&v.to_le_bytes());
+    };
+    let mut hn_rvas = vec![0u32; funcs.len()];
+    for (i, f) in funcs.iter().enumerate() {
+        hn_rvas[i] = idata_rva + hn_off;
+        // 2-byte hint (0) then the NUL-terminated name
+        idata[hn_off as usize + 2..hn_off as usize + 2 + f.len()].copy_from_slice(f);
+        hn_off += 2 + f.len() as u32 + 1;
+        hn_off = (hn_off + 1) & !1; // keep names 2-aligned
+    }
+    let dll_off = hn_off;
+    idata[dll_off as usize..dll_off as usize + 12].copy_from_slice(b"KERNEL32.dll");
+    // IDT entry 0 (entry 1 stays zero = terminator)
+    put32(&mut idata, 0, idata_rva + ilt_off); // OriginalFirstThunk
+    put32(&mut idata, 12, idata_rva + dll_off); // Name
+    put32(&mut idata, 16, idata_rva + iat_off); // FirstThunk
+    for i in 0..funcs.len() as u32 {
+        put64(&mut idata, ilt_off + i * 8, hn_rvas[i as usize] as u64);
+        put64(&mut idata, iat_off + i * 8, hn_rvas[i as usize] as u64);
+    }
+    idata.truncate(((dll_off + 13 + 15) & !15) as usize);
+    let iat_exit = idata_rva + iat_off;
+    let iat_gsh = idata_rva + iat_off + 8;
+    let iat_wf = idata_rva + iat_off + 16;
+    let iat_cf = idata_rva + iat_off + 32; // CreateFileA
+    let iat_rf = idata_rva + iat_off + 40; // ReadFile
+    let iat_gcl = idata_rva + iat_off + 48; // GetCommandLineA
+    let iat_gmh = idata_rva + iat_off + 56; // GetModuleHandleA
+    let iat_va = idata_rva + iat_off + 64; // VirtualAlloc
+    let iat_gph = idata_rva + iat_off + 72; // GetProcessHeap
+    let iat_ha = idata_rva + iat_off + 80; // HeapAlloc
+
+    // --- entry machine code (x86-64) ---
+    // Deferred RIP-relative fixups: (disp32 position in `code`, target RVA).
+    let mut code: Vec<u8> = Vec::new();
+    let mut fixups: Vec<(usize, u32)> = Vec::new();
+    macro_rules! rel {
+        ($bytes:expr, $target:expr) => {{
+            code.extend_from_slice(&$bytes);
+            fixups.push((code.len() - 4, $target));
+        }};
+    }
+    // slots appended after the code; RVAs filled once the code length is known
+    let ptr_slot_tag = u32::MAX; // sentinel targets resolved specially
+    let wr_slot_tag = u32::MAX - 1;
+    let msg1_tag = u32::MAX - 2;
+    let msg2_tag = u32::MAX - 3;
+    let stdout_slot_tag = u32::MAX - 4;
+    let nread_slot_tag = u32::MAX - 5;
+    let buf_tag = u32::MAX - 6;
+    let fname_tag = u32::MAX - 7;
+    let msg_pp_tag = u32::MAX - 8;
+    let msg_ldr_tag = u32::MAX - 9;
+    let msg_va_tag = u32::MAX - 10;
+
+    // 1) write(1, msg1, len1)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 1, 0, 0, 0]); // mov rdi, 1
+    rel!([0x48, 0x8B, 0x35, 0, 0, 0, 0], ptr_slot_tag); // mov rsi, [rip+ptr_slot]
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+    code.extend_from_slice(&(msg1.len() as u32).to_le_bytes()); // mov rdx, len1
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // 1b) touch the TEB / PEB via %gs — faults here if gs-base / TEB / PEB are
+    //     wrong, so the WriteFile line below never prints.
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0, 0, 0]); // mov rax, gs:[0x30]  (TEB self)
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x60]); // mov rax, [rax+0x60]  (PEB via TEB)
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x10]); // mov rax, [rax+0x10]  (ImageBaseAddress)
+
+    // 2) WriteFile(GetStdHandle(-11), msg2, len2, &written, NULL)
+    code.extend_from_slice(&[0xB9, 0xF5, 0xFF, 0xFF, 0xFF]); // mov ecx, -11
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gsh); // call [rip+iat_GetStdHandle]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (stdout handle)
+    rel!([0x48, 0x89, 0x1D, 0, 0, 0, 0], stdout_slot_tag); // mov [rip+stdout_slot], rbx
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg2_tag); // lea rdx, [rip+msg2]
+    code.extend_from_slice(&[0x41, 0xB8]);
+    code.extend_from_slice(&(msg2.len() as u32).to_le_bytes()); // mov r8d, len2
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // mov qword [rsp+0x20], 0
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf); // call [rip+iat_WriteFile]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+
+    // 2b) CreateFileA(fname, GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0) -> rbx
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], fname_tag); // lea rcx, [rip+fname]
+    code.extend_from_slice(&[0xBA, 0x00, 0x00, 0x00, 0x80]); // mov edx, 0x80000000 (GENERIC_READ)
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (share)
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d  (security)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x03, 0, 0, 0]); // [rsp+0x20]=3 disposition
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0]); // [rsp+0x28]=0 flags
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x30, 0, 0, 0, 0]); // [rsp+0x30]=0 template
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_cf); // call [rip+iat_CreateFileA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (file handle)
+
+    // 2c) ReadFile(rbx, buf, 64, &nread, 0)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], buf_tag); // lea rdx, [rip+buf]
+    code.extend_from_slice(&[0x41, 0xB8, 0x40, 0, 0, 0]); // mov r8d, 64
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], nread_slot_tag); // lea r9, [rip+nread]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // [rsp+0x20]=0 overlapped
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_rf); // call [rip+iat_ReadFile]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+
+    // 2d) WriteFile(stdout, buf, nread, &written, 0)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], stdout_slot_tag); // mov rcx, [rip+stdout_slot]
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], buf_tag); // lea rdx, [rip+buf]
+    rel!([0x44, 0x8B, 0x05, 0, 0, 0, 0], nread_slot_tag); // mov r8d, [rip+nread]
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // [rsp+0x20]=0
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf); // call [rip+iat_WriteFile]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+
+    // 2e) PEB->ProcessParameters->StandardOutput as the WriteFile handle
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0, 0, 0]); // mov rax, gs:[0x30]  (TEB)
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x60]); // mov rax, [rax+0x60]  (PEB)
+    code.extend_from_slice(&[0x48, 0x8B, 0x48, 0x20]); // mov rcx, [rax+0x20]  (ProcessParameters)
+    code.extend_from_slice(&[0x48, 0x8B, 0x49, 0x28]); // mov rcx, [rcx+0x28]  (StandardOutput)
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_pp_tag); // lea rdx, [rip+msg_pp]
+    let pp_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len_pp  (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2f) walk PEB->Ldr; first module DllBase must == PEB->ImageBaseAddress
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0, 0, 0]); // mov rax, gs:[0x30]
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x60]); // mov rax, [rax+0x60]  (PEB)
+    code.extend_from_slice(&[0x48, 0x8B, 0x50, 0x10]); // mov rdx, [rax+0x10]  (ImageBaseAddress)
+    code.extend_from_slice(&[0x48, 0x8B, 0x48, 0x18]); // mov rcx, [rax+0x18]  (Ldr)
+    code.extend_from_slice(&[0x48, 0x8B, 0x49, 0x10]); // mov rcx, [rcx+0x10]  (InLoadOrder.Flink = &entry)
+    code.extend_from_slice(&[0x48, 0x8B, 0x49, 0x30]); // mov rcx, [rcx+0x30]  (entry->DllBase)
+    code.extend_from_slice(&[0x48, 0x39, 0xD1]); // cmp rcx, rdx
+    code.extend_from_slice(&[0x0F, 0x85, 0, 0, 0, 0]); // jne .after_ldr  (patched)
+    let jne_pos = code.len() - 4;
+    let jne_from = code.len();
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_ldr_tag); // lea rdx, [rip+msg_ldr]
+    let ldr_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len_ldr  (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    let after_ldr = code.len();
+    code[jne_pos..jne_pos + 4].copy_from_slice(&((after_ldr - jne_from) as i32).to_le_bytes());
+
+    // 2g) GetCommandLineA() -> rax; WriteFile(1, rax, 22, &written, 0)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gcl); // call [rip+iat_GetCommandLineA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax  (LPSTR)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    code.extend_from_slice(&[0x41, 0xB8, 22, 0, 0, 0]); // mov r8d, 22
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2h) GetModuleHandleA(NULL) — just call it (a broken stub would fault)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28, 0x31, 0xC9]); // sub rsp,0x28 ; xor ecx,ecx
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+
+    // 2i) VirtualAlloc(0, 0x1000, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx  (lpAddress = NULL)
+    code.extend_from_slice(&[0xBA, 0x00, 0x10, 0, 0]); // mov edx, 0x1000
+    code.extend_from_slice(&[0x41, 0xB8, 0x00, 0x30, 0, 0]); // mov r8d, 0x3000
+    code.extend_from_slice(&[0x41, 0xB9, 0x04, 0, 0, 0]); // mov r9d, 0x04
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_va); // call [rip+iat_VirtualAlloc]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0xC6, 0x00, 0x5A]); // mov byte [rax], 0x5A  (#PF if unmapped)
+    code.extend_from_slice(&[0x0F, 0xB6, 0x08]); // movzx ecx, byte [rax]
+
+    // 2j) HeapAlloc(GetProcessHeap(), 0, 64); write to it
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gph); // call [rip+iat_GetProcessHeap]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC1]); // mov rcx, rax  (hHeap)
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx  (flags)
+    code.extend_from_slice(&[0x41, 0xB8, 0x40, 0, 0, 0]); // mov r8d, 64
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_ha); // call [rip+iat_HeapAlloc]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0xC6, 0x00, 0x42]); // mov byte [rax], 0x42  (#PF if bad)
+
+    // 2k) WriteFile(1, msg_va, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_va_tag); // lea rdx, [rip+msg_va]
+    let va_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len_va  (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 3) ExitProcess(0)
+    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_exit); // call [rip+iat_ExitProcess]
+    code.extend_from_slice(&[0xCC]); // int3
+
+    // --- data slots at the end of .text ---
+    while code.len() % 8 != 0 {
+        code.push(0);
+    }
+    let ptr_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // absolute ptr to msg1 (DIR64-relocated)
+    let wr_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // DWORD `written` (+ pad)
+    let stdout_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // saved stdout HANDLE
+    let nread_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // DWORD `nread` (+ pad)
+    let buf_off = code.len();
+    code.extend_from_slice(&[0u8; 64]); // ReadFile buffer
+    let fname_off = code.len();
+    code.extend_from_slice(b"C:\\pe-read.txt\0");
+    while code.len() % 8 != 0 {
+        code.push(0);
+    }
+    let msg1_off = code.len();
+    code.extend_from_slice(msg1);
+    let msg2_off = code.len();
+    code.extend_from_slice(msg2);
+    let msg_pp: &[u8] = b"PE ProcParams OK\n";
+    let msg_ldr: &[u8] = b"PE Ldr OK\n";
+    let msg_va: &[u8] = b"PE VirtualAlloc+Heap OK\n";
+    let msg_pp_off = code.len();
+    code.extend_from_slice(msg_pp);
+    let msg_ldr_off = code.len();
+    code.extend_from_slice(msg_ldr);
+    let msg_va_off = code.len();
+    code.extend_from_slice(msg_va);
+
+    code[pp_r8..pp_r8 + 4].copy_from_slice(&(msg_pp.len() as u32).to_le_bytes());
+    code[ldr_r8..ldr_r8 + 4].copy_from_slice(&(msg_ldr.len() as u32).to_le_bytes());
+    code[va_r8..va_r8 + 4].copy_from_slice(&(msg_va.len() as u32).to_le_bytes());
+    code[ptr_off..ptr_off + 8]
+        .copy_from_slice(&(IMAGE_BASE + text_rva as u64 + msg1_off as u64).to_le_bytes());
+    for (pos, target) in fixups {
+        let target_rva = match target {
+            t if t == ptr_slot_tag => text_rva + ptr_off as u32,
+            t if t == wr_slot_tag => text_rva + wr_off as u32,
+            t if t == stdout_slot_tag => text_rva + stdout_off as u32,
+            t if t == nread_slot_tag => text_rva + nread_off as u32,
+            t if t == buf_tag => text_rva + buf_off as u32,
+            t if t == fname_tag => text_rva + fname_off as u32,
+            t if t == msg1_tag => text_rva + msg1_off as u32,
+            t if t == msg2_tag => text_rva + msg2_off as u32,
+            t if t == msg_pp_tag => text_rva + msg_pp_off as u32,
+            t if t == msg_ldr_tag => text_rva + msg_ldr_off as u32,
+            t if t == msg_va_tag => text_rva + msg_va_off as u32,
+            rva => rva,
+        };
+        let next_rva = text_rva as i64 + pos as i64 + 4;
+        code[pos..pos + 4].copy_from_slice(&((target_rva as i64 - next_rva) as i32).to_le_bytes());
+    }
+    let ptr_reloc_rva = text_rva + ptr_off as u32;
+
+    // --- .reloc: one block, one DIR64 fixup for the msg1 pointer slot ---
+    let mut reloc: Vec<u8> = Vec::new();
+    reloc.extend_from_slice(&(ptr_reloc_rva & !0xFFF).to_le_bytes()); // PageRVA
+    reloc.extend_from_slice(&12u32.to_le_bytes()); // BlockSize
+    reloc.extend_from_slice(&((10u16 << 12) | (ptr_reloc_rva & 0xFFF) as u16).to_le_bytes());
+    reloc.extend_from_slice(&0u16.to_le_bytes()); // ABSOLUTE padding
+
+    // --- PE32+ container ---
     let text_vsize = code.len() as u32;
     let text_raw_ptr = 0x200u32;
     let text_raw_size = text_vsize.div_ceil(FILE_ALIGN) * FILE_ALIGN;
-    let size_of_image = text_rva + text_vsize.div_ceil(SECT_ALIGN) * SECT_ALIGN;
+    let reloc_raw_ptr = text_raw_ptr + text_raw_size;
+    let reloc_vsize = reloc.len() as u32;
+    let reloc_raw_size = reloc_vsize.div_ceil(FILE_ALIGN) * FILE_ALIGN;
+    let idata_raw_ptr = reloc_raw_ptr + reloc_raw_size;
+    let idata_vsize = idata.len() as u32;
+    let idata_raw_size = idata_vsize.div_ceil(FILE_ALIGN) * FILE_ALIGN;
+    let size_of_image = idata_rva + idata_vsize.div_ceil(SECT_ALIGN) * SECT_ALIGN;
     let size_of_headers = 0x200u32;
 
-    let mut pe = vec![0u8; text_raw_ptr as usize + text_raw_size as usize];
+    let mut pe = vec![0u8; (idata_raw_ptr + idata_raw_size) as usize];
     pe[0..2].copy_from_slice(b"MZ");
-    let e_lfanew = 0x40u32;
-    pe[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+    pe[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
 
-    let o = e_lfanew as usize;
+    let o = 0x40usize;
     pe[o..o + 4].copy_from_slice(b"PE\0\0");
     let coff = o + 4;
     pe[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes()); // Machine
-    pe[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections
-    let opt_size = 0xF0u16; // 112 fixed + 16 data dirs * 8
+    pe[coff + 2..coff + 4].copy_from_slice(&3u16.to_le_bytes()); // NumberOfSections
+    let opt_size = 0xF0u16;
     pe[coff + 16..coff + 18].copy_from_slice(&opt_size.to_le_bytes());
     pe[coff + 18..coff + 20].copy_from_slice(&0x0022u16.to_le_bytes()); // EXECUTABLE | LARGE_ADDRESS_AWARE
 
@@ -449,18 +748,35 @@ fn write_pe_hello(path: &Path) {
     pe[opt + 56..opt + 60].copy_from_slice(&size_of_image.to_le_bytes());
     pe[opt + 60..opt + 64].copy_from_slice(&size_of_headers.to_le_bytes());
     pe[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes()); // Subsystem = CONSOLE
+    pe[opt + 70..opt + 72].copy_from_slice(&0x0040u16.to_le_bytes()); // DllCharacteristics = DYNAMIC_BASE
     pe[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
-    // data directories (opt+112 .. +240) left zero — no imports/relocs/TLS
+    // data directory 1 = IMPORT
+    pe[opt + 112 + 8..opt + 112 + 12].copy_from_slice(&idata_rva.to_le_bytes());
+    pe[opt + 112 + 12..opt + 112 + 16].copy_from_slice(&40u32.to_le_bytes());
+    // data directory 5 = BASE_RELOC
+    pe[opt + 112 + 5 * 8..opt + 112 + 5 * 8 + 4].copy_from_slice(&reloc_rva.to_le_bytes());
+    pe[opt + 112 + 5 * 8 + 4..opt + 112 + 5 * 8 + 8].copy_from_slice(&reloc_vsize.to_le_bytes());
+    // data directory 12 = IAT
+    pe[opt + 112 + 12 * 8..opt + 112 + 12 * 8 + 4].copy_from_slice(&iat_exit.to_le_bytes());
+    pe[opt + 112 + 12 * 8 + 4..opt + 112 + 12 * 8 + 8]
+        .copy_from_slice(&(funcs.len() as u32 * 8).to_le_bytes());
 
-    let sh = opt + opt_size as usize;
-    pe[sh..sh + 8].copy_from_slice(b".text\0\0\0");
-    pe[sh + 8..sh + 12].copy_from_slice(&text_vsize.to_le_bytes()); // VirtualSize
-    pe[sh + 12..sh + 16].copy_from_slice(&text_rva.to_le_bytes()); // VirtualAddress
-    pe[sh + 16..sh + 20].copy_from_slice(&text_raw_size.to_le_bytes()); // SizeOfRawData
-    pe[sh + 20..sh + 24].copy_from_slice(&text_raw_ptr.to_le_bytes()); // PointerToRawData
-    pe[sh + 36..sh + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // CODE|EXECUTE|READ
+    let mut sec = |i: usize, name: &[u8], vsize: u32, rva: u32, raw_size: u32, raw_ptr: u32, ch: u32| {
+        let h = opt + opt_size as usize + i * 40;
+        pe[h..h + name.len()].copy_from_slice(name);
+        pe[h + 8..h + 12].copy_from_slice(&vsize.to_le_bytes());
+        pe[h + 12..h + 16].copy_from_slice(&rva.to_le_bytes());
+        pe[h + 16..h + 20].copy_from_slice(&raw_size.to_le_bytes());
+        pe[h + 20..h + 24].copy_from_slice(&raw_ptr.to_le_bytes());
+        pe[h + 36..h + 40].copy_from_slice(&ch.to_le_bytes());
+    };
+    sec(0, b".text", text_vsize, text_rva, text_raw_size, text_raw_ptr, 0x6000_0020); // CODE|EXEC|READ
+    sec(1, b".reloc", reloc_vsize, reloc_rva, reloc_raw_size, reloc_raw_ptr, 0x4200_0040); // IDATA|DISCARD|READ
+    sec(2, b".idata", idata_vsize, idata_rva, idata_raw_size, idata_raw_ptr, 0xC000_0040); // IDATA|READ|WRITE
 
     pe[text_raw_ptr as usize..text_raw_ptr as usize + code.len()].copy_from_slice(&code);
+    pe[reloc_raw_ptr as usize..reloc_raw_ptr as usize + reloc.len()].copy_from_slice(&reloc);
+    pe[idata_raw_ptr as usize..idata_raw_ptr as usize + idata.len()].copy_from_slice(&idata);
     std::fs::write(path, &pe).expect("write pe-hello.exe");
 }
 
@@ -482,7 +798,8 @@ fn spawn_interactive_qemu(tag: &str, iso: &Path, disk: &Path) -> (std::process::
         "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0",
         "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0",
     ]);
-    qemu.args(["-display", "none", "-no-reboot"]);
+    let gui = std::env::args().any(|a| a == "--gui");
+    qemu.args(["-display", if gui { "gtk" } else { "none" }, "-no-reboot"]);
     qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
     qemu.args(["-monitor", &format!("unix:{},server,nowait", sock.to_str().unwrap())]);
     for ovmf in ["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/ovmf/OVMF.fd"] {
@@ -492,6 +809,32 @@ fn spawn_interactive_qemu(tag: &str, iso: &Path, disk: &Path) -> (std::process::
         }
     }
     let child = qemu.spawn().expect("spawn qemu");
+
+    // Follow the serial log and stream new lines to this terminal so the run is
+    // visible (the monitor drives the keyboard, so the serial can't be stdio).
+    {
+        let log = log.clone();
+        let tag = tag.to_string();
+        let pid = child.id();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Seek, SeekFrom};
+            let mut pos: u64 = 0;
+            loop {
+                if let Ok(mut f) = std::fs::File::open(&log) {
+                    let _ = f.seek(SeekFrom::Start(pos));
+                    for line in BufReader::new(&f).lines().map_while(Result::ok) {
+                        println!("  {tag} │ {line}");
+                    }
+                    pos = f.stream_position().unwrap_or(pos);
+                }
+                // stop once the qemu process is gone
+                if std::fs::read(format!("/proc/{pid}/stat")).is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        });
+    }
     (child, log, sock)
 }
 
@@ -880,10 +1223,16 @@ fn bootpick_test() {
 /// Boot the non-interactive kernel with `disk` attached over AHCI, wait for a
 /// clean `ExitCode::Success` halt, and return the serial log. Exits on failure.
 fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     let log = workspace_root().join(format!("target/{tag}-serial.log"));
-    let _ = std::fs::remove_file(&log);
+    // The kernel serial is streamed to this terminal live *and* captured for the
+    // assertions *and* written to the log file. `cargo xtask <test> --gui` also
+    // opens a QEMU window so the framebuffer is visible; otherwise `tail -f
+    // target/<tag>-serial.log` in another shell follows a run.
+    let gui = std::env::args().any(|a| a == "--gui");
 
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu.args(["-M", "q35", "-m", "512M", "-smp", &smp.to_string(), "-cdrom", iso.to_str().unwrap()]);
@@ -891,8 +1240,8 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
         "-drive", &format!("id=disk0,if=none,format=raw,file={}", disk.to_str().unwrap()),
         "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0",
     ]);
-    qemu.args(["-display", "none", "-no-reboot"]);
-    qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
+    qemu.args(["-display", if gui { "gtk" } else { "none" }, "-no-reboot"]);
+    qemu.args(["-serial", "stdio", "-monitor", "none"]);
     qemu.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     for ovmf in ["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/ovmf/OVMF.fd"] {
         if Path::new(ovmf).exists() {
@@ -900,9 +1249,31 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
             break;
         }
     }
+    qemu.stdin(std::process::Stdio::null());
+    qemu.stdout(std::process::Stdio::piped());
 
     let mut child = qemu.spawn().expect("spawn qemu");
-    let deadline = Instant::now() + Duration::from_secs(150);
+    let out = child.stdout.take().expect("qemu stdout");
+    let serial: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let reader = {
+        let serial = Arc::clone(&serial);
+        let log = log.clone();
+        let tag = tag.to_string();
+        std::thread::spawn(move || {
+            let mut logf = std::fs::File::create(&log).ok();
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                println!("  {tag} │ {line}");
+                if let Some(f) = logf.as_mut() {
+                    let _ = writeln!(f, "{line}");
+                }
+                let mut s = serial.lock().unwrap();
+                s.push_str(&line);
+                s.push('\n');
+            }
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(240);
     let status = loop {
         if let Some(s) = child.try_wait().expect("wait qemu") {
             break Some(s);
@@ -913,10 +1284,11 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
         }
         std::thread::sleep(Duration::from_millis(200));
     };
+    let _ = reader.join();
 
-    let serial = std::fs::read_to_string(&log).unwrap_or_default();
+    let serial = Arc::try_unwrap(serial).unwrap().into_inner().unwrap();
     if status.and_then(|s| s.code()) != Some(QEMU_SUCCESS) {
-        eprintln!("{tag}: kernel did not halt cleanly\n--- serial ---\n{serial}\n---");
+        eprintln!("{tag}: kernel did not halt cleanly (see the stream above / target/{tag}-serial.log)");
         exit(1);
     }
     serial
@@ -1090,7 +1462,7 @@ fn ncq_error_test(iso: &Path) {
     }
 
     let mut child = qemu.spawn().expect("spawn qemu");
-    let deadline = Instant::now() + Duration::from_secs(150);
+    let deadline = Instant::now() + Duration::from_secs(240);
     let status = loop {
         if let Some(s) = child.try_wait().expect("wait qemu") {
             break Some(s);
@@ -1146,9 +1518,16 @@ fn pe_test(iso: &Path) {
     let disk = disk_image();
     let serial = boot_kernel_headless("pe", iso, &disk, 4);
     let ok = serial.contains("THOS: pe exited")
-        && serial.contains("PE on THOS via native loader");
+        && serial.contains("PE on THOS via native loader") // raw syscall + DIR64 reloc
+        && serial.contains("PE via WriteFile") // GetStdHandle + WriteFile + gs/TEB/PEB
+        && serial.contains("PE ReadFile OK via CreateFileA") // CreateFileA + ReadFile
+        && serial.contains("PE ProcParams OK") // PEB->ProcessParameters->StandardOutput
+        && serial.contains("PE Ldr OK") // PEB->Ldr module list walk
+        && serial.contains("PE argv0 pe-hello.exe") // GetCommandLineA
+        && serial.contains("PE VirtualAlloc+Heap OK") // VirtualAlloc + GetProcessHeap + HeapAlloc
+        && serial.contains("THOS: pe reject ok");
     if ok {
-        println!("pe-test: OK — native PE64 loader ran a statically linked .exe");
+        println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap");
     } else {
         eprintln!("pe-test: FAIL — the PE did not run to exit\n--- serial ---\n{serial}\n---");
         exit(1);

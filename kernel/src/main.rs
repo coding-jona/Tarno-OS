@@ -42,6 +42,7 @@ mod idt;
 #[cfg(feature = "interactive")]
 mod login;
 mod mm;
+mod nt;
 mod object;
 mod pci;
 mod pe;
@@ -616,11 +617,19 @@ fn storage_milestone() {
     {
         let exe = fs.read_path("/pe-hello.exe").expect("read /pe-hello.exe from ext2");
         kprintln!("THOS: pe ok            /pe-hello.exe = {} bytes", exe.len());
-        let pid = process::spawn_pe(&exe);
+        let pid = process::spawn_pe(&exe).expect("spawn_pe: /pe-hello.exe rejected");
         while !process::pid_exited(pid) {
             sched::yield_now();
         }
         kprintln!("THOS: pe exited        native PE64 ran to exit");
+
+        // Hostile input: a truncated / garbage PE must be rejected cleanly, not
+        // panic the kernel.
+        let mut junk = Vec::from(&exe[..exe.len().min(200)]);
+        junk[0x3C] = 0xFF; // point e_lfanew off the end
+        assert!(process::spawn_pe(&junk).is_err(), "malformed PE was not rejected");
+        assert!(process::spawn_pe(b"MZ\x90\x00not really a pe").is_err());
+        kprintln!("THOS: pe reject ok     malformed PEs rejected, kernel alive");
     }
 
     // AHCI write: round-trip a known pattern through a scratch sector past the
