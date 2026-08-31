@@ -304,6 +304,19 @@ fn disk_image() -> PathBuf {
         img.to_str().unwrap(),
     ]));
 
+    // A real on-disk PE DLL at C:\Windows\System32\thoscrt.dll — the exe imports
+    // thoscrt!thos_add, and thoscrt itself imports KERNEL32!GetLastError.
+    let thoscrt = root.join("target/thoscrt.dll");
+    write_thoscrt_dll(&thoscrt);
+    for dir in ["/Windows", "/Windows/System32"] {
+        run(Command::new("debugfs").args(["-w", "-R", &format!("mkdir {dir}"), img.to_str().unwrap()]));
+    }
+    run(Command::new("debugfs").args([
+        "-w", "-R",
+        &format!("write {} /Windows/System32/thoscrt.dll", thoscrt.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+
     // BusyBox applet links: `/bin/<applet>` hard-links to the single `/busybox`
     // inode, so the shell can run `ls`, `cat`, ... by PATH lookup (BusyBox
     // dispatches on `basename(argv[0])`). `debugfs ln` does not maintain the
@@ -415,11 +428,11 @@ fn write_pe_hello(path: &Path) {
     let reloc_rva = 0x2000u32;
     let idata_rva = 0x3000u32;
 
-    // --- .idata: import from KERNEL32.dll ---
-    let funcs: &[&[u8]] = &[
-        b"ExitProcess",   // NT idx 0
-        b"GetStdHandle",  // 1
-        b"WriteFile",     // 2
+    // --- .idata: imports from KERNEL32.dll and the on-disk thoscrt.dll ---
+    let k32_funcs: &[&[u8]] = &[
+        b"ExitProcess",      // NT idx 0
+        b"GetStdHandle",     // 1
+        b"WriteFile",        // 2
         b"GetLastError",     // 3
         b"CreateFileA",      // 5
         b"ReadFile",         // 6
@@ -431,47 +444,83 @@ fn write_pe_hello(path: &Path) {
         b"GetProcAddress",   // 16
         b"LoadLibraryA",     // 17
     ];
-    let ilt_off = 0x28u32; // after 2 IDT entries (2*20)
-    let iat_off = ilt_off + (funcs.len() as u32 + 1) * 8;
-    let mut hn_off = iat_off + (funcs.len() as u32 + 1) * 8;
-    let mut idata: Vec<u8> = vec![0u8; 0x300];
+    let imports: [(&[u8], &[&[u8]]); 2] = [
+        (b"KERNEL32.dll", k32_funcs),
+        (b"thoscrt.dll", &[b"thos_add"]),
+    ];
+    let n_imp = imports.len();
+    let import_dir_size = ((n_imp + 1) * 20) as u32;
+
     let put32 = |b: &mut Vec<u8>, at: u32, v: u32| {
         b[at as usize..at as usize + 4].copy_from_slice(&v.to_le_bytes());
     };
     let put64 = |b: &mut Vec<u8>, at: u32, v: u64| {
         b[at as usize..at as usize + 8].copy_from_slice(&v.to_le_bytes());
     };
-    let mut hn_rvas = vec![0u32; funcs.len()];
-    for (i, f) in funcs.iter().enumerate() {
-        hn_rvas[i] = idata_rva + hn_off;
-        // 2-byte hint (0) then the NUL-terminated name
-        idata[hn_off as usize + 2..hn_off as usize + 2 + f.len()].copy_from_slice(f);
-        hn_off += 2 + f.len() as u32 + 1;
-        hn_off = (hn_off + 1) & !1; // keep names 2-aligned
+
+    // IMPORT_DESCRIPTOR[n_imp] + null terminator, 8-aligned.
+    let mut idata: Vec<u8> = vec![0u8; ((n_imp + 1) * 20 + 7) & !7];
+    // Per DLL: ILT (len+1 thunks) then IAT (len+1 thunks).
+    let mut ilt_at = vec![0u32; n_imp];
+    let mut iat_at = vec![0u32; n_imp];
+    for d in 0..n_imp {
+        ilt_at[d] = idata.len() as u32;
+        idata.resize(idata.len() + (imports[d].1.len() + 1) * 8, 0);
+        iat_at[d] = idata.len() as u32;
+        idata.resize(idata.len() + (imports[d].1.len() + 1) * 8, 0);
     }
-    let dll_off = hn_off;
-    idata[dll_off as usize..dll_off as usize + 12].copy_from_slice(b"KERNEL32.dll");
-    // IDT entry 0 (entry 1 stays zero = terminator)
-    put32(&mut idata, 0, idata_rva + ilt_off); // OriginalFirstThunk
-    put32(&mut idata, 12, idata_rva + dll_off); // Name
-    put32(&mut idata, 16, idata_rva + iat_off); // FirstThunk
-    for i in 0..funcs.len() as u32 {
-        put64(&mut idata, ilt_off + i * 8, hn_rvas[i as usize] as u64);
-        put64(&mut idata, iat_off + i * 8, hn_rvas[i as usize] as u64);
+    // Hint/name entries.
+    let mut hn_rvas: Vec<Vec<u32>> = vec![Vec::new(); n_imp];
+    for d in 0..n_imp {
+        for f in imports[d].1 {
+            if idata.len() % 2 != 0 {
+                idata.push(0);
+            }
+            hn_rvas[d].push(idata_rva + idata.len() as u32);
+            idata.extend_from_slice(&[0, 0]); // hint
+            idata.extend_from_slice(f);
+            idata.push(0);
+        }
     }
-    idata.truncate(((dll_off + 13 + 15) & !15) as usize);
-    let iat_exit = idata_rva + iat_off;
-    let iat_gsh = idata_rva + iat_off + 8;
-    let iat_wf = idata_rva + iat_off + 16;
-    let iat_cf = idata_rva + iat_off + 32; // CreateFileA
-    let iat_rf = idata_rva + iat_off + 40; // ReadFile
-    let iat_gcl = idata_rva + iat_off + 48; // GetCommandLineA
-    let iat_gmh = idata_rva + iat_off + 56; // GetModuleHandleA
-    let iat_va = idata_rva + iat_off + 64; // VirtualAlloc
-    let iat_gph = idata_rva + iat_off + 72; // GetProcessHeap
-    let iat_ha = idata_rva + iat_off + 80; // HeapAlloc
-    let iat_gpa = idata_rva + iat_off + 88; // GetProcAddress
-    let iat_ll = idata_rva + iat_off + 96; // LoadLibraryA
+    // DLL name strings.
+    let mut dllname_rva = vec![0u32; n_imp];
+    for d in 0..n_imp {
+        if idata.len() % 2 != 0 {
+            idata.push(0);
+        }
+        dllname_rva[d] = idata_rva + idata.len() as u32;
+        idata.extend_from_slice(imports[d].0);
+        idata.push(0);
+    }
+    while idata.len() % 16 != 0 {
+        idata.push(0);
+    }
+    // IMPORT_DESCRIPTORs + thunk arrays (ILT == IAT pre-load).
+    for d in 0..n_imp {
+        let e = (d * 20) as u32;
+        put32(&mut idata, e, idata_rva + ilt_at[d]); // OriginalFirstThunk
+        put32(&mut idata, e + 12, dllname_rva[d]); // Name
+        put32(&mut idata, e + 16, idata_rva + iat_at[d]); // FirstThunk
+        for k in 0..imports[d].1.len() as u32 {
+            put64(&mut idata, ilt_at[d] + k * 8, hn_rvas[d][k as usize] as u64);
+            put64(&mut idata, iat_at[d] + k * 8, hn_rvas[d][k as usize] as u64);
+        }
+    }
+
+    let iat0 = idata_rva + iat_at[0]; // KERNEL32 IAT
+    let iat_exit = iat0;
+    let iat_gsh = iat0 + 8;
+    let iat_wf = iat0 + 16;
+    let iat_cf = iat0 + 32; // CreateFileA
+    let iat_rf = iat0 + 40; // ReadFile
+    let iat_gcl = iat0 + 48; // GetCommandLineA
+    let iat_gmh = iat0 + 56; // GetModuleHandleA
+    let iat_va = iat0 + 64; // VirtualAlloc
+    let iat_gph = iat0 + 72; // GetProcessHeap
+    let iat_ha = iat0 + 80; // HeapAlloc
+    let iat_gpa = iat0 + 88; // GetProcAddress
+    let iat_ll = iat0 + 96; // LoadLibraryA
+    let iat_add = idata_rva + iat_at[1]; // thoscrt!thos_add
 
     // --- entry machine code (x86-64) ---
     // Deferred RIP-relative fixups: (disp32 position in `code`, target RVA).
@@ -502,6 +551,7 @@ fn write_pe_hello(path: &Path) {
     let ntwritename_tag = u32::MAX - 15;
     let iosb_tag = u32::MAX - 16;
     let msg_ntdll_tag = u32::MAX - 17;
+    let msg_dll_tag = u32::MAX - 18;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -706,6 +756,26 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0xFF, 0xD6]); // call rsi
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x58]); // add rsp, 0x58
 
+    // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
+    //     its exported thos_add(40, 2) through the IAT the loader bound to the
+    //     DLL's real export; trap unless it returns 42, then print the line.
+    code.extend_from_slice(&[0xB9, 40, 0, 0, 0]); // mov ecx, 40
+    code.extend_from_slice(&[0xBA, 2, 0, 0, 0]); // mov edx, 2
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_add); // call [rip+iat_thos_add]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x83, 0xF8, 0x2A]); // cmp eax, 42
+    code.extend_from_slice(&[0x74, 0x01]); // je +1
+    code.extend_from_slice(&[0xCC]); // int3 (wrong result from thos_add)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_dll_tag); // lea rdx, [rip+msg_dll]
+    let dll_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len_dll (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 3) ExitProcess(0)
     code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
@@ -749,6 +819,7 @@ fn write_pe_hello(path: &Path) {
     let msg_ldr: &[u8] = b"PE Ldr OK\n";
     let msg_va: &[u8] = b"PE VirtualAlloc+Heap OK\n";
     let msg_gpa: &[u8] = b"PE GetProcAddress OK\n";
+    let msg_dll: &[u8] = b"PE dll thos_add=42\n";
     let msg_pp_off = code.len();
     code.extend_from_slice(msg_pp);
     let msg_ldr_off = code.len();
@@ -759,7 +830,10 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(msg_gpa);
     let msg_ntdll_off = code.len();
     code.extend_from_slice(msg_ntdll);
+    let msg_dll_off = code.len();
+    code.extend_from_slice(msg_dll);
 
+    code[dll_r8..dll_r8 + 4].copy_from_slice(&(msg_dll.len() as u32).to_le_bytes());
     code[pp_r8..pp_r8 + 4].copy_from_slice(&(msg_pp.len() as u32).to_le_bytes());
     code[ldr_r8..ldr_r8 + 4].copy_from_slice(&(msg_ldr.len() as u32).to_le_bytes());
     code[va_r8..va_r8 + 4].copy_from_slice(&(msg_va.len() as u32).to_le_bytes());
@@ -786,6 +860,7 @@ fn write_pe_hello(path: &Path) {
             t if t == ntwritename_tag => text_rva + ntwritename_off as u32,
             t if t == iosb_tag => text_rva + iosb_off as u32,
             t if t == msg_ntdll_tag => text_rva + msg_ntdll_off as u32,
+            t if t == msg_dll_tag => text_rva + msg_dll_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -842,14 +917,14 @@ fn write_pe_hello(path: &Path) {
     pe[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
     // data directory 1 = IMPORT
     pe[opt + 112 + 8..opt + 112 + 12].copy_from_slice(&idata_rva.to_le_bytes());
-    pe[opt + 112 + 12..opt + 112 + 16].copy_from_slice(&40u32.to_le_bytes());
+    pe[opt + 112 + 12..opt + 112 + 16].copy_from_slice(&import_dir_size.to_le_bytes());
     // data directory 5 = BASE_RELOC
     pe[opt + 112 + 5 * 8..opt + 112 + 5 * 8 + 4].copy_from_slice(&reloc_rva.to_le_bytes());
     pe[opt + 112 + 5 * 8 + 4..opt + 112 + 5 * 8 + 8].copy_from_slice(&reloc_vsize.to_le_bytes());
     // data directory 12 = IAT
     pe[opt + 112 + 12 * 8..opt + 112 + 12 * 8 + 4].copy_from_slice(&iat_exit.to_le_bytes());
     pe[opt + 112 + 12 * 8 + 4..opt + 112 + 12 * 8 + 8]
-        .copy_from_slice(&(funcs.len() as u32 * 8).to_le_bytes());
+        .copy_from_slice(&(k32_funcs.len() as u32 * 8).to_le_bytes());
 
     let mut sec = |i: usize, name: &[u8], vsize: u32, rva: u32, raw_size: u32, raw_ptr: u32, ch: u32| {
         let h = opt + opt_size as usize + i * 40;
@@ -868,6 +943,167 @@ fn write_pe_hello(path: &Path) {
     pe[reloc_raw_ptr as usize..reloc_raw_ptr as usize + reloc.len()].copy_from_slice(&reloc);
     pe[idata_raw_ptr as usize..idata_raw_ptr as usize + idata.len()].copy_from_slice(&idata);
     std::fs::write(path, &pe).expect("write pe-hello.exe");
+}
+
+/// A real on-disk PE32+ DLL for the `C:\Windows\System32` loader path. Exports
+/// `thos_add(a, b) -> a + b`, which along the way calls its own imported
+/// `KERNEL32.dll!GetLastError` — so loading it exercises **recursive** import
+/// resolution. `DYNAMIC_BASE` + a minimal `.reloc` force the DLL relocation
+/// path (the loader places it in its arena, not at the preferred `ImageBase`).
+fn write_thoscrt_dll(path: &Path) {
+    const IMAGE_BASE: u64 = 0x1_8000_0000;
+    const SECT_ALIGN: u32 = 0x1000;
+    const FILE_ALIGN: u32 = 0x200;
+    let text_rva = 0x1000u32;
+    let rdata_rva = 0x2000u32;
+    let reloc_rva = 0x3000u32;
+
+    let p32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let p64 = |b: &mut [u8], at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+
+    // --- .rdata: import table (KERNEL32!GetLastError) + export table --------
+    let mut rdata: Vec<u8> = Vec::new();
+    rdata.resize(40, 0); // 2 * 20-byte IMPORT_DESCRIPTOR (2nd = null terminator)
+    let ilt_off = rdata.len() as u32;
+    rdata.resize(rdata.len() + 16, 0); // ILT: 1 thunk + null
+    let iat_off = rdata.len() as u32;
+    rdata.resize(rdata.len() + 16, 0); // IAT: 1 thunk + null
+    let hint_off = rdata.len() as u32;
+    rdata.extend_from_slice(&[0, 0]); // hint
+    rdata.extend_from_slice(b"GetLastError\0");
+    if rdata.len() % 2 != 0 {
+        rdata.push(0);
+    }
+    let dllname_off = rdata.len() as u32;
+    rdata.extend_from_slice(b"KERNEL32.dll\0");
+    while rdata.len() % 4 != 0 {
+        rdata.push(0);
+    }
+    p32(&mut rdata, 0, rdata_rva + ilt_off); // OriginalFirstThunk
+    p32(&mut rdata, 12, rdata_rva + dllname_off); // Name
+    p32(&mut rdata, 16, rdata_rva + iat_off); // FirstThunk
+    p64(&mut rdata, ilt_off as usize, (rdata_rva + hint_off) as u64);
+    p64(&mut rdata, iat_off as usize, (rdata_rva + hint_off) as u64);
+    let import_dir_rva = rdata_rva; // IDT starts at rdata+0
+    let iat_dir_rva = rdata_rva + iat_off;
+    let iat_gle_rva = rdata_rva + iat_off; // the one imported slot
+
+    let exp_dir_off = rdata.len() as u32;
+    rdata.resize(rdata.len() + 40, 0); // IMAGE_EXPORT_DIRECTORY
+    let eat_off = rdata.len() as u32;
+    rdata.resize(rdata.len() + 4, 0); // AddressOfFunctions[1]
+    let enpt_off = rdata.len() as u32;
+    rdata.resize(rdata.len() + 4, 0); // AddressOfNames[1]
+    let ord_off = rdata.len() as u32;
+    rdata.resize(rdata.len() + 2, 0); // AddressOfNameOrdinals[1]
+    if rdata.len() % 2 != 0 {
+        rdata.push(0);
+    }
+    let expname_off = rdata.len() as u32;
+    rdata.extend_from_slice(b"thos_add\0");
+    let expmod_off = rdata.len() as u32;
+    rdata.extend_from_slice(b"thoscrt.dll\0");
+    while rdata.len() % 4 != 0 {
+        rdata.push(0);
+    }
+    let export_dir_rva = rdata_rva + exp_dir_off;
+    let export_dir_size = rdata.len() as u32 - exp_dir_off;
+    p32(&mut rdata, exp_dir_off as usize + 0x0C, rdata_rva + expmod_off); // Name
+    p32(&mut rdata, exp_dir_off as usize + 0x10, 1); // Base (ordinal base)
+    p32(&mut rdata, exp_dir_off as usize + 0x14, 1); // NumberOfFunctions
+    p32(&mut rdata, exp_dir_off as usize + 0x18, 1); // NumberOfNames
+    p32(&mut rdata, exp_dir_off as usize + 0x1C, rdata_rva + eat_off);
+    p32(&mut rdata, exp_dir_off as usize + 0x20, rdata_rva + enpt_off);
+    p32(&mut rdata, exp_dir_off as usize + 0x24, rdata_rva + ord_off);
+    p32(&mut rdata, eat_off as usize, text_rva); // thos_add == start of .text
+    p32(&mut rdata, enpt_off as usize, rdata_rva + expname_off);
+    rdata[ord_off as usize..ord_off as usize + 2].copy_from_slice(&0u16.to_le_bytes());
+
+    // --- .text: thos_add(rcx=a, rdx=b) — call imported GetLastError, ret a+b -
+    let mut code: Vec<u8> = Vec::new();
+    code.extend_from_slice(&[0x51]); // push rcx
+    code.extend_from_slice(&[0x52]); // push rdx
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    let call_pos = code.len();
+    code.extend_from_slice(&[0xFF, 0x15, 0, 0, 0, 0]); // call [rip+GetLastError]
+    let disp = iat_gle_rva as i64 - (text_rva as i64 + call_pos as i64 + 6);
+    code[call_pos + 2..call_pos + 6].copy_from_slice(&(disp as i32).to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x5A]); // pop rdx
+    code.extend_from_slice(&[0x59]); // pop rcx
+    code.extend_from_slice(&[0x8D, 0x04, 0x11]); // lea eax, [rcx+rdx]
+    code.extend_from_slice(&[0xC3]); // ret
+
+    // --- .reloc: one header-only block — no fixups, but its presence makes
+    //     the loader take the DLL relocation path. ---
+    let mut reloc: Vec<u8> = Vec::new();
+    reloc.extend_from_slice(&text_rva.to_le_bytes()); // PageRVA
+    reloc.extend_from_slice(&8u32.to_le_bytes()); // BlockSize (header only)
+
+    // --- PE32+ container ---
+    let text_vsize = code.len() as u32;
+    let rdata_vsize = rdata.len() as u32;
+    let reloc_vsize = reloc.len() as u32;
+    let text_raw_ptr = 0x200u32;
+    let text_raw_size = text_vsize.div_ceil(FILE_ALIGN) * FILE_ALIGN;
+    let rdata_raw_ptr = text_raw_ptr + text_raw_size;
+    let rdata_raw_size = rdata_vsize.div_ceil(FILE_ALIGN) * FILE_ALIGN;
+    let reloc_raw_ptr = rdata_raw_ptr + rdata_raw_size;
+    let reloc_raw_size = reloc_vsize.div_ceil(FILE_ALIGN) * FILE_ALIGN;
+    let size_of_image = reloc_rva + reloc_vsize.div_ceil(SECT_ALIGN) * SECT_ALIGN;
+    let size_of_headers = 0x200u32;
+
+    let mut pe = vec![0u8; (reloc_raw_ptr + reloc_raw_size) as usize];
+    pe[0..2].copy_from_slice(b"MZ");
+    pe[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+    let o = 0x40usize;
+    pe[o..o + 4].copy_from_slice(b"PE\0\0");
+    let coff = o + 4;
+    pe[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes());
+    pe[coff + 2..coff + 4].copy_from_slice(&3u16.to_le_bytes()); // 3 sections
+    let opt_size = 0xF0u16;
+    pe[coff + 16..coff + 18].copy_from_slice(&opt_size.to_le_bytes());
+    pe[coff + 18..coff + 20].copy_from_slice(&0x2022u16.to_le_bytes()); // EXECUTABLE|LAA|DLL
+    let opt = coff + 20;
+    pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
+    pe[opt + 16..opt + 20].copy_from_slice(&0u32.to_le_bytes()); // AddressOfEntryPoint = 0 (no DllMain)
+    pe[opt + 20..opt + 24].copy_from_slice(&text_rva.to_le_bytes());
+    pe[opt + 24..opt + 32].copy_from_slice(&IMAGE_BASE.to_le_bytes());
+    pe[opt + 32..opt + 36].copy_from_slice(&SECT_ALIGN.to_le_bytes());
+    pe[opt + 36..opt + 40].copy_from_slice(&FILE_ALIGN.to_le_bytes());
+    pe[opt + 40..opt + 42].copy_from_slice(&6u16.to_le_bytes());
+    pe[opt + 48..opt + 50].copy_from_slice(&6u16.to_le_bytes());
+    pe[opt + 56..opt + 60].copy_from_slice(&size_of_image.to_le_bytes());
+    pe[opt + 60..opt + 64].copy_from_slice(&size_of_headers.to_le_bytes());
+    pe[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes()); // Subsystem
+    pe[opt + 70..opt + 72].copy_from_slice(&0x0040u16.to_le_bytes()); // DllCharacteristics = DYNAMIC_BASE
+    pe[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+    p32(&mut pe, opt + 112, export_dir_rva); // dir 0 EXPORT
+    p32(&mut pe, opt + 112 + 4, export_dir_size);
+    p32(&mut pe, opt + 112 + 8, import_dir_rva); // dir 1 IMPORT
+    p32(&mut pe, opt + 112 + 12, 40);
+    p32(&mut pe, opt + 112 + 5 * 8, reloc_rva); // dir 5 BASE_RELOC
+    p32(&mut pe, opt + 112 + 5 * 8 + 4, reloc_vsize);
+    p32(&mut pe, opt + 112 + 12 * 8, iat_dir_rva); // dir 12 IAT
+    p32(&mut pe, opt + 112 + 12 * 8 + 4, 8);
+
+    let mut sec = |i: usize, name: &[u8], vsize: u32, rva: u32, raw_size: u32, raw_ptr: u32, ch: u32| {
+        let h = opt + opt_size as usize + i * 40;
+        pe[h..h + name.len()].copy_from_slice(name);
+        pe[h + 8..h + 12].copy_from_slice(&vsize.to_le_bytes());
+        pe[h + 12..h + 16].copy_from_slice(&rva.to_le_bytes());
+        pe[h + 16..h + 20].copy_from_slice(&raw_size.to_le_bytes());
+        pe[h + 20..h + 24].copy_from_slice(&raw_ptr.to_le_bytes());
+        pe[h + 36..h + 40].copy_from_slice(&ch.to_le_bytes());
+    };
+    sec(0, b".text", text_vsize, text_rva, text_raw_size, text_raw_ptr, 0x6000_0020); // CODE|EXEC|READ
+    sec(1, b".rdata", rdata_vsize, rdata_rva, rdata_raw_size, rdata_raw_ptr, 0xC000_0040); // IDATA|READ|WRITE
+    sec(2, b".reloc", reloc_vsize, reloc_rva, reloc_raw_size, reloc_raw_ptr, 0x4200_0040);
+
+    pe[text_raw_ptr as usize..text_raw_ptr as usize + code.len()].copy_from_slice(&code);
+    pe[rdata_raw_ptr as usize..rdata_raw_ptr as usize + rdata.len()].copy_from_slice(&rdata);
+    pe[reloc_raw_ptr as usize..reloc_raw_ptr as usize + reloc.len()].copy_from_slice(&reloc);
+    std::fs::write(path, &pe).expect("write thoscrt.dll");
 }
 
 // --- shared plumbing for the interactive (monitor-driven) QEMU tests ---
@@ -1617,9 +1853,10 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE VirtualAlloc+Heap OK") // VirtualAlloc + GetProcessHeap + HeapAlloc
         && serial.contains("PE GetProcAddress OK") // LoadLibraryA + synthetic kernel32 export table
         && serial.contains("PE ntdll OK") // ntdll boundary: GetModuleHandleA + GetProcAddress + 9-arg NtWriteFile
+        && serial.contains("PE dll thos_add=42") // real DLL from C:\Windows\System32 + recursive imports
         && serial.contains("THOS: pe reject ok");
     if ok {
-        println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll");
+        println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll/System32-DLL");
     } else {
         eprintln!("pe-test: FAIL — the PE did not run to exit\n--- serial ---\n{serial}\n---");
         exit(1);

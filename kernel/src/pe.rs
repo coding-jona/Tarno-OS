@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Phase 3 — a minimal PE32+ (x86-64) loader.
 //!
-//! Maps a **statically linked** Win64 `.exe` — no imports, no TLS — and jumps
-//! to its entry point in ring 3. Base relocations (`IMAGE_REL_BASED_DIR64`) are
-//! applied, so a PE that ships a `.reloc` section can load away from its
-//! preferred `ImageBase`. Imports (data dir 1) are still rejected; resolving
-//! them against `ntdll`/`kernel32` is the next step and the start of the NT
-//! personality.
+//! Maps a Win64 `.exe`, resolves its imports, and jumps to its entry point in
+//! ring 3. Base relocations (`IMAGE_REL_BASED_DIR64`) are applied, so an image
+//! that ships a `.reloc` section can load away from its preferred `ImageBase`.
+//! Imports bind against the two synthetic system modules (`kernel32.dll`,
+//! `ntdll.dll` — trampoline pages built in-kernel) **and** against real on-disk
+//! PE DLLs read from `C:\Windows\System32`: [`Loader`] stages each dependency
+//! (parse → relocate → parse exports → recurse into *its* imports → map) into a
+//! bump arena of virtual space and binds the IAT to the real export addresses.
+//! `DllMain` is not run yet.
 //!
 //! **Every input is treated as hostile.** A malformed header, an out-of-range
 //! offset, an overflowing size — all produce `Err`, never a slice panic.
 
+use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -40,6 +45,15 @@ const ALT_BASE_SHIFT: u64 = 0x1000_0000;
 
 const MAX_IMAGE_SIZE: u64 = 256 * 1024 * 1024;
 const MAX_SECTIONS: usize = 96;
+
+/// On-disk DLLs load into a bump arena of virtual space, one 64 KiB-aligned
+/// slot per module, clear of the exe, the user stack, and the synthetic pages.
+const PE_DLL_ARENA: u64 = NT_STUB_BASE + 0x0080_0000;
+const PE_DLL_ARENA_END: u64 = 0x0000_7FF8_0000_0000;
+/// Windows `\Windows\System32` maps here on THOS's fs.
+const SYSTEM32_DIR: &str = "/Windows/System32";
+/// Cap on transitive DLL dependency depth.
+const MAX_DLL_DEPTH: u32 = 8;
 
 /// The builtin "NT stub" page mapped into every PE process. Each imported Win32
 /// function resolves to one 16-byte trampoline here:
@@ -89,21 +103,243 @@ const SYNTH_EXPDIR_OFF: u64 = 0x400; // IMAGE_EXPORT_DIRECTORY within the page
 pub const PE_ANSI_CMDLINE_ADDR: u64 = PE_PARAMS_ADDR + ANSI_CMDLINE_OFF;
 const ANSI_CMDLINE: &[u8] = b"PE argv0 pe-hello.exe\n\0";
 
-/// Virtual address of the trampoline implementing `dll!func`, or `None` if THOS
-/// does not provide it yet (the loader then rejects the PE rather than
-/// mislinking). The address lands inside the owning synthetic module page, so a
-/// bound IAT slot and a `GetProcAddress` result for the same function agree.
-fn resolve_import(dll: &str, func: &str) -> Option<u64> {
-    let dll = dll.trim_end_matches('\0').to_ascii_lowercase();
-    let (page, table): (u64, &[&str]) = match dll.as_str() {
-        "kernel32.dll" => (PE_KERNEL32_ADDR, &crate::nt::NT_EXPORTS),
-        "ntdll.dll" => (PE_NTDLL_ADDR, &crate::nt::NTDLL_EXPORTS),
-        _ => return None,
-    };
-    table
-        .iter()
-        .position(|&n| n == func)
-        .map(|i| page + SYNTH_STUBS_OFF + i as u64 * NT_STUB_STRIDE)
+/// Reduce a raw import DLL name to its lowercase base name with a `.dll`
+/// extension (`"..\\KERNEL32"` → `"kernel32.dll"`).
+fn normalize_dll_name(raw: &str) -> String {
+    let base = raw
+        .trim_end_matches('\0')
+        .rsplit(|c| c == '\\' || c == '/')
+        .next()
+        .unwrap_or(raw);
+    let mut s = base.to_ascii_lowercase();
+    if !s.contains('.') {
+        s.push_str(".dll");
+    }
+    s
+}
+
+/// A module already resolved for the process: a synthetic system DLL or a real
+/// file loaded from System32. `exports` maps each exported name to its final
+/// virtual address, so an importer binds without touching mapped memory.
+struct LoadedModule {
+    name: String, // lowercase base name incl. ".dll"
+    #[allow(dead_code)]
+    full: String, // "C:\\Windows\\System32\\NAME"
+    #[allow(dead_code)]
+    base: u64,
+    #[allow(dead_code)]
+    size: u64,
+    #[allow(dead_code)]
+    entry: u64, // 0 = none / not run
+    exports: BTreeMap<String, u64>,
+    #[allow(dead_code)]
+    is_file: bool,
+}
+
+/// Per-`load()` DLL resolver: owns the dependency graph and the VA arena the
+/// on-disk DLLs map into.
+struct Loader<'a> {
+    proc: &'a Process,
+    fs: Option<crate::ext2::Ext2>,
+    arena_next: u64,
+    mods: Vec<LoadedModule>,
+    depth: u32,
+}
+
+impl<'a> Loader<'a> {
+    /// Seed with the two synthetic system modules (already mapped by
+    /// `map_kernel32_page` / `map_ntdll_page`).
+    fn new(proc: &'a Process) -> Self {
+        let mut mods = Vec::new();
+        for (name, base, table) in [
+            ("kernel32.dll", PE_KERNEL32_ADDR, &crate::nt::NT_EXPORTS[..]),
+            ("ntdll.dll", PE_NTDLL_ADDR, &crate::nt::NTDLL_EXPORTS[..]),
+        ] {
+            let mut exports = BTreeMap::new();
+            for (i, &fname) in table.iter().enumerate() {
+                exports.insert(
+                    String::from(fname),
+                    base + SYNTH_STUBS_OFF + i as u64 * NT_STUB_STRIDE,
+                );
+            }
+            mods.push(LoadedModule {
+                full: format!("C:\\Windows\\System32\\{}", name.to_ascii_uppercase()),
+                name: String::from(name),
+                base,
+                size: 0x1000,
+                entry: 0,
+                exports,
+                is_file: false,
+            });
+        }
+        Loader { proc, fs: None, arena_next: PE_DLL_ARENA, mods, depth: 0 }
+    }
+
+    fn fs(&mut self) -> Result<&crate::ext2::Ext2, &'static str> {
+        if self.fs.is_none() {
+            self.fs = Some(crate::ext2::open().map_err(|_| "PE: cannot mount fs for DLL load")?);
+        }
+        Ok(self.fs.as_ref().unwrap())
+    }
+
+    fn arena_alloc(&mut self, size_of_image: u64) -> Result<u64, &'static str> {
+        let base = self.arena_next;
+        let span = (size_of_image + 0xFFFF) & !0xFFFF;
+        let end = base
+            .checked_add(span)
+            .filter(|&e| e < PE_DLL_ARENA_END)
+            .ok_or("PE: DLL arena exhausted")?;
+        self.arena_next = end;
+        Ok(base)
+    }
+
+    /// Index into `self.mods` for `raw_name`, loading it from System32 on a miss.
+    fn resolve_module(&mut self, raw_name: &str) -> Result<usize, &'static str> {
+        let name = normalize_dll_name(raw_name);
+        if let Some(i) = self.mods.iter().position(|m| m.name == name) {
+            return Ok(i);
+        }
+        if self.depth >= MAX_DLL_DEPTH {
+            return Err("PE: DLL dependency chain too deep");
+        }
+        let path = format!("{SYSTEM32_DIR}/{name}");
+        let bytes = self.fs()?.read_path(&path).ok_or("PE: DLL not found in System32")?;
+        self.depth += 1;
+        let r = self.load_dll(&name, &bytes);
+        self.depth -= 1;
+        r
+    }
+
+    /// Stage, register, recursively bind, and map one on-disk DLL.
+    fn load_dll(&mut self, name: &str, bytes: &[u8]) -> Result<usize, &'static str> {
+        let base = self.arena_alloc(peek_size_of_image(bytes)?)?;
+        let mut staged = stage_image(bytes, Some(base))?;
+        let exports = parse_exports(&staged.img, base, staged.export_rva, staged.export_size)?;
+
+        // Register before recursing so an import cycle terminates; the export
+        // VAs are final already (arena base + RVA), no mapping needed to bind.
+        let idx = self.mods.len();
+        self.mods.push(LoadedModule {
+            name: String::from(name),
+            full: format!("C:\\Windows\\System32\\{name}"),
+            base,
+            size: staged.size_of_image,
+            entry: if staged.entry != base { staged.entry } else { 0 },
+            exports,
+            is_file: true,
+        });
+
+        if staged.import_size != 0 {
+            self.bind_imports(&mut staged.img, staged.import_rva as u64, staged.size_of_image)?;
+        }
+        map_seg(self.proc, &staged.img, base, 0, staged.hdr_n, false)?;
+        for &(rva, mem_size, exec) in &staged.segs {
+            map_seg(self.proc, &staged.img, base + rva, rva, mem_size, exec)?;
+        }
+        Ok(idx)
+    }
+
+    /// Walk an image's Import Directory Table and overwrite each IAT slot with
+    /// the target VA, pulling in dependency DLLs from System32 as needed.
+    fn bind_imports(
+        &mut self,
+        img: &mut [u8],
+        import_rva: u64,
+        size_of_image: u64,
+    ) -> Result<(), &'static str> {
+        let mut idt = import_rva as usize;
+        loop {
+            if (idt + 20) as u64 > size_of_image || idt + 20 > img.len() {
+                return Err("PE: import table truncated");
+            }
+            let ilt_rva = u32::from_le_bytes(img[idt..idt + 4].try_into().unwrap()) as u64;
+            let name_rva = u32::from_le_bytes(img[idt + 12..idt + 16].try_into().unwrap()) as u64;
+            let iat_rva = u32::from_le_bytes(img[idt + 16..idt + 20].try_into().unwrap()) as u64;
+            if name_rva == 0 && iat_rva == 0 {
+                return Ok(()); // null terminator
+            }
+            let dll = String::from(cstr_at(img, name_rva)?);
+            let midx = self.resolve_module(&dll)?;
+
+            let names_rva = if ilt_rva != 0 { ilt_rva } else { iat_rva };
+            let mut i = 0u64;
+            loop {
+                let t_off = (names_rva + i * 8) as usize;
+                let p_off = (iat_rva + i * 8) as usize;
+                if (t_off + 8) as u64 > size_of_image
+                    || t_off + 8 > img.len()
+                    || (p_off + 8) as u64 > size_of_image
+                    || p_off + 8 > img.len()
+                {
+                    return Err("PE: import thunk out of range");
+                }
+                let thunk = u64::from_le_bytes(img[t_off..t_off + 8].try_into().unwrap());
+                if thunk == 0 {
+                    break;
+                }
+                if thunk & 0x8000_0000_0000_0000 != 0 {
+                    return Err("PE: import by ordinal not supported yet");
+                }
+                let func = cstr_at(img, (thunk & 0x7FFF_FFFF) + 2)?; // skip the 2-byte hint
+                let addr = match self.mods[midx].exports.get(func) {
+                    Some(&a) => a,
+                    None => {
+                        crate::kprintln!("THOS: pe unresolved    {}!{}", dll.as_str(), func);
+                        return Err("PE: unresolved import");
+                    }
+                };
+                img[p_off..p_off + 8].copy_from_slice(&addr.to_le_bytes());
+                i += 1;
+            }
+            idt += 20;
+        }
+    }
+}
+
+/// Peek `SizeOfImage` from a PE file without a full parse (arena sizing).
+fn peek_size_of_image(file: &[u8]) -> Result<u64, &'static str> {
+    let pe_off = rd_u32(file, 0x3C)? as usize;
+    if file.get(pe_off..pe_off + 4) != Some(b"PE\0\0") {
+        return Err("PE: no PE signature");
+    }
+    let soi = rd_u32(file, pe_off + 4 + 20 + 56)? as u64;
+    if soi == 0 || soi > MAX_IMAGE_SIZE {
+        return Err("PE: absurd SizeOfImage");
+    }
+    Ok(soi)
+}
+
+/// Parse an `IMAGE_EXPORT_DIRECTORY` out of a materialised image, yielding
+/// `name -> absolute VA` (`base + function RVA`). Forwarder RVAs are skipped.
+fn parse_exports(
+    img: &[u8],
+    base: u64,
+    export_rva: u32,
+    export_size: u32,
+) -> Result<BTreeMap<String, u64>, &'static str> {
+    let mut map = BTreeMap::new();
+    if export_rva == 0 {
+        return Ok(map);
+    }
+    let ed = export_rva as usize;
+    let n_funcs = rd_u32(img, ed + 0x14)?;
+    let n_names = rd_u32(img, ed + 0x18)? as usize;
+    let eat = rd_u32(img, ed + 0x1C)? as usize;
+    let enpt = rd_u32(img, ed + 0x20)? as usize;
+    let ords = rd_u32(img, ed + 0x24)? as usize;
+    for i in 0..n_names {
+        let name = String::from(cstr_at(img, rd_u32(img, enpt + i * 4)? as u64)?);
+        let ord = rd_u16(img, ords + i * 2)? as u32;
+        if ord >= n_funcs {
+            continue;
+        }
+        let frva = rd_u32(img, eat + ord as usize * 4)? as u64;
+        if frva == 0 || (frva >= export_rva as u64 && frva < (export_rva + export_size) as u64) {
+            continue; // empty slot or forwarder (unsupported)
+        }
+        map.insert(name, base + frva);
+    }
+    Ok(map)
 }
 
 fn rd_u16(img: &[u8], off: usize) -> Result<u16, &'static str> {
@@ -122,7 +358,25 @@ fn rd_u64(img: &[u8], off: usize) -> Result<u64, &'static str> {
         .ok_or("PE: truncated (u64)")
 }
 
-pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'static str> {
+/// One image (exe or DLL) parsed, materialised at RVA 0, and relocated to
+/// `load_base` — but not yet mapped, and with its IAT not yet bound.
+struct StagedImage {
+    load_base: u64,
+    size_of_image: u64,
+    entry: u64, // absolute; == load_base when AddressOfEntryPoint is 0
+    hdr_n: u64,
+    img: Vec<u8>,
+    segs: Vec<(u64, u64, bool)>, // (rva, mem_size, exec)
+    import_rva: u32,
+    import_size: u32,
+    export_rva: u32,
+    export_size: u32,
+}
+
+/// Parse + materialise + relocate `file`. `want_base` fixes the load address
+/// (a DLL arena slot); `None` uses the preferred `ImageBase`, shifting only if
+/// the image opted into relocation.
+fn stage_image(file: &[u8], want_base: Option<u64>) -> Result<StagedImage, &'static str> {
     if file.get(0..2) != Some(b"MZ") {
         return Err("PE: not an MZ image");
     }
@@ -179,6 +433,7 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     if dir(9)?.1 != 0 {
         return Err("PE: TLS directory not supported yet");
     }
+    let (export_rva, export_size) = dir(0)?;
     let (import_rva, import_size) = dir(1)?;
     let (reloc_rva, reloc_size) = dir(5)?;
 
@@ -219,46 +474,65 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
         let _ = chars & IMAGE_SCN_MEM_WRITE; // honoured once W^X lands
     }
 
-    // Preferred base unless the PE opted into relocation — then move it, to
-    // actually exercise the fixup path (a real availability check comes with
-    // the DLL loader).
+    // Where does it load? A DLL takes the arena slot the caller picked; an exe
+    // keeps its preferred `ImageBase` unless it opted into relocation, in which
+    // case it is shifted to exercise the fixup path.
     let relocatable = reloc_size != 0 && dll_chars & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE != 0;
-    let load_base = if relocatable {
-        image_base
+    let load_base = match want_base {
+        Some(b) => b,
+        None if relocatable => image_base
             .checked_add(ALT_BASE_SHIFT)
             .filter(|b| b + size_of_image < 0x0000_8000_0000_0000)
-            .ok_or("PE: no room for an alternative base")?
-    } else {
-        image_base
+            .ok_or("PE: no room for an alternative base")?,
+        None => image_base,
     };
     let delta = load_base.wrapping_sub(image_base);
-
-    if delta != 0 && reloc_size != 0 {
+    if delta != 0 {
+        if reloc_size == 0 {
+            return Err("PE: needs relocation but has no .reloc");
+        }
         apply_relocs(&mut img, reloc_rva as u64, reloc_size as u64, delta, size_of_image)?;
-    } else if delta != 0 {
-        return Err("PE: needs relocation but has no .reloc");
     }
 
-    // Resolve the import table against THOS's builtin NT stubs and patch the
-    // IAT in place (post-relocation). No real DLL files yet.
-    if import_size != 0 {
-        resolve_imports(&mut img, import_rva as u64, size_of_image)?;
+    Ok(StagedImage {
+        load_base,
+        size_of_image,
+        entry: load_base + entry_rva,
+        hdr_n: hdr_n as u64,
+        img,
+        segs,
+        import_rva,
+        import_size,
+        export_rva,
+        export_size,
+    })
+}
+
+/// Load a Win64 `.exe`: stage it, resolve its imports (pulling in synthetic
+/// system modules and real DLLs from `C:\Windows\System32`), map everything,
+/// and lay out the TEB / PEB.
+pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'static str> {
+    let mut ldr = Loader::new(proc);
+    let mut staged = stage_image(file, None)?;
+
+    if staged.import_size != 0 {
+        ldr.bind_imports(&mut staged.img, staged.import_rva as u64, staged.size_of_image)?;
     }
 
-    // --- map the finished image (headers first, sections win on any overlap) ---
-    map_seg(proc, &img, load_base, 0, hdr_n as u64, false)?;
-    for (rva, mem_size, exec) in segs {
-        map_seg(proc, &img, load_base + rva, rva, mem_size, exec)?;
+    // Map the exe (headers first, sections win on any overlap).
+    map_seg(proc, &staged.img, staged.load_base, 0, staged.hdr_n, false)?;
+    for &(rva, mem_size, exec) in &staged.segs {
+        map_seg(proc, &staged.img, staged.load_base + rva, rva, mem_size, exec)?;
     }
     map_kernel32_page(proc)?;
     map_ntdll_page(proc)?;
-    map_teb_peb(proc, load_base, load_base + entry_rva, size_of_image, stack_top)?;
+    map_teb_peb(proc, staged.load_base, staged.entry, staged.size_of_image, stack_top)?;
 
     Ok(PeImage {
-        entry: load_base + entry_rva,
+        entry: staged.entry,
         teb: PE_TEB_ADDR,
-        base: load_base,
-        size: size_of_image,
+        base: staged.load_base,
+        size: staged.size_of_image,
     })
 }
 
@@ -454,59 +728,6 @@ fn cstr_at(img: &[u8], off: u64) -> Result<&str, &'static str> {
     let slice = img.get(off..(off + 256).min(img.len())).ok_or("PE: string out of range")?;
     let end = slice.iter().position(|&b| b == 0).ok_or("PE: unterminated string")?;
     core::str::from_utf8(&slice[..end]).map_err(|_| "PE: non-UTF8 import name")
-}
-
-/// Walk the Import Directory Table, resolve each thunk against `resolve_import`,
-/// and overwrite its IAT slot with the stub address. Rejects any import THOS
-/// does not provide (rather than leaving a dangling IAT entry).
-fn resolve_imports(img: &mut [u8], import_rva: u64, size_of_image: u64) -> Result<(), &'static str> {
-    let mut idt = import_rva as usize;
-    loop {
-        let end = idt + 20;
-        if end as u64 > size_of_image || end > img.len() {
-            return Err("PE: import table truncated");
-        }
-        let ilt_rva = u32::from_le_bytes(img[idt..idt + 4].try_into().unwrap()) as u64;
-        let name_rva = u32::from_le_bytes(img[idt + 12..idt + 16].try_into().unwrap()) as u64;
-        let iat_rva = u32::from_le_bytes(img[idt + 16..idt + 20].try_into().unwrap()) as u64;
-        if name_rva == 0 && iat_rva == 0 {
-            return Ok(()); // null terminator
-        }
-        let dll = String::from(cstr_at(img, name_rva)?); // owned — img is mutated below
-
-        // The ILT holds the by-name/ordinal descriptors; the IAT is what we
-        // patch. If the ILT is absent, the IAT still holds them pre-load.
-        let names_rva = if ilt_rva != 0 { ilt_rva } else { iat_rva };
-        let mut i = 0u64;
-        loop {
-            let t_off = (names_rva + i * 8) as usize;
-            let p_off = (iat_rva + i * 8) as usize;
-            if (t_off + 8) as u64 > size_of_image || t_off + 8 > img.len() {
-                return Err("PE: import thunk out of range");
-            }
-            let thunk = u64::from_le_bytes(img[t_off..t_off + 8].try_into().unwrap());
-            if thunk == 0 {
-                break;
-            }
-            let addr = if thunk & 0x8000_0000_0000_0000 != 0 {
-                // import by ordinal — no ordinal tables yet
-                return Err("PE: import by ordinal not supported yet");
-            } else {
-                let hint_name_rva = thunk & 0x7FFF_FFFF;
-                let func = cstr_at(img, hint_name_rva + 2)?; // skip the 2-byte hint
-                match resolve_import(&dll, func) {
-                    Some(a) => a,
-                    None => {
-                        crate::kprintln!("THOS: pe unresolved    {}!{}", dll.as_str(), func);
-                        return Err("PE: unresolved import");
-                    }
-                }
-            };
-            img[p_off..p_off + 8].copy_from_slice(&addr.to_le_bytes());
-            i += 1;
-        }
-        idt += 20;
-    }
 }
 
 fn map_kernel32_page(proc: &Process) -> Result<(), &'static str> {
