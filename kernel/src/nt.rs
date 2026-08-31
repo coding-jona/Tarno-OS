@@ -247,9 +247,9 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         NT_LDRGETPROCEDUREADDRESS => {
             let addr = if a1 != 0 {
                 let namebuf = unsafe { *((a1 + 8) as *const u64) }; // STRING.Buffer
-                export_by_name(a0, &user_cstr(namebuf))
+                export_by_name(a0, &user_cstr(namebuf), 0)
             } else {
-                export_by_ordinal(a0, a2 as u16)
+                export_by_ordinal(a0, a2 as u16, 0)
             };
             if addr == 0 {
                 return STATUS_PROCEDURE_NOT_FOUND as i64;
@@ -429,9 +429,9 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
         // the upper bits are zero (`MAKEINTRESOURCE`-style).
         NT_GETPROCADDRESS => {
             let r = if a1 >> 16 == 0 {
-                export_by_ordinal(a0, a1 as u16)
+                export_by_ordinal(a0, a1 as u16, 0)
             } else {
-                export_by_name(a0, &user_cstr(a1))
+                export_by_name(a0, &user_cstr(a1), 0)
             };
             if r == 0 {
                 set_last_error(127); // ERROR_PROC_NOT_FOUND
@@ -589,38 +589,58 @@ impl ExportDir {
         })
     }
 
-    /// `base + AddressOfFunctions[idx]`, rejecting an empty slot or a forwarder
-    /// RVA (one pointing back inside the export directory). 0 on any problem.
-    unsafe fn func_at(&self, idx: u64) -> i64 {
+    /// `base + AddressOfFunctions[idx]`. A forwarder RVA (one pointing back
+    /// inside the export directory) is followed: read the `"Dll.Func"` string,
+    /// find the target module in the `Ldr` list, resolve there. 0 on any problem.
+    unsafe fn resolve_slot(&self, idx: u64, depth: u32) -> i64 {
         if idx >= self.n_funcs {
             return 0;
         }
         let frva = *((self.eat + idx * 4) as *const u32) as u64;
-        if frva == 0 || (frva >= self.dir_rva && frva < self.dir_rva + self.dir_size) {
+        if frva == 0 {
             return 0;
         }
-        (self.base + frva) as i64
+        if frva < self.dir_rva || frva >= self.dir_rva + self.dir_size {
+            return (self.base + frva) as i64; // ordinary address
+        }
+        // Forwarder.
+        if depth > 8 {
+            return 0;
+        }
+        let s = user_cstr(self.base + frva);
+        let Some((dll, func)) = s.rsplit_once('.') else { return 0 };
+        let tbase = ldr_find(&normalize_mod(dll));
+        if tbase == 0 {
+            return 0;
+        }
+        match func.strip_prefix('#') {
+            Some(n) => match n.parse::<u16>() {
+                Ok(o) => export_by_ordinal(tbase, o, depth + 1),
+                _ => 0,
+            },
+            None => export_by_name(tbase, func, depth + 1),
+        }
     }
 }
 
-fn export_by_name(base: u64, name: &str) -> i64 {
+fn export_by_name(base: u64, name: &str, depth: u32) -> i64 {
     unsafe {
         let Some(ed) = ExportDir::parse(base) else { return 0 };
         for i in 0..ed.n_names {
             let nrva = *((ed.enpt + (i * 4) as u64) as *const u32) as u64;
             if user_cstr(base + nrva) == name {
                 let ord = *((ed.ords + (i * 2) as u64) as *const u16) as u64;
-                return ed.func_at(ord);
+                return ed.resolve_slot(ord, depth);
             }
         }
     }
     0
 }
 
-fn export_by_ordinal(base: u64, ordinal: u16) -> i64 {
+fn export_by_ordinal(base: u64, ordinal: u16, depth: u32) -> i64 {
     unsafe {
         let Some(ed) = ExportDir::parse(base) else { return 0 };
-        ed.func_at((ordinal as u64).wrapping_sub(ed.ord_base))
+        ed.resolve_slot((ordinal as u64).wrapping_sub(ed.ord_base), depth)
     }
 }
 

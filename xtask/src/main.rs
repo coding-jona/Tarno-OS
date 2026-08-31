@@ -447,7 +447,7 @@ fn write_pe_hello(path: &Path) {
     // A func spelled `#N` is imported by ordinal N instead of by name.
     let imports: [(&[u8], &[&[u8]]); 2] = [
         (b"KERNEL32.dll", k32_funcs),
-        (b"thoscrt.dll", &[b"thos_add", b"#2"]),
+        (b"thoscrt.dll", &[b"thos_add", b"#2", b"thos_fwd"]),
     ];
     let n_imp = imports.len();
     let import_dir_size = ((n_imp + 1) * 20) as u32;
@@ -529,6 +529,7 @@ fn write_pe_hello(path: &Path) {
     let iat_ll = iat0 + 96; // LoadLibraryA
     let iat_add = idata_rva + iat_at[1]; // thoscrt!thos_add  (by name)
     let iat_mul = idata_rva + iat_at[1] + 8; // thoscrt!thos_mul (by ordinal 2)
+    let iat_fwd = idata_rva + iat_at[1] + 16; // thoscrt!thos_fwd (forwarded to KERNEL32.GetProcessHeap)
 
     // --- entry machine code (x86-64) ---
     // Deferred RIP-relative fixups: (disp32 position in `code`, target RVA).
@@ -564,6 +565,7 @@ fn write_pe_hello(path: &Path) {
     let thosaddname_tag = u32::MAX - 20;
     let msg_dll_ldr_tag = u32::MAX - 21;
     let msg_ord_tag = u32::MAX - 22;
+    let msg_fwd_tag = u32::MAX - 23;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -838,6 +840,24 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2q) thos_fwd is a forwarder export (thoscrt -> KERNEL32.GetProcessHeap).
+    //     After the loader follows it, calling thos_fwd() is calling
+    //     GetProcessHeap() -> a fixed non-zero handle. Trap on 0, else print.
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_fwd); // call [rip+iat_thos_fwd]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    code.extend_from_slice(&[0x75, 0x01]); // jne +1
+    code.extend_from_slice(&[0xCC]); // int3
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_fwd_tag); // lea rdx, [rip+msg_fwd]
+    let fwd_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 3) ExitProcess(0)
     code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
@@ -888,6 +908,7 @@ fn write_pe_hello(path: &Path) {
     let msg_dll: &[u8] = b"PE dll thos_add=42 (DllMain ran)\n";
     let msg_dll_ldr: &[u8] = b"PE dll Ldr OK\n";
     let msg_ord: &[u8] = b"PE dll ordinal OK\n";
+    let msg_fwd: &[u8] = b"PE dll forward OK\n";
     let msg_pp_off = code.len();
     code.extend_from_slice(msg_pp);
     let msg_ldr_off = code.len();
@@ -904,10 +925,13 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(msg_dll_ldr);
     let msg_ord_off = code.len();
     code.extend_from_slice(msg_ord);
+    let msg_fwd_off = code.len();
+    code.extend_from_slice(msg_fwd);
 
     code[dll_r8..dll_r8 + 4].copy_from_slice(&(msg_dll.len() as u32).to_le_bytes());
     code[dll_ldr_r8..dll_ldr_r8 + 4].copy_from_slice(&(msg_dll_ldr.len() as u32).to_le_bytes());
     code[ord_r8..ord_r8 + 4].copy_from_slice(&(msg_ord.len() as u32).to_le_bytes());
+    code[fwd_r8..fwd_r8 + 4].copy_from_slice(&(msg_fwd.len() as u32).to_le_bytes());
     code[pp_r8..pp_r8 + 4].copy_from_slice(&(msg_pp.len() as u32).to_le_bytes());
     code[ldr_r8..ldr_r8 + 4].copy_from_slice(&(msg_ldr.len() as u32).to_le_bytes());
     code[va_r8..va_r8 + 4].copy_from_slice(&(msg_va.len() as u32).to_le_bytes());
@@ -939,6 +963,7 @@ fn write_pe_hello(path: &Path) {
             t if t == thoscrtname_tag => text_rva + thoscrtname_off as u32,
             t if t == thosaddname_tag => text_rva + thosaddname_off as u32,
             t if t == msg_ord_tag => text_rva + msg_ord_off as u32,
+            t if t == msg_fwd_tag => text_rva + msg_fwd_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -1066,17 +1091,18 @@ fn write_thoscrt_dll(path: &Path) {
     let iat_dir_rva = rdata_rva + iat_off;
     let iat_gle_rva = rdata_rva + iat_off; // the one imported slot
 
-    // Two exports: thos_add (ordinal 1, resolved by name) and thos_mul
-    // (ordinal 2 — pe-hello imports it *by ordinal*). EAT[1] is back-patched
-    // once thos_mul's offset in .text is known.
+    // Three exports: thos_add (ord 1, by name), thos_mul (ord 2 — pe-hello
+    // imports it *by ordinal*), thos_fwd (ord 3 — a **forwarder** to
+    // KERNEL32.GetProcessHeap). EAT[1] is back-patched once thos_mul's .text
+    // offset is known.
     let exp_dir_off = rdata.len() as u32;
     rdata.resize(rdata.len() + 40, 0); // IMAGE_EXPORT_DIRECTORY
     let eat_off = rdata.len() as u32;
-    rdata.resize(rdata.len() + 8, 0); // AddressOfFunctions[2]
+    rdata.resize(rdata.len() + 12, 0); // AddressOfFunctions[3]
     let enpt_off = rdata.len() as u32;
-    rdata.resize(rdata.len() + 8, 0); // AddressOfNames[2]
+    rdata.resize(rdata.len() + 12, 0); // AddressOfNames[3]
     let ord_off = rdata.len() as u32;
-    rdata.resize(rdata.len() + 4, 0); // AddressOfNameOrdinals[2]
+    rdata.resize(rdata.len() + 6, 0); // AddressOfNameOrdinals[3]
     if rdata.len() % 2 != 0 {
         rdata.push(0);
     }
@@ -1084,8 +1110,14 @@ fn write_thoscrt_dll(path: &Path) {
     rdata.extend_from_slice(b"thos_add\0");
     let expname2_off = rdata.len() as u32;
     rdata.extend_from_slice(b"thos_mul\0");
+    let expname3_off = rdata.len() as u32;
+    rdata.extend_from_slice(b"thos_fwd\0");
     let expmod_off = rdata.len() as u32;
     rdata.extend_from_slice(b"thoscrt.dll\0");
+    // The forwarder target string, placed *inside* the export-directory span so
+    // the loader recognises EAT[2] as a forwarder RVA.
+    let fwd_str_off = rdata.len() as u32;
+    rdata.extend_from_slice(b"KERNEL32.GetProcessHeap\0");
     while rdata.len() % 4 != 0 {
         rdata.push(0);
     }
@@ -1093,16 +1125,19 @@ fn write_thoscrt_dll(path: &Path) {
     let export_dir_size = rdata.len() as u32 - exp_dir_off;
     p32(&mut rdata, exp_dir_off as usize + 0x0C, rdata_rva + expmod_off); // Name
     p32(&mut rdata, exp_dir_off as usize + 0x10, 1); // Base (ordinal base)
-    p32(&mut rdata, exp_dir_off as usize + 0x14, 2); // NumberOfFunctions
-    p32(&mut rdata, exp_dir_off as usize + 0x18, 2); // NumberOfNames
+    p32(&mut rdata, exp_dir_off as usize + 0x14, 3); // NumberOfFunctions
+    p32(&mut rdata, exp_dir_off as usize + 0x18, 3); // NumberOfNames
     p32(&mut rdata, exp_dir_off as usize + 0x1C, rdata_rva + eat_off);
     p32(&mut rdata, exp_dir_off as usize + 0x20, rdata_rva + enpt_off);
     p32(&mut rdata, exp_dir_off as usize + 0x24, rdata_rva + ord_off);
     p32(&mut rdata, eat_off as usize, text_rva); // EAT[0] = thos_add = start of .text
+    p32(&mut rdata, eat_off as usize + 8, rdata_rva + fwd_str_off); // EAT[2] = forwarder RVA
     p32(&mut rdata, enpt_off as usize, rdata_rva + expname_off);
     p32(&mut rdata, enpt_off as usize + 4, rdata_rva + expname2_off);
+    p32(&mut rdata, enpt_off as usize + 8, rdata_rva + expname3_off);
     rdata[ord_off as usize..ord_off as usize + 2].copy_from_slice(&0u16.to_le_bytes()); // name[0] -> EAT[0]
     rdata[ord_off as usize + 2..ord_off as usize + 4].copy_from_slice(&1u16.to_le_bytes()); // name[1] -> EAT[1]
+    rdata[ord_off as usize + 4..ord_off as usize + 6].copy_from_slice(&2u16.to_le_bytes()); // name[2] -> EAT[2]
 
     // A writable slot DllMain(DLL_PROCESS_ATTACH) sets to 1; thos_add refuses
     // to compute unless it is set, so `thos_add(40,2) == 42` also proves the
@@ -1978,6 +2013,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
+        && serial.contains("PE dll forward OK") // forwarder export (thoscrt -> KERNEL32.GetProcessHeap)
         && serial.contains("THOS: pe reject ok");
     if ok {
         println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll/System32-DLL (in Ldr)");
