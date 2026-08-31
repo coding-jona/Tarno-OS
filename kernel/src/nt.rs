@@ -83,11 +83,17 @@ pub const NT_NTPROTECTVIRTUALMEMORY: u16 = 5;
 pub const NT_NTTERMINATEPROCESS: u16 = 6;
 pub const NT_LDRGETPROCEDUREADDRESS: u16 = 7;
 pub const NT_LDRLOADDLL: u16 = 8;
-pub const NTDLL_STUB_COUNT: u16 = 9;
+pub const NT_NTQUERYINFORMATIONPROCESS: u16 = 9;
+pub const NT_NTQUERYVIRTUALMEMORY: u16 = 10;
+pub const NT_NTSETINFORMATIONTHREAD: u16 = 11;
+pub const NT_NTSETINFORMATIONPROCESS: u16 = 12;
+pub const NTDLL_STUB_COUNT: u16 = 13;
 
-/// The `ntdll` export table, in stub-index order (see [`NT_EXPORTS`] for the
-/// `kernel32` equivalent). The synthetic `ntdll.dll` module exports exactly
-/// these, and [`crate::pe::resolve_import`] binds `ntdll.dll` imports here.
+/// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
+/// service number, and `dispatch_ntdll` is a table-driven switch on it. The
+/// synthetic `ntdll.dll` module exports exactly these names at exactly these
+/// ordinals, and [`crate::pe::resolve_import`] binds `ntdll.dll` imports here.
+/// (See [`NT_EXPORTS`] for the Win32 `kernel32` shim layer that sits on top.)
 pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtClose",
     "NtWriteFile",
@@ -98,6 +104,10 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtTerminateProcess",
     "LdrGetProcedureAddress",
     "LdrLoadDll",
+    "NtQueryInformationProcess",
+    "NtQueryVirtualMemory",
+    "NtSetInformationThread",
+    "NtSetInformationProcess",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -119,6 +129,8 @@ const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_END_OF_FILE: u32 = 0xC000_0011;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
@@ -242,6 +254,69 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         }
         // No teardown / per-page protection yet.
         NT_NTFREEVIRTUALMEMORY | NT_NTPROTECTVIRTUALMEMORY => STATUS_SUCCESS as i64,
+
+        // NtQueryInformationProcess(ProcessHandle, InfoClass, Buffer, Length,
+        //                           *ReturnLength). Only ProcessBasicInformation
+        // (class 0) — the call a real ntdll uses first, to find the PEB.
+        NT_NTQUERYINFORMATIONPROCESS => {
+            let (class, buf, len) = (a1 as u32, a2, a3 as usize);
+            let ret_len = stack(0);
+            if class != 0 {
+                return STATUS_INVALID_INFO_CLASS as i64;
+            }
+            if len < 0x30 {
+                return STATUS_INFO_LENGTH_MISMATCH as i64;
+            }
+            let peb = teb().map_or(0, |t| unsafe { *(t.add(0x60) as *const u64) });
+            unsafe {
+                let b = buf as *mut u64;
+                *b.add(0) = 0; // ExitStatus
+                *b.add(1) = peb; // PebBaseAddress
+                *b.add(2) = 1; // AffinityMask
+                *b.add(3) = 8; // BasePriority
+                *b.add(4) = process::current_pid(); // UniqueProcessId
+                *b.add(5) = 0; // InheritedFromUniqueProcessId
+            }
+            if ret_len != 0 {
+                unsafe { *(ret_len as *mut u32) = 0x30 }; // ReturnLength is ULONG
+            }
+            STATUS_SUCCESS as i64
+        }
+
+        // NtQueryVirtualMemory(ProcessHandle, BaseAddress, InfoClass, Buffer,
+        //                      Length, *ReturnLength). Only MemoryBasicInformation
+        // (class 0); reports one committed RWX private region per page (W^X and
+        // real region tracking arrive later).
+        NT_NTQUERYVIRTUALMEMORY => {
+            let (addr, class, buf, len) = (a1, a2 as u32, a3, stack(0) as usize);
+            let ret_len = stack(1);
+            if class != 0 {
+                return STATUS_INVALID_INFO_CLASS as i64;
+            }
+            if len < 0x30 {
+                return STATUS_INFO_LENGTH_MISMATCH as i64;
+            }
+            let page = addr & !0xFFF;
+            unsafe {
+                let b = buf as *mut u64;
+                *b.add(0) = page; // BaseAddress
+                *b.add(1) = page; // AllocationBase
+                *(b.add(2) as *mut u32) = 0x40; // AllocationProtect = PAGE_EXECUTE_READWRITE
+                *b.add(3) = 0x1000; // RegionSize
+                *(b.add(4) as *mut u32) = 0x1000; // State = MEM_COMMIT
+                *(b.add(4) as *mut u32).add(1) = 0x40; // Protect
+                *(b.add(5) as *mut u32) = 0x2_0000; // Type = MEM_PRIVATE
+            }
+            if ret_len != 0 {
+                unsafe { *(ret_len as *mut u64) = 0x30 }; // ReturnLength is SIZE_T
+            }
+            STATUS_SUCCESS as i64
+        }
+
+        // NtSetInformationThread / NtSetInformationProcess — early ntdll calls
+        // these with classes THOS can safely ignore (debugger flags, priority,
+        // …). Accept everything until a class actually needs backing.
+        NT_NTSETINFORMATIONTHREAD | NT_NTSETINFORMATIONPROCESS => STATUS_SUCCESS as i64,
 
         // LdrGetProcedureAddress(DllHandle, *AnsiName(STRING), Ordinal, *Address)
         NT_LDRGETPROCEDUREADDRESS => {

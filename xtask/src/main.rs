@@ -584,6 +584,9 @@ fn write_pe_hello(path: &Path) {
     let msg_fwd_tag = u32::MAX - 23;
     let tls_index_tag = u32::MAX - 24;
     let msg_tls_tag = u32::MAX - 25;
+    let ntqipname_tag = u32::MAX - 26;
+    let pbi_tag = u32::MAX - 27;
+    let msg_ntqip_tag = u32::MAX - 28;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -788,6 +791,42 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0xFF, 0xD6]); // call rsi
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x58]); // add rsp, 0x58
 
+    // 2m2) NtQueryInformationProcess(ProcessBasicInformation): the call a real
+    //      ntdll uses first, to find the PEB. Verify Pbi.PebBaseAddress matches
+    //      the PEB reached via gs:[0x30]->[0x60].
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag); // lea rcx, [rip+ntdllname]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh); // call [rip+iat_GetModuleHandleA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (hNtdll)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], ntqipname_tag); // lea rdx, [rip+ntqipname]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa); // call [rip+iat_GetProcAddress]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax  (NtQueryInformationProcess)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rcx, -1  (current process)
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx  (ProcessBasicInformation)
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], pbi_tag); // lea r8, [rip+pbi]
+    code.extend_from_slice(&[0x41, 0xB9, 0x30, 0, 0, 0]); // mov r9d, 0x30
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // sub rsp,0x38; [rsp+0x20]=0
+    code.extend_from_slice(&[0xFF, 0xD6]); // call rsi
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0, 0, 0]); // mov rax, gs:[0x30]
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x60]); // mov rax, [rax+0x60]  (PEB)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], pbi_tag); // lea rcx, [rip+pbi]
+    code.extend_from_slice(&[0x48, 0x3B, 0x41, 0x08]); // cmp rax, [rcx+8]  (Pbi.PebBaseAddress)
+    code.extend_from_slice(&[0x74, 0x01]); // je +1
+    code.extend_from_slice(&[0xCC]); // int3
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_ntqip_tag); // lea rdx, [rip+msg_ntqip]
+    let ntqip_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -947,11 +986,15 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"thoscrt.dll\0");
     let thosaddname_off = code.len();
     code.extend_from_slice(b"thos_add\0");
+    let ntqipname_off = code.len();
+    code.extend_from_slice(b"NtQueryInformationProcess\0");
     while code.len() % 8 != 0 {
         code.push(0);
     }
     let iosb_off = code.len();
     code.extend_from_slice(&[0u8; 16]); // IO_STATUS_BLOCK { NTSTATUS; ULONG_PTR }
+    let pbi_off = code.len();
+    code.extend_from_slice(&[0u8; 48]); // PROCESS_BASIC_INFORMATION
     let tls_dir_off = code.len();
     code.extend_from_slice(&[0u8; 40]); // IMAGE_TLS_DIRECTORY64 (fields filled + DIR64-relocated)
     let tls_raw_off = code.len();
@@ -997,7 +1040,11 @@ fn write_pe_hello(path: &Path) {
     let msg_tls: &[u8] = b"PE TLS OK\n";
     let msg_tls_off = code.len();
     code.extend_from_slice(msg_tls);
+    let msg_ntqip: &[u8] = b"PE NtQIP OK\n";
+    let msg_ntqip_off = code.len();
+    code.extend_from_slice(msg_ntqip);
 
+    code[ntqip_r8..ntqip_r8 + 4].copy_from_slice(&(msg_ntqip.len() as u32).to_le_bytes());
     code[tls_r8..tls_r8 + 4].copy_from_slice(&(msg_tls.len() as u32).to_le_bytes());
     code[dll_r8..dll_r8 + 4].copy_from_slice(&(msg_dll.len() as u32).to_le_bytes());
     code[dll_ldr_r8..dll_ldr_r8 + 4].copy_from_slice(&(msg_dll_ldr.len() as u32).to_le_bytes());
@@ -1049,6 +1096,9 @@ fn write_pe_hello(path: &Path) {
             t if t == msg_fwd_tag => text_rva + msg_fwd_off as u32,
             t if t == tls_index_tag => text_rva + tls_index_off as u32,
             t if t == msg_tls_tag => text_rva + msg_tls_off as u32,
+            t if t == ntqipname_tag => text_rva + ntqipname_off as u32,
+            t if t == pbi_tag => text_rva + pbi_off as u32,
+            t if t == msg_ntqip_tag => text_rva + msg_ntqip_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -2342,6 +2392,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE VirtualAlloc+Heap OK") // VirtualAlloc + GetProcessHeap + HeapAlloc
         && serial.contains("PE GetProcAddress OK") // LoadLibraryA + synthetic kernel32 export table
         && serial.contains("PE ntdll OK") // ntdll boundary: GetModuleHandleA + GetProcAddress + 9-arg NtWriteFile
+        && serial.contains("PE NtQIP OK") // NtQueryInformationProcess(ProcessBasicInformation) -> PebBaseAddress
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
