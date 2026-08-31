@@ -857,7 +857,7 @@ fn write_pe_hello(path: &Path) {
     let msg_ldr: &[u8] = b"PE Ldr OK\n";
     let msg_va: &[u8] = b"PE VirtualAlloc+Heap OK\n";
     let msg_gpa: &[u8] = b"PE GetProcAddress OK\n";
-    let msg_dll: &[u8] = b"PE dll thos_add=42\n";
+    let msg_dll: &[u8] = b"PE dll thos_add=42 (DllMain ran)\n";
     let msg_dll_ldr: &[u8] = b"PE dll Ldr OK\n";
     let msg_pp_off = code.len();
     code.extend_from_slice(msg_pp);
@@ -1064,8 +1064,20 @@ fn write_thoscrt_dll(path: &Path) {
     p32(&mut rdata, enpt_off as usize, rdata_rva + expname_off);
     rdata[ord_off as usize..ord_off as usize + 2].copy_from_slice(&0u16.to_le_bytes());
 
-    // --- .text: thos_add(rcx=a, rdx=b) — call imported GetLastError, ret a+b -
+    // A writable slot DllMain(DLL_PROCESS_ATTACH) sets to 1; thos_add refuses
+    // to compute unless it is set, so `thos_add(40,2) == 42` also proves the
+    // loader ran DllMain before the exe entry.
+    while rdata.len() % 4 != 0 {
+        rdata.push(0);
+    }
+    let sentinel_rva = rdata_rva + rdata.len() as u32;
+    rdata.resize(rdata.len() + 4, 0);
+
+    // --- .text: thos_add first (its RVA is the exported address), then DllMain.
     let mut code: Vec<u8> = Vec::new();
+
+    // thos_add(rcx=a, rdx=b): call imported GetLastError, then — only if the
+    // DllMain sentinel is set — return a+b, else return 0.
     code.extend_from_slice(&[0x51]); // push rcx
     code.extend_from_slice(&[0x52]); // push rdx
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
@@ -1076,7 +1088,25 @@ fn write_thoscrt_dll(path: &Path) {
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
     code.extend_from_slice(&[0x5A]); // pop rdx
     code.extend_from_slice(&[0x59]); // pop rcx
+    let cmp_pos = code.len();
+    code.extend_from_slice(&[0x83, 0x3D, 0, 0, 0, 0, 0x00]); // cmp dword [rip+sentinel], 0
+    let cmp_disp = sentinel_rva as i64 - (text_rva as i64 + cmp_pos as i64 + 7);
+    code[cmp_pos + 2..cmp_pos + 6].copy_from_slice(&(cmp_disp as i32).to_le_bytes());
+    code.extend_from_slice(&[0x74, 0x04]); // je .fail (+4)
     code.extend_from_slice(&[0x8D, 0x04, 0x11]); // lea eax, [rcx+rdx]
+    code.extend_from_slice(&[0xC3]); // ret
+    code.extend_from_slice(&[0x31, 0xC0]); // .fail: xor eax, eax
+    code.extend_from_slice(&[0xC3]); // ret
+
+    // DllMain(rcx=hinst, edx=fdwReason, r8=lpvReserved) -> BOOL
+    let dllmain_off = code.len() as u32;
+    code.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1  (DLL_PROCESS_ATTACH)
+    code.extend_from_slice(&[0x75, 0x0A]); // jne .skip (+10)
+    let movm_pos = code.len();
+    code.extend_from_slice(&[0xC7, 0x05, 0, 0, 0, 0, 0x01, 0, 0, 0]); // mov dword [rip+sentinel], 1
+    let movm_disp = sentinel_rva as i64 - (text_rva as i64 + movm_pos as i64 + 10);
+    code[movm_pos + 2..movm_pos + 6].copy_from_slice(&(movm_disp as i32).to_le_bytes());
+    code.extend_from_slice(&[0xB8, 0x01, 0, 0, 0]); // .skip: mov eax, 1  (TRUE)
     code.extend_from_slice(&[0xC3]); // ret
 
     // --- .reloc: one header-only block — no fixups, but its presence makes
@@ -1111,7 +1141,7 @@ fn write_thoscrt_dll(path: &Path) {
     pe[coff + 18..coff + 20].copy_from_slice(&0x2022u16.to_le_bytes()); // EXECUTABLE|LAA|DLL
     let opt = coff + 20;
     pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
-    pe[opt + 16..opt + 20].copy_from_slice(&0u32.to_le_bytes()); // AddressOfEntryPoint = 0 (no DllMain)
+    pe[opt + 16..opt + 20].copy_from_slice(&(text_rva + dllmain_off).to_le_bytes()); // AddressOfEntryPoint = DllMain
     pe[opt + 20..opt + 24].copy_from_slice(&text_rva.to_le_bytes());
     pe[opt + 24..opt + 32].copy_from_slice(&IMAGE_BASE.to_le_bytes());
     pe[opt + 32..opt + 36].copy_from_slice(&SECT_ALIGN.to_le_bytes());
@@ -1898,7 +1928,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE VirtualAlloc+Heap OK") // VirtualAlloc + GetProcessHeap + HeapAlloc
         && serial.contains("PE GetProcAddress OK") // LoadLibraryA + synthetic kernel32 export table
         && serial.contains("PE ntdll OK") // ntdll boundary: GetModuleHandleA + GetProcAddress + 9-arg NtWriteFile
-        && serial.contains("PE dll thos_add=42") // real DLL from C:\Windows\System32 + recursive imports
+        && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("THOS: pe reject ok");
     if ok {

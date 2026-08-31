@@ -97,6 +97,14 @@ const LDR_ENTRY_STRIDE: u64 = 0x80;
 const LDRDATA_STR_OFF: usize = 0x800;
 const MAX_FILE_LDR_MODS: usize = 12;
 
+/// A ring-3 process-bootstrap page. When any file DLL has an entry point, the
+/// PE thread starts here instead of at the exe entry: it calls each
+/// `DllMain(base, DLL_PROCESS_ATTACH, 1)` in dependency order, then jumps to
+/// the real exe entry. This is the loader's job on Windows (`LdrpInitializeProcess`).
+const PE_BOOTSTRAP_ADDR: u64 = NT_STUB_BASE + 0x7000;
+const BOOTSTRAP_LIST_OFF: usize = 0x400; // {base,entry} u64 pairs, {0,0}-terminated
+const BOOTSTRAP_ENTRY_OFF: usize = 0x800; // real exe entry VA
+
 /// Synthetic system DLLs: one page each carrying a minimal PE32+ header, a
 /// copy of the NT trampolines, and a real `IMAGE_EXPORT_DIRECTORY` naming
 /// each. Both are present in the PEB `Ldr` lists so `GetModuleHandleA` /
@@ -565,12 +573,93 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
         &file_mods,
     )?;
 
+    // DLLs that ship a `DllMain`, dependency order (a DLL is registered before
+    // its own file-DLL imports, so reverse of load order is deps-first).
+    let dllmains: Vec<(u64, u64)> = file_mods
+        .iter()
+        .rev()
+        .filter(|m| m.entry != 0)
+        .map(|m| (m.base, m.entry))
+        .collect();
+    let entry = if dllmains.is_empty() {
+        staged.entry
+    } else {
+        map_bootstrap(proc, &dllmains, staged.entry)?;
+        PE_BOOTSTRAP_ADDR
+    };
+
     Ok(PeImage {
-        entry: staged.entry,
+        entry,
         teb: PE_TEB_ADDR,
         base: staged.load_base,
         size: staged.size_of_image,
     })
+}
+
+/// Build the ring-3 process-bootstrap page: a small loop that calls every
+/// `DllMain(hinst, DLL_PROCESS_ATTACH=1, lpvReserved=1)` then jumps to
+/// `exe_entry`. Mapped exec + read-only at [`PE_BOOTSTRAP_ADDR`].
+fn map_bootstrap(
+    proc: &Process,
+    dllmains: &[(u64, u64)],
+    exe_entry: u64,
+) -> Result<(), &'static str> {
+    let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (bootstrap)")?;
+    let phys = frame.start_address();
+    let page = unsafe {
+        let p = phys_to_virt(phys).as_mut_ptr::<u8>();
+        core::ptr::write_bytes(p, 0, 4096);
+        core::slice::from_raw_parts_mut(p, 4096)
+    };
+
+    // {base, entry} pairs then a {0,0} terminator.
+    let mut o = BOOTSTRAP_LIST_OFF;
+    for &(base, ent) in dllmains {
+        page[o..o + 8].copy_from_slice(&base.to_le_bytes());
+        page[o + 8..o + 16].copy_from_slice(&ent.to_le_bytes());
+        o += 16;
+    }
+    if o + 16 > BOOTSTRAP_ENTRY_OFF {
+        return Err("PE: too many DllMains for the bootstrap page");
+    }
+    page[BOOTSTRAP_ENTRY_OFF..BOOTSTRAP_ENTRY_OFF + 8].copy_from_slice(&exe_entry.to_le_bytes());
+
+    // code @ offset 0
+    let mut c: Vec<u8> = Vec::new();
+    c.extend_from_slice(&[0x48, 0xBB]); // mov rbx, imm64
+    c.extend_from_slice(&(PE_BOOTSTRAP_ADDR + BOOTSTRAP_LIST_OFF as u64).to_le_bytes());
+    let loop_start = c.len();
+    c.extend_from_slice(&[0x48, 0x8B, 0x03]); // mov rax, [rbx]  (base)
+    c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    let jz_at = c.len();
+    c.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]); // jz .done (rel32)
+    c.extend_from_slice(&[0x48, 0x89, 0xC1]); // mov rcx, rax  (hinstDLL)
+    c.extend_from_slice(&[0xBA, 1, 0, 0, 0]); // mov edx, 1    (DLL_PROCESS_ATTACH)
+    c.extend_from_slice(&[0x41, 0xB8, 1, 0, 0, 0]); // mov r8d, 1  (lpvReserved != NULL)
+    c.extend_from_slice(&[0x48, 0x8B, 0x73, 0x08]); // mov rsi, [rbx+8]  (entry)
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    c.extend_from_slice(&[0xFF, 0xD6]); // call rsi
+    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    c.extend_from_slice(&[0x48, 0x83, 0xC3, 0x10]); // add rbx, 16
+    let jmp_at = c.len();
+    c.extend_from_slice(&[0xE9, 0, 0, 0, 0]); // jmp .loop (rel32)
+    let rel = loop_start as i64 - (jmp_at as i64 + 5);
+    c[jmp_at + 1..jmp_at + 5].copy_from_slice(&(rel as i32).to_le_bytes());
+    let done = c.len();
+    c[jz_at + 2..jz_at + 6].copy_from_slice(&((done as i64 - (jz_at as i64 + 6)) as i32).to_le_bytes());
+    let mov_at = c.len();
+    c.extend_from_slice(&[0x48, 0x8B, 0x05, 0, 0, 0, 0]); // mov rax, [rip+exe_entry_slot]
+    let disp = BOOTSTRAP_ENTRY_OFF as i64 - (mov_at as i64 + 7);
+    c[mov_at + 3..mov_at + 7].copy_from_slice(&(disp as i32).to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+
+    if c.len() > BOOTSTRAP_LIST_OFF {
+        return Err("PE: bootstrap code overflow");
+    }
+    page[..c.len()].copy_from_slice(&c);
+
+    proc.map(PE_BOOTSTRAP_ADDR, phys.as_u64(), false, true); // r-x
+    Ok(())
 }
 
 /// Write a circular doubly-linked `LIST_ENTRY` ring (`Flink` at +0, `Blink` at
