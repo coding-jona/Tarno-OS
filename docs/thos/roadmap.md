@@ -329,8 +329,13 @@ late.
       follows a forwarder (`resolve_module` → recurse), and `nt.rs`'s
       `resolve_slot` does the same at runtime for `GetProcAddress`. `pe-test`'s
       `thoscrt!thos_fwd` forwards to `KERNEL32.GetProcessHeap` (`PE dll forward OK`).
-    - **TLS directory** (data dir 9) — allocate the TLS block, wire
-      `TEB.ThreadLocalStoragePointer`, run `AddressOfCallBacks`.
+    - **TLS directory** (data dir 9) — *done.* `stage_image` reads the
+      `IMAGE_TLS_DIRECTORY` post-reloc; `Loader::tls_add_module` copies each
+      module's TLS template into a per-thread block on the `PE_TLS_ADDR` page,
+      writes `ThreadLocalStoragePointer[idx]` + the module's `AddressOfIndex`,
+      and queues its callbacks. `map_teb_peb` sets `TEB+0x58`; the ring-3
+      bootstrap runs TLS callbacks before `DllMain`s. `pe-test` verifies via
+      `gs:[0x58]` (`PE TLS OK`). Still static-only — no `TlsAlloc`, one thread.
     - honour a `FALSE` from `DllMain`.
   - **Then:** the real `ntdll` lower boundary (the `__wine_unix_call` seam +
     a wineserver-equivalent on the executive) so Wine's PE DLLs can sit on
