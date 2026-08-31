@@ -341,9 +341,20 @@ late.
       `ExitProcess(0x135)` inline instead of jumping to the exe entry.
       `pe-test`'s `failcrt.dll` aborts init so `pe-dllfail.exe`'s entry never
       runs (`THOS: pe dllfail ok`).
-  - **Then:** the real `ntdll` lower boundary (the `__wine_unix_call` seam +
-    a wineserver-equivalent on the executive) so Wine's PE DLLs can sit on
-    THOS; process isolation / integrity for the security phase.
+  - **`ntdll` lower boundary — started.** `NTDLL_EXPORTS` is now framed as
+    THOS's **SSDT**: the stub index *is* the service number, `dispatch_ntdll`
+    the table-driven switch. First query primitives a real `ntdll` startup
+    touches: `NtQueryInformationProcess(ProcessBasicInformation)` (→ PEB, the
+    bootstrap call — `pe-test` `PE NtQIP OK`), `NtQueryVirtualMemory`
+    (`MemoryBasicInformation`, placeholder region), `NtSetInformationThread` /
+    `NtSetInformationProcess` (accept-all).
+  - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
+    unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
+    unmodified), or a from-scratch `ntdll` — with real waitable objects
+    (`NtCreateEvent` / `NtWaitForSingleObject` on the executive `Event` /
+    `WaitQueue`, per-process HANDLE table), SEH ↔ trap dispatch, APC delivery,
+    a minimal registry; then process isolation / integrity for the security
+    phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
