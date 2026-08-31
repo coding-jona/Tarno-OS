@@ -36,7 +36,35 @@ pub const NT_VIRTUALPROTECT: u16 = 12;
 pub const NT_GETPROCESSHEAP: u16 = 13;
 pub const NT_HEAPALLOC: u16 = 14;
 pub const NT_HEAPFREE: u16 = 15;
-pub const NT_STUB_COUNT: u16 = 16;
+pub const NT_GETPROCADDRESS: u16 = 16;
+pub const NT_LOADLIBRARYA: u16 = 17;
+pub const NT_STUB_COUNT: u16 = 18;
+
+/// The `kernel32` export table, in stub-index order. Drives both
+/// [`crate::pe::resolve_import`] (import → stub index) and the synthetic
+/// `kernel32.dll` module's `IMAGE_EXPORT_DIRECTORY` (name → stub RVA), so
+/// `GetProcAddress` / `LoadLibraryA` resolve against the same list an import
+/// does. Index **must** equal the matching `NT_*` constant.
+pub const NT_EXPORTS: [&str; NT_STUB_COUNT as usize] = [
+    "ExitProcess",
+    "GetStdHandle",
+    "WriteFile",
+    "GetLastError",
+    "SetLastError",
+    "CreateFileA",
+    "ReadFile",
+    "CloseHandle",
+    "GetCommandLineA",
+    "GetModuleHandleA",
+    "VirtualAlloc",
+    "VirtualFree",
+    "VirtualProtect",
+    "GetProcessHeap",
+    "HeapAlloc",
+    "HeapFree",
+    "GetProcAddress",
+    "LoadLibraryA",
+];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
 /// opaque tokens to a Win32 program; ours is just a fixed non-zero value.
@@ -171,8 +199,8 @@ pub fn dispatch(idx: u16, frame: &mut UserFrame) -> i64 {
         NT_GETCOMMANDLINEA => crate::pe::PE_ANSI_CMDLINE_ADDR as i64,
 
         // GetModuleHandleA(lpModuleName) -> HMODULE. NULL -> the exe's base
-        // (PEB->ImageBaseAddress). Named lookup against the Ldr list isn't wired
-        // yet, so a name returns NULL + ERROR_MOD_NOT_FOUND.
+        // (PEB->ImageBaseAddress); a name -> the matching PEB->Ldr entry's
+        // DllBase (case-insensitive, `.dll` implied), else NULL + MOD_NOT_FOUND.
         NT_GETMODULEHANDLEA => {
             if a0 == 0 {
                 teb().map_or(0, |t| unsafe {
@@ -180,9 +208,39 @@ pub fn dispatch(idx: u16, frame: &mut UserFrame) -> i64 {
                     *((peb + 0x10) as *const u64) as i64
                 })
             } else {
+                match ldr_find(&normalize_mod(&user_cstr(a0))) {
+                    b if b != 0 => b as i64,
+                    _ => {
+                        set_last_error(126); // ERROR_MOD_NOT_FOUND
+                        0
+                    }
+                }
+            }
+        }
+
+        // LoadLibraryA(lpLibFileName) -> HMODULE. No on-disk DLLs yet, so this
+        // only hands back an already-present module (the synthetic kernel32).
+        NT_LOADLIBRARYA => match ldr_find(&normalize_mod(&user_cstr(a0))) {
+            b if b != 0 => b as i64,
+            _ => {
                 set_last_error(126); // ERROR_MOD_NOT_FOUND
                 0
             }
+        },
+
+        // GetProcAddress(hModule, lpProcName) -> FARPROC. Parses the module's
+        // IMAGE_EXPORT_DIRECTORY. `lpProcName` is a string, or an ordinal when
+        // the upper bits are zero (`MAKEINTRESOURCE`-style).
+        NT_GETPROCADDRESS => {
+            let r = if a1 >> 16 == 0 {
+                export_by_ordinal(a0, a1 as u16)
+            } else {
+                export_by_name(a0, &user_cstr(a1))
+            };
+            if r == 0 {
+                set_last_error(127); // ERROR_PROC_NOT_FOUND
+            }
+            r
         }
 
         // VirtualAlloc(addr, size, type, protect): we always pick the address.
@@ -239,6 +297,145 @@ fn win_path_to_thos(win: &str) -> alloc::string::String {
         out.push_str(part);
     }
     out
+}
+
+/// Normalise a module name for an `Ldr` lookup: drop any directory, lowercase,
+/// and append `.dll` when there is no extension (matching `GetModuleHandleA`).
+fn normalize_mod(name: &str) -> alloc::string::String {
+    let base = name.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(name);
+    let mut s = base.to_ascii_lowercase();
+    if !s.contains('.') {
+        s.push_str(".dll");
+    }
+    s
+}
+
+/// `true` if the `n`-code-unit UTF-16LE string at `buf` equals the ASCII
+/// `want` (which the caller has already lowercased), case-insensitively.
+unsafe fn utf16_eq_ci(buf: u64, n: usize, want: &str) -> bool {
+    let wb = want.as_bytes();
+    if wb.len() != n {
+        return false;
+    }
+    for (i, &w) in wb.iter().enumerate() {
+        let c = *((buf + (i * 2) as u64) as *const u16);
+        if c > 0x7F || (c as u8).to_ascii_lowercase() != w {
+            return false;
+        }
+    }
+    true
+}
+
+/// Walk `PEB->Ldr->InLoadOrderModuleList` for a module whose `BaseDllName`
+/// matches `want` (already normalised/lowercased). Returns its `DllBase`, or 0.
+fn ldr_find(want: &str) -> u64 {
+    let Some(t) = teb() else { return 0 };
+    unsafe {
+        let peb = *(t.add(0x60) as *const u64);
+        if peb == 0 {
+            return 0;
+        }
+        let ldr = *((peb + 0x18) as *const u64);
+        if ldr == 0 {
+            return 0;
+        }
+        let head = ldr + 0x10; // InLoadOrderModuleList
+        let mut cur = *(head as *const u64); // first Flink
+        // InLoadOrderLinks sits at offset 0 of LDR_DATA_TABLE_ENTRY.
+        for _ in 0..64 {
+            if cur == head || cur == 0 {
+                break;
+            }
+            let len = *((cur + 0x58) as *const u16) as usize; // BaseDllName.Length
+            let bufp = *((cur + 0x60) as *const u64); // BaseDllName.Buffer
+            if bufp != 0 && len >= 2 && utf16_eq_ci(bufp, len / 2, want) {
+                return *((cur + 0x30) as *const u64); // DllBase
+            }
+            cur = *(cur as *const u64); // next Flink
+        }
+    }
+    0
+}
+
+/// Parsed `IMAGE_EXPORT_DIRECTORY` — absolute pointers into the mapped module.
+struct ExportDir {
+    base: u64,
+    eat: u64,   // AddressOfFunctions   (u32 RVAs)
+    enpt: u64,  // AddressOfNames       (u32 RVAs)
+    ords: u64,  // AddressOfNameOrdinals(u16 indices)
+    n_names: usize,
+    n_funcs: u64,
+    ord_base: u64,
+    dir_rva: u64,
+    dir_size: u64,
+}
+
+impl ExportDir {
+    /// Locate and sanity-check the export directory of the PE mapped at `base`.
+    unsafe fn parse(base: u64) -> Option<ExportDir> {
+        if base == 0 {
+            return None;
+        }
+        let pe = base + *((base + 0x3C) as *const u32) as u64;
+        if *(pe as *const u32) != 0x0000_4550 {
+            return None; // "PE\0\0"
+        }
+        let opt = pe + 4 + 20;
+        if *(opt as *const u16) != 0x20B || *((opt + 108) as *const u32) < 1 {
+            return None; // not PE32+, or no export data dir slot
+        }
+        let dir_rva = *((opt + 112) as *const u32) as u64;
+        let dir_size = *((opt + 116) as *const u32) as u64;
+        if dir_rva == 0 {
+            return None;
+        }
+        let ed = base + dir_rva;
+        Some(ExportDir {
+            base,
+            eat: base + *((ed + 0x1C) as *const u32) as u64,
+            enpt: base + *((ed + 0x20) as *const u32) as u64,
+            ords: base + *((ed + 0x24) as *const u32) as u64,
+            n_names: *((ed + 0x18) as *const u32) as usize,
+            n_funcs: *((ed + 0x14) as *const u32) as u64,
+            ord_base: *((ed + 0x10) as *const u32) as u64,
+            dir_rva,
+            dir_size,
+        })
+    }
+
+    /// `base + AddressOfFunctions[idx]`, rejecting an empty slot or a forwarder
+    /// RVA (one pointing back inside the export directory). 0 on any problem.
+    unsafe fn func_at(&self, idx: u64) -> i64 {
+        if idx >= self.n_funcs {
+            return 0;
+        }
+        let frva = *((self.eat + idx * 4) as *const u32) as u64;
+        if frva == 0 || (frva >= self.dir_rva && frva < self.dir_rva + self.dir_size) {
+            return 0;
+        }
+        (self.base + frva) as i64
+    }
+}
+
+fn export_by_name(base: u64, name: &str) -> i64 {
+    unsafe {
+        let Some(ed) = ExportDir::parse(base) else { return 0 };
+        for i in 0..ed.n_names {
+            let nrva = *((ed.enpt + (i * 4) as u64) as *const u32) as u64;
+            if user_cstr(base + nrva) == name {
+                let ord = *((ed.ords + (i * 2) as u64) as *const u16) as u64;
+                return ed.func_at(ord);
+            }
+        }
+    }
+    0
+}
+
+fn export_by_ordinal(base: u64, ordinal: u16) -> i64 {
+    unsafe {
+        let Some(ed) = ExportDir::parse(base) else { return 0 };
+        ed.func_at((ordinal as u64).wrapping_sub(ed.ord_base))
+    }
 }
 
 fn user_cstr(ptr: u64) -> alloc::string::String {

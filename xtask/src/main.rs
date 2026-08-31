@@ -426,6 +426,8 @@ fn write_pe_hello(path: &Path) {
         b"VirtualAlloc",     // 10
         b"GetProcessHeap",   // 13
         b"HeapAlloc",        // 14
+        b"GetProcAddress",   // 16
+        b"LoadLibraryA",     // 17
     ];
     let ilt_off = 0x28u32; // after 2 IDT entries (2*20)
     let iat_off = ilt_off + (funcs.len() as u32 + 1) * 8;
@@ -466,6 +468,8 @@ fn write_pe_hello(path: &Path) {
     let iat_va = idata_rva + iat_off + 64; // VirtualAlloc
     let iat_gph = idata_rva + iat_off + 72; // GetProcessHeap
     let iat_ha = idata_rva + iat_off + 80; // HeapAlloc
+    let iat_gpa = idata_rva + iat_off + 88; // GetProcAddress
+    let iat_ll = idata_rva + iat_off + 96; // LoadLibraryA
 
     // --- entry machine code (x86-64) ---
     // Deferred RIP-relative fixups: (disp32 position in `code`, target RVA).
@@ -489,6 +493,9 @@ fn write_pe_hello(path: &Path) {
     let msg_pp_tag = u32::MAX - 8;
     let msg_ldr_tag = u32::MAX - 9;
     let msg_va_tag = u32::MAX - 10;
+    let msg_gpa_tag = u32::MAX - 11;
+    let k32name_tag = u32::MAX - 12;
+    let wfname_tag = u32::MAX - 13;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -639,6 +646,29 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2l) LoadLibraryA("kernel32.dll") -> rbx  (Ldr name walk),
+    //     GetProcAddress(rbx, "WriteFile") -> rsi  (export-directory parse),
+    //     then call the resolved pointer to print the success line.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], k32name_tag); // lea rcx, [rip+k32name]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_ll); // call [rip+iat_LoadLibraryA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (HMODULE)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], wfname_tag); // lea rdx, [rip+wfname]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa); // call [rip+iat_GetProcAddress]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax  (resolved WriteFile)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_gpa_tag); // lea rdx, [rip+msg_gpa]
+    let gpa_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len_gpa  (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    code.extend_from_slice(&[0xFF, 0xD6]); // call rsi
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+
     // 3) ExitProcess(0)
     code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
@@ -661,6 +691,10 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0u8; 64]); // ReadFile buffer
     let fname_off = code.len();
     code.extend_from_slice(b"C:\\pe-read.txt\0");
+    let k32name_off = code.len();
+    code.extend_from_slice(b"kernel32.dll\0");
+    let wfname_off = code.len();
+    code.extend_from_slice(b"WriteFile\0");
     while code.len() % 8 != 0 {
         code.push(0);
     }
@@ -671,16 +705,20 @@ fn write_pe_hello(path: &Path) {
     let msg_pp: &[u8] = b"PE ProcParams OK\n";
     let msg_ldr: &[u8] = b"PE Ldr OK\n";
     let msg_va: &[u8] = b"PE VirtualAlloc+Heap OK\n";
+    let msg_gpa: &[u8] = b"PE GetProcAddress OK\n";
     let msg_pp_off = code.len();
     code.extend_from_slice(msg_pp);
     let msg_ldr_off = code.len();
     code.extend_from_slice(msg_ldr);
     let msg_va_off = code.len();
     code.extend_from_slice(msg_va);
+    let msg_gpa_off = code.len();
+    code.extend_from_slice(msg_gpa);
 
     code[pp_r8..pp_r8 + 4].copy_from_slice(&(msg_pp.len() as u32).to_le_bytes());
     code[ldr_r8..ldr_r8 + 4].copy_from_slice(&(msg_ldr.len() as u32).to_le_bytes());
     code[va_r8..va_r8 + 4].copy_from_slice(&(msg_va.len() as u32).to_le_bytes());
+    code[gpa_r8..gpa_r8 + 4].copy_from_slice(&(msg_gpa.len() as u32).to_le_bytes());
     code[ptr_off..ptr_off + 8]
         .copy_from_slice(&(IMAGE_BASE + text_rva as u64 + msg1_off as u64).to_le_bytes());
     for (pos, target) in fixups {
@@ -696,6 +734,9 @@ fn write_pe_hello(path: &Path) {
             t if t == msg_pp_tag => text_rva + msg_pp_off as u32,
             t if t == msg_ldr_tag => text_rva + msg_ldr_off as u32,
             t if t == msg_va_tag => text_rva + msg_va_off as u32,
+            t if t == msg_gpa_tag => text_rva + msg_gpa_off as u32,
+            t if t == k32name_tag => text_rva + k32name_off as u32,
+            t if t == wfname_tag => text_rva + wfname_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -1525,9 +1566,10 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE Ldr OK") // PEB->Ldr module list walk
         && serial.contains("PE argv0 pe-hello.exe") // GetCommandLineA
         && serial.contains("PE VirtualAlloc+Heap OK") // VirtualAlloc + GetProcessHeap + HeapAlloc
+        && serial.contains("PE GetProcAddress OK") // LoadLibraryA + synthetic kernel32 export table
         && serial.contains("THOS: pe reject ok");
     if ok {
-        println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap");
+        println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress");
     } else {
         eprintln!("pe-test: FAIL — the PE did not run to exit\n--- serial ---\n{serial}\n---");
         exit(1);

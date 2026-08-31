@@ -63,8 +63,8 @@ const NT_STUB_STRIDE: u64 = 16;
 /// not fault.
 const PE_TEB_ADDR: u64 = NT_STUB_BASE + 0x1000;
 const PE_PEB_ADDR: u64 = NT_STUB_BASE + 0x2000;
-/// One page holding `RTL_USER_PROCESS_PARAMETERS`, `PEB_LDR_DATA`, one
-/// `LDR_DATA_TABLE_ENTRY` (the exe), plus the strings they point at.
+/// One page holding `RTL_USER_PROCESS_PARAMETERS`, `PEB_LDR_DATA`, the
+/// `LDR_DATA_TABLE_ENTRY`s (the exe + synthetic kernel32), plus their strings.
 const PE_PARAMS_ADDR: u64 = NT_STUB_BASE + 0x3000;
 const PARAMS_OFF: u64 = 0x000; // RTL_USER_PROCESS_PARAMETERS
 const LDR_OFF: u64 = 0x100; // PEB_LDR_DATA
@@ -72,34 +72,33 @@ const MOD_OFF: u64 = 0x180; // LDR_DATA_TABLE_ENTRY (the exe)
 const WSTR_OFF: u64 = 0x200; // UTF-16 strings
 const ANSI_CMDLINE_OFF: u64 = 0x400; // ANSI command line
 const ENV_OFF: u64 = 0x500; // environment block (empty)
+const MOD2_OFF: u64 = 0x600; // LDR_DATA_TABLE_ENTRY (synthetic kernel32)
+
+/// A synthetic `kernel32.dll`: one page carrying a minimal PE32+ header, a
+/// second copy of the NT trampolines, and a real `IMAGE_EXPORT_DIRECTORY`
+/// naming each one. Present in the PEB `Ldr` lists so `GetModuleHandleA` /
+/// `LoadLibraryA` hand back its base and `GetProcAddress` resolves names
+/// against it.
+const PE_KERNEL32_ADDR: u64 = NT_STUB_BASE + 0x4000;
+const K32_STUBS_OFF: u64 = 0x180; // trampoline table within the page
+const K32_EXPDIR_OFF: u64 = 0x400; // IMAGE_EXPORT_DIRECTORY within the page
 /// `GetCommandLineA` returns this.
 pub const PE_ANSI_CMDLINE_ADDR: u64 = PE_PARAMS_ADDR + ANSI_CMDLINE_OFF;
 const ANSI_CMDLINE: &[u8] = b"PE argv0 pe-hello.exe\n\0";
 
 /// Index of the stub implementing `dll!func`, or `None` if THOS does not
 /// provide it yet (the loader then rejects the PE rather than mislinking).
+/// Every name lives in [`crate::nt::NT_EXPORTS`], whose position **is** the
+/// stub index — the same table the synthetic `kernel32.dll` exports.
 fn resolve_import(dll: &str, func: &str) -> Option<u16> {
-    use crate::nt::*;
     let dll = dll.trim_end_matches('\0').to_ascii_lowercase();
-    match (dll.as_str(), func) {
-        ("kernel32.dll", "ExitProcess") => Some(NT_EXITPROCESS),
-        ("kernel32.dll", "GetStdHandle") => Some(NT_GETSTDHANDLE),
-        ("kernel32.dll", "WriteFile") => Some(NT_WRITEFILE),
-        ("kernel32.dll", "GetLastError") => Some(NT_GETLASTERROR),
-        ("kernel32.dll", "SetLastError") => Some(NT_SETLASTERROR),
-        ("kernel32.dll", "CreateFileA") => Some(NT_CREATEFILEA),
-        ("kernel32.dll", "ReadFile") => Some(NT_READFILE),
-        ("kernel32.dll", "CloseHandle") => Some(NT_CLOSEHANDLE),
-        ("kernel32.dll", "GetCommandLineA") => Some(NT_GETCOMMANDLINEA),
-        ("kernel32.dll", "GetModuleHandleA") => Some(NT_GETMODULEHANDLEA),
-        ("kernel32.dll", "VirtualAlloc") => Some(NT_VIRTUALALLOC),
-        ("kernel32.dll", "VirtualFree") => Some(NT_VIRTUALFREE),
-        ("kernel32.dll", "VirtualProtect") => Some(NT_VIRTUALPROTECT),
-        ("kernel32.dll", "GetProcessHeap") => Some(NT_GETPROCESSHEAP),
-        ("kernel32.dll", "HeapAlloc") => Some(NT_HEAPALLOC),
-        ("kernel32.dll", "HeapFree") => Some(NT_HEAPFREE),
-        _ => None,
+    if dll != "kernel32.dll" {
+        return None;
     }
+    crate::nt::NT_EXPORTS
+        .iter()
+        .position(|&n| n == func)
+        .map(|i| i as u16)
 }
 
 fn rd_u16(img: &[u8], off: usize) -> Result<u16, &'static str> {
@@ -247,6 +246,7 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
         map_seg(proc, &img, load_base + rva, rva, mem_size, exec)?;
     }
     map_stub_page(proc)?;
+    map_kernel32_page(proc)?;
     map_teb_peb(proc, load_base, load_base + entry_rva, size_of_image, stack_top)?;
 
     Ok(PeImage {
@@ -317,6 +317,8 @@ fn map_teb_peb(
         let (cmd_buf, cmd_len) = wstr(b, "pe-hello.exe");
         let (base_buf, base_len) = wstr(b, "pe-hello.exe");
         let (cur_buf, cur_len) = wstr(b, "C:\\");
+        let (k32_full_buf, k32_full_len) = wstr(b, "C:\\Windows\\System32\\KERNEL32.DLL");
+        let (k32_base_buf, k32_base_len) = wstr(b, "KERNEL32.DLL");
 
         // --- RTL_USER_PROCESS_PARAMETERS @ PARAMS_OFF ---
         put(b, PARAMS_OFF + 0x00, 0x1000); // MaximumLength
@@ -335,18 +337,24 @@ fn map_teb_peb(
         put(b, PARAMS_OFF + 0x78, cmd_buf);
         put(b, PARAMS_OFF + 0x80, PE_PARAMS_ADDR + ENV_OFF); // Environment (empty: two NUL words)
 
-        // --- PEB_LDR_DATA @ LDR_OFF (one circular element: the exe) ---
+        // --- PEB_LDR_DATA @ LDR_OFF: two circular elements, exe then kernel32.
+        //     Each of the three lists threads head -> exe -> kernel32 -> head. ---
         let ldr = PE_PARAMS_ADDR + LDR_OFF;
-        let m = PE_PARAMS_ADDR + MOD_OFF;
+        let m1 = PE_PARAMS_ADDR + MOD_OFF;
+        let m2 = PE_PARAMS_ADDR + MOD2_OFF;
         put(b, LDR_OFF + 0x00, 0x58); // Length
         b[(LDR_OFF + 0x04) as usize] = 1; // Initialized
         for (i, list) in [0x10u64, 0x20, 0x30].iter().enumerate() {
+            let i = i as u64;
             let head = ldr + list;
-            let link = m + i as u64 * 0x10; // entry's matching LIST_ENTRY
-            put(b, LDR_OFF + list, link); // head.Flink
-            put(b, LDR_OFF + list + 8, link); // head.Blink
-            put(b, MOD_OFF + i as u64 * 0x10, head); // entry.link.Flink
-            put(b, MOD_OFF + i as u64 * 0x10 + 8, head); // entry.link.Blink
+            let l1 = m1 + i * 0x10; // exe's LIST_ENTRY for this list
+            let l2 = m2 + i * 0x10; // kernel32's LIST_ENTRY for this list
+            put(b, LDR_OFF + list, l1); // head.Flink -> exe
+            put(b, LDR_OFF + list + 8, l2); // head.Blink -> kernel32
+            put(b, MOD_OFF + i * 0x10, l2); // exe.Flink -> kernel32
+            put(b, MOD_OFF + i * 0x10 + 8, head); // exe.Blink -> head
+            put(b, MOD2_OFF + i * 0x10, head); // kernel32.Flink -> head
+            put(b, MOD2_OFF + i * 0x10 + 8, l1); // kernel32.Blink -> exe
         }
         put(b, MOD_OFF + 0x30, image_base); // DllBase
         put(b, MOD_OFF + 0x38, entry); // EntryPoint
@@ -357,6 +365,16 @@ fn map_teb_peb(
         put16(b, MOD_OFF + 0x58, base_len); // BaseDllName
         put16(b, MOD_OFF + 0x5A, base_len + 2);
         put(b, MOD_OFF + 0x60, base_buf);
+
+        put(b, MOD2_OFF + 0x30, PE_KERNEL32_ADDR); // DllBase
+        put(b, MOD2_OFF + 0x38, 0); // EntryPoint (none)
+        put(b, MOD2_OFF + 0x40, 0x1000); // SizeOfImage
+        put16(b, MOD2_OFF + 0x48, k32_full_len); // FullDllName
+        put16(b, MOD2_OFF + 0x4A, k32_full_len + 2);
+        put(b, MOD2_OFF + 0x50, k32_full_buf);
+        put16(b, MOD2_OFF + 0x58, k32_base_len); // BaseDllName
+        put16(b, MOD2_OFF + 0x5A, k32_base_len + 2);
+        put(b, MOD2_OFF + 0x60, k32_base_buf);
 
         // --- ANSI command line (GetCommandLineA) + empty environment ---
         b[ANSI_CMDLINE_OFF as usize..ANSI_CMDLINE_OFF as usize + ANSI_CMDLINE.len()]
@@ -495,6 +513,98 @@ fn map_stub_page(proc: &Process) -> Result<(), &'static str> {
     }
 
     proc.map(NT_STUB_BASE, phys.as_u64(), false, true);
+    Ok(())
+}
+
+/// Build the synthetic `kernel32.dll` image at [`PE_KERNEL32_ADDR`] (one page,
+/// exec + read-only): a minimal PE32+ header, the NT trampolines again at
+/// [`K32_STUBS_OFF`], and an `IMAGE_EXPORT_DIRECTORY` at [`K32_EXPDIR_OFF`]
+/// whose `AddressOfFunctions[i]` points at trampoline `i` and whose
+/// `AddressOfNames[i]` is `NT_EXPORTS[i]`. `nt::export_by_name` walks exactly
+/// this layout for `GetProcAddress`.
+fn map_kernel32_page(proc: &Process) -> Result<(), &'static str> {
+    let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (kernel32)")?;
+    let phys = frame.start_address();
+    let page = unsafe {
+        let p = phys_to_virt(phys).as_mut_ptr::<u8>();
+        core::ptr::write_bytes(p, 0, 4096);
+        core::slice::from_raw_parts_mut(p, 4096)
+    };
+    let p16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let p32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let p64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+
+    // DOS stub + PE signature.
+    page[0..2].copy_from_slice(b"MZ");
+    p32(page, 0x3C, 0x40);
+    page[0x40..0x44].copy_from_slice(b"PE\0\0");
+
+    // COFF header @ 0x44.
+    let coff = 0x44usize;
+    p16(page, coff, 0x8664); // Machine
+    p16(page, coff + 2, 0); // NumberOfSections (headers-only module)
+    p16(page, coff + 16, 0xF0); // SizeOfOptionalHeader
+    p16(page, coff + 18, 0x2022); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE | DLL
+
+    // PE32+ optional header @ 0x58.
+    let opt = coff + 20;
+    p16(page, opt, 0x20B); // Magic = PE32+
+    p64(page, opt + 24, PE_KERNEL32_ADDR); // ImageBase
+    p32(page, opt + 32, 0x1000); // SectionAlignment
+    p32(page, opt + 36, 0x200); // FileAlignment
+    p32(page, opt + 56, 0x1000); // SizeOfImage (one page)
+    p32(page, opt + 60, 0x200); // SizeOfHeaders
+    p16(page, opt + 68, 3); // Subsystem (unused)
+    p32(page, opt + 108, 16); // NumberOfRvaAndSizes
+
+    let n = crate::nt::NT_STUB_COUNT as usize;
+
+    // Trampolines: `mov eax, NT_BASE|idx ; mov r10, rcx ; syscall ; ret`.
+    for idx in 0..n {
+        let mut stub = [0xB8u8, 0, 0, 0, 0, 0x49, 0x89, 0xCA, 0x0F, 0x05, 0xC3];
+        let sel = (crate::nt::NT_BASE | idx as u64) as u32;
+        stub[1..5].copy_from_slice(&sel.to_le_bytes());
+        let at = K32_STUBS_OFF as usize + idx * NT_STUB_STRIDE as usize;
+        page[at..at + stub.len()].copy_from_slice(&stub);
+    }
+
+    // Export tables, laid out after the fixed-size directory.
+    let expdir = K32_EXPDIR_OFF as usize;
+    let eat = expdir + 0x28; // AddressOfFunctions
+    let enpt = eat + n * 4; // AddressOfNames
+    let ords = enpt + n * 4; // AddressOfNameOrdinals
+    let mut cur = ords + n * 2;
+
+    let name_rva = cur;
+    page[cur..cur + 12].copy_from_slice(b"KERNEL32.DLL");
+    cur += 13;
+
+    for (i, fname) in crate::nt::NT_EXPORTS.iter().enumerate() {
+        p32(page, eat + i * 4, K32_STUBS_OFF as u32 + (i * NT_STUB_STRIDE as usize) as u32);
+        p32(page, enpt + i * 4, cur as u32);
+        p16(page, ords + i * 2, i as u16);
+        let fb = fname.as_bytes();
+        page[cur..cur + fb.len()].copy_from_slice(fb);
+        cur += fb.len() + 1;
+    }
+    if cur > 4096 {
+        return Err("PE: synthetic kernel32 overflows its page");
+    }
+
+    // IMAGE_EXPORT_DIRECTORY @ K32_EXPDIR_OFF.
+    p32(page, expdir + 0x0C, name_rva as u32); // Name
+    p32(page, expdir + 0x10, 1); // Base (ordinal base)
+    p32(page, expdir + 0x14, n as u32); // NumberOfFunctions
+    p32(page, expdir + 0x18, n as u32); // NumberOfNames
+    p32(page, expdir + 0x1C, eat as u32); // AddressOfFunctions
+    p32(page, expdir + 0x20, enpt as u32); // AddressOfNames
+    p32(page, expdir + 0x24, ords as u32); // AddressOfNameOrdinals
+
+    // Data directory 0 (export).
+    p32(page, opt + 112, expdir as u32);
+    p32(page, opt + 116, (cur - expdir) as u32);
+
+    proc.map(PE_KERNEL32_ADDR, phys.as_u64(), false, true); // r-x
     Ok(())
 }
 
