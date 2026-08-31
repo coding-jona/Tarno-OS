@@ -105,3 +105,6 @@ jobs:
 
       - name: Read the ESP (GPT → EFI System Partition → FAT32 → file)
         run: cargo xtask fat-test
+
+      - name: Native PE loader (a statically linked Win64 .exe runs)
+        run: cargo xtask pe-test

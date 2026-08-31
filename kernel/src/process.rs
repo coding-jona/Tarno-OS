@@ -591,6 +591,23 @@ pub fn spawn_init(bytes: &[u8], argv: &[&str], envp: &[&str]) -> u64 {
     task.pid
 }
 
+/// `spawn` a statically linked Win64 `.exe`: map the PE and enter its entry
+/// point in ring 3 with a bare 16-aligned stack (no SysV block — Win64 entry
+/// points take no stack args). Returns the pid. The NT personality (PEB/TEB,
+/// `gs` base) is layered on later; a self-contained `.exe` that only makes
+/// syscalls runs on this alone.
+#[allow(dead_code)] // only the `petest` milestone calls this so far
+pub fn spawn_pe(bytes: &[u8]) -> u64 {
+    let space = Process::new();
+    let img = crate::pe::load(&space, bytes).expect("spawn_pe: bad PE");
+    let stack_top = space.new_user_stack();
+    // MS x64 ABI: at the entry instruction RSP+8 must be 16-aligned.
+    let rsp = (stack_top & !0xF) - 8;
+    let task = Task::new(0, space);
+    sched::spawn_user("pe", task.clone(), img.entry, rsp);
+    task.pid
+}
+
 /// `fork`: eager (non-COW) copy of the caller's address space; the child
 /// resumes at the same user instruction with `rax = 0`.
 pub fn fork(frame: &UserFrame) -> i64 {

@@ -44,6 +44,7 @@ mod login;
 mod mm;
 mod object;
 mod pci;
+mod pe;
 mod process;
 mod sched;
 mod serial;
@@ -606,6 +607,20 @@ fn storage_milestone() {
             sched::yield_now();
         }
         kprintln!("THOS: pipe ok          `|` and `$(…)` through BusyBox sh");
+    }
+
+    // Phase 3: a statically linked Win64 `.exe` loaded by the native PE loader
+    // (no Wine, no ntdll yet — it only makes syscalls). Milestone 3 headline in
+    // miniature: ELF and PE containers, same ring-3 kernel.
+    #[cfg(feature = "petest")]
+    {
+        let exe = fs.read_path("/pe-hello.exe").expect("read /pe-hello.exe from ext2");
+        kprintln!("THOS: pe ok            /pe-hello.exe = {} bytes", exe.len());
+        let pid = process::spawn_pe(&exe);
+        while !process::pid_exited(pid) {
+            sched::yield_now();
+        }
+        kprintln!("THOS: pe exited        native PE64 ran to exit");
     }
 
     // AHCI write: round-trip a known pattern through a scratch sector past the
