@@ -444,9 +444,10 @@ fn write_pe_hello(path: &Path) {
         b"GetProcAddress",   // 16
         b"LoadLibraryA",     // 17
     ];
+    // A func spelled `#N` is imported by ordinal N instead of by name.
     let imports: [(&[u8], &[&[u8]]); 2] = [
         (b"KERNEL32.dll", k32_funcs),
-        (b"thoscrt.dll", &[b"thos_add"]),
+        (b"thoscrt.dll", &[b"thos_add", b"#2"]),
     ];
     let n_imp = imports.len();
     let import_dir_size = ((n_imp + 1) * 20) as u32;
@@ -469,17 +470,23 @@ fn write_pe_hello(path: &Path) {
         iat_at[d] = idata.len() as u32;
         idata.resize(idata.len() + (imports[d].1.len() + 1) * 8, 0);
     }
-    // Hint/name entries.
-    let mut hn_rvas: Vec<Vec<u32>> = vec![Vec::new(); n_imp];
+    // Thunk value per import: an ORDINAL_FLAG|ordinal for `#N`, else the RVA of
+    // a freshly emitted hint/name entry.
+    let mut thunks: Vec<Vec<u64>> = vec![Vec::new(); n_imp];
     for d in 0..n_imp {
         for f in imports[d].1 {
-            if idata.len() % 2 != 0 {
+            if let Some(ord) = f.strip_prefix(b"#") {
+                let n: u16 = std::str::from_utf8(ord).unwrap().parse().unwrap();
+                thunks[d].push(0x8000_0000_0000_0000u64 | n as u64);
+            } else {
+                if idata.len() % 2 != 0 {
+                    idata.push(0);
+                }
+                thunks[d].push((idata_rva + idata.len() as u32) as u64);
+                idata.extend_from_slice(&[0, 0]); // hint
+                idata.extend_from_slice(f);
                 idata.push(0);
             }
-            hn_rvas[d].push(idata_rva + idata.len() as u32);
-            idata.extend_from_slice(&[0, 0]); // hint
-            idata.extend_from_slice(f);
-            idata.push(0);
         }
     }
     // DLL name strings.
@@ -502,8 +509,8 @@ fn write_pe_hello(path: &Path) {
         put32(&mut idata, e + 12, dllname_rva[d]); // Name
         put32(&mut idata, e + 16, idata_rva + iat_at[d]); // FirstThunk
         for k in 0..imports[d].1.len() as u32 {
-            put64(&mut idata, ilt_at[d] + k * 8, hn_rvas[d][k as usize] as u64);
-            put64(&mut idata, iat_at[d] + k * 8, hn_rvas[d][k as usize] as u64);
+            put64(&mut idata, ilt_at[d] + k * 8, thunks[d][k as usize]);
+            put64(&mut idata, iat_at[d] + k * 8, thunks[d][k as usize]);
         }
     }
 
@@ -520,7 +527,8 @@ fn write_pe_hello(path: &Path) {
     let iat_ha = iat0 + 80; // HeapAlloc
     let iat_gpa = iat0 + 88; // GetProcAddress
     let iat_ll = iat0 + 96; // LoadLibraryA
-    let iat_add = idata_rva + iat_at[1]; // thoscrt!thos_add
+    let iat_add = idata_rva + iat_at[1]; // thoscrt!thos_add  (by name)
+    let iat_mul = idata_rva + iat_at[1] + 8; // thoscrt!thos_mul (by ordinal 2)
 
     // --- entry machine code (x86-64) ---
     // Deferred RIP-relative fixups: (disp32 position in `code`, target RVA).
@@ -555,6 +563,7 @@ fn write_pe_hello(path: &Path) {
     let thoscrtname_tag = u32::MAX - 19;
     let thosaddname_tag = u32::MAX - 20;
     let msg_dll_ldr_tag = u32::MAX - 21;
+    let msg_ord_tag = u32::MAX - 22;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -810,6 +819,25 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2p) thos_mul is imported from thoscrt.dll BY ORDINAL (2), not by name.
+    //     Call it (6*7), trap unless 42, print.
+    code.extend_from_slice(&[0xB9, 6, 0, 0, 0]); // mov ecx, 6
+    code.extend_from_slice(&[0xBA, 7, 0, 0, 0]); // mov edx, 7
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_mul); // call [rip+iat_thos_mul]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x83, 0xF8, 0x2A]); // cmp eax, 42
+    code.extend_from_slice(&[0x74, 0x01]); // je +1
+    code.extend_from_slice(&[0xCC]); // int3
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_ord_tag); // lea rdx, [rip+msg_ord]
+    let ord_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 3) ExitProcess(0)
     code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
@@ -859,6 +887,7 @@ fn write_pe_hello(path: &Path) {
     let msg_gpa: &[u8] = b"PE GetProcAddress OK\n";
     let msg_dll: &[u8] = b"PE dll thos_add=42 (DllMain ran)\n";
     let msg_dll_ldr: &[u8] = b"PE dll Ldr OK\n";
+    let msg_ord: &[u8] = b"PE dll ordinal OK\n";
     let msg_pp_off = code.len();
     code.extend_from_slice(msg_pp);
     let msg_ldr_off = code.len();
@@ -873,9 +902,12 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(msg_dll);
     let msg_dll_ldr_off = code.len();
     code.extend_from_slice(msg_dll_ldr);
+    let msg_ord_off = code.len();
+    code.extend_from_slice(msg_ord);
 
     code[dll_r8..dll_r8 + 4].copy_from_slice(&(msg_dll.len() as u32).to_le_bytes());
     code[dll_ldr_r8..dll_ldr_r8 + 4].copy_from_slice(&(msg_dll_ldr.len() as u32).to_le_bytes());
+    code[ord_r8..ord_r8 + 4].copy_from_slice(&(msg_ord.len() as u32).to_le_bytes());
     code[pp_r8..pp_r8 + 4].copy_from_slice(&(msg_pp.len() as u32).to_le_bytes());
     code[ldr_r8..ldr_r8 + 4].copy_from_slice(&(msg_ldr.len() as u32).to_le_bytes());
     code[va_r8..va_r8 + 4].copy_from_slice(&(msg_va.len() as u32).to_le_bytes());
@@ -906,6 +938,7 @@ fn write_pe_hello(path: &Path) {
             t if t == msg_dll_ldr_tag => text_rva + msg_dll_ldr_off as u32,
             t if t == thoscrtname_tag => text_rva + thoscrtname_off as u32,
             t if t == thosaddname_tag => text_rva + thosaddname_off as u32,
+            t if t == msg_ord_tag => text_rva + msg_ord_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -1033,19 +1066,24 @@ fn write_thoscrt_dll(path: &Path) {
     let iat_dir_rva = rdata_rva + iat_off;
     let iat_gle_rva = rdata_rva + iat_off; // the one imported slot
 
+    // Two exports: thos_add (ordinal 1, resolved by name) and thos_mul
+    // (ordinal 2 — pe-hello imports it *by ordinal*). EAT[1] is back-patched
+    // once thos_mul's offset in .text is known.
     let exp_dir_off = rdata.len() as u32;
     rdata.resize(rdata.len() + 40, 0); // IMAGE_EXPORT_DIRECTORY
     let eat_off = rdata.len() as u32;
-    rdata.resize(rdata.len() + 4, 0); // AddressOfFunctions[1]
+    rdata.resize(rdata.len() + 8, 0); // AddressOfFunctions[2]
     let enpt_off = rdata.len() as u32;
-    rdata.resize(rdata.len() + 4, 0); // AddressOfNames[1]
+    rdata.resize(rdata.len() + 8, 0); // AddressOfNames[2]
     let ord_off = rdata.len() as u32;
-    rdata.resize(rdata.len() + 2, 0); // AddressOfNameOrdinals[1]
+    rdata.resize(rdata.len() + 4, 0); // AddressOfNameOrdinals[2]
     if rdata.len() % 2 != 0 {
         rdata.push(0);
     }
     let expname_off = rdata.len() as u32;
     rdata.extend_from_slice(b"thos_add\0");
+    let expname2_off = rdata.len() as u32;
+    rdata.extend_from_slice(b"thos_mul\0");
     let expmod_off = rdata.len() as u32;
     rdata.extend_from_slice(b"thoscrt.dll\0");
     while rdata.len() % 4 != 0 {
@@ -1055,14 +1093,16 @@ fn write_thoscrt_dll(path: &Path) {
     let export_dir_size = rdata.len() as u32 - exp_dir_off;
     p32(&mut rdata, exp_dir_off as usize + 0x0C, rdata_rva + expmod_off); // Name
     p32(&mut rdata, exp_dir_off as usize + 0x10, 1); // Base (ordinal base)
-    p32(&mut rdata, exp_dir_off as usize + 0x14, 1); // NumberOfFunctions
-    p32(&mut rdata, exp_dir_off as usize + 0x18, 1); // NumberOfNames
+    p32(&mut rdata, exp_dir_off as usize + 0x14, 2); // NumberOfFunctions
+    p32(&mut rdata, exp_dir_off as usize + 0x18, 2); // NumberOfNames
     p32(&mut rdata, exp_dir_off as usize + 0x1C, rdata_rva + eat_off);
     p32(&mut rdata, exp_dir_off as usize + 0x20, rdata_rva + enpt_off);
     p32(&mut rdata, exp_dir_off as usize + 0x24, rdata_rva + ord_off);
-    p32(&mut rdata, eat_off as usize, text_rva); // thos_add == start of .text
+    p32(&mut rdata, eat_off as usize, text_rva); // EAT[0] = thos_add = start of .text
     p32(&mut rdata, enpt_off as usize, rdata_rva + expname_off);
-    rdata[ord_off as usize..ord_off as usize + 2].copy_from_slice(&0u16.to_le_bytes());
+    p32(&mut rdata, enpt_off as usize + 4, rdata_rva + expname2_off);
+    rdata[ord_off as usize..ord_off as usize + 2].copy_from_slice(&0u16.to_le_bytes()); // name[0] -> EAT[0]
+    rdata[ord_off as usize + 2..ord_off as usize + 4].copy_from_slice(&1u16.to_le_bytes()); // name[1] -> EAT[1]
 
     // A writable slot DllMain(DLL_PROCESS_ATTACH) sets to 1; thos_add refuses
     // to compute unless it is set, so `thos_add(40,2) == 42` also proves the
@@ -1108,6 +1148,13 @@ fn write_thoscrt_dll(path: &Path) {
     code[movm_pos + 2..movm_pos + 6].copy_from_slice(&(movm_disp as i32).to_le_bytes());
     code.extend_from_slice(&[0xB8, 0x01, 0, 0, 0]); // .skip: mov eax, 1  (TRUE)
     code.extend_from_slice(&[0xC3]); // ret
+
+    // thos_mul(rcx=a, rdx=b) -> a*b — pe-hello imports this one by ordinal (2).
+    let thos_mul_off = code.len() as u32;
+    code.extend_from_slice(&[0x89, 0xC8]); // mov eax, ecx
+    code.extend_from_slice(&[0x0F, 0xAF, 0xC2]); // imul eax, edx
+    code.extend_from_slice(&[0xC3]); // ret
+    p32(&mut rdata, (eat_off + 4) as usize, text_rva + thos_mul_off); // EAT[1] = thos_mul
 
     // --- .reloc: one header-only block — no fixups, but its presence makes
     //     the loader take the DLL relocation path. ---
@@ -1930,6 +1977,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE ntdll OK") // ntdll boundary: GetModuleHandleA + GetProcAddress + 9-arg NtWriteFile
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
+        && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
         && serial.contains("THOS: pe reject ok");
     if ok {
         println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll/System32-DLL (in Ldr)");

@@ -135,21 +135,33 @@ fn normalize_dll_name(raw: &str) -> String {
 }
 
 /// A module already resolved for the process: a synthetic system DLL or a real
-/// file loaded from System32. `exports` maps each exported name to its final
-/// virtual address, so an importer binds without touching mapped memory.
+/// file loaded from System32. `eat` holds each export's final virtual address
+/// indexed by `ordinal - ord_base`; `names` maps an export name to that index.
+/// An importer binds by name or by ordinal without touching mapped memory.
 struct LoadedModule {
     name: String, // lowercase base name incl. ".dll"
     #[allow(dead_code)]
     full: String, // "C:\\Windows\\System32\\NAME"
-    #[allow(dead_code)]
     base: u64,
-    #[allow(dead_code)]
     size: u64,
-    #[allow(dead_code)]
     entry: u64, // 0 = none / not run
-    exports: BTreeMap<String, u64>,
-    #[allow(dead_code)]
+    eat: Vec<u64>,
+    ord_base: u32,
+    names: BTreeMap<String, usize>,
     is_file: bool,
+}
+
+impl LoadedModule {
+    fn by_name(&self, n: &str) -> Option<u64> {
+        self.names
+            .get(n)
+            .and_then(|&i| self.eat.get(i).copied())
+            .filter(|&v| v != 0)
+    }
+    fn by_ordinal(&self, ord: u16) -> Option<u64> {
+        let i = (ord as u32).checked_sub(self.ord_base)? as usize;
+        self.eat.get(i).copied().filter(|&v| v != 0)
+    }
 }
 
 /// Per-`load()` DLL resolver: owns the dependency graph and the VA arena the
@@ -171,12 +183,12 @@ impl<'a> Loader<'a> {
             ("kernel32.dll", PE_KERNEL32_ADDR, &crate::nt::NT_EXPORTS[..]),
             ("ntdll.dll", PE_NTDLL_ADDR, &crate::nt::NTDLL_EXPORTS[..]),
         ] {
-            let mut exports = BTreeMap::new();
+            // Matches `map_synth_dll`'s export directory: Base 1, EAT[i] = stub i.
+            let mut eat = Vec::with_capacity(table.len());
+            let mut names = BTreeMap::new();
             for (i, &fname) in table.iter().enumerate() {
-                exports.insert(
-                    String::from(fname),
-                    base + SYNTH_STUBS_OFF + i as u64 * NT_STUB_STRIDE,
-                );
+                eat.push(base + SYNTH_STUBS_OFF + i as u64 * NT_STUB_STRIDE);
+                names.insert(String::from(fname), i);
             }
             mods.push(LoadedModule {
                 full: format!("C:\\Windows\\System32\\{}", name.to_ascii_uppercase()),
@@ -184,7 +196,9 @@ impl<'a> Loader<'a> {
                 base,
                 size: 0x1000,
                 entry: 0,
-                exports,
+                eat,
+                ord_base: 1,
+                names,
                 is_file: false,
             });
         }
@@ -230,7 +244,8 @@ impl<'a> Loader<'a> {
     fn load_dll(&mut self, name: &str, bytes: &[u8]) -> Result<usize, &'static str> {
         let base = self.arena_alloc(peek_size_of_image(bytes)?)?;
         let mut staged = stage_image(bytes, Some(base))?;
-        let exports = parse_exports(&staged.img, base, staged.export_rva, staged.export_size)?;
+        let (eat, ord_base, names) =
+            parse_export_table(&staged.img, base, staged.export_rva, staged.export_size)?;
 
         // Register before recursing so an import cycle terminates; the export
         // VAs are final already (arena base + RVA), no mapping needed to bind.
@@ -241,7 +256,9 @@ impl<'a> Loader<'a> {
             base,
             size: staged.size_of_image,
             entry: if staged.entry != base { staged.entry } else { 0 },
-            exports,
+            eat,
+            ord_base,
+            names,
             is_file: true,
         });
 
@@ -293,15 +310,20 @@ impl<'a> Loader<'a> {
                 if thunk == 0 {
                     break;
                 }
-                if thunk & 0x8000_0000_0000_0000 != 0 {
-                    return Err("PE: import by ordinal not supported yet");
-                }
-                let func = cstr_at(img, (thunk & 0x7FFF_FFFF) + 2)?; // skip the 2-byte hint
-                let addr = match self.mods[midx].exports.get(func) {
-                    Some(&a) => a,
-                    None => {
-                        crate::kprintln!("THOS: pe unresolved    {}!{}", dll.as_str(), func);
-                        return Err("PE: unresolved import");
+                let addr = if thunk & 0x8000_0000_0000_0000 != 0 {
+                    let ord = (thunk & 0xFFFF) as u16;
+                    self.mods[midx].by_ordinal(ord).ok_or_else(|| {
+                        crate::kprintln!("THOS: pe unresolved    {}#{}", dll.as_str(), ord);
+                        "PE: unresolved import (ordinal)"
+                    })?
+                } else {
+                    let func = cstr_at(img, (thunk & 0x7FFF_FFFF) + 2)?; // skip the 2-byte hint
+                    match self.mods[midx].by_name(func) {
+                        Some(a) => a,
+                        None => {
+                            crate::kprintln!("THOS: pe unresolved    {}!{}", dll.as_str(), func);
+                            return Err("PE: unresolved import");
+                        }
                     }
                 };
                 img[p_off..p_off + 8].copy_from_slice(&addr.to_le_bytes());
@@ -325,37 +347,47 @@ fn peek_size_of_image(file: &[u8]) -> Result<u64, &'static str> {
     Ok(soi)
 }
 
-/// Parse an `IMAGE_EXPORT_DIRECTORY` out of a materialised image, yielding
-/// `name -> absolute VA` (`base + function RVA`). Forwarder RVAs are skipped.
-fn parse_exports(
+/// Parse an `IMAGE_EXPORT_DIRECTORY` out of a materialised image. Returns
+/// `(eat, ord_base, names)`: `eat[i]` is the absolute VA of the export with
+/// ordinal `ord_base + i` (0 for an empty slot or a forwarder — forwarders are
+/// resolved in a later pass); `names` maps an export name to its `eat` index.
+#[allow(clippy::type_complexity)]
+fn parse_export_table(
     img: &[u8],
     base: u64,
     export_rva: u32,
     export_size: u32,
-) -> Result<BTreeMap<String, u64>, &'static str> {
-    let mut map = BTreeMap::new();
+) -> Result<(Vec<u64>, u32, BTreeMap<String, usize>), &'static str> {
+    let mut names = BTreeMap::new();
     if export_rva == 0 {
-        return Ok(map);
+        return Ok((Vec::new(), 1, names));
     }
     let ed = export_rva as usize;
-    let n_funcs = rd_u32(img, ed + 0x14)?;
+    let ord_base = rd_u32(img, ed + 0x10)?;
+    let n_funcs = rd_u32(img, ed + 0x14)? as usize;
     let n_names = rd_u32(img, ed + 0x18)? as usize;
-    let eat = rd_u32(img, ed + 0x1C)? as usize;
-    let enpt = rd_u32(img, ed + 0x20)? as usize;
-    let ords = rd_u32(img, ed + 0x24)? as usize;
-    for i in 0..n_names {
-        let name = String::from(cstr_at(img, rd_u32(img, enpt + i * 4)? as u64)?);
-        let ord = rd_u16(img, ords + i * 2)? as u32;
-        if ord >= n_funcs {
-            continue;
-        }
-        let frva = rd_u32(img, eat + ord as usize * 4)? as u64;
-        if frva == 0 || (frva >= export_rva as u64 && frva < (export_rva + export_size) as u64) {
-            continue; // empty slot or forwarder (unsupported)
-        }
-        map.insert(name, base + frva);
+    let eat_rva = rd_u32(img, ed + 0x1C)? as usize;
+    let enpt_rva = rd_u32(img, ed + 0x20)? as usize;
+    let ords_rva = rd_u32(img, ed + 0x24)? as usize;
+    if n_funcs > 64 * 1024 {
+        return Err("PE: absurd export count");
     }
-    Ok(map)
+
+    let mut eat = Vec::with_capacity(n_funcs);
+    for i in 0..n_funcs {
+        let frva = rd_u32(img, eat_rva + i * 4)? as u64;
+        let forwarder =
+            frva >= export_rva as u64 && frva < (export_rva as u64 + export_size as u64);
+        eat.push(if frva == 0 || forwarder { 0 } else { base + frva });
+    }
+    for i in 0..n_names {
+        let name = String::from(cstr_at(img, rd_u32(img, enpt_rva + i * 4)? as u64)?);
+        let idx = rd_u16(img, ords_rva + i * 2)? as usize;
+        if idx < eat.len() {
+            names.insert(name, idx);
+        }
+    }
+    Ok((eat, ord_base, names))
 }
 
 fn rd_u16(img: &[u8], off: usize) -> Result<u16, &'static str> {
