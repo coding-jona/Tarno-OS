@@ -552,6 +552,9 @@ fn write_pe_hello(path: &Path) {
     let iosb_tag = u32::MAX - 16;
     let msg_ntdll_tag = u32::MAX - 17;
     let msg_dll_tag = u32::MAX - 18;
+    let thoscrtname_tag = u32::MAX - 19;
+    let thosaddname_tag = u32::MAX - 20;
+    let msg_dll_ldr_tag = u32::MAX - 21;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -776,6 +779,37 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2o) thoscrt.dll is now in the PEB Ldr list: resolve thos_add at runtime
+    //     via GetModuleHandleA + GetProcAddress (not the static IAT), call it,
+    //     trap unless 42, print.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], thoscrtname_tag); // lea rcx, [rip+thoscrtname]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh); // call [rip+iat_GetModuleHandleA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (hThoscrt)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], thosaddname_tag); // lea rdx, [rip+thosaddname]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa); // call [rip+iat_GetProcAddress]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax  (resolved thos_add)
+    code.extend_from_slice(&[0xB9, 40, 0, 0, 0]); // mov ecx, 40
+    code.extend_from_slice(&[0xBA, 2, 0, 0, 0]); // mov edx, 2
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    code.extend_from_slice(&[0xFF, 0xD6]); // call rsi
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x83, 0xF8, 0x2A]); // cmp eax, 42
+    code.extend_from_slice(&[0x74, 0x01]); // je +1
+    code.extend_from_slice(&[0xCC]); // int3
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_dll_ldr_tag); // lea rdx, [rip+msg_dll_ldr]
+    let dll_ldr_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 3) ExitProcess(0)
     code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
@@ -806,6 +840,10 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"ntdll.dll\0");
     let ntwritename_off = code.len();
     code.extend_from_slice(b"NtWriteFile\0");
+    let thoscrtname_off = code.len();
+    code.extend_from_slice(b"thoscrt.dll\0");
+    let thosaddname_off = code.len();
+    code.extend_from_slice(b"thos_add\0");
     while code.len() % 8 != 0 {
         code.push(0);
     }
@@ -820,6 +858,7 @@ fn write_pe_hello(path: &Path) {
     let msg_va: &[u8] = b"PE VirtualAlloc+Heap OK\n";
     let msg_gpa: &[u8] = b"PE GetProcAddress OK\n";
     let msg_dll: &[u8] = b"PE dll thos_add=42\n";
+    let msg_dll_ldr: &[u8] = b"PE dll Ldr OK\n";
     let msg_pp_off = code.len();
     code.extend_from_slice(msg_pp);
     let msg_ldr_off = code.len();
@@ -832,8 +871,11 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(msg_ntdll);
     let msg_dll_off = code.len();
     code.extend_from_slice(msg_dll);
+    let msg_dll_ldr_off = code.len();
+    code.extend_from_slice(msg_dll_ldr);
 
     code[dll_r8..dll_r8 + 4].copy_from_slice(&(msg_dll.len() as u32).to_le_bytes());
+    code[dll_ldr_r8..dll_ldr_r8 + 4].copy_from_slice(&(msg_dll_ldr.len() as u32).to_le_bytes());
     code[pp_r8..pp_r8 + 4].copy_from_slice(&(msg_pp.len() as u32).to_le_bytes());
     code[ldr_r8..ldr_r8 + 4].copy_from_slice(&(msg_ldr.len() as u32).to_le_bytes());
     code[va_r8..va_r8 + 4].copy_from_slice(&(msg_va.len() as u32).to_le_bytes());
@@ -861,6 +903,9 @@ fn write_pe_hello(path: &Path) {
             t if t == iosb_tag => text_rva + iosb_off as u32,
             t if t == msg_ntdll_tag => text_rva + msg_ntdll_off as u32,
             t if t == msg_dll_tag => text_rva + msg_dll_off as u32,
+            t if t == msg_dll_ldr_tag => text_rva + msg_dll_ldr_off as u32,
+            t if t == thoscrtname_tag => text_rva + thoscrtname_off as u32,
+            t if t == thosaddname_tag => text_rva + thosaddname_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -1854,9 +1899,10 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE GetProcAddress OK") // LoadLibraryA + synthetic kernel32 export table
         && serial.contains("PE ntdll OK") // ntdll boundary: GetModuleHandleA + GetProcAddress + 9-arg NtWriteFile
         && serial.contains("PE dll thos_add=42") // real DLL from C:\Windows\System32 + recursive imports
+        && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("THOS: pe reject ok");
     if ok {
-        println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll/System32-DLL");
+        println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll/System32-DLL (in Ldr)");
     } else {
         eprintln!("pe-test: FAIL — the PE did not run to exit\n--- serial ---\n{serial}\n---");
         exit(1);

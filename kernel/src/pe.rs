@@ -89,6 +89,14 @@ const ENV_OFF: u64 = 0x500; // environment block (empty)
 const MOD2_OFF: u64 = 0x600; // LDR_DATA_TABLE_ENTRY (synthetic kernel32)
 const MOD3_OFF: u64 = 0x700; // LDR_DATA_TABLE_ENTRY (synthetic ntdll)
 
+/// A dedicated page for the `LDR_DATA_TABLE_ENTRY`s of DLLs loaded from disk
+/// (the params page is full). Entries grow up from 0; their UTF-16 names live
+/// in the back half. Enough for a first cut; a multi-page region comes later.
+const PE_LDRDATA_ADDR: u64 = NT_STUB_BASE + 0x6000;
+const LDR_ENTRY_STRIDE: u64 = 0x80;
+const LDRDATA_STR_OFF: usize = 0x800;
+const MAX_FILE_LDR_MODS: usize = 12;
+
 /// Synthetic system DLLs: one page each carrying a minimal PE32+ header, a
 /// copy of the NT trampolines, and a real `IMAGE_EXPORT_DIRECTORY` naming
 /// each. Both are present in the PEB `Ldr` lists so `GetModuleHandleA` /
@@ -511,6 +519,14 @@ fn stage_image(file: &[u8], want_base: Option<u64>) -> Result<StagedImage, &'sta
 /// Load a Win64 `.exe`: stage it, resolve its imports (pulling in synthetic
 /// system modules and real DLLs from `C:\Windows\System32`), map everything,
 /// and lay out the TEB / PEB.
+/// A DLL loaded from disk, as the PEB `Ldr` list needs it.
+struct LdrFileMod {
+    base: u64,
+    entry: u64,
+    size: u64,
+    name: String, // lowercase base name incl. ".dll"
+}
+
 pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'static str> {
     let mut ldr = Loader::new(proc);
     let mut staged = stage_image(file, None)?;
@@ -526,7 +542,28 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     }
     map_kernel32_page(proc)?;
     map_ntdll_page(proc)?;
-    map_teb_peb(proc, staged.load_base, staged.entry, staged.size_of_image, stack_top)?;
+
+    let file_mods: Vec<LdrFileMod> = ldr
+        .mods
+        .iter()
+        .filter(|m| m.is_file)
+        .map(|m| LdrFileMod { base: m.base, entry: m.entry, size: m.size, name: m.name.clone() })
+        .collect();
+    if file_mods.len() > MAX_FILE_LDR_MODS {
+        crate::kprintln!(
+            "THOS: pe warn          {} file DLLs, only {} land in the Ldr list",
+            file_mods.len(),
+            MAX_FILE_LDR_MODS
+        );
+    }
+    map_teb_peb(
+        proc,
+        staged.load_base,
+        staged.entry,
+        staged.size_of_image,
+        stack_top,
+        &file_mods,
+    )?;
 
     Ok(PeImage {
         entry: staged.entry,
@@ -536,15 +573,46 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     })
 }
 
+/// Write a circular doubly-linked `LIST_ENTRY` ring (`Flink` at +0, `Blink` at
+/// +8) for the nodes whose VA falls inside `[page_base, page_base+0x1000)`.
+/// `nodes[0]` is the list head; the ring closes back to it.
+fn link_ring(page: &mut [u8], page_base: u64, nodes: &[u64]) {
+    let n = nodes.len();
+    for (p, &va) in nodes.iter().enumerate() {
+        if va < page_base || va >= page_base + 4096 {
+            continue;
+        }
+        let off = (va - page_base) as usize;
+        page[off..off + 8].copy_from_slice(&nodes[(p + 1) % n].to_le_bytes());
+        page[off + 8..off + 16].copy_from_slice(&nodes[(p + n - 1) % n].to_le_bytes());
+    }
+}
+
 /// Allocate + map the TEB and PEB pages and fill the few fields a Win64 entry /
-/// CRT touches immediately.
+/// CRT touches immediately, plus the `PEB->Ldr` module list (exe, the two
+/// synthetic modules, then every DLL loaded from `C:\Windows\System32`).
 fn map_teb_peb(
     proc: &Process,
     image_base: u64,
     entry: u64,
     size_of_image: u64,
     stack_top: u64,
+    file_mods: &[LdrFileMod],
 ) -> Result<(), &'static str> {
+    let n_file = file_mods.len().min(MAX_FILE_LDR_MODS);
+    // The LIST_ENTRY VAs for list `i` (0=InLoadOrder, 1=InMemoryOrder,
+    // 2=InInitOrder): head, exe, kernel32, ntdll, then each file DLL.
+    let nodes_for = |i: u64| -> Vec<u64> {
+        let mut v = Vec::with_capacity(4 + n_file);
+        v.push(PE_PARAMS_ADDR + LDR_OFF + 0x10 + i * 0x10); // head
+        v.push(PE_PARAMS_ADDR + MOD_OFF + i * 0x10); // exe
+        v.push(PE_PARAMS_ADDR + MOD2_OFF + i * 0x10); // kernel32
+        v.push(PE_PARAMS_ADDR + MOD3_OFF + i * 0x10); // ntdll
+        for k in 0..n_file {
+            v.push(PE_LDRDATA_ADDR + k as u64 * LDR_ENTRY_STRIDE + i * 0x10);
+        }
+        v
+    };
     let w = |addr: u64, fill: &dyn Fn(&mut [u8])| -> Result<(), &'static str> {
         let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (TEB/PEB)")?;
         let phys = frame.start_address();
@@ -618,27 +686,16 @@ fn map_teb_peb(
         put(b, PARAMS_OFF + 0x78, cmd_buf);
         put(b, PARAMS_OFF + 0x80, PE_PARAMS_ADDR + ENV_OFF); // Environment (empty: two NUL words)
 
-        // --- PEB_LDR_DATA @ LDR_OFF: three circular elements — exe, then the
-        //     synthetic kernel32 and ntdll. Each of the three lists threads
-        //     head -> exe -> kernel32 -> ntdll -> head. The head LIST_ENTRYs
-        //     sit at LDR_OFF+0x10/0x20/0x30; an entry's are at MODx_OFF+0/0x10/
-        //     0x20 (list i). ---
-        let mod_offs = [MOD_OFF, MOD2_OFF, MOD3_OFF];
+        // --- PEB_LDR_DATA @ LDR_OFF. The three lists each thread
+        //     head -> exe -> kernel32 -> ntdll -> file DLLs -> head. The head
+        //     LIST_ENTRYs sit at LDR_OFF+0x10/0x20/0x30; an entry's own three
+        //     are at its base +0x00/0x10/0x20. `link_ring` writes the links for
+        //     whichever page each node lives in; the file-DLL entries and their
+        //     links are filled in the separate PE_LDRDATA page below. ---
         put(b, LDR_OFF + 0x00, 0x58); // Length
         b[(LDR_OFF + 0x04) as usize] = 1; // Initialized
         for i in 0..3u64 {
-            let head_off = LDR_OFF + 0x10 + i * 0x10;
-            let head_va = PE_PARAMS_ADDR + head_off;
-            let link_va = |k: usize| PE_PARAMS_ADDR + mod_offs[k] + i * 0x10;
-            put(b, head_off, link_va(0)); // head.Flink -> first module
-            put(b, head_off + 8, link_va(mod_offs.len() - 1)); // head.Blink -> last
-            for k in 0..mod_offs.len() {
-                let off = mod_offs[k] + i * 0x10;
-                let flink = if k + 1 == mod_offs.len() { head_va } else { link_va(k + 1) };
-                let blink = if k == 0 { head_va } else { link_va(k - 1) };
-                put(b, off, flink);
-                put(b, off + 8, blink);
-            }
+            link_ring(b, PE_PARAMS_ADDR, &nodes_for(i));
         }
         put(b, MOD_OFF + 0x30, image_base); // DllBase
         put(b, MOD_OFF + 0x38, entry); // EntryPoint
@@ -675,6 +732,44 @@ fn map_teb_peb(
             .copy_from_slice(ANSI_CMDLINE);
         // ENV_OFF: leave the two NUL words already zeroed
     })?;
+
+    // --- PE_LDRDATA page: one LDR_DATA_TABLE_ENTRY per on-disk DLL, plus its
+    //     UTF-16 names, plus this page's share of the three ring links. ---
+    if n_file != 0 {
+        w(PE_LDRDATA_ADDR, &|d| {
+            let mut scur = LDRDATA_STR_OFF;
+            let mut wput = |d: &mut [u8], s: &str| -> (u64, u16) {
+                let va = PE_LDRDATA_ADDR + scur as u64;
+                let mut n = 0usize;
+                for u in s.encode_utf16() {
+                    d[scur + n..scur + n + 2].copy_from_slice(&u.to_le_bytes());
+                    n += 2;
+                }
+                d[scur + n..scur + n + 2].copy_from_slice(&[0, 0]);
+                scur += n + 2;
+                scur = (scur + 1) & !1;
+                (va, n as u16)
+            };
+            for (k, m) in file_mods.iter().take(n_file).enumerate() {
+                let e = k * LDR_ENTRY_STRIDE as usize;
+                let (full_buf, full_len) =
+                    wput(d, &alloc::format!("C:\\Windows\\System32\\{}", m.name));
+                let (base_buf, base_len) = wput(d, &m.name);
+                d[e + 0x30..e + 0x38].copy_from_slice(&m.base.to_le_bytes()); // DllBase
+                d[e + 0x38..e + 0x40].copy_from_slice(&m.entry.to_le_bytes()); // EntryPoint
+                d[e + 0x40..e + 0x48].copy_from_slice(&(m.size & 0xFFFF_FFFF).to_le_bytes());
+                d[e + 0x48..e + 0x4A].copy_from_slice(&full_len.to_le_bytes()); // FullDllName
+                d[e + 0x4A..e + 0x4C].copy_from_slice(&(full_len + 2).to_le_bytes());
+                d[e + 0x50..e + 0x58].copy_from_slice(&full_buf.to_le_bytes());
+                d[e + 0x58..e + 0x5A].copy_from_slice(&base_len.to_le_bytes()); // BaseDllName
+                d[e + 0x5A..e + 0x5C].copy_from_slice(&(base_len + 2).to_le_bytes());
+                d[e + 0x60..e + 0x68].copy_from_slice(&base_buf.to_le_bytes());
+            }
+            for i in 0..3u64 {
+                link_ring(d, PE_LDRDATA_ADDR, &nodes_for(i));
+            }
+        })?;
+    }
     Ok(())
 }
 
