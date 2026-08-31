@@ -790,6 +790,7 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     // (dependency order — a DLL is registered before its own file-DLL imports,
     // so reverse of load order is deps-first). All share the
     // `(hinst, DLL_PROCESS_ATTACH, 1)` signature.
+    let n_tls = ldr.tls_cbs.len();
     let mut init: Vec<(u64, u64)> = ldr.tls_cbs.clone();
     init.extend(
         file_mods
@@ -801,7 +802,7 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     let entry = if init.is_empty() {
         staged.entry
     } else {
-        map_bootstrap(proc, &init, staged.entry)?;
+        map_bootstrap(proc, &init, n_tls, staged.entry)?;
         PE_BOOTSTRAP_ADDR
     };
 
@@ -820,6 +821,7 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
 fn map_bootstrap(
     proc: &Process,
     init: &[(u64, u64)],
+    n_tls: usize,
     exe_entry: u64,
 ) -> Result<(), &'static str> {
     let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (bootstrap)")?;
@@ -830,7 +832,9 @@ fn map_bootstrap(
         core::slice::from_raw_parts_mut(p, 4096)
     };
 
-    // {base, entry} pairs then a {0,0} terminator.
+    // {base, entry} pairs then a {0,0} terminator. The first `n_tls` are TLS
+    // callbacks (return value ignored); the rest are DllMains (a `FALSE`
+    // return aborts process init).
     let mut o = BOOTSTRAP_LIST_OFF;
     for &(base, ent) in init {
         page[o..o + 8].copy_from_slice(&base.to_le_bytes());
@@ -838,37 +842,61 @@ fn map_bootstrap(
         o += 16;
     }
     if o + 16 > BOOTSTRAP_ENTRY_OFF {
-        return Err("PE: too many DllMains for the bootstrap page");
+        return Err("PE: too many init routines for the bootstrap page");
     }
     page[BOOTSTRAP_ENTRY_OFF..BOOTSTRAP_ENTRY_OFF + 8].copy_from_slice(&exe_entry.to_le_bytes());
 
-    // code @ offset 0
+    // code @ offset 0:
+    //   rbx = &list; r13 = n_tls; r14 = index
+    //   loop: base = [rbx]; if base == 0 -> jmp exe_entry
+    //         call [rbx+8](base, DLL_PROCESS_ATTACH, 1)
+    //         if r14 >= r13 && eax == 0 -> ExitProcess(STATUS-ish)
+    //         r14++; rbx += 16; loop
     let mut c: Vec<u8> = Vec::new();
-    c.extend_from_slice(&[0x48, 0xBB]); // mov rbx, imm64
+    c.extend_from_slice(&[0x48, 0xBB]); // mov rbx, imm64  (list)
     c.extend_from_slice(&(PE_BOOTSTRAP_ADDR + BOOTSTRAP_LIST_OFF as u64).to_le_bytes());
+    c.extend_from_slice(&[0x41, 0xBD]); // mov r13d, imm32  (n_tls)
+    c.extend_from_slice(&(n_tls as u32).to_le_bytes());
+    c.extend_from_slice(&[0x45, 0x31, 0xF6]); // xor r14d, r14d  (index)
     let loop_start = c.len();
-    c.extend_from_slice(&[0x48, 0x8B, 0x03]); // mov rax, [rbx]  (base)
+    c.extend_from_slice(&[0x48, 0x8B, 0x03]); // mov rax, [rbx]
     c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
     let jz_at = c.len();
-    c.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]); // jz .done (rel32)
-    c.extend_from_slice(&[0x48, 0x89, 0xC1]); // mov rcx, rax  (hinstDLL)
-    c.extend_from_slice(&[0xBA, 1, 0, 0, 0]); // mov edx, 1    (DLL_PROCESS_ATTACH)
-    c.extend_from_slice(&[0x41, 0xB8, 1, 0, 0, 0]); // mov r8d, 1  (lpvReserved != NULL)
-    c.extend_from_slice(&[0x48, 0x8B, 0x73, 0x08]); // mov rsi, [rbx+8]  (entry)
+    c.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]); // jz .done
+    c.extend_from_slice(&[0x48, 0x89, 0xC1]); // mov rcx, rax
+    c.extend_from_slice(&[0xBA, 1, 0, 0, 0]); // mov edx, 1
+    c.extend_from_slice(&[0x41, 0xB8, 1, 0, 0, 0]); // mov r8d, 1
+    c.extend_from_slice(&[0x48, 0x8B, 0x73, 0x08]); // mov rsi, [rbx+8]
     c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
     c.extend_from_slice(&[0xFF, 0xD6]); // call rsi
     c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    c.extend_from_slice(&[0x45, 0x39, 0xEE]); // cmp r14d, r13d
+    c.extend_from_slice(&[0x72, 0x04]); // jb .next   (index < n_tls: a TLS callback, ignore eax)
+    c.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+    c.extend_from_slice(&[0x74, 0x0C]); // jz .fail   (DllMain returned FALSE -> 12 bytes to .fail)
+    // .next:
+    c.extend_from_slice(&[0x41, 0xFF, 0xC6]); // inc r14d
     c.extend_from_slice(&[0x48, 0x83, 0xC3, 0x10]); // add rbx, 16
     let jmp_at = c.len();
-    c.extend_from_slice(&[0xE9, 0, 0, 0, 0]); // jmp .loop (rel32)
-    let rel = loop_start as i64 - (jmp_at as i64 + 5);
-    c[jmp_at + 1..jmp_at + 5].copy_from_slice(&(rel as i32).to_le_bytes());
-    let done = c.len();
-    c[jz_at + 2..jz_at + 6].copy_from_slice(&((done as i64 - (jz_at as i64 + 6)) as i32).to_le_bytes());
+    c.extend_from_slice(&[0xE9, 0, 0, 0, 0]); // jmp .loop
+    c[jmp_at + 1..jmp_at + 5]
+        .copy_from_slice(&((loop_start as i64 - (jmp_at as i64 + 5)) as i32).to_le_bytes());
+    // .fail: ExitProcess(0x135) via the NT_EXITPROCESS selector, inline.
+    c.extend_from_slice(&[0xB9, 0x35, 0x01, 0, 0]); // mov ecx, 0x135  (exit code)
+    let sel = (crate::nt::NT_BASE | crate::nt::NT_EXITPROCESS as u64) as u32;
+    c.extend_from_slice(&[0xB8]); // mov eax, imm32
+    c.extend_from_slice(&sel.to_le_bytes());
+    c.extend_from_slice(&[0x49, 0x89, 0xCA]); // mov r10, rcx
+    c.extend_from_slice(&[0x0F, 0x05]); // syscall
+    c.extend_from_slice(&[0x0F, 0x0B]); // ud2  (unreachable)
+    // .done:
+    let done_at = c.len();
+    c[jz_at + 2..jz_at + 6]
+        .copy_from_slice(&((done_at as i64 - (jz_at as i64 + 6)) as i32).to_le_bytes());
     let mov_at = c.len();
     c.extend_from_slice(&[0x48, 0x8B, 0x05, 0, 0, 0, 0]); // mov rax, [rip+exe_entry_slot]
-    let disp = BOOTSTRAP_ENTRY_OFF as i64 - (mov_at as i64 + 7);
-    c[mov_at + 3..mov_at + 7].copy_from_slice(&(disp as i32).to_le_bytes());
+    c[mov_at + 3..mov_at + 7]
+        .copy_from_slice(&((BOOTSTRAP_ENTRY_OFF as i64 - (mov_at as i64 + 7)) as i32).to_le_bytes());
     c.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
 
     if c.len() > BOOTSTRAP_LIST_OFF {

@@ -317,6 +317,22 @@ fn disk_image() -> PathBuf {
         img.to_str().unwrap(),
     ]));
 
+    // DllMain-returns-FALSE test: failcrt.dll aborts init; pe-dllfail.exe's
+    // entry (which prints a line) must therefore never run.
+    let failcrt = root.join("target/failcrt.dll");
+    write_failcrt_dll(&failcrt);
+    run(Command::new("debugfs").args([
+        "-w", "-R",
+        &format!("write {} /Windows/System32/failcrt.dll", failcrt.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+    let pedllfail = root.join("target/pe-dllfail.exe");
+    write_pe_dllfail(&pedllfail);
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} pe-dllfail.exe", pedllfail.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+
     // BusyBox applet links: `/bin/<applet>` hard-links to the single `/busybox`
     // inode, so the shell can run `ls`, `cat`, ... by PATH lookup (BusyBox
     // dispatches on `basename(argv[0])`). `debugfs ln` does not maintain the
@@ -1357,6 +1373,228 @@ fn write_thoscrt_dll(path: &Path) {
     std::fs::write(path, &pe).expect("write thoscrt.dll");
 }
 
+/// Assemble a minimal PE32+ (`.exe` or `.dll`) from parts. `sections` are
+/// `(name, rva, characteristics, bytes)`; `dirs` are `(index, rva, size)` data
+/// directory entries. With `reloc_stub`, a header-only `.reloc` section +
+/// `DYNAMIC_BASE` are appended (0 fixups — the caller's content must be
+/// position-independent), so the loader will accept the image at any base.
+fn write_min_pe(
+    path: &Path,
+    is_dll: bool,
+    image_base: u64,
+    entry_rva: u32,
+    sections: &[(&[u8], u32, u32, &[u8])],
+    dirs: &[(usize, u32, u32)],
+    reloc_stub: bool,
+) {
+    const SECT_ALIGN: u32 = 0x1000;
+    const FILE_ALIGN: u32 = 0x200;
+
+    let text_rva = sections[0].1;
+    let reloc_rva = sections
+        .iter()
+        .map(|(_, rva, _, d)| rva + (d.len() as u32).div_ceil(SECT_ALIGN) * SECT_ALIGN)
+        .max()
+        .unwrap_or(SECT_ALIGN);
+    let reloc_body: Vec<u8> = {
+        let mut v = Vec::new();
+        v.extend_from_slice(&text_rva.to_le_bytes()); // PageRVA
+        v.extend_from_slice(&8u32.to_le_bytes()); // BlockSize (header only)
+        v
+    };
+    let mut secs: Vec<(&[u8], u32, u32, &[u8])> = sections.to_vec();
+    if reloc_stub {
+        secs.push((b".reloc", reloc_rva, 0x4200_0040, &reloc_body));
+    }
+    let sections = &secs[..];
+
+    let opt_size = 0xF0usize;
+    let hdr = 0x40 + 4 + 20 + opt_size + sections.len() * 40;
+    let size_of_headers = (hdr as u32).div_ceil(FILE_ALIGN) * FILE_ALIGN;
+
+    let mut raw_ptr = size_of_headers;
+    let mut layout: Vec<(u32, u32, u32)> = Vec::new(); // (raw_ptr, raw_size, vsize)
+    for (_, _, _, data) in sections {
+        let rs = (data.len() as u32).div_ceil(FILE_ALIGN) * FILE_ALIGN;
+        layout.push((raw_ptr, rs, data.len() as u32));
+        raw_ptr += rs;
+    }
+    let size_of_image = sections
+        .iter()
+        .map(|(_, rva, _, d)| rva + (d.len() as u32).div_ceil(SECT_ALIGN) * SECT_ALIGN)
+        .max()
+        .unwrap_or(SECT_ALIGN);
+
+    let mut pe = vec![0u8; raw_ptr as usize];
+    pe[0..2].copy_from_slice(b"MZ");
+    pe[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+    let o = 0x40usize;
+    pe[o..o + 4].copy_from_slice(b"PE\0\0");
+    let coff = o + 4;
+    pe[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes());
+    pe[coff + 2..coff + 4].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+    pe[coff + 16..coff + 18].copy_from_slice(&(opt_size as u16).to_le_bytes());
+    let chars: u16 = if is_dll { 0x2022 } else { 0x0022 }; // EXECUTABLE|LAA (+DLL)
+    pe[coff + 18..coff + 20].copy_from_slice(&chars.to_le_bytes());
+    let opt = coff + 20;
+    pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes());
+    pe[opt + 16..opt + 20].copy_from_slice(&entry_rva.to_le_bytes());
+    pe[opt + 24..opt + 32].copy_from_slice(&image_base.to_le_bytes());
+    pe[opt + 32..opt + 36].copy_from_slice(&SECT_ALIGN.to_le_bytes());
+    pe[opt + 36..opt + 40].copy_from_slice(&FILE_ALIGN.to_le_bytes());
+    pe[opt + 40..opt + 42].copy_from_slice(&6u16.to_le_bytes());
+    pe[opt + 48..opt + 50].copy_from_slice(&6u16.to_le_bytes());
+    pe[opt + 56..opt + 60].copy_from_slice(&size_of_image.to_le_bytes());
+    pe[opt + 60..opt + 64].copy_from_slice(&size_of_headers.to_le_bytes());
+    pe[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes()); // Subsystem
+    if reloc_stub {
+        pe[opt + 70..opt + 72].copy_from_slice(&0x0040u16.to_le_bytes()); // DYNAMIC_BASE
+    }
+    pe[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+    let mut dirs = dirs.to_vec();
+    if reloc_stub {
+        dirs.push((5, reloc_rva, reloc_body.len() as u32));
+    }
+    for &(idx, rva, size) in &dirs {
+        pe[opt + 112 + idx * 8..opt + 112 + idx * 8 + 4].copy_from_slice(&rva.to_le_bytes());
+        pe[opt + 112 + idx * 8 + 4..opt + 112 + idx * 8 + 8].copy_from_slice(&size.to_le_bytes());
+    }
+    for (i, (name, rva, sc, data)) in sections.iter().enumerate() {
+        let h = opt + opt_size + i * 40;
+        pe[h..h + name.len()].copy_from_slice(name);
+        pe[h + 8..h + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        pe[h + 12..h + 16].copy_from_slice(&rva.to_le_bytes());
+        pe[h + 16..h + 20].copy_from_slice(&layout[i].1.to_le_bytes());
+        pe[h + 20..h + 24].copy_from_slice(&layout[i].0.to_le_bytes());
+        pe[h + 36..h + 40].copy_from_slice(&sc.to_le_bytes());
+        pe[layout[i].0 as usize..layout[i].0 as usize + data.len()].copy_from_slice(data);
+    }
+    std::fs::write(path, &pe).expect("write min pe");
+}
+
+/// `failcrt.dll` — exports `fc_dummy`, and its `DllMain(DLL_PROCESS_ATTACH)`
+/// returns **FALSE**. Loaded at its preferred base (no relocations).
+fn write_failcrt_dll(path: &Path) {
+    const IB: u64 = 0x1_9000_0000;
+    let text_rva = 0x1000u32;
+    let rdata_rva = 0x2000u32;
+    let p32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+
+    // .text: fc_dummy at 0, DllMain after it.
+    let mut text: Vec<u8> = Vec::new();
+    text.extend_from_slice(&[0x31, 0xC0, 0xC3]); // fc_dummy: xor eax,eax ; ret
+    let dllmain_off = text.len() as u32;
+    text.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1
+    text.extend_from_slice(&[0x75, 0x03]); // jne .ok
+    text.extend_from_slice(&[0x31, 0xC0, 0xC3]); // xor eax,eax ; ret   (FALSE)
+    text.extend_from_slice(&[0xB8, 0x01, 0, 0, 0]); // .ok: mov eax, 1
+    text.extend_from_slice(&[0xC3]); // ret
+
+    // .rdata: export directory with one name, fc_dummy -> EAT[0] = text_rva.
+    let mut rd = vec![0u8; 40];
+    let eat_off = rd.len() as u32;
+    rd.extend_from_slice(&[0u8; 4]);
+    let enpt_off = rd.len() as u32;
+    rd.extend_from_slice(&[0u8; 4]);
+    let ord_off = rd.len() as u32;
+    rd.extend_from_slice(&[0u8; 2]);
+    let name_off = rd.len() as u32;
+    rd.extend_from_slice(b"fc_dummy\0");
+    let mod_off = rd.len() as u32;
+    rd.extend_from_slice(b"failcrt.dll\0");
+    while rd.len() % 4 != 0 {
+        rd.push(0);
+    }
+    p32(&mut rd, 0x0C, rdata_rva + mod_off);
+    p32(&mut rd, 0x10, 1);
+    p32(&mut rd, 0x14, 1);
+    p32(&mut rd, 0x18, 1);
+    p32(&mut rd, 0x1C, rdata_rva + eat_off);
+    p32(&mut rd, 0x20, rdata_rva + enpt_off);
+    p32(&mut rd, 0x24, rdata_rva + ord_off);
+    p32(&mut rd, eat_off as usize, text_rva);
+    p32(&mut rd, enpt_off as usize, rdata_rva + name_off);
+    let exp_size = rd.len() as u32;
+
+    write_min_pe(
+        path,
+        true,
+        IB,
+        text_rva + dllmain_off,
+        &[
+            (b".text", text_rva, 0x6000_0020, &text),
+            (b".rdata", rdata_rva, 0x4000_0040, &rd),
+        ],
+        &[(0, rdata_rva, exp_size)],
+        true,
+    );
+}
+
+/// `pe-dllfail.exe` — imports `failcrt.dll!fc_dummy` (so the DLL loads and its
+/// FALSE `DllMain` runs). Its entry prints "PE DLLFAIL REACHED ENTRY" via raw
+/// Linux syscalls and exits — the line only appears if init was *not* aborted.
+fn write_pe_dllfail(path: &Path) {
+    const IB: u64 = 0x1_4000_0000;
+    let text_rva = 0x1000u32;
+    let idata_rva = 0x2000u32;
+    let p32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let p64 = |b: &mut [u8], at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+
+    // .idata: one IMPORT_DESCRIPTOR for failcrt.dll, one thunk (fc_dummy).
+    let mut id = vec![0u8; 40]; // IDT[0] + null
+    let ilt_off = id.len() as u32;
+    id.extend_from_slice(&[0u8; 16]);
+    let iat_off = id.len() as u32;
+    id.extend_from_slice(&[0u8; 16]);
+    let hint_off = id.len() as u32;
+    id.extend_from_slice(&[0, 0]);
+    id.extend_from_slice(b"fc_dummy\0");
+    if id.len() % 2 != 0 {
+        id.push(0);
+    }
+    let dll_off = id.len() as u32;
+    id.extend_from_slice(b"failcrt.dll\0");
+    while id.len() % 4 != 0 {
+        id.push(0);
+    }
+    p32(&mut id, 0, idata_rva + ilt_off);
+    p32(&mut id, 12, idata_rva + dll_off);
+    p32(&mut id, 16, idata_rva + iat_off);
+    p64(&mut id, ilt_off as usize, (idata_rva + hint_off) as u64);
+    p64(&mut id, iat_off as usize, (idata_rva + hint_off) as u64);
+
+    // .text: write(1, msg, len) ; exit_group(0)  — RIP-relative, no relocs.
+    let msg: &[u8] = b"PE DLLFAIL REACHED ENTRY\n";
+    let mut text: Vec<u8> = Vec::new();
+    text.extend_from_slice(&[0xB8, 1, 0, 0, 0]); // mov eax, 1  (write)
+    text.extend_from_slice(&[0xBF, 1, 0, 0, 0]); // mov edi, 1
+    let lea_at = text.len();
+    text.extend_from_slice(&[0x48, 0x8D, 0x35, 0, 0, 0, 0]); // lea rsi, [rip+msg]
+    text.extend_from_slice(&[0xBA]);
+    text.extend_from_slice(&(msg.len() as u32).to_le_bytes()); // mov edx, len
+    text.extend_from_slice(&[0x0F, 0x05]); // syscall
+    text.extend_from_slice(&[0xB8, 231, 0, 0, 0]); // mov eax, 231 (exit_group)
+    text.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+    text.extend_from_slice(&[0x0F, 0x05]); // syscall
+    let msg_off = text.len();
+    text.extend_from_slice(msg);
+    let disp = msg_off as i64 - (lea_at as i64 + 7);
+    text[lea_at + 3..lea_at + 7].copy_from_slice(&(disp as i32).to_le_bytes());
+
+    write_min_pe(
+        path,
+        false,
+        IB,
+        text_rva,
+        &[
+            (b".text", text_rva, 0x6000_0020, &text),
+            (b".idata", idata_rva, 0xC000_0040, &id),
+        ],
+        &[(1, idata_rva, 40)],
+        false,
+    );
+}
+
 // --- shared plumbing for the interactive (monitor-driven) QEMU tests ---
 
 /// Spawn the interactive kernel with a USB keyboard, serial → file, and the
@@ -2109,6 +2347,8 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
         && serial.contains("PE dll forward OK") // forwarder export (thoscrt -> KERNEL32.GetProcessHeap)
         && serial.contains("PE TLS OK") // static TLS: block copied, __tls_index written, callback ran
+        && serial.contains("THOS: pe dllfail ok") // a DllMain returning FALSE aborted process init
+        && !serial.contains("PE DLLFAIL REACHED ENTRY") // ...so the exe entry never ran
         && serial.contains("THOS: pe reject ok");
     if ok {
         println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll/System32-DLL (in Ldr)");
