@@ -753,7 +753,8 @@ fn spawn_interactive_qemu(tag: &str, iso: &Path, disk: &Path) -> (std::process::
         "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0",
         "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0",
     ]);
-    qemu.args(["-display", "none", "-no-reboot"]);
+    let gui = std::env::args().any(|a| a == "--gui");
+    qemu.args(["-display", if gui { "gtk" } else { "none" }, "-no-reboot"]);
     qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
     qemu.args(["-monitor", &format!("unix:{},server,nowait", sock.to_str().unwrap())]);
     for ovmf in ["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/ovmf/OVMF.fd"] {
@@ -763,6 +764,32 @@ fn spawn_interactive_qemu(tag: &str, iso: &Path, disk: &Path) -> (std::process::
         }
     }
     let child = qemu.spawn().expect("spawn qemu");
+
+    // Follow the serial log and stream new lines to this terminal so the run is
+    // visible (the monitor drives the keyboard, so the serial can't be stdio).
+    {
+        let log = log.clone();
+        let tag = tag.to_string();
+        let pid = child.id();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Seek, SeekFrom};
+            let mut pos: u64 = 0;
+            loop {
+                if let Ok(mut f) = std::fs::File::open(&log) {
+                    let _ = f.seek(SeekFrom::Start(pos));
+                    for line in BufReader::new(&f).lines().map_while(Result::ok) {
+                        println!("  {tag} │ {line}");
+                    }
+                    pos = f.stream_position().unwrap_or(pos);
+                }
+                // stop once the qemu process is gone
+                if std::fs::read(format!("/proc/{pid}/stat")).is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        });
+    }
     (child, log, sock)
 }
 
@@ -1151,10 +1178,16 @@ fn bootpick_test() {
 /// Boot the non-interactive kernel with `disk` attached over AHCI, wait for a
 /// clean `ExitCode::Success` halt, and return the serial log. Exits on failure.
 fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     let log = workspace_root().join(format!("target/{tag}-serial.log"));
-    let _ = std::fs::remove_file(&log);
+    // The kernel serial is streamed to this terminal live *and* captured for the
+    // assertions *and* written to the log file. `cargo xtask <test> --gui` also
+    // opens a QEMU window so the framebuffer is visible; otherwise `tail -f
+    // target/<tag>-serial.log` in another shell follows a run.
+    let gui = std::env::args().any(|a| a == "--gui");
 
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu.args(["-M", "q35", "-m", "512M", "-smp", &smp.to_string(), "-cdrom", iso.to_str().unwrap()]);
@@ -1162,8 +1195,8 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
         "-drive", &format!("id=disk0,if=none,format=raw,file={}", disk.to_str().unwrap()),
         "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0",
     ]);
-    qemu.args(["-display", "none", "-no-reboot"]);
-    qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
+    qemu.args(["-display", if gui { "gtk" } else { "none" }, "-no-reboot"]);
+    qemu.args(["-serial", "stdio", "-monitor", "none"]);
     qemu.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     for ovmf in ["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/ovmf/OVMF.fd"] {
         if Path::new(ovmf).exists() {
@@ -1171,8 +1204,30 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
             break;
         }
     }
+    qemu.stdin(std::process::Stdio::null());
+    qemu.stdout(std::process::Stdio::piped());
 
     let mut child = qemu.spawn().expect("spawn qemu");
+    let out = child.stdout.take().expect("qemu stdout");
+    let serial: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let reader = {
+        let serial = Arc::clone(&serial);
+        let log = log.clone();
+        let tag = tag.to_string();
+        std::thread::spawn(move || {
+            let mut logf = std::fs::File::create(&log).ok();
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                println!("  {tag} │ {line}");
+                if let Some(f) = logf.as_mut() {
+                    let _ = writeln!(f, "{line}");
+                }
+                let mut s = serial.lock().unwrap();
+                s.push_str(&line);
+                s.push('\n');
+            }
+        })
+    };
+
     let deadline = Instant::now() + Duration::from_secs(240);
     let status = loop {
         if let Some(s) = child.try_wait().expect("wait qemu") {
@@ -1184,10 +1239,11 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
         }
         std::thread::sleep(Duration::from_millis(200));
     };
+    let _ = reader.join();
 
-    let serial = std::fs::read_to_string(&log).unwrap_or_default();
+    let serial = Arc::try_unwrap(serial).unwrap().into_inner().unwrap();
     if status.and_then(|s| s.code()) != Some(QEMU_SUCCESS) {
-        eprintln!("{tag}: kernel did not halt cleanly\n--- serial ---\n{serial}\n---");
+        eprintln!("{tag}: kernel did not halt cleanly (see the stream above / target/{tag}-serial.log)");
         exit(1);
     }
     serial
