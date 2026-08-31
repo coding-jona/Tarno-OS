@@ -63,6 +63,18 @@ const NT_STUB_STRIDE: u64 = 16;
 /// not fault.
 const PE_TEB_ADDR: u64 = NT_STUB_BASE + 0x1000;
 const PE_PEB_ADDR: u64 = NT_STUB_BASE + 0x2000;
+/// One page holding `RTL_USER_PROCESS_PARAMETERS`, `PEB_LDR_DATA`, one
+/// `LDR_DATA_TABLE_ENTRY` (the exe), plus the strings they point at.
+const PE_PARAMS_ADDR: u64 = NT_STUB_BASE + 0x3000;
+const PARAMS_OFF: u64 = 0x000; // RTL_USER_PROCESS_PARAMETERS
+const LDR_OFF: u64 = 0x100; // PEB_LDR_DATA
+const MOD_OFF: u64 = 0x180; // LDR_DATA_TABLE_ENTRY (the exe)
+const WSTR_OFF: u64 = 0x200; // UTF-16 strings
+const ANSI_CMDLINE_OFF: u64 = 0x400; // ANSI command line
+const ENV_OFF: u64 = 0x500; // environment block (empty)
+/// `GetCommandLineA` returns this.
+pub const PE_ANSI_CMDLINE_ADDR: u64 = PE_PARAMS_ADDR + ANSI_CMDLINE_OFF;
+const ANSI_CMDLINE: &[u8] = b"PE argv0 pe-hello.exe\n\0";
 
 /// Index of the stub implementing `dll!func`, or `None` if THOS does not
 /// provide it yet (the loader then rejects the PE rather than mislinking).
@@ -78,6 +90,8 @@ fn resolve_import(dll: &str, func: &str) -> Option<u16> {
         ("kernel32.dll", "CreateFileA") => Some(NT_CREATEFILEA),
         ("kernel32.dll", "ReadFile") => Some(NT_READFILE),
         ("kernel32.dll", "CloseHandle") => Some(NT_CLOSEHANDLE),
+        ("kernel32.dll", "GetCommandLineA") => Some(NT_GETCOMMANDLINEA),
+        ("kernel32.dll", "GetModuleHandleA") => Some(NT_GETMODULEHANDLEA),
         _ => None,
     }
 }
@@ -227,7 +241,7 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
         map_seg(proc, &img, load_base + rva, rva, mem_size, exec)?;
     }
     map_stub_page(proc)?;
-    map_teb_peb(proc, load_base, stack_top)?;
+    map_teb_peb(proc, load_base, load_base + entry_rva, size_of_image, stack_top)?;
 
     Ok(PeImage {
         entry: load_base + entry_rva,
@@ -239,7 +253,13 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
 
 /// Allocate + map the TEB and PEB pages and fill the few fields a Win64 entry /
 /// CRT touches immediately.
-fn map_teb_peb(proc: &Process, image_base: u64, stack_top: u64) -> Result<(), &'static str> {
+fn map_teb_peb(
+    proc: &Process,
+    image_base: u64,
+    entry: u64,
+    size_of_image: u64,
+    stack_top: u64,
+) -> Result<(), &'static str> {
     let w = |addr: u64, fill: &dyn Fn(&mut [u8])| -> Result<(), &'static str> {
         let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (TEB/PEB)")?;
         let phys = frame.start_address();
@@ -252,19 +272,89 @@ fn map_teb_peb(proc: &Process, image_base: u64, stack_top: u64) -> Result<(), &'
         proc.map(addr, phys.as_u64(), true, false); // rw, no-exec
         Ok(())
     };
-    let put = |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    let put = |b: &mut [u8], off: u64, v: u64| {
+        b[off as usize..off as usize + 8].copy_from_slice(&v.to_le_bytes())
+    };
+    let put16 = |b: &mut [u8], off: u64, v: u16| {
+        b[off as usize..off as usize + 2].copy_from_slice(&v.to_le_bytes())
+    };
 
     w(PE_TEB_ADDR, &|t| {
         put(t, 0x08, stack_top); // NT_TIB.StackBase
         put(t, 0x10, stack_top.saturating_sub(64 * 1024)); // NT_TIB.StackLimit
         put(t, 0x30, PE_TEB_ADDR); // NT_TIB.Self
         put(t, 0x60, PE_PEB_ADDR); // ProcessEnvironmentBlock
-                                   // 0x68 LastErrorValue stays 0
     })?;
     w(PE_PEB_ADDR, &|p| {
-        // 0x02 BeingDebugged stays 0
         put(p, 0x10, image_base); // ImageBaseAddress
-                                  // 0x18 Ldr, 0x20 ProcessParameters stay NULL (no loader data yet)
+        put(p, 0x18, PE_PARAMS_ADDR + LDR_OFF); // Ldr
+        put(p, 0x20, PE_PARAMS_ADDR + PARAMS_OFF); // ProcessParameters
+    })?;
+
+    // A UTF-16LE string placed at WSTR_OFF+cursor; returns (buffer_va, byte_len).
+    w(PE_PARAMS_ADDR, &|b| {
+        let mut wcur = WSTR_OFF;
+        let mut wstr = |b: &mut [u8], s: &str| -> (u64, u16) {
+            let va = PE_PARAMS_ADDR + wcur;
+            let mut n = 0u64;
+            for u in s.encode_utf16() {
+                b[(wcur + n) as usize..(wcur + n) as usize + 2].copy_from_slice(&u.to_le_bytes());
+                n += 2;
+            }
+            b[(wcur + n) as usize..(wcur + n) as usize + 2].copy_from_slice(&[0, 0]); // NUL
+            wcur += n + 2;
+            wcur = (wcur + 1) & !1;
+            (va, n as u16)
+        };
+        let (image_buf, image_len) = wstr(b, "C:\\pe-hello.exe");
+        let (cmd_buf, cmd_len) = wstr(b, "pe-hello.exe");
+        let (base_buf, base_len) = wstr(b, "pe-hello.exe");
+        let (cur_buf, cur_len) = wstr(b, "C:\\");
+
+        // --- RTL_USER_PROCESS_PARAMETERS @ PARAMS_OFF ---
+        put(b, PARAMS_OFF + 0x00, 0x1000); // MaximumLength
+        put(b, PARAMS_OFF + 0x04, 0x1000); // Length + Flags (fits in the u64)
+        put(b, PARAMS_OFF + 0x20, 0); // StandardInput
+        put(b, PARAMS_OFF + 0x28, 1); // StandardOutput
+        put(b, PARAMS_OFF + 0x30, 2); // StandardError
+        put16(b, PARAMS_OFF + 0x38, cur_len); // CurrentDirectory.DosPath.Length
+        put16(b, PARAMS_OFF + 0x3A, cur_len + 2);
+        put(b, PARAMS_OFF + 0x40, cur_buf);
+        put16(b, PARAMS_OFF + 0x60, image_len); // ImagePathName
+        put16(b, PARAMS_OFF + 0x62, image_len + 2);
+        put(b, PARAMS_OFF + 0x68, image_buf);
+        put16(b, PARAMS_OFF + 0x70, cmd_len); // CommandLine
+        put16(b, PARAMS_OFF + 0x72, cmd_len + 2);
+        put(b, PARAMS_OFF + 0x78, cmd_buf);
+        put(b, PARAMS_OFF + 0x80, PE_PARAMS_ADDR + ENV_OFF); // Environment (empty: two NUL words)
+
+        // --- PEB_LDR_DATA @ LDR_OFF (one circular element: the exe) ---
+        let ldr = PE_PARAMS_ADDR + LDR_OFF;
+        let m = PE_PARAMS_ADDR + MOD_OFF;
+        put(b, LDR_OFF + 0x00, 0x58); // Length
+        b[(LDR_OFF + 0x04) as usize] = 1; // Initialized
+        for (i, list) in [0x10u64, 0x20, 0x30].iter().enumerate() {
+            let head = ldr + list;
+            let link = m + i as u64 * 0x10; // entry's matching LIST_ENTRY
+            put(b, LDR_OFF + list, link); // head.Flink
+            put(b, LDR_OFF + list + 8, link); // head.Blink
+            put(b, MOD_OFF + i as u64 * 0x10, head); // entry.link.Flink
+            put(b, MOD_OFF + i as u64 * 0x10 + 8, head); // entry.link.Blink
+        }
+        put(b, MOD_OFF + 0x30, image_base); // DllBase
+        put(b, MOD_OFF + 0x38, entry); // EntryPoint
+        put(b, MOD_OFF + 0x40, size_of_image & 0xFFFF_FFFF); // SizeOfImage (u32, low half of the slot)
+        put16(b, MOD_OFF + 0x48, image_len); // FullDllName
+        put16(b, MOD_OFF + 0x4A, image_len + 2);
+        put(b, MOD_OFF + 0x50, image_buf);
+        put16(b, MOD_OFF + 0x58, base_len); // BaseDllName
+        put16(b, MOD_OFF + 0x5A, base_len + 2);
+        put(b, MOD_OFF + 0x60, base_buf);
+
+        // --- ANSI command line (GetCommandLineA) + empty environment ---
+        b[ANSI_CMDLINE_OFF as usize..ANSI_CMDLINE_OFF as usize + ANSI_CMDLINE.len()]
+            .copy_from_slice(ANSI_CMDLINE);
+        // ENV_OFF: leave the two NUL words already zeroed
     })?;
     Ok(())
 }

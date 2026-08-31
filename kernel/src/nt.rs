@@ -28,7 +28,9 @@ pub const NT_SETLASTERROR: u16 = 4;
 pub const NT_CREATEFILEA: u16 = 5;
 pub const NT_READFILE: u16 = 6;
 pub const NT_CLOSEHANDLE: u16 = 7;
-pub const NT_STUB_COUNT: u16 = 8;
+pub const NT_GETCOMMANDLINEA: u16 = 8;
+pub const NT_GETMODULEHANDLEA: u16 = 9;
+pub const NT_STUB_COUNT: u16 = 10;
 
 const STD_INPUT_HANDLE: i32 = -10;
 const STD_OUTPUT_HANDLE: i32 = -11;
@@ -152,6 +154,25 @@ pub fn dispatch(idx: u16, frame: &mut UserFrame) -> i64 {
         NT_SETLASTERROR => {
             set_last_error(a0 as u32);
             0
+        }
+
+        // GetCommandLineA() -> LPSTR : the ANSI command line we placed in the
+        // process's parameter page.
+        NT_GETCOMMANDLINEA => crate::pe::PE_ANSI_CMDLINE_ADDR as i64,
+
+        // GetModuleHandleA(lpModuleName) -> HMODULE. NULL -> the exe's base
+        // (PEB->ImageBaseAddress). Named lookup against the Ldr list isn't wired
+        // yet, so a name returns NULL + ERROR_MOD_NOT_FOUND.
+        NT_GETMODULEHANDLEA => {
+            if a0 == 0 {
+                teb().map_or(0, |t| unsafe {
+                    let peb = *(t.add(0x60) as *const u64);
+                    *((peb + 0x10) as *const u64) as i64
+                })
+            } else {
+                set_last_error(126); // ERROR_MOD_NOT_FOUND
+                0
+            }
         }
 
         _ => {

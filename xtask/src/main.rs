@@ -418,9 +418,11 @@ fn write_pe_hello(path: &Path) {
         b"ExitProcess",   // NT idx 0
         b"GetStdHandle",  // 1
         b"WriteFile",     // 2
-        b"GetLastError",  // 3
-        b"CreateFileA",   // 5
-        b"ReadFile",      // 6
+        b"GetLastError",     // 3
+        b"CreateFileA",      // 5
+        b"ReadFile",         // 6
+        b"GetCommandLineA",  // 8
+        b"GetModuleHandleA", // 9
     ];
     let ilt_off = 0x28u32; // after 2 IDT entries (2*20)
     let iat_off = ilt_off + (funcs.len() as u32 + 1) * 8;
@@ -456,6 +458,8 @@ fn write_pe_hello(path: &Path) {
     let iat_wf = idata_rva + iat_off + 16;
     let iat_cf = idata_rva + iat_off + 32; // CreateFileA
     let iat_rf = idata_rva + iat_off + 40; // ReadFile
+    let iat_gcl = idata_rva + iat_off + 48; // GetCommandLineA
+    let iat_gmh = idata_rva + iat_off + 56; // GetModuleHandleA
 
     // --- entry machine code (x86-64) ---
     // Deferred RIP-relative fixups: (disp32 position in `code`, target RVA).
@@ -476,6 +480,8 @@ fn write_pe_hello(path: &Path) {
     let nread_slot_tag = u32::MAX - 5;
     let buf_tag = u32::MAX - 6;
     let fname_tag = u32::MAX - 7;
+    let msg_pp_tag = u32::MAX - 8;
+    let msg_ldr_tag = u32::MAX - 9;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -541,6 +547,58 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf); // call [rip+iat_WriteFile]
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
 
+    // 2e) PEB->ProcessParameters->StandardOutput as the WriteFile handle
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0, 0, 0]); // mov rax, gs:[0x30]  (TEB)
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x60]); // mov rax, [rax+0x60]  (PEB)
+    code.extend_from_slice(&[0x48, 0x8B, 0x48, 0x20]); // mov rcx, [rax+0x20]  (ProcessParameters)
+    code.extend_from_slice(&[0x48, 0x8B, 0x49, 0x28]); // mov rcx, [rcx+0x28]  (StandardOutput)
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_pp_tag); // lea rdx, [rip+msg_pp]
+    let pp_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len_pp  (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2f) walk PEB->Ldr; first module DllBase must == PEB->ImageBaseAddress
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0, 0, 0]); // mov rax, gs:[0x30]
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x60]); // mov rax, [rax+0x60]  (PEB)
+    code.extend_from_slice(&[0x48, 0x8B, 0x50, 0x10]); // mov rdx, [rax+0x10]  (ImageBaseAddress)
+    code.extend_from_slice(&[0x48, 0x8B, 0x48, 0x18]); // mov rcx, [rax+0x18]  (Ldr)
+    code.extend_from_slice(&[0x48, 0x8B, 0x49, 0x10]); // mov rcx, [rcx+0x10]  (InLoadOrder.Flink = &entry)
+    code.extend_from_slice(&[0x48, 0x8B, 0x49, 0x30]); // mov rcx, [rcx+0x30]  (entry->DllBase)
+    code.extend_from_slice(&[0x48, 0x39, 0xD1]); // cmp rcx, rdx
+    code.extend_from_slice(&[0x0F, 0x85, 0, 0, 0, 0]); // jne .after_ldr  (patched)
+    let jne_pos = code.len() - 4;
+    let jne_from = code.len();
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_ldr_tag); // lea rdx, [rip+msg_ldr]
+    let ldr_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len_ldr  (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    let after_ldr = code.len();
+    code[jne_pos..jne_pos + 4].copy_from_slice(&((after_ldr - jne_from) as i32).to_le_bytes());
+
+    // 2g) GetCommandLineA() -> rax; WriteFile(1, rax, 22, &written, 0)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gcl); // call [rip+iat_GetCommandLineA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax  (LPSTR)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    code.extend_from_slice(&[0x41, 0xB8, 22, 0, 0, 0]); // mov r8d, 22
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2h) GetModuleHandleA(NULL) — just call it (a broken stub would fault)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28, 0x31, 0xC9]); // sub rsp,0x28 ; xor ecx,ecx
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+
     // 3) ExitProcess(0)
     code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
@@ -570,7 +628,15 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(msg1);
     let msg2_off = code.len();
     code.extend_from_slice(msg2);
+    let msg_pp: &[u8] = b"PE ProcParams OK\n";
+    let msg_ldr: &[u8] = b"PE Ldr OK\n";
+    let msg_pp_off = code.len();
+    code.extend_from_slice(msg_pp);
+    let msg_ldr_off = code.len();
+    code.extend_from_slice(msg_ldr);
 
+    code[pp_r8..pp_r8 + 4].copy_from_slice(&(msg_pp.len() as u32).to_le_bytes());
+    code[ldr_r8..ldr_r8 + 4].copy_from_slice(&(msg_ldr.len() as u32).to_le_bytes());
     code[ptr_off..ptr_off + 8]
         .copy_from_slice(&(IMAGE_BASE + text_rva as u64 + msg1_off as u64).to_le_bytes());
     for (pos, target) in fixups {
@@ -583,6 +649,8 @@ fn write_pe_hello(path: &Path) {
             t if t == fname_tag => text_rva + fname_off as u32,
             t if t == msg1_tag => text_rva + msg1_off as u32,
             t if t == msg2_tag => text_rva + msg2_off as u32,
+            t if t == msg_pp_tag => text_rva + msg_pp_off as u32,
+            t if t == msg_ldr_tag => text_rva + msg_ldr_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -1352,9 +1420,12 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE on THOS via native loader") // raw syscall + DIR64 reloc
         && serial.contains("PE via WriteFile") // GetStdHandle + WriteFile + gs/TEB/PEB
         && serial.contains("PE ReadFile OK via CreateFileA") // CreateFileA + ReadFile
+        && serial.contains("PE ProcParams OK") // PEB->ProcessParameters->StandardOutput
+        && serial.contains("PE Ldr OK") // PEB->Ldr module list walk
+        && serial.contains("PE argv0 pe-hello.exe") // GetCommandLineA
         && serial.contains("THOS: pe reject ok");
     if ok {
-        println!("pe-test: OK — PE loader: reloc, imports, gs/TEB/PEB, CreateFileA/ReadFile/WriteFile");
+        println!("pe-test: OK — PE loader: reloc, imports, gs/TEB/PEB, PEB Ldr/params, file I/O");
     } else {
         eprintln!("pe-test: FAIL — the PE did not run to exit\n--- serial ---\n{serial}\n---");
         exit(1);
