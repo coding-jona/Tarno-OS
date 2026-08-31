@@ -92,6 +92,12 @@ fn resolve_import(dll: &str, func: &str) -> Option<u16> {
         ("kernel32.dll", "CloseHandle") => Some(NT_CLOSEHANDLE),
         ("kernel32.dll", "GetCommandLineA") => Some(NT_GETCOMMANDLINEA),
         ("kernel32.dll", "GetModuleHandleA") => Some(NT_GETMODULEHANDLEA),
+        ("kernel32.dll", "VirtualAlloc") => Some(NT_VIRTUALALLOC),
+        ("kernel32.dll", "VirtualFree") => Some(NT_VIRTUALFREE),
+        ("kernel32.dll", "VirtualProtect") => Some(NT_VIRTUALPROTECT),
+        ("kernel32.dll", "GetProcessHeap") => Some(NT_GETPROCESSHEAP),
+        ("kernel32.dll", "HeapAlloc") => Some(NT_HEAPALLOC),
+        ("kernel32.dll", "HeapFree") => Some(NT_HEAPFREE),
         _ => None,
     }
 }
@@ -289,6 +295,7 @@ fn map_teb_peb(
         put(p, 0x10, image_base); // ImageBaseAddress
         put(p, 0x18, PE_PARAMS_ADDR + LDR_OFF); // Ldr
         put(p, 0x20, PE_PARAMS_ADDR + PARAMS_OFF); // ProcessParameters
+        put(p, 0x30, crate::nt::PE_PROCESS_HEAP); // ProcessHeap
     })?;
 
     // A UTF-16LE string placed at WSTR_OFF+cursor; returns (buffer_va, byte_len).

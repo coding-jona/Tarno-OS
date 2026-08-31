@@ -244,9 +244,19 @@ late.
     then **opens `C:\pe-read.txt` with `CreateFileA`, reads it with `ReadFile`,
     and echoes it with `WriteFile`** — a PE process doing real Win32 file I/O on
     THOS objects — then `ExitProcess(0)`, all through the IAT.
-  - **Next:** real `Ldr` / `ProcessParameters` in the PEB (`GetCommandLineA`,
-    `GetModuleHandle`), more `kernel32` (`GetProcAddress`, heap, `VirtualAlloc`),
-    a proper `ntdll` boundary (`Nt*` primitives) under `kernel32`, then real
+  - **PEB `Ldr` + `ProcessParameters` + memory:** a parameter page per PE
+    process holds `RTL_USER_PROCESS_PARAMETERS` (std handles, `ImagePathName` /
+    `CommandLine` / `CurrentDirectory` as `UNICODE_STRING`s, an empty
+    environment) and a `PEB_LDR_DATA` + one circular `LDR_DATA_TABLE_ENTRY` for
+    the exe (`DllBase` / `EntryPoint` / `SizeOfImage` / names), wired at
+    `PEB+0x20` / `PEB+0x18`. `PEB+0x30` = `ProcessHeap`. Stubs:
+    `GetCommandLineA`, `GetModuleHandleA(NULL)`→ImageBase, **`VirtualAlloc`** /
+    `VirtualFree` / `VirtualProtect` (anon zeroed mapping via `mmap_anon`; RWX
+    for now), **`GetProcessHeap` / `HeapAlloc` / `HeapFree`** (one anon mapping
+    per alloc — a real allocator comes later). `pe-test` `VirtualAlloc`s a page
+    and `HeapAlloc`s a block and writes to both (`PE VirtualAlloc+Heap OK`).
+  - **Next:** a proper `ntdll` boundary + a synthetic `kernel32` module with an
+    export table so `GetProcAddress` / `LoadLibrary` resolve, then real
     PE-built DLLs from a `C:\Windows\System32` tree; then process isolation /
     integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /

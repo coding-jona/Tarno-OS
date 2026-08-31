@@ -30,7 +30,17 @@ pub const NT_READFILE: u16 = 6;
 pub const NT_CLOSEHANDLE: u16 = 7;
 pub const NT_GETCOMMANDLINEA: u16 = 8;
 pub const NT_GETMODULEHANDLEA: u16 = 9;
-pub const NT_STUB_COUNT: u16 = 10;
+pub const NT_VIRTUALALLOC: u16 = 10;
+pub const NT_VIRTUALFREE: u16 = 11;
+pub const NT_VIRTUALPROTECT: u16 = 12;
+pub const NT_GETPROCESSHEAP: u16 = 13;
+pub const NT_HEAPALLOC: u16 = 14;
+pub const NT_HEAPFREE: u16 = 15;
+pub const NT_STUB_COUNT: u16 = 16;
+
+/// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
+/// opaque tokens to a Win32 program; ours is just a fixed non-zero value.
+pub const PE_PROCESS_HEAP: u64 = 0x0000_7FF0_0000_0100;
 
 const STD_INPUT_HANDLE: i32 = -10;
 const STD_OUTPUT_HANDLE: i32 = -11;
@@ -174,6 +184,35 @@ pub fn dispatch(idx: u16, frame: &mut UserFrame) -> i64 {
                 0
             }
         }
+
+        // VirtualAlloc(addr, size, type, protect): we always pick the address.
+        // Backed by an anonymous zeroed mapping; RWX regardless of `protect`
+        // until W^X lands.
+        NT_VIRTUALALLOC => {
+            let size = a1;
+            match sched::current_proc().map(|p| p.mmap_anon(size)) {
+                Some(base) if base != 0 => base as i64,
+                _ => {
+                    set_last_error(8); // ERROR_NOT_ENOUGH_MEMORY
+                    0
+                }
+            }
+        }
+        // VirtualFree / VirtualProtect: no teardown / per-page protection yet.
+        NT_VIRTUALFREE | NT_VIRTUALPROTECT => 1,
+
+        NT_GETPROCESSHEAP => PE_PROCESS_HEAP as i64,
+
+        // HeapAlloc(hHeap, flags, bytes): one anon mapping per call. Wasteful
+        // for tiny allocations but correct; a real heap allocator comes later.
+        NT_HEAPALLOC => {
+            let bytes = a2.max(1);
+            match sched::current_proc().map(|p| p.mmap_anon(bytes)) {
+                Some(base) if base != 0 => base as i64, // mmap_anon already zeroes
+                _ => 0,
+            }
+        }
+        NT_HEAPFREE => 1,
 
         _ => {
             crate::kprintln!("THOS: nt unhandled call {}", idx);
