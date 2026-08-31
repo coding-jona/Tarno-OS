@@ -62,14 +62,17 @@ late.
     **both the primary and the group-1 backup superblock** (both clean).
     Missing: growing a dir past 12 direct blocks, htree, timestamps, hard
     links, 64-bit sizes, journalling.
-  - Status: **FAT16 / FAT32 read** (`fat.rs`) — parse the BPB, pick the FAT
-    width from the cluster count, walk the FAT chain, traverse 8.3 directory
-    entries (long-name/VFAT entries skipped). `Fat::open(part_lba)` +
-    `read_path("/EFI/THOS/HELLO.TXT")`. `cargo xtask fat-test` splices a FAT32
-    "super-floppy" into a hole past the ext2 image (LBA 51000) and checks the
-    kernel reads the file back. Missing: FAT12, writes, long names, and — the
-    real point — a **GPT parser** to find the actual ESP partition on a
-    partitioned disk (next step; needs a GPT test image or the real Kingston).
+  - Status: **read the ESP** — `gpt.rs` finds a partition by type GUID (the
+    `C12A7328-…` EFI System Partition) in a GPT whose LBA 0 is at an arbitrary
+    base; `fat.rs` reads FAT16 / FAT32 (BPB → FAT-width by cluster count → FAT
+    chain → 8.3 directory walk, VFAT long-name entries skipped).
+    `cargo xtask fat-test` splices a self-contained GPT image (protective MBR +
+    one ESP holding a FAT32 volume) into a hole past the ext2 image (LBA 51000);
+    the kernel does `gpt::find_esp(51000)` → `fat::Fat::open(esp_lba)` →
+    `read_path("/EFI/THOS/HELLO.TXT")` and prints it. Missing: FAT12, FAT
+    writes, long names, and mounting the ext2 root from a GPT partition rather
+    than raw LBA 0 (the "one real disk layout" migration — tied to the
+    installer).
 - **AHCI/SATA driver** (Intel `8086:7a62`, standard AHCI 1.3.1 register interface,
   MSI/MSI-X, command list / FIS) → real root FS from the **Kingston A400 240 GB SATA
   SSD** (`sdc`). NVMe is Windows' disk and is never touched; an NVMe driver is

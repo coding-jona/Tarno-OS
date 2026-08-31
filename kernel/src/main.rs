@@ -37,6 +37,7 @@ mod ext2;
 mod fat;
 mod file;
 mod gdt;
+mod gpt;
 mod idt;
 #[cfg(feature = "interactive")]
 mod login;
@@ -527,19 +528,24 @@ fn storage_milestone() {
     assert!(ahci::read(cap, &mut [0u8; ahci::SECTOR]).is_err(), "read past EOD not rejected");
     kprintln!("THOS: ahci cap ok      {} sectors; out-of-range read rejected", cap);
 
-    // FAT reader: a FAT16 "super-floppy" volume lives at LBA 51000, past the
-    // ext2 image (see xtask `disk_image`). Real ESPs are GPT-partitioned FAT32;
-    // reading the actual ESP off a GPT disk is a later step — this exercises the
-    // filesystem parser: BPB → FAT chain → 8.3 directory walk.
-    match fat::Fat::open(51_000) {
-        Ok(vol) => match vol.read_path("/EFI/THOS/HELLO.TXT") {
-            Some(b) => {
-                kprintln!("THOS: fat ok           /EFI/THOS/HELLO.TXT = {} bytes", b.len());
-                serial::write_bytes(&b);
+    // GPT + FAT: a self-contained GPT image (protective MBR, one ESP holding a
+    // FAT32 volume) is spliced in at LBA 51000, past the ext2 image (see xtask
+    // `disk_image`). Find the ESP by type GUID, mount it, read a known file —
+    // the full "read the ESP" path: GPT → partition → BPB → FAT chain → 8.3.
+    match gpt::find_esp(51_000) {
+        Some(esp_lba) => {
+            kprintln!("THOS: gpt ok           ESP at LBA {}", esp_lba);
+            match fat::Fat::open(esp_lba).and_then(|v| {
+                v.read_path("/EFI/THOS/HELLO.TXT").ok_or("file not found")
+            }) {
+                Ok(b) => {
+                    kprintln!("THOS: fat ok           /EFI/THOS/HELLO.TXT = {} bytes", b.len());
+                    serial::write_bytes(&b);
+                }
+                Err(e) => kprintln!("THOS: fat FAIL         {}", e),
             }
-            None => kprintln!("THOS: fat FAIL         /EFI/THOS/HELLO.TXT not found"),
-        },
-        Err(e) => kprintln!("THOS: fat FAIL         {}", e),
+        }
+        None => kprintln!("THOS: gpt FAIL         no ESP found at LBA 51000"),
     }
 
     let fs = ext2::open().expect("mount ext2");

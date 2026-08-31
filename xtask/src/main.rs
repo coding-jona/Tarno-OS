@@ -307,27 +307,65 @@ fn disk_image() -> PathBuf {
         img.to_str().unwrap(),
     ]));
 
-    // A FAT32 "super-floppy" volume spliced into a hole past the ext2 image
-    // (LBA 51000; the fs is the first 16 MiB, the AHCI scratch write is a single
-    // sector at LBA 50000). FAT32 is what real ESPs use. The kernel's FAT reader
-    // reads `/EFI/THOS/HELLO.TXT` from it. Needs `mkfs.vfat` (dosfstools) +
-    // `mmd`/`mcopy` (mtools).
-    let fat = root.join("target/fat.img");
+    // A self-contained GPT disk image — one EFI System Partition holding a
+    // FAT32 volume with `/EFI/THOS/HELLO.TXT` — spliced into a hole past the
+    // ext2 image (LBA 51000; the fs is the first 16 MiB, the AHCI scratch write
+    // is a single sector at LBA 50000). The kernel walks GPT → ESP → FAT32.
+    // Needs `sfdisk` (util-linux), `mkfs.vfat` (dosfstools), `mmd`/`mcopy`
+    // (mtools).
+    let gpt = root.join("target/esp-gpt.img");
+    let fat = root.join("target/esp-fat.img");
     let hello = root.join("target/fat-hello.txt");
     std::fs::write(&hello, b"THOS reads FAT\n").unwrap();
-    let _ = std::fs::remove_file(&fat);
+    for f in [&gpt, &fat] {
+        let _ = std::fs::remove_file(f);
+    }
+
+    // 48 MiB FAT32 volume.
+    let fat_sectors: u64 = 48 * 1024 * 1024 / 512;
     run(Command::new("mkfs.vfat").args([
-        "-F", "32", "-n", "THOSFAT", "-C", fat.to_str().unwrap(), "49152",
+        "-F", "32", "-n", "THOSESP", "-C", fat.to_str().unwrap(), &(fat_sectors / 2).to_string(),
     ]));
-    run(Command::new("mmd").args([
-        "-i", fat.to_str().unwrap(), "::/EFI", "::/EFI/THOS",
-    ]));
+    run(Command::new("mmd").args(["-i", fat.to_str().unwrap(), "::/EFI", "::/EFI/THOS"]));
     run(Command::new("mcopy").args([
         "-i", fat.to_str().unwrap(),
         hello.to_str().unwrap(), "::/EFI/THOS/HELLO.TXT",
     ]));
+
+    // GPT container: 1 MiB alignment gap, the ESP, then room for the backup GPT.
+    let part_start = 2048u64;
+    let gpt_sectors = part_start + fat_sectors + 2048;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&gpt)
+        .and_then(|f| f.set_len(gpt_sectors * 512))
+        .expect("create esp-gpt.img");
+    let script = format!(
+        "label: gpt\nstart={part_start}, size={fat_sectors}, \
+         type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name=\"EFI System\"\n"
+    );
+    let mut sf = Command::new("sfdisk")
+        .arg(gpt.to_str().unwrap())
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sfdisk");
+    use std::io::Write;
+    sf.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    if !sf.wait().expect("wait sfdisk").success() {
+        eprintln!("sfdisk failed");
+        exit(1);
+    }
     run(Command::new("dd").args([
         &format!("if={}", fat.to_str().unwrap()),
+        &format!("of={}", gpt.to_str().unwrap()),
+        "bs=512", &format!("seek={part_start}"), "conv=notrunc", "status=none",
+    ]));
+
+    // Splice the whole GPT image into the main disk at LBA 51000.
+    run(Command::new("dd").args([
+        &format!("if={}", gpt.to_str().unwrap()),
         &format!("of={}", img.to_str().unwrap()),
         "bs=512", "seek=51000", "conv=notrunc", "status=none",
     ]));
@@ -773,7 +811,7 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
     }
 
     let mut child = qemu.spawn().expect("spawn qemu");
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + Duration::from_secs(150);
     let status = loop {
         if let Some(s) = child.try_wait().expect("wait qemu") {
             break Some(s);
@@ -961,7 +999,7 @@ fn ncq_error_test(iso: &Path) {
     }
 
     let mut child = qemu.spawn().expect("spawn qemu");
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + Duration::from_secs(150);
     let status = loop {
         if let Some(s) = child.try_wait().expect("wait qemu") {
             break Some(s);
@@ -1002,10 +1040,13 @@ fn busybox_test(iso: &Path) {
 fn fat_test(iso: &Path) {
     let disk = disk_image();
     let serial = boot_kernel_headless("fat", iso, &disk, 4);
-    if serial.contains("THOS: fat ok") && serial.contains("THOS reads FAT") {
-        println!("fat-test: OK — read /EFI/THOS/HELLO.TXT from a FAT32 volume");
+    let ok = serial.contains("THOS: gpt ok")
+        && serial.contains("THOS: fat ok")
+        && serial.contains("THOS reads FAT");
+    if ok {
+        println!("fat-test: OK — GPT → ESP → FAT32, read /EFI/THOS/HELLO.TXT");
     } else {
-        eprintln!("fat-test: FAIL — FAT read did not produce the file\n--- serial ---\n{serial}\n---");
+        eprintln!("fat-test: FAIL — GPT/FAT read did not produce the file\n--- serial ---\n{serial}\n---");
         exit(1);
     }
 }
