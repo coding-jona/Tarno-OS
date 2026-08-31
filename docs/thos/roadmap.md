@@ -157,8 +157,15 @@ late.
     `execve` drops the marked fds. A zombie task's fd table is cleared at
     `exit` so the far end of a pipe sees EOF before `wait4` reaps it.
     `cargo xtask pipe-test` boots BusyBox `sh -c` with a `|` and two `$(…)` and
-    checks the exact output. Still missing: `fchdir` (no fd→path yet), writing
-    through `/bin/*` links, real (non-yield) blocking waits.
+    checks the exact output.
+  - **Real blocking waits.** `WaitQueue::wait_if(pred)` closes the condvar
+    lost-wakeup race (queue lock held across predicate + enqueue). The three hot
+    spin loops now sleep instead of `yield`ing: pipe read/write on the pipe's
+    own `WaitQueue`, `wait4` on a global `CHILD_EXIT` queue woken at `exit`, and
+    fd-0 reads on a console `INPUT_WQ` woken by the keyboard poll thread — an
+    idle shell prompt no longer pins a core. Still missing: `fchdir` (no
+    fd→path), writing through `/bin/*` links, `nanosleep` (still a yield spin —
+    needs a timer wheel).
   - Disk I/O is batched: `mm` reserves a 1 MiB contiguous DMA arena, AHCI gives
     each tag a 32 KiB bounce buffer and transfers up to 32 KiB per NCQ command,
     and `ext2::read_file` issues one read per run of consecutive blocks. The
