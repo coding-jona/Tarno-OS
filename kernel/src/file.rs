@@ -61,7 +61,7 @@ impl FileOps for KeyboardFile {
             if n > 0 {
                 return n as i64;
             }
-            crate::sched::yield_now();
+            crate::console::wait_for_input();
         }
     }
     fn write(&self, _buf: &[u8]) -> i64 {
@@ -219,6 +219,8 @@ struct PipeInner {
     buf: Mutex<VecDeque<u8>>,
     readers: AtomicUsize,
     writers: AtomicUsize,
+    /// Woken on every state change: data added, space freed, an end closed.
+    wq: crate::wait::WaitQueue,
 }
 
 /// Read end. EOF (`read` returns 0) once every write end is dropped.
@@ -234,6 +236,7 @@ pub fn pipe() -> (Arc<PipeReadEnd>, Arc<PipeWriteEnd>) {
         buf: Mutex::new(VecDeque::new()),
         readers: AtomicUsize::new(1),
         writers: AtomicUsize::new(1),
+        wq: crate::wait::WaitQueue::new(),
     });
     (Arc::new(PipeReadEnd(inner.clone())), Arc::new(PipeWriteEnd(inner)))
 }
@@ -241,11 +244,13 @@ pub fn pipe() -> (Arc<PipeReadEnd>, Arc<PipeWriteEnd>) {
 impl Drop for PipeReadEnd {
     fn drop(&mut self) {
         self.0.readers.fetch_sub(1, Ordering::Release);
+        self.0.wq.wake_all(); // let blocked writers see -EPIPE
     }
 }
 impl Drop for PipeWriteEnd {
     fn drop(&mut self) {
         self.0.writers.fetch_sub(1, Ordering::Release);
+        self.0.wq.wake_all(); // let blocked readers see EOF
     }
 }
 
@@ -259,13 +264,17 @@ impl FileOps for PipeReadEnd {
                     for b in buf.iter_mut().take(n) {
                         *b = q.pop_front().unwrap();
                     }
+                    drop(q);
+                    self.0.wq.wake_all(); // space freed — wake blocked writers
                     return n as i64;
                 }
                 if self.0.writers.load(Ordering::Acquire) == 0 {
                     return 0; // EOF — no writers left
                 }
             }
-            crate::sched::yield_now();
+            self.0.wq.wait_if(|| {
+                self.0.buf.lock().is_empty() && self.0.writers.load(Ordering::Acquire) != 0
+            });
         }
     }
     fn write(&self, _buf: &[u8]) -> i64 {
@@ -296,10 +305,14 @@ impl FileOps for PipeWriteEnd {
                     let n = space.min(data.len() - done);
                     q.extend(data[done..done + n].iter().copied());
                     done += n;
+                    drop(q);
+                    self.0.wq.wake_all(); // data available — wake blocked readers
                     continue;
                 }
             }
-            crate::sched::yield_now();
+            self.0.wq.wait_if(|| {
+                self.0.buf.lock().len() == PIPE_CAP && self.0.readers.load(Ordering::Acquire) != 0
+            });
         }
         done as i64
     }

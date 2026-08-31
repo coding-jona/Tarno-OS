@@ -289,6 +289,9 @@ impl Process {
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static TASKS: Mutex<BTreeMap<u64, Arc<Task>>> = Mutex::new(BTreeMap::new());
+/// Woken whenever any task records its exit status — `wait4` sleeps on it
+/// instead of polling.
+static CHILD_EXIT: crate::wait::WaitQueue = crate::wait::WaitQueue::new();
 
 /// The logged-in session identity, stamped onto every task created after login.
 /// `(uid, name)`. Grows into the executive `Principal`.
@@ -557,6 +560,23 @@ pub fn set_exit_status(code: i32) {
         t.fds.lock().clear();
         t.exited.store(true, Ordering::Release);
     }
+    CHILD_EXIT.wake_all(); // an interested parent may be blocked in wait4
+}
+
+/// Predicate for `wait4` to sleep on: this task has a matching live child and
+/// none of its matching children has exited yet.
+fn should_block_in_wait4(me: u64, pid: i64) -> bool {
+    let tasks = TASKS.lock();
+    let mut has_child = false;
+    for t in tasks.values() {
+        if t.ppid == me && (pid == -1 || t.pid == pid as u64) {
+            has_child = true;
+            if t.exited.load(Ordering::Acquire) {
+                return false;
+            }
+        }
+    }
+    has_child
 }
 
 /// `spawn` the initial user program: build its address space + entry stack and
@@ -649,6 +669,7 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
 /// Has task `pid` exited? (`true` also if it has already been reaped away.)
 /// For kernel-side milestones that spawn a process and want to await *that*
 /// process, not just the first user thread to exit.
+#[allow(dead_code)] // only the `pipetest` milestone calls this
 pub fn pid_exited(pid: u64) -> bool {
     TASKS.lock().get(&pid).map_or(true, |t| t.exited.load(Ordering::Acquire))
 }
@@ -681,6 +702,6 @@ pub fn wait4(pid: i64, status_ptr: u64) -> i64 {
                 return -10; // ECHILD
             }
         }
-        sched::yield_now();
+        CHILD_EXIT.wait_if(|| should_block_in_wait4(me, pid));
     }
 }
