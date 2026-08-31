@@ -284,10 +284,26 @@ late.
     slot and a `GetProcAddress` result agree. `pe-test`:
     `GetModuleHandleA("ntdll.dll")` → `GetProcAddress(h,"NtWriteFile")` → a
     real 9-arg NT call (`PE ntdll OK`).
-  - **Next:** real PE-built DLLs from a `C:\Windows\System32` tree — an on-disk
-    `ntdll` / `kernel32` whose `Nt*` stubs are the syscall and whose `Rtl*` /
-    CRT code is real, loader recursion, IAT binding against on-disk exports;
-    then process isolation / integrity for the security phase.
+  - **Real on-disk DLLs from `C:\Windows\System32`:** `pe.rs` is built around a
+    per-`load()` `Loader`. `stage_image(file, want_base)` parses + materialises
+    + relocates one image (exe or DLL) without mapping or binding. The
+    `Loader` seeds the two synthetic modules with their export maps, owns a
+    bump arena of VA space (`PE_DLL_ARENA`), and resolves imports:
+    `resolve_module` = synthetic hit / already-loaded / read
+    `/Windows/System32/<name>` from ext2 and `load_dll` it; `load_dll` stages
+    into the arena, `parse_exports` from the image, registers **before**
+    recursing (so an import cycle terminates), binds its own imports, then
+    maps its segments; `bind_imports` walks the IDT and patches each IAT slot
+    with the real export VA (synthetic trampoline **or** on-disk `.text`),
+    depth-capped. `pe-test` ships a real PE32+ `thoscrt.dll` (exports
+    `thos_add`, itself imports `KERNEL32!GetLastError`) at
+    `C:\Windows\System32`; the exe imports `thoscrt!thos_add`, calls it, and
+    asserts `42` (`PE dll thos_add=42`). `DllMain` is not run yet.
+  - **Next:** thread file DLLs into the PEB `Ldr` lists (so runtime
+    `GetModuleHandleA` / `GetProcAddress` / `LoadLibraryA` see them) and run
+    `DllMain`; then swap the hand-built test DLLs for **Wine-sourced** PE
+    `kernel32` / `ntdll` / `user32` …; then process isolation / integrity for
+    the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
