@@ -317,75 +317,34 @@ default — the same feature class as Windows Family Safety / iOS Screen Time /
 Android parental controls, wired into the principal model rather than bolted on
 (*user requirement, 2026-08-31*).
 
-- **At first-run setup**, before the admin session exists, the operator
-  establishes an age. It yields a per-principal `maturity` attribute
-  (`adult` / `minor`, exact age retained for finer thresholds) stored in the
-  credential store next to the admin cred.
+- **Not at setup — triggered on demand.** THOS installs and runs without any age
+  check. The `age-verify` flow fires only when a principal that is not currently
+  `adult-verified` tries to reach **18+ content** (an app/site/package the policy
+  engine rates adult). The result is cached on the principal and reused; it
+  **expires after ~14 days of account inactivity** (and a hard max regardless),
+  after which the next 18+ access re-runs the flow. A `minor` account never hits
+  this — the admin sets `minor` directly and only the admin can lift it.
 
-  **Genuine-document verification is a hard requirement (*user, 2026-08-31*),
-  and that constrains the method to exactly one:** the **eID / ePassport NFC
-  chip**. A photo / scan / OCR of the printed page *cannot* establish
-  authenticity — the printed side of an ID has no digital signature, and its
-  real anti-forgery features (hologram, UV, microprint, guilloche, tactile
-  laser engraving) need physical inspection hardware, not a webcam. Any
-  "AI checks if the photo looks real" is heuristic and spoofable and THOS will
-  not pretend otherwise.
+  **The decided flow** (*user, 2026-08-31*), fully local, buffers zeroed
+  immediately, nothing written to disk:
+  1. **Capture front + back of a national ID card** (webcam, or uploaded stills
+     if the machine has no camera) — the whole card legible.
+  2. **Pull the data** — MRZ / VIZ OCR → date of birth (+ cross-check MRZ↔VIZ,
+     check digits); derive the age.
+  3. **Face match** — one webcam photo of the operator; an algorithm compares
+     the ID portrait against the live face (+ a basic liveness check so it isn't
+     a photo of a photo). **Skipped if there is no webcam.**
+  4. Grant `adult-verified` with a timestamp; discard the images and OCR crops.
 
-  The chip path, fully local and offline:
-  1. Read the contactless chip (ISO-14443) over a USB PC/SC reader.
-  2. **PACE** (or BAC) key agreement using the MRZ / CAN as the shared secret,
-     establishing a secure channel to the chip.
-  3. **Passive Authentication** — the chip's `SOD` hashes each data group and is
-     signed by the issuing country's Document Signer (`DSC`), which chains to the
-     country root (`CSCA`). Verify: every read data group's hash matches the
-     `SOD`, and the `SOD` signature chains to a trusted `CSCA` in a **master
-     list shipped once with THOS** (ICAO PKD / national equivalent). Passing this
-     means the data is a genuine, unmodified issued document.
-  4. **Chip / Active Authentication** — challenge-response against a key whose
-     public half is inside the signed data, proving the chip is the original and
-     not a clone of copied data groups.
-  5. Take `DG1` (MRZ incl. date of birth); derive the age; **discard everything
-     else** (`DG2` face image and the rest are never persisted).
-
-  A typed birthdate ("declaration") stays available as a **fallback the admin
-  can permit** for machines without a reader / chipped ID, clearly recorded as
-  `assurance = declared`; the policy engine can be configured to refuse to grant
-  `adult` on a declaration alone.
-
-  Residual gap even with the chip: it proves the *document* is genuine, not that
-  the person at the keyboard is its holder. That needs `DG2` + a live camera
-  face match — a separate subsystem THOS does not ship by default.
-
-  **Optical / camera document check (front + back scan, hologram-tilt).** This is
-  a real technique — commercial remote-ID-verification products capture a tilt
-  sequence to see the diffractive (OVD / kinegram) features move, cross-check the
-  MRZ against the printed VIZ, look for tamper edges, and detect screen /
-  photocopy recapture. But those are large ML systems, trained per document type
-  and version on labelled genuine-vs-forged corpora, cloud-hosted and
-  continuously retrained; their output is a *probability*, not a proof.
-  A from-scratch OS with no camera driver, no ML runtime, no reference corpus
-  and no update pipeline cannot build this to a trustworthy level — a hand-rolled
-  version would be **security theatre**: it would look like it verifies while
-  passing competent forgeries and failing on lighting, which for a child-safety
-  gate is worse than an honest weaker gate. ("You see tampering immediately" is
-  true for a trained human examiner with the card in hand, not for naïve software
-  on a webcam frame.) So THOS's optical path, if built, is an explicitly
-  **weak heuristic** layer (`assurance = optical-weak`) with two inputs:
-  - **Live webcam tilt (preferred).** Front + back + a short tilt clip; checks:
-    OVD / hologram motion across frames, screen-recapture / printout detection
-    (a real card reflects differently frame-to-frame), MRZ↔VIZ DOB match,
-    portrait present. Needs a UVC camera driver — a large THOS item on its own —
-    so this only becomes available once THOS has one.
-  - **Uploaded image (fallback, weaker).** For a machine with no webcam: one or
-    two stills the operator supplies. Static checks only (MRZ↔VIZ DOB match,
-    portrait present, obvious tamper edges, still-frame recapture heuristics).
-    **No motion / liveness signal** — an upload is trivially a photo of someone
-    else's genuine card.
-
-  Neither optical input grants `adult` on its own; the policy-engine default is
-  `chip-verified` only. A genuine "the document is authentic" result comes only
-  from the chip, or from integrating a third-party verification service (not
-  local; the deployer's choice, not a THOS default).
+  Why an ID card and not a chip reader: THOS **does not assume an NFC reader
+  exists**. It does assume that anyone entitled to 18+ content is ≥ 18 and that
+  adults reliably hold a national ID card, while minors often do not — so
+  requiring the card as the artefact is itself a real filter, and the face match
+  stops a minor simply presenting a parent's card. This is `assurance = optical`
+  (with-face) / `optical-doc-only` (no webcam): it **deters**, it is not a
+  cryptographic proof. The NFC-chip path (PACE → Passive + Chip Authentication
+  against a CSCA master list) stays specified as an **optional high-assurance
+  upgrade** for deployers who want `chip-verified`, not a default requirement.
 - **Default-deny for adult content.** Until a principal is `adult`, the policy
   engine (the same one the exec-gate and Security Service already run) denies:
   launching apps/packages carrying an `18+` age rating; installs from stores
@@ -398,14 +357,21 @@ Android parental controls, wired into the principal model rather than bolted on
   an age-rating check to its `policy engine` step; the Security Service's
   network firewall/IDS does the domain-category filtering; the package/store
   layer checks the rating at install time.
-- **`age-verify` module** outputs `(age, assurance)` and never persists the
-  source material — the decode / APDU / frame buffers are zeroed the moment the
-  age is extracted, nothing touches disk.
-  `assurance ∈ { declared, optical-weak, chip-verified }`; the policy engine
-  decides which is enough to grant `adult` (default: only `chip-verified`).
+- **`age-verify` module** outputs `(age, assurance, verified_at)` and never
+  persists the source material — camera / OCR / APDU buffers are zeroed the
+  moment the age is extracted, nothing touches disk.
+  `assurance ∈ { declared, optical-doc-only, optical, chip-verified }`; the
+  policy engine decides which clears the 18+ gate (default: `optical` and up,
+  since the real backstop is the admin-lock + default-deny filter, not the
+  proof strength) and how long a grant lasts before the inactivity re-scan.
 
-Engineering reality — the chip path is a substantial, security-critical module:
-- **USB PC/SC (CCID) reader driver** — a new device class for THOS.
+Engineering reality:
+- **Primary (optical) path:** a UVC camera driver (a large item on its own),
+  MRZ / OCR-B recognition (a purpose-built recogniser, not a full OCR port), a
+  face-detect + face-embedding compare with a basic liveness check, all on
+  device. OCR is noisy (~80 % on clear MRZ) — hence `optical`, not proof.
+- **Optional chip upgrade — a substantial, security-critical module:**
+  **USB PC/SC (CCID) reader driver** — a new device class for THOS.
 - **PACE** is password-authenticated EC Diffie-Hellman (domain params, the
   generic-mapping step, mutual auth); BAC is the older 3DES fallback. Getting
   this wrong makes the gate worthless, so it needs real review.
@@ -432,9 +398,13 @@ Open-source building blocks (2026-08 survey — reuse, don't reinvent):
 - **CSCA trust anchors:** the ICAO PKD **master list** (LDIF, signed by the UN
   CSCA). ⚠ its terms are **non-commercial only** — for a distributed THOS use
   national master lists (e.g. German BSI) instead. Ship + refresh out-of-band.
-- **MRZ OCR (optical path only):** PassportEye (Tesseract, ~80 % precision —
-  confirms OCR is noisy and why `optical-weak` is honest), `mrz-scanner`
-  (fully-offline PWA) as UX reference.
+- **MRZ OCR (optical path):** PassportEye (Tesseract, ~80 % precision —
+  confirms OCR is noisy and why `optical` is `deters`, not `proves`),
+  `mrz-scanner` (fully-offline PWA) as UX reference.
+- **Face compare / age (optical path):** `BetterAgeVerify` (privacy-first OSS,
+  on-device, images deleted immediately) and general OSS face-embedding models
+  as references for the ID-portrait ↔ live-face match + a photo-of-photo
+  liveness check.
 - **Content-category domain lists (policy-engine network filter):**
   `StevenBlack/hosts` (porn / gambling extensions), **HaGeZi dns-blocklists**
   (NSFW + gambling categories), `blocklistproject/Lists`, `aegis-blocklist`
