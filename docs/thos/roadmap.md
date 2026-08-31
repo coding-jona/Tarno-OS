@@ -197,8 +197,19 @@ late.
     hand-assembled statically linked Win64 `.exe` (`write(1,…)` + `exit(0)` via
     `syscall` — the CPU runs `syscall` from any ring-3 code regardless of
     container) into ext2 and checks it prints + exits. ELF and PE processes run
-    in the same boot on the same kernel. Next: base relocations, then PEB/TEB +
-    `gs` base, then the `Nt*` dispatch + `ntdll` lower boundary.
+    in the same boot on the same kernel.
+  - **Hardening done (P0):** `pe.rs` treats every input as hostile — bounds-
+    checked LE reads, sane limits on `SizeOfImage` / `NumberOfSections` /
+    `ImageBase`, overflow-checked arithmetic, section data clamped to what the
+    file holds. A malformed `.exe` returns `Err`, never a slice panic;
+    `spawn_pe` returns `Result`. `pe-test` also feeds it a truncated / bad-
+    `e_lfanew` blob and asserts the kernel rejects it and stays alive.
+  - **Next (P1):**
+    - **Base relocations** — load at an alternative base when the preferred one
+      is taken, apply data directory 5 (`IMAGE_REL_BASED_DIR64`).
+    - **Imports** — resolve data directory 1 against loaded DLLs
+      (`kernel32` / `ntdll` / `user32`); this is where the NT personality
+      proper begins (SSDT dispatch, `Nt*` core, PEB/TEB + `gs` base).
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
