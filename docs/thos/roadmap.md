@@ -213,20 +213,26 @@ late.
     now loads its message pointer from an **absolute** slot patched by a DIR64
     fixup — a wrong delta would fault or misprint, so the exact-string check is
     the relocation test.
-  - **Imports — first cut done (P1):** `pe::load` walks the Import Directory
-    Table, resolves each by-name thunk against a builtin resolver, and patches
-    the IAT in place (post-relocation). A **shared NT stub page** is mapped into
-    every PE process at a fixed high address; each resolved import points at a
-    tiny trampoline there that enters the kernel via `syscall`. Right now the
-    only stub is `KERNEL32.dll!ExitProcess` → `SYS_exit`; anything unresolved is
-    rejected (logged as `dll!func`), not left dangling. The `pe-test` `.exe`
-    imports `ExitProcess` and calls it through the IAT — a bad patch would fault
-    on the indirect `call`. **This is the seed of the NT personality.**
-  - **Next:** grow the stub table with real arg marshalling
-    (`GetStdHandle`/`WriteFile` → `write`), PEB/TEB + `gs` base, a distinct
-    `Nt*` syscall number space and dispatch, then real PE-built DLLs from a
-    `C:\Windows\System32` tree; then process isolation / integrity for the
-    security phase.
+  - **Imports + NT syscall surface done (P1):** `pe::load` walks the Import
+    Directory Table, resolves each by-name thunk against a builtin resolver, and
+    patches the IAT in place (post-relocation); unresolved names / ordinals are
+    rejected, not left dangling. A **shared NT stub page** is mapped into every
+    PE process at a fixed high address — one 16-byte trampoline per NT call
+    (`mov eax, NT_BASE|idx; mov r10, rcx; syscall; ret`). `rax` values in the
+    `NT_BASE` (`0x4E540000`) range route to **`nt::dispatch`** (`nt.rs`), which
+    reads the Win64 arg registers (`r10`=former `rcx`, `rdx`, `r8`, `r9`, then
+    the stack) off the `UserFrame` and marshals onto THOS objects.
+  - **`GetStdHandle` / `WriteFile` / `ExitProcess` implemented.** The `pe-test`
+    `.exe` prints its first line via a raw `syscall` (relocated absolute
+    pointer), then prints a second line via
+    `WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, len, &written, NULL)` —
+    real Win64 arg passing, `*written` write-back, `TRUE` return — then
+    `ExitProcess(0)`, all through the IAT. **A PE process now makes real Win32
+    API calls that operate on THOS's own fd/console objects.**
+  - **Next:** more `kernel32` (`CreateFileA`/`ReadFile`/`GetLastError`), PEB/TEB
+    + `gs` base, a proper `ntdll` boundary (`Nt*` primitives) under `kernel32`,
+    then real PE-built DLLs from a `C:\Windows\System32` tree; then process
+    isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a

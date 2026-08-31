@@ -760,6 +760,9 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             sched::exit()
         }
 
+        // NT-personality calls from a PE's import stubs.
+        n if n & !0xFFFF == crate::nt::NT_BASE => crate::nt::dispatch((n & 0xFFFF) as u16, frame),
+
         n => {
             kprintln!("THOS: unhandled syscall {}", n);
             ENOSYS

@@ -524,6 +524,11 @@ fn user_selectors() -> (u64, u64) {
     ((s.user_code.0 | 3) as u64, (s.user_data.0 | 3) as u64)
 }
 
+/// The current task's file object for `fd`, if open.
+pub fn current_fd(fd: i32) -> Option<Arc<dyn FileOps>> {
+    sched::current().task().and_then(|t| t.fd_get(fd))
+}
+
 pub fn current_pid() -> u64 {
     sched::current().task().map(|t| t.pid).unwrap_or(0)
 }

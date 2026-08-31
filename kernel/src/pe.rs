@@ -40,24 +40,30 @@ const MAX_IMAGE_SIZE: u64 = 256 * 1024 * 1024;
 const MAX_SECTIONS: usize = 96;
 
 /// The builtin "NT stub" page mapped into every PE process. Each imported Win32
-/// function resolves to one of these tiny trampolines, which enter the THOS
-/// kernel via `syscall`. This is the seed of the NT personality — real `ntdll`
-/// and per-call arg marshalling grow from here.
+/// function resolves to one 16-byte trampoline here:
+///
+/// ```text
+///   mov eax, NT_BASE | idx     ; select the NT call
+///   mov r10, rcx               ; preserve Win64 arg0 before syscall clobbers rcx
+///   syscall
+///   ret
+/// ```
+///
+/// `nt::dispatch` reads the remaining Win64 args (`rdx`, `r8`, `r9`, stack)
+/// off the frame. This is the seed of the NT personality; real `ntdll` and
+/// more calls grow from here.
 const NT_STUB_BASE: u64 = 0x0000_7FF0_0000_0000;
-const STUB_EXITPROCESS: u64 = 0x00;
-/// `mov rax, 60 (SYS_exit); mov rdi, rcx (Win64 arg0); syscall`
-const NT_STUB_BLOB: &[u8] = &[
-    0x48, 0xC7, 0xC0, 60, 0, 0, 0, // mov rax, 60
-    0x48, 0x89, 0xCF, // mov rdi, rcx
-    0x0F, 0x05, // syscall
-];
+const NT_STUB_STRIDE: u64 = 16;
 
-/// Address of the stub that implements `dll!func`, or `None` if THOS does not
+/// Index of the stub implementing `dll!func`, or `None` if THOS does not
 /// provide it yet (the loader then rejects the PE rather than mislinking).
-fn resolve_import(dll: &str, func: &str) -> Option<u64> {
-    let dll = dll.trim_end_matches(|c| c == '\0');
-    match (dll.to_ascii_lowercase().as_str(), func) {
-        ("kernel32.dll", "ExitProcess") => Some(NT_STUB_BASE + STUB_EXITPROCESS),
+fn resolve_import(dll: &str, func: &str) -> Option<u16> {
+    use crate::nt::*;
+    let dll = dll.trim_end_matches('\0').to_ascii_lowercase();
+    match (dll.as_str(), func) {
+        ("kernel32.dll", "ExitProcess") => Some(NT_EXITPROCESS),
+        ("kernel32.dll", "GetStdHandle") => Some(NT_GETSTDHANDLE),
+        ("kernel32.dll", "WriteFile") => Some(NT_WRITEFILE),
         _ => None,
     }
 }
@@ -299,20 +305,21 @@ fn resolve_imports(img: &mut [u8], import_rva: u64, size_of_image: u64) -> Resul
             if thunk == 0 {
                 break;
             }
-            let addr = if thunk & 0x8000_0000_0000_0000 != 0 {
+            let stub_idx = if thunk & 0x8000_0000_0000_0000 != 0 {
                 // import by ordinal — no ordinal tables yet
                 return Err("PE: import by ordinal not supported yet");
             } else {
                 let hint_name_rva = thunk & 0x7FFF_FFFF;
                 let func = cstr_at(img, hint_name_rva + 2)?; // skip the 2-byte hint
                 match resolve_import(&dll, func) {
-                    Some(a) => a,
+                    Some(i) => i,
                     None => {
                         crate::kprintln!("THOS: pe unresolved    {}!{}", dll.as_str(), func);
                         return Err("PE: unresolved import");
                     }
                 }
             };
+            let addr = NT_STUB_BASE + stub_idx as u64 * NT_STUB_STRIDE;
             img[p_off..p_off + 8].copy_from_slice(&addr.to_le_bytes());
             i += 1;
         }
@@ -320,15 +327,28 @@ fn resolve_imports(img: &mut [u8], import_rva: u64, size_of_image: u64) -> Resul
     }
 }
 
-/// Map the shared NT stub page into `proc` at [`NT_STUB_BASE`] (exec, read-only).
+/// Map the shared NT stub page into `proc` at [`NT_STUB_BASE`] (exec,
+/// read-only), one 16-byte trampoline per NT call index.
 fn map_stub_page(proc: &Process) -> Result<(), &'static str> {
     let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (stub page)")?;
     let phys = frame.start_address();
     let dst = phys_to_virt(phys).as_mut_ptr::<u8>();
-    unsafe {
-        core::ptr::write_bytes(dst, 0, 4096);
-        core::ptr::copy_nonoverlapping(NT_STUB_BLOB.as_ptr(), dst, NT_STUB_BLOB.len());
+    unsafe { core::ptr::write_bytes(dst, 0, 4096) };
+
+    for idx in 0..crate::nt::NT_STUB_COUNT {
+        let stub = [
+            0xB8, 0, 0, 0, 0, // mov eax, imm32  (patched below)
+            0x49, 0x89, 0xCA, // mov r10, rcx
+            0x0F, 0x05, // syscall
+            0xC3, // ret
+        ];
+        let mut stub = stub;
+        let sel = (crate::nt::NT_BASE | idx as u64) as u32;
+        stub[1..5].copy_from_slice(&sel.to_le_bytes());
+        let at = idx as usize * NT_STUB_STRIDE as usize;
+        unsafe { core::ptr::copy_nonoverlapping(stub.as_ptr(), dst.add(at), stub.len()) };
     }
+
     proc.map(NT_STUB_BASE, phys.as_u64(), false, true);
     Ok(())
 }

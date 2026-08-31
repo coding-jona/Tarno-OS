@@ -42,6 +42,7 @@ mod idt;
 #[cfg(feature = "interactive")]
 mod login;
 mod mm;
+mod nt;
 mod object;
 mod pci;
 mod pe;

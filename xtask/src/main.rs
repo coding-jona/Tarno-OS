@@ -389,13 +389,17 @@ fn disk_image() -> PathBuf {
 
 /// Write a minimal statically linked Win64 console `.exe`: `.text` (RWX) +
 /// `.reloc` + `.idata`, `DYNAMIC_BASE` set. The entry:
-///   - `write(1, msg)` via a raw `syscall` (the CPU runs `syscall` from any
-///     ring-3 code) — `msg` comes from an **absolute** slot needing a `DIR64`
-///     base relocation;
-///   - `ExitProcess(0)` through the **IAT**, imported from `KERNEL32.dll`.
-/// Exercises header parse, section map, relocation fixup, and import resolution.
+///   1. `write(1, msg1)` via a raw `syscall` — `msg1` from an **absolute** slot
+///      needing a `DIR64` base relocation;
+///   2. `WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), msg2, len, &written, NULL)`
+///      — real Win64 arg passing (rcx/rdx/r8/r9 + a stack slot), through the
+///      **IAT** into THOS's NT stubs;
+///   3. `ExitProcess(0)` through the IAT.
+/// Exercises header parse, section map, relocation fixup, import resolution,
+/// and Win64→THOS argument marshalling.
 fn write_pe_hello(path: &Path) {
-    let msg: &[u8] = b"PE on THOS via native loader\n";
+    let msg1: &[u8] = b"PE on THOS via native loader\n";
+    let msg2: &[u8] = b"PE via WriteFile\n";
     const IMAGE_BASE: u64 = 0x1_4000_0000;
     const SECT_ALIGN: u32 = 0x1000;
     const FILE_ALIGN: u32 = 0x200;
@@ -403,73 +407,121 @@ fn write_pe_hello(path: &Path) {
     let reloc_rva = 0x2000u32;
     let idata_rva = 0x3000u32;
 
-    // .idata layout (offsets within the section):
-    let idt_off = 0x00u32; // Import Directory Table (2 * 20)
-    let ilt_off = 0x28u32; // Import Lookup Table  (2 * 8)
-    let iat_off = 0x38u32; // Import Address Table (2 * 8)  <- loader patches [0]
-    let hn_off = 0x48u32; // Hint/Name: u16 hint + "ExitProcess\0"
-    let dll_off = 0x58u32; // "KERNEL32.dll\0"
-    let iat_slot0_rva = idata_rva + iat_off;
-
-    // --- entry machine code (x86-64) ---
-    let mut code: Vec<u8> = Vec::new();
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1  (SYS_write)
-    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 1, 0, 0, 0]); // mov rdi, 1  (fd)
-    let mov_disp = code.len() + 3;
-    code.extend_from_slice(&[0x48, 0x8B, 0x35, 0, 0, 0, 0]); // mov rsi, [rip+disp32]
-    let rdx_imm = code.len() + 3;
-    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0, 0, 0, 0]); // mov rdx, len
-    code.extend_from_slice(&[0x0F, 0x05]); // syscall
-    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx           (ExitProcess arg0 = 0)
-    let call_disp = code.len() + 2;
-    code.extend_from_slice(&[0xFF, 0x15, 0, 0, 0, 0]); // call [rip+disp32]  (IAT slot 0)
-    let after_call = code.len();
-    code.extend_from_slice(&[0xCC]); // int3  (ExitProcess must not return)
-    while code.len() % 8 != 0 {
-        code.push(0);
-    }
-    let ptr_off = code.len(); // absolute pointer to msg (relocated)
-    code.extend_from_slice(&[0u8; 8]);
-    let msg_off = code.len();
-    code.extend_from_slice(msg);
-
-    code[mov_disp..mov_disp + 4]
-        .copy_from_slice(&((ptr_off as i64 - (mov_disp as i64 + 4)) as i32).to_le_bytes());
-    code[rdx_imm..rdx_imm + 4].copy_from_slice(&(msg.len() as u32).to_le_bytes());
-    let call_target_rva = iat_slot0_rva as i64;
-    let call_next_rva = text_rva as i64 + after_call as i64;
-    code[call_disp..call_disp + 4]
-        .copy_from_slice(&((call_target_rva - call_next_rva) as i32).to_le_bytes());
-    let msg_va = IMAGE_BASE + text_rva as u64 + msg_off as u64;
-    code[ptr_off..ptr_off + 8].copy_from_slice(&msg_va.to_le_bytes());
-    let ptr_reloc_rva = text_rva + ptr_off as u32;
-
-    // --- .reloc: one block, one DIR64 fixup for the pointer slot ---
-    let mut reloc: Vec<u8> = Vec::new();
-    reloc.extend_from_slice(&(ptr_reloc_rva & !0xFFF).to_le_bytes()); // PageRVA
-    reloc.extend_from_slice(&12u32.to_le_bytes()); // BlockSize
-    reloc.extend_from_slice(&((10u16 << 12) | (ptr_reloc_rva & 0xFFF) as u16).to_le_bytes());
-    reloc.extend_from_slice(&0u16.to_le_bytes()); // ABSOLUTE padding
-
-    // --- .idata ---
-    let mut idata = vec![0u8; 0x66];
+    // --- .idata: import KERNEL32.dll!{ExitProcess, GetStdHandle, WriteFile} ---
+    let funcs: [&[u8]; 3] = [b"ExitProcess", b"GetStdHandle", b"WriteFile"];
+    let ilt_off = 0x28u32; // after 2 IDT entries (2*20)
+    let iat_off = ilt_off + (funcs.len() as u32 + 1) * 8;
+    let mut hn_off = iat_off + (funcs.len() as u32 + 1) * 8;
+    let mut idata: Vec<u8> = vec![0u8; 0x200];
     let put32 = |b: &mut Vec<u8>, at: u32, v: u32| {
         b[at as usize..at as usize + 4].copy_from_slice(&v.to_le_bytes());
     };
     let put64 = |b: &mut Vec<u8>, at: u32, v: u64| {
         b[at as usize..at as usize + 8].copy_from_slice(&v.to_le_bytes());
     };
-    // IDT entry 0
-    put32(&mut idata, idt_off, idata_rva + ilt_off); // OriginalFirstThunk (ILT)
-    put32(&mut idata, idt_off + 12, idata_rva + dll_off); // Name
-    put32(&mut idata, idt_off + 16, idata_rva + iat_off); // FirstThunk (IAT)
-    // IDT entry 1 = null terminator (already zeroed)
-    put64(&mut idata, ilt_off, (idata_rva + hn_off) as u64); // by-name
-    put64(&mut idata, iat_off, (idata_rva + hn_off) as u64); // same until the loader patches it
-    // Hint/Name
-    idata[hn_off as usize..hn_off as usize + 2].copy_from_slice(&0u16.to_le_bytes());
-    idata[hn_off as usize + 2..hn_off as usize + 2 + 11].copy_from_slice(b"ExitProcess");
+    let mut hn_rvas = [0u32; 3];
+    for (i, f) in funcs.iter().enumerate() {
+        hn_rvas[i] = idata_rva + hn_off;
+        // 2-byte hint (0) then the NUL-terminated name
+        idata[hn_off as usize + 2..hn_off as usize + 2 + f.len()].copy_from_slice(f);
+        hn_off += 2 + f.len() as u32 + 1;
+        hn_off = (hn_off + 1) & !1; // keep names 2-aligned
+    }
+    let dll_off = hn_off;
     idata[dll_off as usize..dll_off as usize + 12].copy_from_slice(b"KERNEL32.dll");
+    // IDT entry 0 (entry 1 stays zero = terminator)
+    put32(&mut idata, 0, idata_rva + ilt_off); // OriginalFirstThunk
+    put32(&mut idata, 12, idata_rva + dll_off); // Name
+    put32(&mut idata, 16, idata_rva + iat_off); // FirstThunk
+    for i in 0..funcs.len() as u32 {
+        put64(&mut idata, ilt_off + i * 8, hn_rvas[i as usize] as u64);
+        put64(&mut idata, iat_off + i * 8, hn_rvas[i as usize] as u64);
+    }
+    idata.truncate(((dll_off + 13 + 15) & !15) as usize);
+    let iat_exit = idata_rva + iat_off;
+    let iat_gsh = idata_rva + iat_off + 8;
+    let iat_wf = idata_rva + iat_off + 16;
+
+    // --- entry machine code (x86-64) ---
+    // Deferred RIP-relative fixups: (disp32 position in `code`, target RVA).
+    let mut code: Vec<u8> = Vec::new();
+    let mut fixups: Vec<(usize, u32)> = Vec::new();
+    macro_rules! rel {
+        ($bytes:expr, $target:expr) => {{
+            code.extend_from_slice(&$bytes);
+            fixups.push((code.len() - 4, $target));
+        }};
+    }
+    // slots appended after the code; RVAs filled once the code length is known
+    let ptr_slot_tag = u32::MAX; // sentinel targets resolved specially
+    let wr_slot_tag = u32::MAX - 1;
+    let msg1_tag = u32::MAX - 2;
+    let msg2_tag = u32::MAX - 3;
+
+    // 1) write(1, msg1, len1)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 1, 0, 0, 0]); // mov rdi, 1
+    rel!([0x48, 0x8B, 0x35, 0, 0, 0, 0], ptr_slot_tag); // mov rsi, [rip+ptr_slot]
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+    code.extend_from_slice(&(msg1.len() as u32).to_le_bytes()); // mov rdx, len1
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // 2) WriteFile(GetStdHandle(-11), msg2, len2, &written, NULL)
+    code.extend_from_slice(&[0xB9, 0xF5, 0xFF, 0xFF, 0xFF]); // mov ecx, -11
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gsh); // call [rip+iat_GetStdHandle]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (handle)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg2_tag); // lea rdx, [rip+msg2]
+    code.extend_from_slice(&[0x41, 0xB8]);
+    code.extend_from_slice(&(msg2.len() as u32).to_le_bytes()); // mov r8d, len2
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // mov qword [rsp+0x20], 0
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf); // call [rip+iat_WriteFile]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+
+    // 3) ExitProcess(0)
+    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_exit); // call [rip+iat_ExitProcess]
+    code.extend_from_slice(&[0xCC]); // int3
+
+    // --- data slots at the end of .text ---
+    while code.len() % 8 != 0 {
+        code.push(0);
+    }
+    let ptr_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // absolute ptr to msg1 (DIR64-relocated)
+    let wr_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // DWORD `written` (+ pad)
+    let msg1_off = code.len();
+    code.extend_from_slice(msg1);
+    let msg2_off = code.len();
+    code.extend_from_slice(msg2);
+
+    code[ptr_off..ptr_off + 8]
+        .copy_from_slice(&(IMAGE_BASE + text_rva as u64 + msg1_off as u64).to_le_bytes());
+    for (pos, target) in fixups {
+        let target_rva = match target {
+            t if t == ptr_slot_tag => text_rva + ptr_off as u32,
+            t if t == wr_slot_tag => text_rva + wr_off as u32,
+            t if t == msg1_tag => text_rva + msg1_off as u32,
+            t if t == msg2_tag => text_rva + msg2_off as u32,
+            rva => rva,
+        };
+        let next_rva = text_rva as i64 + pos as i64 + 4;
+        code[pos..pos + 4].copy_from_slice(&((target_rva as i64 - next_rva) as i32).to_le_bytes());
+    }
+    let ptr_reloc_rva = text_rva + ptr_off as u32;
+
+    // --- .reloc: one block, one DIR64 fixup for the msg1 pointer slot ---
+    let mut reloc: Vec<u8> = Vec::new();
+    reloc.extend_from_slice(&(ptr_reloc_rva & !0xFFF).to_le_bytes()); // PageRVA
+    reloc.extend_from_slice(&12u32.to_le_bytes()); // BlockSize
+    reloc.extend_from_slice(&((10u16 << 12) | (ptr_reloc_rva & 0xFFF) as u16).to_le_bytes());
+    reloc.extend_from_slice(&0u16.to_le_bytes()); // ABSOLUTE padding
 
     // --- PE32+ container ---
     let text_vsize = code.len() as u32;
@@ -518,8 +570,9 @@ fn write_pe_hello(path: &Path) {
     pe[opt + 112 + 5 * 8..opt + 112 + 5 * 8 + 4].copy_from_slice(&reloc_rva.to_le_bytes());
     pe[opt + 112 + 5 * 8 + 4..opt + 112 + 5 * 8 + 8].copy_from_slice(&reloc_vsize.to_le_bytes());
     // data directory 12 = IAT
-    pe[opt + 112 + 12 * 8..opt + 112 + 12 * 8 + 4].copy_from_slice(&iat_slot0_rva.to_le_bytes());
-    pe[opt + 112 + 12 * 8 + 4..opt + 112 + 12 * 8 + 8].copy_from_slice(&16u32.to_le_bytes());
+    pe[opt + 112 + 12 * 8..opt + 112 + 12 * 8 + 4].copy_from_slice(&iat_exit.to_le_bytes());
+    pe[opt + 112 + 12 * 8 + 4..opt + 112 + 12 * 8 + 8]
+        .copy_from_slice(&(funcs.len() as u32 * 8).to_le_bytes());
 
     let mut sec = |i: usize, name: &[u8], vsize: u32, rva: u32, raw_size: u32, raw_ptr: u32, ch: u32| {
         let h = opt + opt_size as usize + i * 40;
@@ -1222,9 +1275,11 @@ fn pe_test(iso: &Path) {
     let disk = disk_image();
     let serial = boot_kernel_headless("pe", iso, &disk, 4);
     let ok = serial.contains("THOS: pe exited")
-        && serial.contains("PE on THOS via native loader");
+        && serial.contains("PE on THOS via native loader") // raw syscall + DIR64 reloc
+        && serial.contains("PE via WriteFile") // GetStdHandle + WriteFile through the IAT
+        && serial.contains("THOS: pe reject ok");
     if ok {
-        println!("pe-test: OK — native PE64 loader ran a statically linked .exe");
+        println!("pe-test: OK — PE loader: reloc, imports, GetStdHandle/WriteFile marshalling");
     } else {
         eprintln!("pe-test: FAIL — the PE did not run to exit\n--- serial ---\n{serial}\n---");
         exit(1);
