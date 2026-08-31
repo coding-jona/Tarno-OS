@@ -13,8 +13,11 @@
 //! straight to a THOS write); a real `ntdll` with `Nt*` primitives layers on
 //! later.
 
+use alloc::sync::Arc;
+
 use crate::syscall::UserFrame;
-use crate::{process, sched};
+use crate::wait::Event;
+use crate::{object, process, sched};
 
 /// `rax` values `NT_BASE ..= NT_BASE|0xFFFF` are NT-personality calls.
 pub const NT_BASE: u64 = 0x4E54_0000; // 'N' 'T'
@@ -87,7 +90,11 @@ pub const NT_NTQUERYINFORMATIONPROCESS: u16 = 9;
 pub const NT_NTQUERYVIRTUALMEMORY: u16 = 10;
 pub const NT_NTSETINFORMATIONTHREAD: u16 = 11;
 pub const NT_NTSETINFORMATIONPROCESS: u16 = 12;
-pub const NTDLL_STUB_COUNT: u16 = 13;
+pub const NT_NTCREATEEVENT: u16 = 13;
+pub const NT_NTWAITFORSINGLEOBJECT: u16 = 14;
+pub const NT_NTSETEVENT: u16 = 15;
+pub const NT_NTRESETEVENT: u16 = 16;
+pub const NTDLL_STUB_COUNT: u16 = 17;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -108,6 +115,10 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtQueryVirtualMemory",
     "NtSetInformationThread",
     "NtSetInformationProcess",
+    "NtCreateEvent",
+    "NtWaitForSingleObject",
+    "NtSetEvent",
+    "NtResetEvent",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -131,6 +142,12 @@ const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+const STATUS_TIMEOUT: u32 = 0x0000_0102;
+
+/// NT `HANDLE`s to executive objects (events, …) carry this bit, so `NtClose`
+/// and the wait/signal calls know to route to [`object`] rather than the fd
+/// table. A real per-process unified HANDLE table replaces this later.
+const NT_OBJ_TAG: u64 = 0x4000_0000;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
@@ -207,8 +224,15 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // NtTerminateProcess(ProcessHandle, ExitStatus)
         NT_NTTERMINATEPROCESS => proc_terminate(a1 as i32),
 
-        // NtClose(Handle)
-        NT_NTCLOSE => status(handle_close_core(a0 as i32), STATUS_INVALID_HANDLE),
+        // NtClose(Handle) — an executive-object HANDLE or an fd.
+        NT_NTCLOSE => {
+            let ok = if a0 & NT_OBJ_TAG != 0 {
+                object::close(object::Handle((a0 & !NT_OBJ_TAG) as u32))
+            } else {
+                handle_close_core(a0 as i32)
+            };
+            status(ok, STATUS_INVALID_HANDLE)
+        }
 
         // NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
         //             Buffer, Length, ByteOffset, Key)
@@ -317,6 +341,63 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // these with classes THOS can safely ignore (debugger flags, priority,
         // …). Accept everything until a class actually needs backing.
         NT_NTSETINFORMATIONTHREAD | NT_NTSETINFORMATIONPROCESS => STATUS_SUCCESS as i64,
+
+        // NtCreateEvent(*EventHandle, DesiredAccess, *ObjectAttributes,
+        //               EventType, InitialState). Unnamed only; the executive
+        // `Event` is manual-reset, so `EventType` (0 notification /
+        // 1 synchronization) is not honoured yet.
+        NT_NTCREATEEVENT => {
+            let ev = Event::new();
+            if stack(0) & 0xFF != 0 {
+                ev.signal(); // InitialState = TRUE
+            }
+            let h = object::insert(Arc::new(ev));
+            unsafe { *(a0 as *mut u64) = NT_OBJ_TAG | h.0 as u64 };
+            STATUS_SUCCESS as i64
+        }
+
+        // NtWaitForSingleObject(Handle, Alertable, *Timeout). NULL timeout =
+        // block until signalled; `*Timeout == 0` = poll; any other value is
+        // treated as an immediate poll (a real timed wait comes with the
+        // executive timer path). Events only for now.
+        NT_NTWAITFORSINGLEOBJECT => {
+            if a0 & NT_OBJ_TAG == 0 {
+                return STATUS_INVALID_HANDLE as i64;
+            }
+            let Some(ev) = object::get::<Event>(object::Handle((a0 & !NT_OBJ_TAG) as u32)) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            let poll_only = a2 != 0 && unsafe { *(a2 as *const i64) } != 0;
+            if a2 == 0 {
+                ev.wait(); // block until signalled
+                STATUS_SUCCESS as i64
+            } else if ev.is_signaled() {
+                STATUS_SUCCESS as i64
+            } else {
+                let _ = poll_only;
+                STATUS_TIMEOUT as i64
+            }
+        }
+
+        // NtSetEvent / NtResetEvent(Handle, *PreviousState)
+        NT_NTSETEVENT | NT_NTRESETEVENT => {
+            if a0 & NT_OBJ_TAG == 0 {
+                return STATUS_INVALID_HANDLE as i64;
+            }
+            let Some(ev) = object::get::<Event>(object::Handle((a0 & !NT_OBJ_TAG) as u32)) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            let prev = ev.is_signaled() as u32;
+            if idx == NT_NTSETEVENT {
+                ev.signal();
+            } else {
+                ev.reset();
+            }
+            if a1 != 0 {
+                unsafe { *(a1 as *mut u32) = prev };
+            }
+            STATUS_SUCCESS as i64
+        }
 
         // LdrGetProcedureAddress(DllHandle, *AnsiName(STRING), Ordinal, *Address)
         NT_LDRGETPROCEDUREADDRESS => {

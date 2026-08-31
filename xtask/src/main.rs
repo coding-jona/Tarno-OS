@@ -587,6 +587,17 @@ fn write_pe_hello(path: &Path) {
     let ntqipname_tag = u32::MAX - 26;
     let pbi_tag = u32::MAX - 27;
     let msg_ntqip_tag = u32::MAX - 28;
+    let cename_tag = u32::MAX - 29;
+    let wfsoname_tag = u32::MAX - 30;
+    let sename_tag = u32::MAX - 31;
+    let closename_tag = u32::MAX - 32;
+    let ce_slot_tag = u32::MAX - 33;
+    let wfso_slot_tag = u32::MAX - 34;
+    let se_slot_tag = u32::MAX - 35;
+    let close_slot_tag = u32::MAX - 36;
+    let evh_tag = u32::MAX - 37;
+    let tzero_tag = u32::MAX - 38;
+    let msg_event_tag = u32::MAX - 39;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -827,6 +838,74 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2m3) executive-backed events. rbx still holds hNtdll. Resolve the four
+    //      Nt* event calls into slots, then: create an unsignalled event,
+    //      poll -> STATUS_TIMEOUT; NtSetEvent; poll -> STATUS_WAIT_0; block on
+    //      a NULL timeout (already signalled) -> STATUS_WAIT_0; NtClose.
+    for (name_tag, slot_tag) in [
+        (cename_tag, ce_slot_tag),
+        (wfsoname_tag, wfso_slot_tag),
+        (sename_tag, se_slot_tag),
+        (closename_tag, close_slot_tag),
+    ] {
+        code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx  (hNtdll)
+        rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], name_tag); // lea rdx, [rip+name]
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+        rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa); // call [rip+iat_GetProcAddress]
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+        rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], slot_tag); // mov [rip+slot], rax
+    }
+    // NtCreateEvent(&evh, 0, 0, 0, FALSE)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], evh_tag); // lea rcx, [rip+evh]
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9]); // xor edx,edx; xor r8d,r8d; xor r9d,r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // sub rsp,0x38; [rsp+0x20]=0
+    rel!([0xFF, 0x15, 0, 0, 0, 0], ce_slot_tag); // call [rip+ce_slot]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0x85, 0xC0, 0x74, 0x01, 0xCC]); // add rsp,0x38; test eax,eax; je +1; int3
+    // NtWaitForSingleObject(evh, 0, &tzero) -> STATUS_TIMEOUT
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag); // mov rcx, [rip+evh]
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], tzero_tag); // lea r8, [rip+tzero]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag); // call [rip+wfso_slot]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x3D, 0x02, 0x01, 0, 0, 0x74, 0x01, 0xCC]); // cmp eax,0x102; je +1; int3
+    // NtSetEvent(evh, 0)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag); // mov rcx, [rip+evh]
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], se_slot_tag); // call [rip+se_slot]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    // NtWaitForSingleObject(evh, 0, &tzero) -> STATUS_WAIT_0
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag);
+    code.extend_from_slice(&[0x31, 0xD2]);
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], tzero_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]); // test eax,eax; je +1; int3
+    // NtWaitForSingleObject(evh, 0, NULL) -> blocking fast path, already signalled
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag);
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0]); // xor edx,edx; xor r8d,r8d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtClose(evh)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], close_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // WriteFile(1, msg_event, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_event_tag);
+    let event_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -988,6 +1067,14 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"thos_add\0");
     let ntqipname_off = code.len();
     code.extend_from_slice(b"NtQueryInformationProcess\0");
+    let cename_off = code.len();
+    code.extend_from_slice(b"NtCreateEvent\0");
+    let wfsoname_off = code.len();
+    code.extend_from_slice(b"NtWaitForSingleObject\0");
+    let sename_off = code.len();
+    code.extend_from_slice(b"NtSetEvent\0");
+    let closename_off = code.len();
+    code.extend_from_slice(b"NtClose\0");
     while code.len() % 8 != 0 {
         code.push(0);
     }
@@ -995,6 +1082,18 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0u8; 16]); // IO_STATUS_BLOCK { NTSTATUS; ULONG_PTR }
     let pbi_off = code.len();
     code.extend_from_slice(&[0u8; 48]); // PROCESS_BASIC_INFORMATION
+    let ce_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtCreateEvent
+    let wfso_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtWaitForSingleObject
+    let se_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtSetEvent
+    let close_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtClose
+    let evh_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // event HANDLE
+    let tzero_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // LARGE_INTEGER timeout = 0 (poll)
     let tls_dir_off = code.len();
     code.extend_from_slice(&[0u8; 40]); // IMAGE_TLS_DIRECTORY64 (fields filled + DIR64-relocated)
     let tls_raw_off = code.len();
@@ -1043,7 +1142,11 @@ fn write_pe_hello(path: &Path) {
     let msg_ntqip: &[u8] = b"PE NtQIP OK\n";
     let msg_ntqip_off = code.len();
     code.extend_from_slice(msg_ntqip);
+    let msg_event: &[u8] = b"PE event OK\n";
+    let msg_event_off = code.len();
+    code.extend_from_slice(msg_event);
 
+    code[event_r8..event_r8 + 4].copy_from_slice(&(msg_event.len() as u32).to_le_bytes());
     code[ntqip_r8..ntqip_r8 + 4].copy_from_slice(&(msg_ntqip.len() as u32).to_le_bytes());
     code[tls_r8..tls_r8 + 4].copy_from_slice(&(msg_tls.len() as u32).to_le_bytes());
     code[dll_r8..dll_r8 + 4].copy_from_slice(&(msg_dll.len() as u32).to_le_bytes());
@@ -1099,6 +1202,17 @@ fn write_pe_hello(path: &Path) {
             t if t == ntqipname_tag => text_rva + ntqipname_off as u32,
             t if t == pbi_tag => text_rva + pbi_off as u32,
             t if t == msg_ntqip_tag => text_rva + msg_ntqip_off as u32,
+            t if t == cename_tag => text_rva + cename_off as u32,
+            t if t == wfsoname_tag => text_rva + wfsoname_off as u32,
+            t if t == sename_tag => text_rva + sename_off as u32,
+            t if t == closename_tag => text_rva + closename_off as u32,
+            t if t == ce_slot_tag => text_rva + ce_slot_off as u32,
+            t if t == wfso_slot_tag => text_rva + wfso_slot_off as u32,
+            t if t == se_slot_tag => text_rva + se_slot_off as u32,
+            t if t == close_slot_tag => text_rva + close_slot_off as u32,
+            t if t == evh_tag => text_rva + evh_off as u32,
+            t if t == tzero_tag => text_rva + tzero_off as u32,
+            t if t == msg_event_tag => text_rva + msg_event_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -2393,6 +2507,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE GetProcAddress OK") // LoadLibraryA + synthetic kernel32 export table
         && serial.contains("PE ntdll OK") // ntdll boundary: GetModuleHandleA + GetProcAddress + 9-arg NtWriteFile
         && serial.contains("PE NtQIP OK") // NtQueryInformationProcess(ProcessBasicInformation) -> PebBaseAddress
+        && serial.contains("PE event OK") // NtCreateEvent/NtWaitForSingleObject/NtSetEvent/NtClose on the executive
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
