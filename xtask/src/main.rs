@@ -289,12 +289,18 @@ fn disk_image() -> PathBuf {
         }
     }
 
-    // A hand-assembled, statically linked Win64 `.exe` (no imports, no relocs)
-    // for the native PE loader -> /pe-hello.exe.
+    // A hand-assembled statically linked Win64 `.exe` for the native PE loader,
+    // plus the file it opens with CreateFileA / ReadFile.
     let exe = root.join("target/pe-hello.exe");
     write_pe_hello(&exe);
     run(Command::new("debugfs").args([
         "-w", "-R", &format!("write {} pe-hello.exe", exe.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+    let peread = root.join("target/pe-read.txt");
+    std::fs::write(&peread, b"PE ReadFile OK via CreateFileA\n").unwrap();
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} pe-read.txt", peread.to_str().unwrap()),
         img.to_str().unwrap(),
     ]));
 
@@ -407,19 +413,26 @@ fn write_pe_hello(path: &Path) {
     let reloc_rva = 0x2000u32;
     let idata_rva = 0x3000u32;
 
-    // --- .idata: import KERNEL32.dll!{ExitProcess, GetStdHandle, WriteFile} ---
-    let funcs: [&[u8]; 3] = [b"ExitProcess", b"GetStdHandle", b"WriteFile"];
+    // --- .idata: import from KERNEL32.dll ---
+    let funcs: &[&[u8]] = &[
+        b"ExitProcess",   // NT idx 0
+        b"GetStdHandle",  // 1
+        b"WriteFile",     // 2
+        b"GetLastError",  // 3
+        b"CreateFileA",   // 5
+        b"ReadFile",      // 6
+    ];
     let ilt_off = 0x28u32; // after 2 IDT entries (2*20)
     let iat_off = ilt_off + (funcs.len() as u32 + 1) * 8;
     let mut hn_off = iat_off + (funcs.len() as u32 + 1) * 8;
-    let mut idata: Vec<u8> = vec![0u8; 0x200];
+    let mut idata: Vec<u8> = vec![0u8; 0x300];
     let put32 = |b: &mut Vec<u8>, at: u32, v: u32| {
         b[at as usize..at as usize + 4].copy_from_slice(&v.to_le_bytes());
     };
     let put64 = |b: &mut Vec<u8>, at: u32, v: u64| {
         b[at as usize..at as usize + 8].copy_from_slice(&v.to_le_bytes());
     };
-    let mut hn_rvas = [0u32; 3];
+    let mut hn_rvas = vec![0u32; funcs.len()];
     for (i, f) in funcs.iter().enumerate() {
         hn_rvas[i] = idata_rva + hn_off;
         // 2-byte hint (0) then the NUL-terminated name
@@ -441,6 +454,8 @@ fn write_pe_hello(path: &Path) {
     let iat_exit = idata_rva + iat_off;
     let iat_gsh = idata_rva + iat_off + 8;
     let iat_wf = idata_rva + iat_off + 16;
+    let iat_cf = idata_rva + iat_off + 32; // CreateFileA
+    let iat_rf = idata_rva + iat_off + 40; // ReadFile
 
     // --- entry machine code (x86-64) ---
     // Deferred RIP-relative fixups: (disp32 position in `code`, target RVA).
@@ -457,6 +472,10 @@ fn write_pe_hello(path: &Path) {
     let wr_slot_tag = u32::MAX - 1;
     let msg1_tag = u32::MAX - 2;
     let msg2_tag = u32::MAX - 3;
+    let stdout_slot_tag = u32::MAX - 4;
+    let nread_slot_tag = u32::MAX - 5;
+    let buf_tag = u32::MAX - 6;
+    let fname_tag = u32::MAX - 7;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -477,7 +496,8 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gsh); // call [rip+iat_GetStdHandle]
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
-    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (handle)
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (stdout handle)
+    rel!([0x48, 0x89, 0x1D, 0, 0, 0, 0], stdout_slot_tag); // mov [rip+stdout_slot], rbx
     code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
     rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg2_tag); // lea rdx, [rip+msg2]
     code.extend_from_slice(&[0x41, 0xB8]);
@@ -485,6 +505,39 @@ fn write_pe_hello(path: &Path) {
     rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
     code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // mov qword [rsp+0x20], 0
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf); // call [rip+iat_WriteFile]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+
+    // 2b) CreateFileA(fname, GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0) -> rbx
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], fname_tag); // lea rcx, [rip+fname]
+    code.extend_from_slice(&[0xBA, 0x00, 0x00, 0x00, 0x80]); // mov edx, 0x80000000 (GENERIC_READ)
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (share)
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d  (security)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x03, 0, 0, 0]); // [rsp+0x20]=3 disposition
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0]); // [rsp+0x28]=0 flags
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x30, 0, 0, 0, 0]); // [rsp+0x30]=0 template
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_cf); // call [rip+iat_CreateFileA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (file handle)
+
+    // 2c) ReadFile(rbx, buf, 64, &nread, 0)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], buf_tag); // lea rdx, [rip+buf]
+    code.extend_from_slice(&[0x41, 0xB8, 0x40, 0, 0, 0]); // mov r8d, 64
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], nread_slot_tag); // lea r9, [rip+nread]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // [rsp+0x20]=0 overlapped
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_rf); // call [rip+iat_ReadFile]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+
+    // 2d) WriteFile(stdout, buf, nread, &written, 0)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], stdout_slot_tag); // mov rcx, [rip+stdout_slot]
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], buf_tag); // lea rdx, [rip+buf]
+    rel!([0x44, 0x8B, 0x05, 0, 0, 0, 0], nread_slot_tag); // mov r8d, [rip+nread]
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // [rsp+0x20]=0
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf); // call [rip+iat_WriteFile]
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
 
@@ -502,6 +555,17 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0u8; 8]); // absolute ptr to msg1 (DIR64-relocated)
     let wr_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // DWORD `written` (+ pad)
+    let stdout_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // saved stdout HANDLE
+    let nread_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // DWORD `nread` (+ pad)
+    let buf_off = code.len();
+    code.extend_from_slice(&[0u8; 64]); // ReadFile buffer
+    let fname_off = code.len();
+    code.extend_from_slice(b"C:\\pe-read.txt\0");
+    while code.len() % 8 != 0 {
+        code.push(0);
+    }
     let msg1_off = code.len();
     code.extend_from_slice(msg1);
     let msg2_off = code.len();
@@ -513,6 +577,10 @@ fn write_pe_hello(path: &Path) {
         let target_rva = match target {
             t if t == ptr_slot_tag => text_rva + ptr_off as u32,
             t if t == wr_slot_tag => text_rva + wr_off as u32,
+            t if t == stdout_slot_tag => text_rva + stdout_off as u32,
+            t if t == nread_slot_tag => text_rva + nread_off as u32,
+            t if t == buf_tag => text_rva + buf_off as u32,
+            t if t == fname_tag => text_rva + fname_off as u32,
             t if t == msg1_tag => text_rva + msg1_off as u32,
             t if t == msg2_tag => text_rva + msg2_off as u32,
             rva => rva,
@@ -1282,10 +1350,11 @@ fn pe_test(iso: &Path) {
     let serial = boot_kernel_headless("pe", iso, &disk, 4);
     let ok = serial.contains("THOS: pe exited")
         && serial.contains("PE on THOS via native loader") // raw syscall + DIR64 reloc
-        && serial.contains("PE via WriteFile") // GetStdHandle + WriteFile through the IAT
+        && serial.contains("PE via WriteFile") // GetStdHandle + WriteFile + gs/TEB/PEB
+        && serial.contains("PE ReadFile OK via CreateFileA") // CreateFileA + ReadFile
         && serial.contains("THOS: pe reject ok");
     if ok {
-        println!("pe-test: OK — PE loader: reloc, imports, GetStdHandle/WriteFile marshalling");
+        println!("pe-test: OK — PE loader: reloc, imports, gs/TEB/PEB, CreateFileA/ReadFile/WriteFile");
     } else {
         eprintln!("pe-test: FAIL — the PE did not run to exit\n--- serial ---\n{serial}\n---");
         exit(1);

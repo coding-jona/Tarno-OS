@@ -73,6 +73,11 @@ fn resolve_import(dll: &str, func: &str) -> Option<u16> {
         ("kernel32.dll", "ExitProcess") => Some(NT_EXITPROCESS),
         ("kernel32.dll", "GetStdHandle") => Some(NT_GETSTDHANDLE),
         ("kernel32.dll", "WriteFile") => Some(NT_WRITEFILE),
+        ("kernel32.dll", "GetLastError") => Some(NT_GETLASTERROR),
+        ("kernel32.dll", "SetLastError") => Some(NT_SETLASTERROR),
+        ("kernel32.dll", "CreateFileA") => Some(NT_CREATEFILEA),
+        ("kernel32.dll", "ReadFile") => Some(NT_READFILE),
+        ("kernel32.dll", "CloseHandle") => Some(NT_CLOSEHANDLE),
         _ => None,
     }
 }

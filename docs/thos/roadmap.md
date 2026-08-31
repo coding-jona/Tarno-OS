@@ -233,17 +233,22 @@ late.
     `NT_BASE` (`0x4E540000`) range route to **`nt::dispatch`** (`nt.rs`), which
     reads the Win64 arg registers (`r10`=former `rcx`, `rdx`, `r8`, `r9`, then
     the stack) off the `UserFrame` and marshals onto THOS objects.
-  - **`GetStdHandle` / `WriteFile` / `ExitProcess` implemented.** The `pe-test`
-    `.exe` prints its first line via a raw `syscall` (relocated absolute
-    pointer), then prints a second line via
-    `WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, len, &written, NULL)` —
-    real Win64 arg passing, `*written` write-back, `TRUE` return — then
-    `ExitProcess(0)`, all through the IAT. **A PE process now makes real Win32
-    API calls that operate on THOS's own fd/console objects.**
-  - **Next:** more `kernel32` (`CreateFileA`/`ReadFile`/`GetLastError`), PEB/TEB
-    + `gs` base, a proper `ntdll` boundary (`Nt*` primitives) under `kernel32`,
-    then real PE-built DLLs from a `C:\Windows\System32` tree; then process
-    isolation / integrity for the security phase.
+  - **`kernel32` file I/O implemented:** `GetStdHandle`, `WriteFile`,
+    `ReadFile`, `CreateFileA` (read-only `OPEN_EXISTING`; a Windows path is
+    mapped `X:\a\b` → `/a/b`), `CloseHandle`, `GetLastError` / `SetLastError`
+    (`TEB.LastErrorValue` at `gs:[0x68]`, reached through the thread's saved
+    `%gs` base), `ExitProcess`. Win64 stack args are read at `[rsp+0x28]`+ off
+    the stub frame; `nt::dispatch` marshals all of them onto THOS's fd table +
+    ext2. The `pe-test` `.exe` prints line 1 via a raw `syscall` (DIR64-relocated
+    absolute pointer), line 2 via `WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),…)`,
+    then **opens `C:\pe-read.txt` with `CreateFileA`, reads it with `ReadFile`,
+    and echoes it with `WriteFile`** — a PE process doing real Win32 file I/O on
+    THOS objects — then `ExitProcess(0)`, all through the IAT.
+  - **Next:** real `Ldr` / `ProcessParameters` in the PEB (`GetCommandLineA`,
+    `GetModuleHandle`), more `kernel32` (`GetProcAddress`, heap, `VirtualAlloc`),
+    a proper `ntdll` boundary (`Nt*` primitives) under `kernel32`, then real
+    PE-built DLLs from a `C:\Windows\System32` tree; then process isolation /
+    integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
