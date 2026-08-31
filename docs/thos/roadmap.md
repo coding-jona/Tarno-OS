@@ -370,13 +370,22 @@ Android parental controls, wired into the principal model rather than bolted on
   gate is worse than an honest weaker gate. ("You see tampering immediately" is
   true for a trained human examiner with the card in hand, not for naïve software
   on a webcam frame.) So THOS's optical path, if built, is an explicitly
-  **weak heuristic** layer (`assurance = optical-weak`): capture front + back +
-  a short tilt clip, run cheap checks (OVD motion present at all, MRZ↔VIZ DOB
-  match, portrait present, obvious screen-recapture), raise the bar against lazy
-  attempts — and the policy engine must **not** grant `adult` on `optical-weak`
-  alone. A genuine "the document is authentic" result comes only from the chip,
-  or from integrating a third-party verification service (which is not local and
-  is the deployer's choice, not a THOS default).
+  **weak heuristic** layer (`assurance = optical-weak`) with two inputs:
+  - **Live webcam tilt (preferred).** Front + back + a short tilt clip; checks:
+    OVD / hologram motion across frames, screen-recapture / printout detection
+    (a real card reflects differently frame-to-frame), MRZ↔VIZ DOB match,
+    portrait present. Needs a UVC camera driver — a large THOS item on its own —
+    so this only becomes available once THOS has one.
+  - **Uploaded image (fallback, weaker).** For a machine with no webcam: one or
+    two stills the operator supplies. Static checks only (MRZ↔VIZ DOB match,
+    portrait present, obvious tamper edges, still-frame recapture heuristics).
+    **No motion / liveness signal** — an upload is trivially a photo of someone
+    else's genuine card.
+
+  Neither optical input grants `adult` on its own; the policy-engine default is
+  `chip-verified` only. A genuine "the document is authentic" result comes only
+  from the chip, or from integrating a third-party verification service (not
+  local; the deployer's choice, not a THOS default).
 - **Default-deny for adult content.** Until a principal is `adult`, the policy
   engine (the same one the exec-gate and Security Service already run) denies:
   launching apps/packages carrying an `18+` age rating; installs from stores
