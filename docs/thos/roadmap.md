@@ -348,13 +348,20 @@ late.
     bootstrap call — `pe-test` `PE NtQIP OK`), `NtQueryVirtualMemory`
     (`MemoryBasicInformation`, placeholder region), `NtSetInformationThread` /
     `NtSetInformationProcess` (accept-all).
+  - **Waitable objects — started.** `NtCreateEvent` builds a `wait::Event` in
+    the executive object manager (`object::insert`); the NT HANDLE carries
+    `NT_OBJ_TAG` so `NtClose` and the wait/signal calls route to `object`, not
+    the fd table. `NtWaitForSingleObject` (NULL timeout → block, `0` → poll),
+    `NtSetEvent` / `NtResetEvent` with `PreviousState`. `pe-test`'s single-thread
+    scenario: create → poll `TIMEOUT` → set → poll `WAIT_0` → block (already
+    set) `WAIT_0` → close (`PE event OK`). Still manual-reset only, no timed
+    wait, no unified per-process HANDLE table.
   - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
     unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
-    unmodified), or a from-scratch `ntdll` — with real waitable objects
-    (`NtCreateEvent` / `NtWaitForSingleObject` on the executive `Event` /
-    `WaitQueue`, per-process HANDLE table), SEH ↔ trap dispatch, APC delivery,
-    a minimal registry; then process isolation / integrity for the security
-    phase.
+    unmodified), or a from-scratch `ntdll` — auto-reset events + a timed wait on
+    the executive timer path, a unified per-process HANDLE table (fds + objects
+    one namespace), SEH ↔ trap dispatch, APC delivery, a minimal registry; then
+    process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
