@@ -387,43 +387,61 @@ fn disk_image() -> PathBuf {
     img
 }
 
-/// Write a minimal statically linked Win64 console `.exe`: one `.text` section
-/// (RWX), no imports / relocs / TLS, whose entry does `write(1, msg)` +
-/// `exit(0)` via the Linux syscall ABI (the CPU runs `syscall` from any ring-3
-/// code regardless of container). Just enough to exercise the PE loader.
+/// Write a minimal statically linked Win64 console `.exe`: `.text` (RWX) +
+/// `.reloc`, `DYNAMIC_BASE` set. The entry loads the message pointer from an
+/// **absolute** 8-byte slot (so it needs a `DIR64` base relocation) and does
+/// `write(1, msg)` + `exit(0)` via the Linux syscall ABI (the CPU runs
+/// `syscall` from any ring-3 code regardless of container). Exercises the PE
+/// loader's header parse, section map, and relocation fixup.
 fn write_pe_hello(path: &Path) {
     let msg: &[u8] = b"PE on THOS via native loader\n";
+    const IMAGE_BASE: u64 = 0x1_4000_0000;
+    const SECT_ALIGN: u32 = 0x1000;
+    const FILE_ALIGN: u32 = 0x200;
+    let text_rva = 0x1000u32;
+    let reloc_rva = 0x2000u32;
 
     // --- entry machine code (x86-64) ---
     let mut code: Vec<u8> = Vec::new();
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1  (SYS_write)
     code.extend_from_slice(&[0x48, 0xC7, 0xC7, 1, 0, 0, 0]); // mov rdi, 1  (fd)
-    let lea_disp = code.len() + 3;
-    code.extend_from_slice(&[0x48, 0x8D, 0x35, 0, 0, 0, 0]); // lea rsi, [rip+disp32]
+    let mov_disp = code.len() + 3;
+    code.extend_from_slice(&[0x48, 0x8B, 0x35, 0, 0, 0, 0]); // mov rsi, [rip+disp32]  (abs ptr slot)
     let rdx_imm = code.len() + 3;
     code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0, 0, 0, 0]); // mov rdx, len
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 60, 0, 0, 0]); // mov rax, 60 (SYS_exit)
     code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    let ptr_off = code.len(); // absolute pointer to msg (relocated)
+    code.extend_from_slice(&[0u8; 8]);
     let msg_off = code.len();
     code.extend_from_slice(msg);
-    let disp = (msg_off as i64 - (lea_disp as i64 + 4)) as i32;
-    code[lea_disp..lea_disp + 4].copy_from_slice(&disp.to_le_bytes());
+    let disp = (ptr_off as i64 - (mov_disp as i64 + 4)) as i32;
+    code[mov_disp..mov_disp + 4].copy_from_slice(&disp.to_le_bytes());
     code[rdx_imm..rdx_imm + 4].copy_from_slice(&(msg.len() as u32).to_le_bytes());
+    let msg_va = IMAGE_BASE + text_rva as u64 + msg_off as u64;
+    code[ptr_off..ptr_off + 8].copy_from_slice(&msg_va.to_le_bytes());
+    let ptr_reloc_rva = text_rva + ptr_off as u32;
+
+    // --- .reloc: one block, one DIR64 fixup for the pointer slot ---
+    let mut reloc: Vec<u8> = Vec::new();
+    reloc.extend_from_slice(&(ptr_reloc_rva & !0xFFF).to_le_bytes()); // PageRVA
+    reloc.extend_from_slice(&12u32.to_le_bytes()); // BlockSize (8 hdr + 2 entry + 2 pad)
+    reloc.extend_from_slice(&((10u16 << 12) | (ptr_reloc_rva & 0xFFF) as u16).to_le_bytes());
+    reloc.extend_from_slice(&0u16.to_le_bytes()); // ABSOLUTE padding
 
     // --- PE32+ container ---
-    const IMAGE_BASE: u64 = 0x1_4000_0000;
-    const SECT_ALIGN: u32 = 0x1000;
-    const FILE_ALIGN: u32 = 0x200;
-    let text_rva = 0x1000u32;
     let text_vsize = code.len() as u32;
     let text_raw_ptr = 0x200u32;
     let text_raw_size = text_vsize.div_ceil(FILE_ALIGN) * FILE_ALIGN;
-    let size_of_image = text_rva + text_vsize.div_ceil(SECT_ALIGN) * SECT_ALIGN;
+    let reloc_raw_ptr = text_raw_ptr + text_raw_size;
+    let reloc_vsize = reloc.len() as u32;
+    let reloc_raw_size = reloc_vsize.div_ceil(FILE_ALIGN) * FILE_ALIGN;
+    let size_of_image = reloc_rva + reloc_vsize.div_ceil(SECT_ALIGN) * SECT_ALIGN;
     let size_of_headers = 0x200u32;
 
-    let mut pe = vec![0u8; text_raw_ptr as usize + text_raw_size as usize];
+    let mut pe = vec![0u8; (reloc_raw_ptr + reloc_raw_size) as usize];
     pe[0..2].copy_from_slice(b"MZ");
     let e_lfanew = 0x40u32;
     pe[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
@@ -432,8 +450,8 @@ fn write_pe_hello(path: &Path) {
     pe[o..o + 4].copy_from_slice(b"PE\0\0");
     let coff = o + 4;
     pe[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes()); // Machine
-    pe[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections
-    let opt_size = 0xF0u16; // 112 fixed + 16 data dirs * 8
+    pe[coff + 2..coff + 4].copy_from_slice(&2u16.to_le_bytes()); // NumberOfSections
+    let opt_size = 0xF0u16;
     pe[coff + 16..coff + 18].copy_from_slice(&opt_size.to_le_bytes());
     pe[coff + 18..coff + 20].copy_from_slice(&0x0022u16.to_le_bytes()); // EXECUTABLE | LARGE_ADDRESS_AWARE
 
@@ -449,18 +467,30 @@ fn write_pe_hello(path: &Path) {
     pe[opt + 56..opt + 60].copy_from_slice(&size_of_image.to_le_bytes());
     pe[opt + 60..opt + 64].copy_from_slice(&size_of_headers.to_le_bytes());
     pe[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes()); // Subsystem = CONSOLE
+    pe[opt + 70..opt + 72].copy_from_slice(&0x0040u16.to_le_bytes()); // DllCharacteristics = DYNAMIC_BASE
     pe[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
-    // data directories (opt+112 .. +240) left zero — no imports/relocs/TLS
+    // data directory 5 = BASE_RELOC
+    pe[opt + 112 + 5 * 8..opt + 112 + 5 * 8 + 4].copy_from_slice(&reloc_rva.to_le_bytes());
+    pe[opt + 112 + 5 * 8 + 4..opt + 112 + 5 * 8 + 8].copy_from_slice(&reloc_vsize.to_le_bytes());
 
     let sh = opt + opt_size as usize;
     pe[sh..sh + 8].copy_from_slice(b".text\0\0\0");
-    pe[sh + 8..sh + 12].copy_from_slice(&text_vsize.to_le_bytes()); // VirtualSize
-    pe[sh + 12..sh + 16].copy_from_slice(&text_rva.to_le_bytes()); // VirtualAddress
-    pe[sh + 16..sh + 20].copy_from_slice(&text_raw_size.to_le_bytes()); // SizeOfRawData
-    pe[sh + 20..sh + 24].copy_from_slice(&text_raw_ptr.to_le_bytes()); // PointerToRawData
+    pe[sh + 8..sh + 12].copy_from_slice(&text_vsize.to_le_bytes());
+    pe[sh + 12..sh + 16].copy_from_slice(&text_rva.to_le_bytes());
+    pe[sh + 16..sh + 20].copy_from_slice(&text_raw_size.to_le_bytes());
+    pe[sh + 20..sh + 24].copy_from_slice(&text_raw_ptr.to_le_bytes());
     pe[sh + 36..sh + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // CODE|EXECUTE|READ
 
+    let sh2 = sh + 40;
+    pe[sh2..sh2 + 8].copy_from_slice(b".reloc\0\0");
+    pe[sh2 + 8..sh2 + 12].copy_from_slice(&reloc_vsize.to_le_bytes());
+    pe[sh2 + 12..sh2 + 16].copy_from_slice(&reloc_rva.to_le_bytes());
+    pe[sh2 + 16..sh2 + 20].copy_from_slice(&reloc_raw_size.to_le_bytes());
+    pe[sh2 + 20..sh2 + 24].copy_from_slice(&reloc_raw_ptr.to_le_bytes());
+    pe[sh2 + 36..sh2 + 40].copy_from_slice(&0x4200_0040u32.to_le_bytes()); // INITIALIZED_DATA|DISCARDABLE|READ
+
     pe[text_raw_ptr as usize..text_raw_ptr as usize + code.len()].copy_from_slice(&code);
+    pe[reloc_raw_ptr as usize..reloc_raw_ptr as usize + reloc.len()].copy_from_slice(&reloc);
     std::fs::write(path, &pe).expect("write pe-hello.exe");
 }
 

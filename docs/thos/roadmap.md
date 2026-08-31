@@ -204,12 +204,18 @@ late.
     file holds. A malformed `.exe` returns `Err`, never a slice panic;
     `spawn_pe` returns `Result`. `pe-test` also feeds it a truncated / bad-
     `e_lfanew` blob and asserts the kernel rejects it and stays alive.
-  - **Next (P1):**
-    - **Base relocations** — load at an alternative base when the preferred one
-      is taken, apply data directory 5 (`IMAGE_REL_BASED_DIR64`).
-    - **Imports** — resolve data directory 1 against loaded DLLs
-      (`kernel32` / `ntdll` / `user32`); this is where the NT personality
-      proper begins (SSDT dispatch, `Nt*` core, PEB/TEB + `gs` base).
+  - **Base relocations done (P1):** `pe::load` materialises the full image at
+    RVA 0, then walks data directory 5 — `IMAGE_REL_BASED_DIR64` targets get
+    `delta` added, `ABSOLUTE` is padding, any other type is rejected. A PE with
+    `DYNAMIC_BASE` + a `.reloc` section is loaded at an alternative base
+    (fixed non-zero shift for now; a real availability check / ASLR comes with
+    the DLL loader) so the fixup path is actually exercised. The `pe-test` `.exe`
+    now loads its message pointer from an **absolute** slot patched by a DIR64
+    fixup — a wrong delta would fault or misprint, so the exact-string check is
+    the relocation test.
+  - **Next (P1):** **Imports** — resolve data directory 1 against loaded DLLs
+    (`kernel32` / `ntdll` / `user32`); this is where the NT personality proper
+    begins (SSDT dispatch, `Nt*` core, PEB/TEB + `gs` base).
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
