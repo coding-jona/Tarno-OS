@@ -317,11 +317,28 @@ default — the same feature class as Windows Family Safety / iOS Screen Time /
 Android parental controls, wired into the principal model rather than bolted on
 (*user requirement, 2026-08-31*).
 
-- **At first-run setup**, before the admin session exists, the operator declares
-  a **birthdate**. It is stored in the credential store next to the admin cred
-  and yields a per-principal `maturity` attribute (`adult` / `minor`, with the
-  exact age retained for finer thresholds later). This is a *declaration*, not
-  cryptographic proof — see the limits below.
+- **At first-run setup**, before the admin session exists, the operator
+  establishes an age. It yields a per-principal `maturity` attribute
+  (`adult` / `minor`, exact age retained for finer thresholds) stored in the
+  credential store next to the admin cred. Two ways to establish it, both fully
+  **local, offline, and image-discarding** — the operator (or, later, the
+  admin) picks the assurance level:
+  - **Declaration** — type a birthdate. Zero assurance beyond the admin lock;
+    what every mainstream OS actually does.
+  - **Document DOB extraction** — feed an image of an official ID (from a file,
+    or a camera once THOS has one); an MRZ / OCR-B recogniser pulls the
+    birthdate from the machine-readable zone; the image buffer is zeroed
+    immediately, only the derived age is kept. Verifies *the number printed on
+    the document*, not that the document is genuine or the operator's — a
+    determined minor can photograph someone else's ID.
+  - **eID / ePassport NFC** (strongest local option) — read the contactless
+    chip (ISO-14443) over a USB reader, run PACE/BAC, take DG1 (MRZ incl. DOB),
+    and verify the issuing country's signature chain (passive authentication)
+    against a **CSCA master list shipped once** with THOS. This is a
+    *cryptographically verified* DOB, entirely offline, no phone-home. It still
+    does not prove the person at the keyboard is the document holder (that needs
+    a camera + a face match — a separate subsystem THOS does not ship by
+    default).
 - **Default-deny for adult content.** Until a principal is `adult`, the policy
   engine (the same one the exec-gate and Security Service already run) denies:
   launching apps/packages carrying an `18+` age rating; installs from stores
@@ -334,24 +351,33 @@ Android parental controls, wired into the principal model rather than bolted on
   an age-rating check to its `policy engine` step; the Security Service's
   network firewall/IDS does the domain-category filtering; the package/store
   layer checks the rating at install time.
-- **Optional external verifier hook.** A pluggable interface lets a real
-  age-verification provider (an eID applet, a bank check, an operator-supplied
-  attestation) upgrade a declaration to a verified claim. THOS ships none by
-  default and never phones home; strong verification is the deployer's choice.
+- **`age-verify` module** owns the three methods behind one interface that
+  outputs `(age, assurance)` and never persists the source material. A
+  4th slot is a pluggable external attestation provider (bank / eID applet) for
+  deployers who want it; THOS ships none.
 
-Honest limits:
-- A *declared* birthdate that only the admin can change is what every mainstream
-  OS actually does — there is no local, offline, privacy-respecting way to
-  *prove* an age without an external identity/biometric provider, and THOS will
-  not ship ID scanning or on-device biometric age estimation.
-- **CSAM is not a content-filter feature and THOS will not implement a CSAM
-  scanner.** Such material is illegal to possess irrespective of any filter, and
-  detection is a specialised legal/reporting domain (hash databases, mandated
-  reporting) that a from-scratch OS must not reinvent. What the design *does*
-  provide against it is incidental: the Security Service already blocks
-  known-malicious/known-bad domains from threat-intel feeds, so hosts on those
-  feeds are blocked by the same mechanism as malware C2 — no dedicated
-  subsystem, no content inspection.
+Engineering reality (the DOB-from-document path is real work, not a weekend):
+- **Image input.** A camera means a USB-Video-Class driver + frame decode — a
+  large item. Until then the input is an image *file* the operator supplies.
+- **The recogniser.** MRZ / OCR-B is a fixed font and layout (ICAO 9303), so a
+  purpose-built recogniser (binarise → segment → template-match the OCR-B glyph
+  set → parse `YYMMDD` + check digit) is tractable; a full OCR engine port is
+  not needed and not wanted.
+- **eID NFC** needs a PC/SC-class USB reader driver, the PACE (EC crypto) / BAC
+  handshake, and passive-authentication signature checks against the CSCA
+  anchors. More code, but the *assurance* is the only genuinely strong local
+  one.
+- **Discarding is the easy part** and is done properly: the decode buffer is
+  zeroed the moment the age is extracted; nothing is written to disk.
+
+Hard limit — **CSAM is not a content-filter feature and THOS will not implement
+a CSAM scanner.** Such material is illegal to possess irrespective of any
+filter, and detection is a specialised legal/reporting domain (hash databases,
+mandated reporting) that a from-scratch OS must not reinvent. The only coverage
+the design gives is incidental: the Security Service already blocks
+known-malicious / known-bad domains from threat-intel feeds, so hosts on those
+feeds are blocked by the same mechanism as malware C2 — no dedicated subsystem,
+no content inspection.
 
 Sequencing: designed in now (the `maturity` attribute rides the principal model
 being built), enforced once the policy engine / exec-gate / network filter land
