@@ -418,6 +418,30 @@ Engineering reality — the chip path is a substantial, security-critical module
   some older / non-EU documents do not — hence the admin-permitted declaration
   fallback).
 
+Open-source building blocks (2026-08 survey — reuse, don't reinvent):
+- **eMRTD chip protocol, in Rust:** `worldfnd/icao-9303` — pure-Rust eMRTD core
+  with BAC, **PACE (ECDH-GM P-256)**, LDS parsing, secure messaging. This is the
+  biggest win — the hard crypto already exists to vendor / port. Cross-check
+  against **JMRTD** (Java, the reference implementation) and **pypassport**
+  (Python: BAC + partial PACE + Passive + Active Auth).
+- **MRZ parse + check digits:** the `mrz` crate (zero deps, `wasm`-clean → very
+  likely `no_std`-portable), or `mrtd` (`asmarques/mrtd`). Trivial to vendor;
+  the *parse* is easy, the OCR that feeds it is the weak link.
+- **PC/SC + CCID:** `pcsc-lite` + `libccid` as the reference for a THOS
+  USB-CCID class driver (the CCID spec is small).
+- **CSCA trust anchors:** the ICAO PKD **master list** (LDIF, signed by the UN
+  CSCA). ⚠ its terms are **non-commercial only** — for a distributed THOS use
+  national master lists (e.g. German BSI) instead. Ship + refresh out-of-band.
+- **MRZ OCR (optical path only):** PassportEye (Tesseract, ~80 % precision —
+  confirms OCR is noisy and why `optical-weak` is honest), `mrz-scanner`
+  (fully-offline PWA) as UX reference.
+- **Content-category domain lists (policy-engine network filter):**
+  `StevenBlack/hosts` (porn / gambling extensions), **HaGeZi dns-blocklists**
+  (NSFW + gambling categories), `blocklistproject/Lists`, `aegis-blocklist`
+  (child-safety, VPN/proxy bypass-prevention). The Security Service just ingests
+  these — no list to author.
+- **Malware scanning (AV):** `yara-x` (pure-Rust YARA), ClamAV signature DBs.
+
 Hard limit — **CSAM is not a content-filter feature and THOS will not implement
 a CSAM scanner.** Such material is illegal to possess irrespective of any
 filter, and detection is a specialised legal/reporting domain (hash databases,
