@@ -62,6 +62,14 @@ late.
     **both the primary and the group-1 backup superblock** (both clean).
     Missing: growing a dir past 12 direct blocks, htree, timestamps, hard
     links, 64-bit sizes, journalling.
+  - Status: **FAT16 / FAT32 read** (`fat.rs`) — parse the BPB, pick the FAT
+    width from the cluster count, walk the FAT chain, traverse 8.3 directory
+    entries (long-name/VFAT entries skipped). `Fat::open(part_lba)` +
+    `read_path("/EFI/THOS/HELLO.TXT")`. `cargo xtask fat-test` splices a FAT32
+    "super-floppy" into a hole past the ext2 image (LBA 51000) and checks the
+    kernel reads the file back. Missing: FAT12, writes, long names, and — the
+    real point — a **GPT parser** to find the actual ESP partition on a
+    partitioned disk (next step; needs a GPT test image or the real Kingston).
 - **AHCI/SATA driver** (Intel `8086:7a62`, standard AHCI 1.3.1 register interface,
   MSI/MSI-X, command list / FIS) → real root FS from the **Kingston A400 240 GB SATA
   SSD** (`sdc`). NVMe is Windows' disk and is never touched; an NVMe driver is

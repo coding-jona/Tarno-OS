@@ -78,10 +78,15 @@ fn main() {
             let iso = build_iso();
             pipe_test(&iso);
         }
+        "fat-test" => {
+            build_kernel(&[]);
+            let iso = build_iso();
+            fat_test(&iso);
+        }
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test|ext2-test|smp-test] [--gui]"
+                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test|ext2-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test] [--gui]"
             );
             exit(2);
         }
@@ -210,12 +215,12 @@ fn disk_image() -> PathBuf {
         "-O", "^resize_inode,^dir_index,^ext_attr",
         img.to_str().unwrap(), "16384",
     ]));
-    // Grow the backing file past the 16 MiB filesystem so there is scratch space
-    // for the AHCI write test (LBA 50000) that the fs never touches.
+    // Grow the backing file past the 16 MiB filesystem: scratch space for the
+    // AHCI write test (LBA 50000) plus room for the FAT32 volume at LBA 51000.
     std::fs::OpenOptions::new()
         .write(true)
         .open(&img)
-        .and_then(|f| f.set_len(32 * 1024 * 1024))
+        .and_then(|f| f.set_len(96 * 1024 * 1024))
         .expect("extend disk.img");
     for (name, elf) in elfs {
         run(Command::new("debugfs").args([
@@ -300,6 +305,31 @@ fn disk_image() -> PathBuf {
     run(Command::new("debugfs").args([
         "-w", "-R", &format!("sif /busybox links_count {links}"),
         img.to_str().unwrap(),
+    ]));
+
+    // A FAT32 "super-floppy" volume spliced into a hole past the ext2 image
+    // (LBA 51000; the fs is the first 16 MiB, the AHCI scratch write is a single
+    // sector at LBA 50000). FAT32 is what real ESPs use. The kernel's FAT reader
+    // reads `/EFI/THOS/HELLO.TXT` from it. Needs `mkfs.vfat` (dosfstools) +
+    // `mmd`/`mcopy` (mtools).
+    let fat = root.join("target/fat.img");
+    let hello = root.join("target/fat-hello.txt");
+    std::fs::write(&hello, b"THOS reads FAT\n").unwrap();
+    let _ = std::fs::remove_file(&fat);
+    run(Command::new("mkfs.vfat").args([
+        "-F", "32", "-n", "THOSFAT", "-C", fat.to_str().unwrap(), "49152",
+    ]));
+    run(Command::new("mmd").args([
+        "-i", fat.to_str().unwrap(), "::/EFI", "::/EFI/THOS",
+    ]));
+    run(Command::new("mcopy").args([
+        "-i", fat.to_str().unwrap(),
+        hello.to_str().unwrap(), "::/EFI/THOS/HELLO.TXT",
+    ]));
+    run(Command::new("dd").args([
+        &format!("if={}", fat.to_str().unwrap()),
+        &format!("of={}", img.to_str().unwrap()),
+        "bs=512", "seek=51000", "conv=notrunc", "status=none",
     ]));
 
     img
@@ -965,6 +995,17 @@ fn busybox_test(iso: &Path) {
         println!("busybox-test: OK — stock static BusyBox `echo` ran unmodified");
     } else {
         eprintln!("busybox-test: FAIL — BusyBox did not run to a clean exit\n--- serial ---\n{serial}\n---");
+        exit(1);
+    }
+}
+
+fn fat_test(iso: &Path) {
+    let disk = disk_image();
+    let serial = boot_kernel_headless("fat", iso, &disk, 4);
+    if serial.contains("THOS: fat ok") && serial.contains("THOS reads FAT") {
+        println!("fat-test: OK — read /EFI/THOS/HELLO.TXT from a FAT32 volume");
+    } else {
+        eprintln!("fat-test: FAIL — FAT read did not produce the file\n--- serial ---\n{serial}\n---");
         exit(1);
     }
 }

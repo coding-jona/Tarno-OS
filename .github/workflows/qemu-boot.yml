@@ -57,6 +57,7 @@ jobs:
           grep -q "THOS: ahci ident" boot.log
           grep -q "THOS: ahci ok" boot.log
           grep -q "THOS: ahci cap ok" boot.log
+          grep -q "THOS: fat ok" boot.log
           grep -q "THOS: ahci ncq ok" boot.log
           grep -qE "THOS: ahci irq +MSI" boot.log
           grep -q "THOS: ext2 ok" boot.log
@@ -100,3 +101,6 @@ jobs:
 
       - name: Pipes and command substitution (`|` + `$(…)` through BusyBox sh)
         run: cargo xtask pipe-test
+
+      - name: FAT reader (read a file from a FAT32 volume)
+        run: cargo xtask fat-test
