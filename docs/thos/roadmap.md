@@ -299,11 +299,17 @@ late.
     `thos_add`, itself imports `KERNEL32!GetLastError`) at
     `C:\Windows\System32`; the exe imports `thoscrt!thos_add`, calls it, and
     asserts `42` (`PE dll thos_add=42`). `DllMain` is not run yet.
-  - **Next:** thread file DLLs into the PEB `Ldr` lists (so runtime
-    `GetModuleHandleA` / `GetProcAddress` / `LoadLibraryA` see them) and run
-    `DllMain`; then swap the hand-built test DLLs for **Wine-sourced** PE
-    `kernel32` / `ntdll` / `user32` …; then process isolation / integrity for
-    the security phase.
+  - **DLLs in the PEB `Ldr` lists:** `map_teb_peb` now writes a real
+    `LDR_DATA_TABLE_ENTRY` for every on-disk DLL into all three module lists
+    (after the exe and the synthetic pair), in a dedicated `PE_LDRDATA` page;
+    a `link_ring` helper threads each circular list across both pages. Runtime
+    `GetModuleHandleA` / `LoadLibraryA` / `GetProcAddress` resolve against
+    System32 DLLs, not just the synthetic ones — `pe-test` looks up
+    `thoscrt!thos_add` at runtime and calls it (`PE dll Ldr OK`). Capped at 12
+    file DLLs (multi-page region later).
+  - **Next:** run `DllMain(DLL_PROCESS_ATTACH)` for file DLLs; then swap the
+    hand-built test DLLs for **Wine-sourced** PE `kernel32` / `ntdll` /
+    `user32` …; then process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
