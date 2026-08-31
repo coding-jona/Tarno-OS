@@ -326,6 +326,35 @@ Phasing:
 - **Milestone 5:** a real Windows game (D3D11, no anti-cheat, statically resolvable)
   starts and is playable; a native Linux workload runs on the same cores concurrently.
 
+### Security architecture — enforce in the kernel, scan in userspace
+
+If THOS is ever a daily driver, security is a first-class subsystem, not a
+bolted-on package — but the **scanner never runs in the kernel**. A bug in a
+YARA rule or a PE analyser must not be able to panic the box.
+
+- **Security Core (kernel):** the hard boundaries only — measured / secure boot,
+  process isolation, the capability policy (already the identity model's
+  direction), W^X + memory protection, file-integrity baselines. Small, auditable,
+  no parsing of untrusted formats beyond what the loaders already do (now
+  hostile-input hardened).
+- **Security Service (isolated userspace):** the scanners — file scanner
+  (YARA / open-source signatures), exec scanner (PE/ELF static analysis, reusing
+  `pe.rs` / `elf.rs`), network firewall / IDS. Talks to the Security Core over a
+  narrow capability-gated interface; a crash there degrades to a policy default,
+  it does not take the kernel down.
+- **The native-exec gate** (unique to the hybrid design): every program entering
+  the system — PE *or* ELF — passes one pipeline before it is allowed to run:
+  `format detect → parse headers → hash / signature check → YARA / static
+  analysis → policy engine → ALLOW | QUARANTINE`. Because both container formats
+  execute natively, this gate covers the whole system with one mechanism instead
+  of two half-measures.
+- **Not** "pick the strongest off-the-shelf AV and embed it." Composed from
+  open-source malware scanning + YARA + THOS's own PE/ELF analysis + integrity
+  checking.
+
+Deliberately **after** the kernel and Windows compatibility are real — noted here
+so it is designed in, not retrofitted.
+
 ## Phase 6 — Research track: real `.sys` drivers (after M5)
 
 - Scope **hard-limited to one device class** (recommended: NDIS networking, as
