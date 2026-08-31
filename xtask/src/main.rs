@@ -83,10 +83,15 @@ fn main() {
             let iso = build_iso();
             fat_test(&iso);
         }
+        "pe-test" => {
+            build_kernel(&["petest"]);
+            let iso = build_iso();
+            pe_test(&iso);
+        }
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test|ext2-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test] [--gui]"
+                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test|ext2-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test|pe-test] [--gui]"
             );
             exit(2);
         }
@@ -284,6 +289,15 @@ fn disk_image() -> PathBuf {
         }
     }
 
+    // A hand-assembled, statically linked Win64 `.exe` (no imports, no relocs)
+    // for the native PE loader -> /pe-hello.exe.
+    let exe = root.join("target/pe-hello.exe");
+    write_pe_hello(&exe);
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} pe-hello.exe", exe.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+
     // BusyBox applet links: `/bin/<applet>` hard-links to the single `/busybox`
     // inode, so the shell can run `ls`, `cat`, ... by PATH lookup (BusyBox
     // dispatches on `basename(argv[0])`). `debugfs ln` does not maintain the
@@ -371,6 +385,83 @@ fn disk_image() -> PathBuf {
     ]));
 
     img
+}
+
+/// Write a minimal statically linked Win64 console `.exe`: one `.text` section
+/// (RWX), no imports / relocs / TLS, whose entry does `write(1, msg)` +
+/// `exit(0)` via the Linux syscall ABI (the CPU runs `syscall` from any ring-3
+/// code regardless of container). Just enough to exercise the PE loader.
+fn write_pe_hello(path: &Path) {
+    let msg: &[u8] = b"PE on THOS via native loader\n";
+
+    // --- entry machine code (x86-64) ---
+    let mut code: Vec<u8> = Vec::new();
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1  (SYS_write)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 1, 0, 0, 0]); // mov rdi, 1  (fd)
+    let lea_disp = code.len() + 3;
+    code.extend_from_slice(&[0x48, 0x8D, 0x35, 0, 0, 0, 0]); // lea rsi, [rip+disp32]
+    let rdx_imm = code.len() + 3;
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0, 0, 0, 0]); // mov rdx, len
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 60, 0, 0, 0]); // mov rax, 60 (SYS_exit)
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    let msg_off = code.len();
+    code.extend_from_slice(msg);
+    let disp = (msg_off as i64 - (lea_disp as i64 + 4)) as i32;
+    code[lea_disp..lea_disp + 4].copy_from_slice(&disp.to_le_bytes());
+    code[rdx_imm..rdx_imm + 4].copy_from_slice(&(msg.len() as u32).to_le_bytes());
+
+    // --- PE32+ container ---
+    const IMAGE_BASE: u64 = 0x1_4000_0000;
+    const SECT_ALIGN: u32 = 0x1000;
+    const FILE_ALIGN: u32 = 0x200;
+    let text_rva = 0x1000u32;
+    let text_vsize = code.len() as u32;
+    let text_raw_ptr = 0x200u32;
+    let text_raw_size = text_vsize.div_ceil(FILE_ALIGN) * FILE_ALIGN;
+    let size_of_image = text_rva + text_vsize.div_ceil(SECT_ALIGN) * SECT_ALIGN;
+    let size_of_headers = 0x200u32;
+
+    let mut pe = vec![0u8; text_raw_ptr as usize + text_raw_size as usize];
+    pe[0..2].copy_from_slice(b"MZ");
+    let e_lfanew = 0x40u32;
+    pe[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+
+    let o = e_lfanew as usize;
+    pe[o..o + 4].copy_from_slice(b"PE\0\0");
+    let coff = o + 4;
+    pe[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes()); // Machine
+    pe[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections
+    let opt_size = 0xF0u16; // 112 fixed + 16 data dirs * 8
+    pe[coff + 16..coff + 18].copy_from_slice(&opt_size.to_le_bytes());
+    pe[coff + 18..coff + 20].copy_from_slice(&0x0022u16.to_le_bytes()); // EXECUTABLE | LARGE_ADDRESS_AWARE
+
+    let opt = coff + 20;
+    pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
+    pe[opt + 16..opt + 20].copy_from_slice(&text_rva.to_le_bytes()); // AddressOfEntryPoint
+    pe[opt + 20..opt + 24].copy_from_slice(&text_rva.to_le_bytes()); // BaseOfCode
+    pe[opt + 24..opt + 32].copy_from_slice(&IMAGE_BASE.to_le_bytes()); // ImageBase
+    pe[opt + 32..opt + 36].copy_from_slice(&SECT_ALIGN.to_le_bytes());
+    pe[opt + 36..opt + 40].copy_from_slice(&FILE_ALIGN.to_le_bytes());
+    pe[opt + 40..opt + 42].copy_from_slice(&6u16.to_le_bytes()); // MajorOperatingSystemVersion
+    pe[opt + 48..opt + 50].copy_from_slice(&6u16.to_le_bytes()); // MajorSubsystemVersion
+    pe[opt + 56..opt + 60].copy_from_slice(&size_of_image.to_le_bytes());
+    pe[opt + 60..opt + 64].copy_from_slice(&size_of_headers.to_le_bytes());
+    pe[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes()); // Subsystem = CONSOLE
+    pe[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
+    // data directories (opt+112 .. +240) left zero — no imports/relocs/TLS
+
+    let sh = opt + opt_size as usize;
+    pe[sh..sh + 8].copy_from_slice(b".text\0\0\0");
+    pe[sh + 8..sh + 12].copy_from_slice(&text_vsize.to_le_bytes()); // VirtualSize
+    pe[sh + 12..sh + 16].copy_from_slice(&text_rva.to_le_bytes()); // VirtualAddress
+    pe[sh + 16..sh + 20].copy_from_slice(&text_raw_size.to_le_bytes()); // SizeOfRawData
+    pe[sh + 20..sh + 24].copy_from_slice(&text_raw_ptr.to_le_bytes()); // PointerToRawData
+    pe[sh + 36..sh + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // CODE|EXECUTE|READ
+
+    pe[text_raw_ptr as usize..text_raw_ptr as usize + code.len()].copy_from_slice(&code);
+    std::fs::write(path, &pe).expect("write pe-hello.exe");
 }
 
 // --- shared plumbing for the interactive (monitor-driven) QEMU tests ---
@@ -1047,6 +1138,19 @@ fn fat_test(iso: &Path) {
         println!("fat-test: OK — GPT → ESP → FAT32, read /EFI/THOS/HELLO.TXT");
     } else {
         eprintln!("fat-test: FAIL — GPT/FAT read did not produce the file\n--- serial ---\n{serial}\n---");
+        exit(1);
+    }
+}
+
+fn pe_test(iso: &Path) {
+    let disk = disk_image();
+    let serial = boot_kernel_headless("pe", iso, &disk, 4);
+    let ok = serial.contains("THOS: pe exited")
+        && serial.contains("PE on THOS via native loader");
+    if ok {
+        println!("pe-test: OK — native PE64 loader ran a statically linked .exe");
+    } else {
+        eprintln!("pe-test: FAIL — the PE did not run to exit\n--- serial ---\n{serial}\n---");
         exit(1);
     }
 }

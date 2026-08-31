@@ -189,6 +189,16 @@ late.
 ## Phase 3 — NT personality (userspace level, still GOP graphics)
 
 - **PE loader** native (sections, imports, TLS, PEB/TEB, `fs`/`gs` base).
+  - Status: **first cut** (`pe.rs`) — parse the DOS/PE/PE32+ headers + section
+    table, map each section as fresh zeroed user frames at the preferred
+    `ImageBase` with per-section exec bit, BSS zero-fill, `process::spawn_pe`
+    enters the entry in ring 3 with a bare 16-aligned stack (no SysV block).
+    Rejects imports / relocations / TLS for now. `cargo xtask pe-test` writes a
+    hand-assembled statically linked Win64 `.exe` (`write(1,…)` + `exit(0)` via
+    `syscall` — the CPU runs `syscall` from any ring-3 code regardless of
+    container) into ext2 and checks it prints + exits. ELF and PE processes run
+    in the same boot on the same kernel. Next: base relocations, then PEB/TEB +
+    `gs` base, then the `Nt*` dispatch + `ntdll` lower boundary.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a

@@ -40,3 +40,6 @@ bbtest = []
 # `pipetest`: run a BusyBox `sh -c` line with `|` and `$(…)` in
 # storage_milestone. Driven by `cargo xtask pipe-test`.
 pipetest = []
+# `petest`: load and run a statically linked Win64 `.exe` via the native PE
+# loader. Driven by `cargo xtask pe-test`.
+petest = []
