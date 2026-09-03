@@ -363,13 +363,24 @@ late.
     honours `EventType`. `NtWaitForSingleObject` with a negative `*Timeout`
     spins a bounded number of yields (a PE syscall runs IF=0, so no tick clock
     / no safe block yet) and returns `STATUS_TIMEOUT` (`pe-test` `PE evt2 OK`).
+  - **SEH ↔ trap dispatch — started.** `crate::seh`: a `#UD` from a PE process
+    is delivered to ring 3 like on Windows — a GPR-saving stub
+    (`thos_ud_entry`) captures an `ExcFrame`, `deliver` writes an
+    `EXCEPTION_RECORD` + x64 `CONTEXT` onto the user stack and re-points
+    execution at a `KiUserExceptionDispatcher` stub page, which calls the
+    process's vectored handler (`RtlAddVectoredExceptionHandler`, one slot for
+    now) and either `NtContinue`s (kernel rebuilds the frame, `iretq`) or
+    `NtTerminateProcess`es. `pe-test` arms a handler, runs `ud2`, the handler
+    steps `CONTEXT.Rip` past it (`PE SEH OK`). `#PF` / `#GP` / `#DE` reuse the
+    path once each gets its stub; frame-based `.pdata` / `.xdata` SEH is then
+    just a smarter `KiUserExceptionDispatcher`.
   - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
     unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
     unmodified), or a from-scratch `ntdll` — an **executive timer wheel** for a
     real timed block (and a preemption-safe path out of a PE syscall), more
-    `HandleObject` kinds (mutant, semaphore, section, thread), SEH ↔ trap
-    dispatch, APC delivery, a minimal registry; then process isolation /
-    integrity for the security phase.
+    `HandleObject` kinds (mutant, semaphore, section, thread), the rest of the
+    fault vectors through `crate::seh`, APC delivery, a minimal registry; then
+    process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
