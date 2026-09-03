@@ -24,6 +24,7 @@ use x86_64::PhysAddr;
 use crate::elf::{self, Image};
 use crate::file::{ConsoleFile, FileOps, KeyboardFile};
 use crate::mm::{hhdm_offset, phys_to_virt, FRAME_ALLOC};
+use crate::wait::Event;
 use crate::syscall::{self, UserFrame};
 use crate::{gdt, sched, vmm};
 
@@ -310,11 +311,20 @@ pub fn current_uid() -> u32 {
     sched::current().task().map(|t| t.uid).unwrap_or(0)
 }
 
-/// One open descriptor: the shared file object plus its close-on-exec flag
-/// (the flag is per-descriptor, not per open-file-description).
+/// What a HANDLE / file descriptor points at. Both personalities share one
+/// per-process table: a POSIX fd and a Win32 `HANDLE` are the same integer
+/// into the same `Vec` — a file, or an executive object.
+#[derive(Clone)]
+pub enum HandleObject {
+    File(Arc<dyn FileOps>),
+    Event(Arc<Event>),
+}
+
+/// One table slot: the object plus its close-on-exec flag (per-descriptor, not
+/// per open-file-description).
 #[derive(Clone)]
 pub struct FdEntry {
-    pub file: Arc<dyn FileOps>,
+    pub obj: HandleObject,
     pub cloexec: bool,
 }
 type Fd = Option<FdEntry>;
@@ -335,7 +345,7 @@ pub struct Task {
 fn seed_fds() -> Vec<Fd> {
     let stdin: Arc<dyn FileOps> = Arc::new(KeyboardFile);
     let out: Arc<dyn FileOps> = Arc::new(ConsoleFile { writable: true });
-    let e = |file: Arc<dyn FileOps>| Some(FdEntry { file, cloexec: false });
+    let e = |f: Arc<dyn FileOps>| Some(FdEntry { obj: HandleObject::File(f), cloexec: false });
     alloc::vec![e(stdin), e(out.clone()), e(out)]
 }
 
@@ -364,18 +374,34 @@ impl Task {
     }
 
     pub fn fd_get(&self, fd: i32) -> Option<Arc<dyn FileOps>> {
-        let fds = self.fds.lock();
-        fds.get(fd as usize).and_then(|f| f.as_ref()).map(|e| e.file.clone())
+        match &self.fds.lock().get(fd as usize)?.as_ref()?.obj {
+            HandleObject::File(f) => Some(f.clone()),
+            _ => None,
+        }
+    }
+
+    /// The `Event` a HANDLE names, if it is one.
+    pub fn handle_event(&self, h: i32) -> Option<Arc<Event>> {
+        match &self.fds.lock().get(h as usize)?.as_ref()?.obj {
+            HandleObject::Event(e) => Some(e.clone()),
+            _ => None,
+        }
     }
 
     pub fn fd_alloc(&self, file: Arc<dyn FileOps>) -> i32 {
         self.fd_alloc_flags(file, false)
     }
-
-    /// Install `file` at the lowest free descriptor, with the given cloexec flag.
     pub fn fd_alloc_flags(&self, file: Arc<dyn FileOps>, cloexec: bool) -> i32 {
+        self.handle_alloc(HandleObject::File(file), cloexec)
+    }
+    pub fn handle_alloc_event(&self, ev: Arc<Event>) -> i32 {
+        self.handle_alloc(HandleObject::Event(ev), false)
+    }
+
+    /// Install `obj` at the lowest free descriptor, with the given cloexec flag.
+    pub fn handle_alloc(&self, obj: HandleObject, cloexec: bool) -> i32 {
         let mut fds = self.fds.lock();
-        let entry = Some(FdEntry { file, cloexec });
+        let entry = Some(FdEntry { obj, cloexec });
         match fds.iter().position(|f| f.is_none()) {
             Some(i) => {
                 fds[i] = entry;
@@ -527,6 +553,16 @@ fn user_selectors() -> (u64, u64) {
 /// The current task's file object for `fd`, if open.
 pub fn current_fd(fd: i32) -> Option<Arc<dyn FileOps>> {
     sched::current().task().and_then(|t| t.fd_get(fd))
+}
+
+/// The current task's `Event` for HANDLE `h`, if it names one.
+pub fn current_event(h: i32) -> Option<Arc<Event>> {
+    sched::current().task().and_then(|t| t.handle_event(h))
+}
+
+/// Install `ev` in the current task's HANDLE table; returns the HANDLE, or -1.
+pub fn current_alloc_event(ev: Arc<Event>) -> i32 {
+    sched::current().task().map_or(-1, |t| t.handle_alloc_event(ev))
 }
 
 pub fn current_pid() -> u64 {
