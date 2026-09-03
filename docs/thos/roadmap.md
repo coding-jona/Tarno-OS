@@ -348,20 +348,22 @@ late.
     bootstrap call — `pe-test` `PE NtQIP OK`), `NtQueryVirtualMemory`
     (`MemoryBasicInformation`, placeholder region), `NtSetInformationThread` /
     `NtSetInformationProcess` (accept-all).
-  - **Waitable objects — started.** `NtCreateEvent` builds a `wait::Event` in
-    the executive object manager (`object::insert`); the NT HANDLE carries
-    `NT_OBJ_TAG` so `NtClose` and the wait/signal calls route to `object`, not
-    the fd table. `NtWaitForSingleObject` (NULL timeout → block, `0` → poll),
-    `NtSetEvent` / `NtResetEvent` with `PreviousState`. `pe-test`'s single-thread
-    scenario: create → poll `TIMEOUT` → set → poll `WAIT_0` → block (already
-    set) `WAIT_0` → close (`PE event OK`). Still manual-reset only, no timed
-    wait, no unified per-process HANDLE table.
+  - **Waitable objects + unified HANDLE table — started.** `Task.fds` now holds
+    a `HandleObject` per slot — `File(Arc<dyn FileOps>)` or
+    `Event(Arc<wait::Event>)` — so a POSIX fd and a Win32 `HANDLE` are the same
+    integer into the same table (the "one object, many views" model; no tag
+    bits). `NtCreateEvent` allocates in that table; `NtClose` / `CloseHandle`
+    close any handle; `NtWaitForSingleObject` (NULL timeout → block, `0` →
+    poll), `NtSetEvent` / `NtResetEvent` (`PreviousState`) resolve through
+    `current_event`. `pe-test`: create → poll `TIMEOUT` → set → poll `WAIT_0` →
+    block (already set) `WAIT_0` → close (`PE event OK`). Still manual-reset
+    only, no timed wait.
   - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
     unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
     unmodified), or a from-scratch `ntdll` — auto-reset events + a timed wait on
-    the executive timer path, a unified per-process HANDLE table (fds + objects
-    one namespace), SEH ↔ trap dispatch, APC delivery, a minimal registry; then
-    process isolation / integrity for the security phase.
+    the executive timer path, more `HandleObject` kinds (mutant, semaphore,
+    section, thread), SEH ↔ trap dispatch, APC delivery, a minimal registry;
+    then process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
