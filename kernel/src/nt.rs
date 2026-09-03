@@ -16,7 +16,7 @@
 use alloc::sync::Arc;
 
 use crate::syscall::UserFrame;
-use crate::wait::Event;
+use crate::wait::{Event, EventMode};
 use crate::{process, sched};
 
 /// `rax` values `NT_BASE ..= NT_BASE|0xFFFF` are NT-personality calls.
@@ -334,8 +334,12 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         //               EventType, InitialState). Unnamed only; the executive
         // `Event` is manual-reset, so `EventType` (0 notification /
         // 1 synchronization) is not honoured yet.
+        // NtCreateEvent(*Handle, DesiredAccess, *ObjectAttributes, EventType,
+        //               InitialState). EventType 0 = NotificationEvent
+        // (manual-reset), 1 = SynchronizationEvent (auto-reset). Unnamed only.
         NT_NTCREATEEVENT => {
-            let ev = Arc::new(Event::new());
+            let mode = if a3 == 1 { EventMode::Auto } else { EventMode::Manual };
+            let ev = Arc::new(Event::with_mode(mode));
             if stack(0) & 0xFF != 0 {
                 ev.signal(); // InitialState = TRUE
             }
@@ -347,22 +351,42 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             STATUS_SUCCESS as i64
         }
 
-        // NtWaitForSingleObject(Handle, Alertable, *Timeout). NULL timeout =
-        // block until signalled; `*Timeout == 0` = poll; any other value is
-        // treated as an immediate poll (a real timed wait comes with the
-        // executive timer path). Events only for now.
+        // NtWaitForSingleObject(Handle, Alertable, *Timeout). NULL = block
+        // forever; `*Timeout == 0` = poll; a negative `*Timeout` is a relative
+        // wait in 100 ns units — spun against the 100 Hz APIC tick until the
+        // event fires or the deadline passes (a real timed block on the
+        // executive timer wheel comes later). Positive (absolute) = poll.
         NT_NTWAITFORSINGLEOBJECT => {
             let Some(ev) = process::current_event(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
             };
             if a2 == 0 {
-                ev.wait(); // block until signalled
-                STATUS_SUCCESS as i64
-            } else if ev.is_signaled() {
-                STATUS_SUCCESS as i64
-            } else {
-                STATUS_TIMEOUT as i64
+                ev.wait();
+                return STATUS_SUCCESS as i64;
             }
+            let timeout = unsafe { *(a2 as *const i64) };
+            if timeout >= 0 {
+                // 0 = poll; positive (absolute deadline) is not tracked, so
+                // also just check the current state.
+                return if ev.try_take() {
+                    STATUS_SUCCESS as i64
+                } else {
+                    STATUS_TIMEOUT as i64
+                };
+            }
+            // Relative timeout. A PE thread's syscall runs with IF=0 (they are
+            // cooperatively scheduled), so we can't rely on the timer tick or
+            // block — spin a bounded number of cooperative yields scaled to the
+            // requested interval and return `STATUS_TIMEOUT`. A true timed
+            // block lands with the executive timer wheel.
+            let spins = (((-timeout) as u64) / 50).clamp(20_000, 4_000_000);
+            for _ in 0..spins {
+                if ev.try_take() {
+                    return STATUS_SUCCESS as i64;
+                }
+                sched::yield_now();
+            }
+            STATUS_TIMEOUT as i64
         }
 
         // NtSetEvent / NtResetEvent(Handle, *PreviousState)
