@@ -604,6 +604,7 @@ fn write_pe_hello(path: &Path) {
     let ravename_tag = u32::MAX - 43;
     let seh_handler_tag = u32::MAX - 44;
     let msg_seh_tag = u32::MAX - 45;
+    let msg_seh2_tag = u32::MAX - 46;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -1003,6 +1004,19 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2m6) #PF: the same armed handler skips the 2-byte load. Exercises the
+    //      error-code fault stub (`thos_pf_entry`) + CR2 capture.
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    code.extend_from_slice(&[0x8A, 0x00]); // mov al, [rax]  <-- #PF read at 0
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_seh2_tag);
+    let seh2_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -1263,7 +1277,11 @@ fn write_pe_hello(path: &Path) {
     let msg_seh: &[u8] = b"PE SEH OK\n";
     let msg_seh_off = code.len();
     code.extend_from_slice(msg_seh);
+    let msg_seh2: &[u8] = b"PE SEH2 OK\n";
+    let msg_seh2_off = code.len();
+    code.extend_from_slice(msg_seh2);
 
+    code[seh2_r8..seh2_r8 + 4].copy_from_slice(&(msg_seh2.len() as u32).to_le_bytes());
     code[seh_r8..seh_r8 + 4].copy_from_slice(&(msg_seh.len() as u32).to_le_bytes());
     code[evt2_r8..evt2_r8 + 4].copy_from_slice(&(msg_evt2.len() as u32).to_le_bytes());
     code[event_r8..event_r8 + 4].copy_from_slice(&(msg_event.len() as u32).to_le_bytes());
@@ -1339,6 +1357,7 @@ fn write_pe_hello(path: &Path) {
             t if t == ravename_tag => text_rva + ravename_off as u32,
             t if t == seh_handler_tag => text_rva + seh_handler_off as u32,
             t if t == msg_seh_tag => text_rva + msg_seh_off as u32,
+            t if t == msg_seh2_tag => text_rva + msg_seh2_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -2636,6 +2655,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE event OK") // NtCreateEvent/NtWaitForSingleObject/NtSetEvent/NtClose on the executive
         && serial.contains("PE evt2 OK") // auto-reset event consume + relative timed wait -> STATUS_TIMEOUT
         && serial.contains("PE SEH OK") // #UD -> KiUserExceptionDispatcher -> vectored handler -> NtContinue
+        && serial.contains("PE SEH2 OK") // #PF via the error-code fault stub, same handler resumes
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
