@@ -753,6 +753,7 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     }
     map_kernel32_page(proc)?;
     map_ntdll_page(proc)?;
+    map_seh_pages(proc)?;
 
     // Static-TLS page (if any module used `.tls`); TEB.ThreadLocalStoragePointer
     // gets its VA below.
@@ -1160,6 +1161,60 @@ fn cstr_at(img: &[u8], off: u64) -> Result<&str, &'static str> {
     let slice = img.get(off..(off + 256).min(img.len())).ok_or("PE: string out of range")?;
     let end = slice.iter().position(|&b| b == 0).ok_or("PE: unterminated string")?;
     core::str::from_utf8(&slice[..end]).map_err(|_| "PE: non-UTF8 import name")
+}
+
+/// The two SEH pages: a writable one-`PVOID` slot for the vectored handler,
+/// and an r-x `KiUserExceptionDispatcher` — it runs the handler with a
+/// `&EXCEPTION_POINTERS`, then `NtContinue`s (on `EXCEPTION_CONTINUE_EXECUTION`)
+/// or `NtTerminateProcess`es.
+fn map_seh_pages(proc: &Process) -> Result<(), &'static str> {
+    // handler slot page (rw, zeroed)
+    let f = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (seh slot)")?;
+    unsafe { core::ptr::write_bytes(phys_to_virt(f.start_address()).as_mut_ptr::<u8>(), 0, 4096) };
+    proc.map(crate::seh::PE_EXC_ADDR, f.start_address().as_u64(), true, false);
+
+    // dispatcher code page (r-x)
+    let f = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (KiUser)")?;
+    let page = unsafe {
+        let p = phys_to_virt(f.start_address()).as_mut_ptr::<u8>();
+        core::ptr::write_bytes(p, 0, 4096);
+        core::slice::from_raw_parts_mut(p, 4096)
+    };
+    let cont = (crate::nt::NT_BASE | crate::nt::NT_NTDLL_FLAG as u64 | crate::nt::NT_NTCONTINUE as u64) as u32;
+    let term = (crate::nt::NT_BASE
+        | crate::nt::NT_NTDLL_FLAG as u64
+        | crate::nt::NT_NTTERMINATEPROCESS as u64) as u32;
+    let mut c: Vec<u8> = Vec::new();
+    // entry: rcx = &EXCEPTION_RECORD, rdx = &CONTEXT
+    c.extend_from_slice(&[0x53]); // push rbx
+    c.extend_from_slice(&[0x48, 0x89, 0xD3]); // mov rbx, rdx  (save CONTEXT ptr)
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+    c.extend_from_slice(&[0x48, 0x89, 0x4C, 0x24, 0x20]); // mov [rsp+0x20], rcx  (EP.ExceptionRecord)
+    c.extend_from_slice(&[0x48, 0x89, 0x54, 0x24, 0x28]); // mov [rsp+0x28], rdx  (EP.ContextRecord)
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+    c.extend_from_slice(&crate::seh::PE_EXC_ADDR.to_le_bytes());
+    c.extend_from_slice(&[0x48, 0x8B, 0x00]); // mov rax, [rax]  (handler VA)
+    c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    c.extend_from_slice(&[0x74, 0x1D]); // jz .term
+    c.extend_from_slice(&[0x48, 0x8D, 0x4C, 0x24, 0x20]); // lea rcx, [rsp+0x20]  (&EXCEPTION_POINTERS)
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    c.extend_from_slice(&[0x83, 0xF8, 0xFF]); // cmp eax, -1  (EXCEPTION_CONTINUE_EXECUTION)
+    c.extend_from_slice(&[0x75, 0x11]); // jne .term
+    c.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx  (CONTEXT)
+    c.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    c.extend_from_slice(&[0xB8]);
+    c.extend_from_slice(&cont.to_le_bytes()); // mov eax, <NtContinue sel>
+    c.extend_from_slice(&[0x49, 0x89, 0xCA, 0x0F, 0x05, 0x0F, 0x0B]); // mov r10,rcx; syscall; ud2
+    // .term:
+    c.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x20]); // mov rax, [rsp+0x20]  (&EXCEPTION_RECORD)
+    c.extend_from_slice(&[0x8B, 0x10]); // mov edx, [rax]  (ExceptionCode)
+    c.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rcx, -1
+    c.extend_from_slice(&[0xB8]);
+    c.extend_from_slice(&term.to_le_bytes()); // mov eax, <NtTerminateProcess sel>
+    c.extend_from_slice(&[0x49, 0x89, 0xCA, 0x0F, 0x05, 0x0F, 0x0B]); // mov r10,rcx; syscall; ud2
+    page[..c.len()].copy_from_slice(&c);
+    proc.map(crate::seh::PE_KIUSER_ADDR, f.start_address().as_u64(), false, true);
+    Ok(())
 }
 
 fn map_kernel32_page(proc: &Process) -> Result<(), &'static str> {

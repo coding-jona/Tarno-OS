@@ -48,6 +48,7 @@ mod pci;
 mod pe;
 mod process;
 mod sched;
+mod seh;
 mod serial;
 mod smp;
 mod syscall;

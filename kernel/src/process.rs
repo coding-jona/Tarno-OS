@@ -545,7 +545,7 @@ pub fn resolve_path(path: &str) -> String {
     out
 }
 
-fn user_selectors() -> (u64, u64) {
+pub fn user_selectors() -> (u64, u64) {
     let s = gdt::selectors();
     ((s.user_code.0 | 3) as u64, (s.user_data.0 | 3) as u64)
 }

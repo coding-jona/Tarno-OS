@@ -601,6 +601,9 @@ fn write_pe_hello(path: &Path) {
     let evh2_tag = u32::MAX - 40;
     let tneg_tag = u32::MAX - 41;
     let msg_evt2_tag = u32::MAX - 42;
+    let ravename_tag = u32::MAX - 43;
+    let seh_handler_tag = u32::MAX - 44;
+    let msg_seh_tag = u32::MAX - 45;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -969,6 +972,37 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2m5) SEH: arm a vectored handler, execute `ud2` (#UD). The kernel
+    //      delivers it to KiUserExceptionDispatcher; the handler bumps
+    //      CONTEXT.Rip past the 2-byte ud2 and returns
+    //      EXCEPTION_CONTINUE_EXECUTION; NtContinue resumes here.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag); // lea rcx, [rip+ntdllname]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh); // GetModuleHandleA("ntdll.dll")
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (hNtdll)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], ravename_tag); // lea rdx, [rip+ravename]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa); // GetProcAddress -> RtlAddVectoredExceptionHandler
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1  (First)
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], seh_handler_tag); // lea rdx, [rip+seh_handler]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    code.extend_from_slice(&[0xFF, 0xD6]); // call rsi
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x0F, 0x0B]); // ud2  <-- #UD; execution resumes right after
+    // WriteFile(1, msg_seh, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_seh_tag);
+    let seh_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -1100,6 +1134,15 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0xC7, 0x40, 0x04, 0x5A, 0x5A, 0x5A, 0x5A]); // mov dword [rax+4], 0x5A5A5A5A
     code.extend_from_slice(&[0xC3]); // .cbret: ret
 
+    // seh_handler — reached only via the vectored-handler pointer.
+    // LONG seh_handler(PEXCEPTION_POINTERS ep in rcx). ep->ContextRecord->Rip
+    // += 2 (skip the ud2); return EXCEPTION_CONTINUE_EXECUTION (-1).
+    let seh_handler_off = code.len();
+    code.extend_from_slice(&[0x48, 0x8B, 0x41, 0x08]); // mov rax, [rcx+8]  (PCONTEXT)
+    code.extend_from_slice(&[0x48, 0x83, 0x80, 0xF8, 0, 0, 0, 0x02]); // add qword [rax+0xF8], 2
+    code.extend_from_slice(&[0xB8, 0xFF, 0xFF, 0xFF, 0xFF]); // mov eax, -1
+    code.extend_from_slice(&[0xC3]); // ret
+
     // --- data slots at the end of .text ---
     while code.len() % 8 != 0 {
         code.push(0);
@@ -1130,6 +1173,8 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"thos_add\0");
     let ntqipname_off = code.len();
     code.extend_from_slice(b"NtQueryInformationProcess\0");
+    let ravename_off = code.len();
+    code.extend_from_slice(b"RtlAddVectoredExceptionHandler\0");
     let cename_off = code.len();
     code.extend_from_slice(b"NtCreateEvent\0");
     let wfsoname_off = code.len();
@@ -1215,7 +1260,11 @@ fn write_pe_hello(path: &Path) {
     let msg_evt2: &[u8] = b"PE evt2 OK\n";
     let msg_evt2_off = code.len();
     code.extend_from_slice(msg_evt2);
+    let msg_seh: &[u8] = b"PE SEH OK\n";
+    let msg_seh_off = code.len();
+    code.extend_from_slice(msg_seh);
 
+    code[seh_r8..seh_r8 + 4].copy_from_slice(&(msg_seh.len() as u32).to_le_bytes());
     code[evt2_r8..evt2_r8 + 4].copy_from_slice(&(msg_evt2.len() as u32).to_le_bytes());
     code[event_r8..event_r8 + 4].copy_from_slice(&(msg_event.len() as u32).to_le_bytes());
     code[ntqip_r8..ntqip_r8 + 4].copy_from_slice(&(msg_ntqip.len() as u32).to_le_bytes());
@@ -1287,6 +1336,9 @@ fn write_pe_hello(path: &Path) {
             t if t == tneg_tag => text_rva + tneg_off as u32,
             t if t == msg_event_tag => text_rva + msg_event_off as u32,
             t if t == msg_evt2_tag => text_rva + msg_evt2_off as u32,
+            t if t == ravename_tag => text_rva + ravename_off as u32,
+            t if t == seh_handler_tag => text_rva + seh_handler_off as u32,
+            t if t == msg_seh_tag => text_rva + msg_seh_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -2583,6 +2635,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE NtQIP OK") // NtQueryInformationProcess(ProcessBasicInformation) -> PebBaseAddress
         && serial.contains("PE event OK") // NtCreateEvent/NtWaitForSingleObject/NtSetEvent/NtClose on the executive
         && serial.contains("PE evt2 OK") // auto-reset event consume + relative timed wait -> STATUS_TIMEOUT
+        && serial.contains("PE SEH OK") // #UD -> KiUserExceptionDispatcher -> vectored handler -> NtContinue
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL

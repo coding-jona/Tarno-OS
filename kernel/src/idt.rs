@@ -17,7 +17,12 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 
     idt.breakpoint.set_handler_fn(breakpoint);
     idt.divide_error.set_handler_fn(divide_error);
-    idt.invalid_opcode.set_handler_fn(invalid_opcode);
+    // #UD routes through a GPR-saving stub so a PE process's `#UD` can be
+    // delivered to ring-3 SEH (see `crate::seh`).
+    unsafe {
+        idt.invalid_opcode
+            .set_handler_addr(x86_64::VirtAddr::new(crate::seh::thos_ud_entry as *const () as u64));
+    }
     idt.general_protection_fault.set_handler_fn(general_protection_fault);
     idt.stack_segment_fault.set_handler_fn(stack_segment_fault);
 
@@ -74,10 +79,6 @@ extern "x86-interrupt" fn apic_spurious(_frame: InterruptStackFrame) {
 
 extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
     fatal("#DE divide error", &frame, None);
-}
-
-extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
-    fatal("#UD invalid opcode", &frame, None);
 }
 
 extern "x86-interrupt" fn nmi(frame: InterruptStackFrame) {

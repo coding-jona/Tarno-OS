@@ -94,7 +94,10 @@ pub const NT_NTCREATEEVENT: u16 = 13;
 pub const NT_NTWAITFORSINGLEOBJECT: u16 = 14;
 pub const NT_NTSETEVENT: u16 = 15;
 pub const NT_NTRESETEVENT: u16 = 16;
-pub const NTDLL_STUB_COUNT: u16 = 17;
+pub const NT_NTCONTINUE: u16 = 17;
+pub const NT_RTLADDVECTOREDEXCEPTIONHANDLER: u16 = 18;
+pub const NT_RTLREMOVEVECTOREDEXCEPTIONHANDLER: u16 = 19;
+pub const NTDLL_STUB_COUNT: u16 = 20;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -119,6 +122,9 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtWaitForSingleObject",
     "NtSetEvent",
     "NtResetEvent",
+    "NtContinue",
+    "RtlAddVectoredExceptionHandler",
+    "RtlRemoveVectoredExceptionHandler",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -387,6 +393,50 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 sched::yield_now();
             }
             STATUS_TIMEOUT as i64
+        }
+
+        // NtContinue(*Context, TestAlert) — resume ring 3 from the CONTEXT the
+        // exception dispatcher (maybe) fixed up. Does not return.
+        NT_NTCONTINUE => {
+            let c = a0;
+            let (cs, ss) = process::user_selectors();
+            let rd = |off: u64| unsafe { *((c + off) as *const u64) };
+            let f = crate::seh::ExcFrame {
+                rax: rd(0x78),
+                rcx: rd(0x80),
+                rdx: rd(0x88),
+                rbx: rd(0x90),
+                rsp: rd(0x98),
+                rbp: rd(0xA0),
+                rsi: rd(0xA8),
+                rdi: rd(0xB0),
+                r8: rd(0xB8),
+                r9: rd(0xC0),
+                r10: rd(0xC8),
+                r11: rd(0xD0),
+                r12: rd(0xD8),
+                r13: rd(0xE0),
+                r14: rd(0xE8),
+                r15: rd(0xF0),
+                rip: rd(0xF8),
+                // keep the saved IF (0 for a cooperative PE thread); bit 1 is
+                // the reserved always-set flag.
+                rflags: unsafe { *((c + 0x44) as *const u32) } as u64 | 0x2,
+                cs,
+                ss,
+            };
+            unsafe { crate::seh::thos_exc_resume(&f) }
+        }
+
+        // RtlAddVectoredExceptionHandler(First, Handler) — one slot for now
+        // (a real ntdll keeps the list in userspace). Returns a non-NULL cookie.
+        NT_RTLADDVECTOREDEXCEPTIONHANDLER => {
+            unsafe { *(crate::seh::PE_EXC_ADDR as *mut u64) = a1 };
+            crate::seh::PE_EXC_ADDR as i64
+        }
+        NT_RTLREMOVEVECTOREDEXCEPTIONHANDLER => {
+            unsafe { *(crate::seh::PE_EXC_ADDR as *mut u64) = 0 };
+            1
         }
 
         // NtSetEvent / NtResetEvent(Handle, *PreviousState)
