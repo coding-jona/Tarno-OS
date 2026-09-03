@@ -363,17 +363,20 @@ late.
     honours `EventType`. `NtWaitForSingleObject` with a negative `*Timeout`
     spins a bounded number of yields (a PE syscall runs IF=0, so no tick clock
     / no safe block yet) and returns `STATUS_TIMEOUT` (`pe-test` `PE evt2 OK`).
-  - **SEH ↔ trap dispatch — started.** `crate::seh`: a `#UD` from a PE process
-    is delivered to ring 3 like on Windows — a GPR-saving stub
-    (`thos_ud_entry`) captures an `ExcFrame`, `deliver` writes an
-    `EXCEPTION_RECORD` + x64 `CONTEXT` onto the user stack and re-points
-    execution at a `KiUserExceptionDispatcher` stub page, which calls the
-    process's vectored handler (`RtlAddVectoredExceptionHandler`, one slot for
-    now) and either `NtContinue`s (kernel rebuilds the frame, `iretq`) or
-    `NtTerminateProcess`es. `pe-test` arms a handler, runs `ud2`, the handler
-    steps `CONTEXT.Rip` past it (`PE SEH OK`). `#PF` / `#GP` / `#DE` reuse the
-    path once each gets its stub; frame-based `.pdata` / `.xdata` SEH is then
-    just a smarter `KiUserExceptionDispatcher`.
+  - **SEH ↔ trap dispatch.** `crate::seh`: a ring-3 CPU fault in a PE process
+    is delivered like on Windows. Two GPR-saving stub shapes —
+    no-error-code (`#UD`, `#DE`) and error-code (`#GP`, `#PF`) — converge on
+    `thos_fault_common` → `thos_fault_dispatch`, which (if the process armed a
+    vectored handler) has `deliver` write an `EXCEPTION_RECORD` + x64 `CONTEXT`
+    onto the user stack and re-point execution at a `KiUserExceptionDispatcher`
+    stub page; `#PF` fills the record's params (access type + faulting VA from
+    CR2). The dispatcher calls the handler
+    (`RtlAddVectoredExceptionHandler`, one slot for now) and either
+    `NtContinue`s (kernel rebuilds the frame, `iretq`, IF kept 0) or
+    `NtTerminateProcess`es; no handler ⇒ the process is killed. `pe-test` arms
+    a handler and resumes through a `ud2` (`PE SEH OK`) and a `mov al,[0]`
+    (`PE SEH2 OK`). Frame-based `.pdata` / `.xdata` SEH is then just a smarter
+    `KiUserExceptionDispatcher`.
   - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
     unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
     unmodified), or a from-scratch `ntdll` — an **executive timer wheel** for a
