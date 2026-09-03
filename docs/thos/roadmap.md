@@ -356,14 +356,20 @@ late.
     close any handle; `NtWaitForSingleObject` (NULL timeout → block, `0` →
     poll), `NtSetEvent` / `NtResetEvent` (`PreviousState`) resolve through
     `current_event`. `pe-test`: create → poll `TIMEOUT` → set → poll `WAIT_0` →
-    block (already set) `WAIT_0` → close (`PE event OK`). Still manual-reset
-    only, no timed wait.
+    block (already set) `WAIT_0` → close (`PE event OK`).
+  - **Auto-reset + relative timed wait.** `wait::Event` gains
+    `EventMode { Manual, Auto }`; auto-reset releases one waiter per signal and
+    self-clears, via the race-free `WaitQueue::wake_one_or`. `NtCreateEvent`
+    honours `EventType`. `NtWaitForSingleObject` with a negative `*Timeout`
+    spins a bounded number of yields (a PE syscall runs IF=0, so no tick clock
+    / no safe block yet) and returns `STATUS_TIMEOUT` (`pe-test` `PE evt2 OK`).
   - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
     unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
-    unmodified), or a from-scratch `ntdll` — auto-reset events + a timed wait on
-    the executive timer path, more `HandleObject` kinds (mutant, semaphore,
-    section, thread), SEH ↔ trap dispatch, APC delivery, a minimal registry;
-    then process isolation / integrity for the security phase.
+    unmodified), or a from-scratch `ntdll` — an **executive timer wheel** for a
+    real timed block (and a preemption-safe path out of a PE syscall), more
+    `HandleObject` kinds (mutant, semaphore, section, thread), SEH ↔ trap
+    dispatch, APC delivery, a minimal registry; then process isolation /
+    integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
