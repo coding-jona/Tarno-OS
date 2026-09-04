@@ -34,30 +34,34 @@ code + the resumable recipe are tracked. The one committed blob is the < 64 KB
 
 ## End-to-end (P0)
 
+One orchestrator, `ml/train/run.sh`, drives every step. All steps are idempotent
+and resumable — safe to re-run after the nightly internet cut-off, a killed
+training run, or a reboot.
+
 ```sh
-# 0. one-time deps (torch only needed for steps 2–3)
-python -m pip install -r ml/train/requirements.txt
-
-# 1. corpus (in an internet window; safe to Ctrl-C and rerun)
-python ml/train/fetch.py
-python ml/train/prepare.py
-
-# 2. train the ~1M spike on CPU (hours; --resume to continue)
-python ml/train/train.py --config config/spike-1m.toml
-python ml/train/export.py --ckpt out/latest.pt --out spike-1m.tlm
-
-# 3. run it — Rust engine, no Python
-cargo run -p thos-lm --example generate --target x86_64-unknown-linux-gnu -- \
-    --weights spike-1m.tlm --prompt "The " --max-tokens 200
-
-# cross-check the Rust engine against the numpy oracle
-python ml/train/ref_forward.py --weights spike-1m.tlm --prompt "The " --dump > ref.txt
+ml/train/run.sh all                 # setup -> data -> train -> export -> sample
 ```
+
+or step by step:
+
+```sh
+ml/train/run.sh setup               # .venv + torch(CPU) + numpy + tqdm
+ml/train/run.sh data                # fetch corpus (resumable) + tokenize/pack
+ml/train/run.sh train-bg            # train on CPU in the background
+ml/train/run.sh status              # progress (loss, step, tok/s)
+ml/train/run.sh export              # out/latest.pt -> spike-1m.tlm
+ml/train/run.sh sample "The "       # build the Rust engine + generate
+```
+
+`run.sh help` lists everything. Overridable via env: `CONFIG=` (default
+`config/spike-1m.toml`), `TLM=`, `PROMPT=`, `MAXTOK=`.
+
+The `train/*.py` scripts still run standalone if you prefer; `run.sh` just wires
+them together with the right paths and resume flags.
 
 ## Tests
 
 ```sh
-cargo build -p thos-lm --target x86_64-unknown-none          # proves it's no_std
-cargo test  -p thos-lm --target x86_64-unknown-linux-gnu     # golden cross-check
-python ml/train/make_fixture.py                              # regenerate the fixture
+ml/train/run.sh test    # no_std build + golden cross-check + regenerate fixture
 ```
+
