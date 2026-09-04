@@ -62,6 +62,25 @@ impl WaitQueue {
         }
     }
 
+    /// Wake exactly one blocked thread; if none is blocked, run `f` (both under
+    /// the queue lock, so it can't race a concurrent [`wait_if`] check).
+    /// Returns whether a thread was woken. This is the race-free building block
+    /// for an auto-reset event's `signal`.
+    pub fn wake_one_or<F: FnOnce()>(&self, f: F) -> bool {
+        let mut w = self.waiters.lock();
+        match w.pop_front() {
+            Some(t) => {
+                drop(w);
+                sched::unblock(t);
+                true
+            }
+            None => {
+                f();
+                false
+            }
+        }
+    }
+
     /// Wake every blocked thread. Returns how many.
     pub fn wake_all(&self) -> usize {
         let drained: VecDeque<Arc<Thread>> = core::mem::take(&mut *self.waiters.lock());
@@ -73,21 +92,41 @@ impl WaitQueue {
     }
 }
 
-/// A manually-reset event: `wait` blocks until `signal`, `reset` clears it.
+/// Manual-reset (`Notification`) stays signalled until `reset`; auto-reset
+/// (`Synchronization`) releases one waiter per `signal` and clears itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EventMode {
+    Manual,
+    Auto,
+}
+
+/// A dispatcher event: `wait` blocks until `signal`. See [`EventMode`].
 pub struct Event {
     signaled: AtomicBool,
+    mode: EventMode,
     queue: WaitQueue,
 }
 
 #[allow(dead_code)]
 impl Event {
     pub const fn new() -> Self {
-        Self { signaled: AtomicBool::new(false), queue: WaitQueue::new() }
+        Self::with_mode(EventMode::Manual)
+    }
+    pub const fn with_mode(mode: EventMode) -> Self {
+        Self { signaled: AtomicBool::new(false), mode, queue: WaitQueue::new() }
     }
 
     pub fn signal(&self) {
-        self.signaled.store(true, Ordering::Release);
-        self.queue.wake_all();
+        match self.mode {
+            EventMode::Manual => {
+                self.signaled.store(true, Ordering::Release);
+                self.queue.wake_all();
+            }
+            // Release one waiter; if none, latch so the next `wait` consumes it.
+            EventMode::Auto => {
+                self.queue.wake_one_or(|| self.signaled.store(true, Ordering::Release));
+            }
+        }
     }
 
     pub fn reset(&self) {
@@ -98,9 +137,28 @@ impl Event {
         self.signaled.load(Ordering::Acquire)
     }
 
+    /// Non-blocking check that consumes the signal for an auto-reset event.
+    pub fn try_take(&self) -> bool {
+        match self.mode {
+            EventMode::Manual => self.signaled.load(Ordering::Acquire),
+            EventMode::Auto => self.signaled.swap(false, Ordering::AcqRel),
+        }
+    }
+
     pub fn wait(&self) {
-        while !self.signaled.load(Ordering::Acquire) {
-            self.queue.wait();
+        match self.mode {
+            EventMode::Manual => {
+                while !self.signaled.load(Ordering::Acquire) {
+                    self.queue.wait();
+                }
+            }
+            // `wait_if` holds the queue lock across the check + enqueue, and
+            // `signal`'s `wake_one_or` takes the same lock — so either we
+            // consume the latched flag, or we block and `signal` wakes us
+            // (the wakeup *is* the signal; nothing else to check).
+            EventMode::Auto => {
+                self.queue.wait_if(|| !self.signaled.swap(false, Ordering::AcqRel));
+            }
         }
     }
 }

@@ -13,7 +13,10 @@
 //! straight to a THOS write); a real `ntdll` with `Nt*` primitives layers on
 //! later.
 
+use alloc::sync::Arc;
+
 use crate::syscall::UserFrame;
+use crate::wait::{Event, EventMode};
 use crate::{process, sched};
 
 /// `rax` values `NT_BASE ..= NT_BASE|0xFFFF` are NT-personality calls.
@@ -83,11 +86,26 @@ pub const NT_NTPROTECTVIRTUALMEMORY: u16 = 5;
 pub const NT_NTTERMINATEPROCESS: u16 = 6;
 pub const NT_LDRGETPROCEDUREADDRESS: u16 = 7;
 pub const NT_LDRLOADDLL: u16 = 8;
-pub const NTDLL_STUB_COUNT: u16 = 9;
+pub const NT_NTQUERYINFORMATIONPROCESS: u16 = 9;
+pub const NT_NTQUERYVIRTUALMEMORY: u16 = 10;
+pub const NT_NTSETINFORMATIONTHREAD: u16 = 11;
+pub const NT_NTSETINFORMATIONPROCESS: u16 = 12;
+pub const NT_NTCREATEEVENT: u16 = 13;
+pub const NT_NTWAITFORSINGLEOBJECT: u16 = 14;
+pub const NT_NTSETEVENT: u16 = 15;
+pub const NT_NTRESETEVENT: u16 = 16;
+pub const NT_NTCONTINUE: u16 = 17;
+pub const NT_RTLADDVECTOREDEXCEPTIONHANDLER: u16 = 18;
+pub const NT_RTLREMOVEVECTOREDEXCEPTIONHANDLER: u16 = 19;
+pub const NT_NTQUEUEAPCTHREAD: u16 = 20;
+pub const NT_NTTESTALERT: u16 = 21;
+pub const NTDLL_STUB_COUNT: u16 = 22;
 
-/// The `ntdll` export table, in stub-index order (see [`NT_EXPORTS`] for the
-/// `kernel32` equivalent). The synthetic `ntdll.dll` module exports exactly
-/// these, and [`crate::pe::resolve_import`] binds `ntdll.dll` imports here.
+/// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
+/// service number, and `dispatch_ntdll` is a table-driven switch on it. The
+/// synthetic `ntdll.dll` module exports exactly these names at exactly these
+/// ordinals, and [`crate::pe::resolve_import`] binds `ntdll.dll` imports here.
+/// (See [`NT_EXPORTS`] for the Win32 `kernel32` shim layer that sits on top.)
 pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtClose",
     "NtWriteFile",
@@ -98,6 +116,19 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtTerminateProcess",
     "LdrGetProcedureAddress",
     "LdrLoadDll",
+    "NtQueryInformationProcess",
+    "NtQueryVirtualMemory",
+    "NtSetInformationThread",
+    "NtSetInformationProcess",
+    "NtCreateEvent",
+    "NtWaitForSingleObject",
+    "NtSetEvent",
+    "NtResetEvent",
+    "NtContinue",
+    "RtlAddVectoredExceptionHandler",
+    "RtlRemoveVectoredExceptionHandler",
+    "NtQueueApcThread",
+    "NtTestAlert",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -119,6 +150,9 @@ const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_END_OF_FILE: u32 = 0xC000_0011;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+const STATUS_TIMEOUT: u32 = 0x0000_0102;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
@@ -195,7 +229,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // NtTerminateProcess(ProcessHandle, ExitStatus)
         NT_NTTERMINATEPROCESS => proc_terminate(a1 as i32),
 
-        // NtClose(Handle)
+        // NtClose(Handle) — one per-process table; files and objects alike.
         NT_NTCLOSE => status(handle_close_core(a0 as i32), STATUS_INVALID_HANDLE),
 
         // NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
@@ -243,6 +277,247 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // No teardown / per-page protection yet.
         NT_NTFREEVIRTUALMEMORY | NT_NTPROTECTVIRTUALMEMORY => STATUS_SUCCESS as i64,
 
+        // NtQueryInformationProcess(ProcessHandle, InfoClass, Buffer, Length,
+        //                           *ReturnLength). Only ProcessBasicInformation
+        // (class 0) — the call a real ntdll uses first, to find the PEB.
+        NT_NTQUERYINFORMATIONPROCESS => {
+            let (class, buf, len) = (a1 as u32, a2, a3 as usize);
+            let ret_len = stack(0);
+            if class != 0 {
+                return STATUS_INVALID_INFO_CLASS as i64;
+            }
+            if len < 0x30 {
+                return STATUS_INFO_LENGTH_MISMATCH as i64;
+            }
+            let peb = teb().map_or(0, |t| unsafe { *(t.add(0x60) as *const u64) });
+            unsafe {
+                let b = buf as *mut u64;
+                *b.add(0) = 0; // ExitStatus
+                *b.add(1) = peb; // PebBaseAddress
+                *b.add(2) = 1; // AffinityMask
+                *b.add(3) = 8; // BasePriority
+                *b.add(4) = process::current_pid(); // UniqueProcessId
+                *b.add(5) = 0; // InheritedFromUniqueProcessId
+            }
+            if ret_len != 0 {
+                unsafe { *(ret_len as *mut u32) = 0x30 }; // ReturnLength is ULONG
+            }
+            STATUS_SUCCESS as i64
+        }
+
+        // NtQueryVirtualMemory(ProcessHandle, BaseAddress, InfoClass, Buffer,
+        //                      Length, *ReturnLength). Only MemoryBasicInformation
+        // (class 0); reports one committed RWX private region per page (W^X and
+        // real region tracking arrive later).
+        NT_NTQUERYVIRTUALMEMORY => {
+            let (addr, class, buf, len) = (a1, a2 as u32, a3, stack(0) as usize);
+            let ret_len = stack(1);
+            if class != 0 {
+                return STATUS_INVALID_INFO_CLASS as i64;
+            }
+            if len < 0x30 {
+                return STATUS_INFO_LENGTH_MISMATCH as i64;
+            }
+            let page = addr & !0xFFF;
+            unsafe {
+                let b = buf as *mut u64;
+                *b.add(0) = page; // BaseAddress
+                *b.add(1) = page; // AllocationBase
+                *(b.add(2) as *mut u32) = 0x40; // AllocationProtect = PAGE_EXECUTE_READWRITE
+                *b.add(3) = 0x1000; // RegionSize
+                *(b.add(4) as *mut u32) = 0x1000; // State = MEM_COMMIT
+                *(b.add(4) as *mut u32).add(1) = 0x40; // Protect
+                *(b.add(5) as *mut u32) = 0x2_0000; // Type = MEM_PRIVATE
+            }
+            if ret_len != 0 {
+                unsafe { *(ret_len as *mut u64) = 0x30 }; // ReturnLength is SIZE_T
+            }
+            STATUS_SUCCESS as i64
+        }
+
+        // NtSetInformationThread / NtSetInformationProcess — early ntdll calls
+        // these with classes THOS can safely ignore (debugger flags, priority,
+        // …). Accept everything until a class actually needs backing.
+        NT_NTSETINFORMATIONTHREAD | NT_NTSETINFORMATIONPROCESS => STATUS_SUCCESS as i64,
+
+        // NtCreateEvent(*EventHandle, DesiredAccess, *ObjectAttributes,
+        //               EventType, InitialState). Unnamed only; the executive
+        // `Event` is manual-reset, so `EventType` (0 notification /
+        // 1 synchronization) is not honoured yet.
+        // NtCreateEvent(*Handle, DesiredAccess, *ObjectAttributes, EventType,
+        //               InitialState). EventType 0 = NotificationEvent
+        // (manual-reset), 1 = SynchronizationEvent (auto-reset). Unnamed only.
+        NT_NTCREATEEVENT => {
+            let mode = if a3 == 1 { EventMode::Auto } else { EventMode::Manual };
+            let ev = Arc::new(Event::with_mode(mode));
+            if stack(0) & 0xFF != 0 {
+                ev.signal(); // InitialState = TRUE
+            }
+            let h = process::current_alloc_event(ev);
+            if h < 0 {
+                return STATUS_NO_MEMORY as i64;
+            }
+            unsafe { *(a0 as *mut u64) = h as u64 };
+            STATUS_SUCCESS as i64
+        }
+
+        // NtWaitForSingleObject(Handle, Alertable, *Timeout). NULL = block
+        // forever; `*Timeout == 0` = poll; a negative `*Timeout` is a relative
+        // wait in 100 ns units — spun against the 100 Hz APIC tick until the
+        // event fires or the deadline passes (a real timed block on the
+        // executive timer wheel comes later). Positive (absolute) = poll.
+        NT_NTWAITFORSINGLEOBJECT => {
+            let Some(ev) = process::current_event(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            if a2 == 0 {
+                ev.wait();
+                return STATUS_SUCCESS as i64;
+            }
+            let timeout = unsafe { *(a2 as *const i64) };
+            if timeout >= 0 {
+                // 0 = poll; positive (absolute deadline) is not tracked, so
+                // also just check the current state.
+                return if ev.try_take() {
+                    STATUS_SUCCESS as i64
+                } else {
+                    STATUS_TIMEOUT as i64
+                };
+            }
+            // Relative timeout. A PE thread's syscall runs with IF=0 (they are
+            // cooperatively scheduled), so we can't rely on the timer tick or
+            // block — spin a bounded number of cooperative yields scaled to the
+            // requested interval and return `STATUS_TIMEOUT`. A true timed
+            // block lands with the executive timer wheel.
+            let spins = (((-timeout) as u64) / 50).clamp(20_000, 4_000_000);
+            for _ in 0..spins {
+                if ev.try_take() {
+                    return STATUS_SUCCESS as i64;
+                }
+                sched::yield_now();
+            }
+            STATUS_TIMEOUT as i64
+        }
+
+        // NtContinue(*Context, TestAlert) — resume ring 3 from the CONTEXT the
+        // exception / APC dispatcher (maybe) fixed up. When `TestAlert` is set
+        // (the `KiUserApcDispatcher` tail passes it), drain the next queued user
+        // APC before resuming, so a run of APCs unwinds one dispatcher call at a
+        // time. Does not return.
+        NT_NTCONTINUE => {
+            let c = a0;
+            let (cs, ss) = process::user_selectors();
+            let rd = |off: u64| unsafe { *((c + off) as *const u64) };
+            let mut f = crate::seh::ExcFrame {
+                rax: rd(0x78),
+                rcx: rd(0x80),
+                rdx: rd(0x88),
+                rbx: rd(0x90),
+                rsp: rd(0x98),
+                rbp: rd(0xA0),
+                rsi: rd(0xA8),
+                rdi: rd(0xB0),
+                r8: rd(0xB8),
+                r9: rd(0xC0),
+                r10: rd(0xC8),
+                r11: rd(0xD0),
+                r12: rd(0xD8),
+                r13: rd(0xE0),
+                r14: rd(0xE8),
+                r15: rd(0xF0),
+                rip: rd(0xF8),
+                // keep the saved IF (0 for a cooperative PE thread); bit 1 is
+                // the reserved always-set flag.
+                rflags: unsafe { *((c + 0x44) as *const u32) } as u64 | 0x2,
+                cs,
+                ss,
+            };
+            if a1 != 0 {
+                if let Some((rsp, rip)) = crate::apc::take_and_stage(&exc_frame_regs(&f)) {
+                    f.rsp = rsp;
+                    f.rip = rip;
+                }
+            }
+            unsafe { crate::seh::thos_exc_resume(&f) }
+        }
+
+        // NtQueueApcThread(ThreadHandle, ApcRoutine, ApcArgument1, ApcArgument2,
+        //                  ApcArgument3). Only the current thread is a valid
+        // target while a PE process is single-threaded: NtCurrentThread (-2) or
+        // NtCurrentProcess (-1).
+        NT_NTQUEUEAPCTHREAD => {
+            if a0 as i64 != -2 && a0 as i64 != -1 {
+                return STATUS_INVALID_HANDLE as i64;
+            }
+            if a1 == 0 {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let e = process::ApcEntry { routine: a1, arg1: a2, arg2: a3, arg3: stack(0) };
+            status(process::current_queue_apc(e), STATUS_INVALID_HANDLE)
+        }
+
+        // NtTestAlert() — if a user APC is queued, deliver it now by redirecting
+        // this thread's return through `KiUserApcDispatcher`; the staged CONTEXT
+        // carries STATUS_SUCCESS in `Rax` so the eventual resume returns it.
+        NT_NTTESTALERT => {
+            let (cs, ss) = process::user_selectors();
+            let r = crate::apc::Regs {
+                rax: STATUS_SUCCESS as u64,
+                rcx: 0,
+                rdx: frame.rdx,
+                rbx: frame.rbx,
+                rsp: frame.rsp,
+                rbp: frame.rbp,
+                rsi: frame.rsi,
+                rdi: frame.rdi,
+                r8: frame.r8,
+                r9: frame.r9,
+                r10: frame.r10,
+                r11: frame.r11,
+                r12: frame.r12,
+                r13: frame.r13,
+                r14: frame.r14,
+                r15: frame.r15,
+                rip: frame.rip,
+                rflags: frame.rflags,
+                cs,
+                ss,
+            };
+            if let Some((rsp, rip)) = crate::apc::take_and_stage(&r) {
+                frame.rsp = rsp;
+                frame.rip = rip;
+            }
+            STATUS_SUCCESS as i64
+        }
+
+        // RtlAddVectoredExceptionHandler(First, Handler) — one slot for now
+        // (a real ntdll keeps the list in userspace). Returns a non-NULL cookie.
+        NT_RTLADDVECTOREDEXCEPTIONHANDLER => {
+            unsafe { *(crate::seh::PE_EXC_ADDR as *mut u64) = a1 };
+            crate::seh::PE_EXC_ADDR as i64
+        }
+        NT_RTLREMOVEVECTOREDEXCEPTIONHANDLER => {
+            unsafe { *(crate::seh::PE_EXC_ADDR as *mut u64) = 0 };
+            1
+        }
+
+        // NtSetEvent / NtResetEvent(Handle, *PreviousState)
+        NT_NTSETEVENT | NT_NTRESETEVENT => {
+            let Some(ev) = process::current_event(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            let prev = ev.is_signaled() as u32;
+            if idx == NT_NTSETEVENT {
+                ev.signal();
+            } else {
+                ev.reset();
+            }
+            if a1 != 0 {
+                unsafe { *(a1 as *mut u32) = prev };
+            }
+            STATUS_SUCCESS as i64
+        }
+
         // LdrGetProcedureAddress(DllHandle, *AnsiName(STRING), Ordinal, *Address)
         NT_LDRGETPROCEDUREADDRESS => {
             let addr = if a1 != 0 {
@@ -282,6 +557,33 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
 
 fn status(ok: bool, err: u32) -> i64 {
     if ok { STATUS_SUCCESS as i64 } else { err as i64 }
+}
+
+/// Snapshot a rebuilt `seh::ExcFrame` as [`crate::apc::Regs`] so a pending APC
+/// can be staged on top of the state `NtContinue` is about to resume.
+fn exc_frame_regs(f: &crate::seh::ExcFrame) -> crate::apc::Regs {
+    crate::apc::Regs {
+        rax: f.rax,
+        rcx: f.rcx,
+        rdx: f.rdx,
+        rbx: f.rbx,
+        rsp: f.rsp,
+        rbp: f.rbp,
+        rsi: f.rsi,
+        rdi: f.rdi,
+        r8: f.r8,
+        r9: f.r9,
+        r10: f.r10,
+        r11: f.r11,
+        r12: f.r12,
+        r13: f.r13,
+        r14: f.r14,
+        r15: f.r15,
+        rip: f.rip,
+        rflags: f.rflags,
+        cs: f.cs,
+        ss: f.ss,
+    }
 }
 
 /// Fill an `IO_STATUS_BLOCK` (`{ NTSTATUS Status; ULONG_PTR Information; }`).

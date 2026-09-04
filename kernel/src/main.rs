@@ -27,6 +27,7 @@ extern crate alloc;
 
 mod acpi;
 mod ahci;
+mod apc;
 mod apic;
 mod console;
 mod cpu;
@@ -48,6 +49,7 @@ mod pci;
 mod pe;
 mod process;
 mod sched;
+mod seh;
 mod serial;
 mod smp;
 mod syscall;

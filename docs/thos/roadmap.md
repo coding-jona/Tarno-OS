@@ -341,9 +341,58 @@ late.
       `ExitProcess(0x135)` inline instead of jumping to the exe entry.
       `pe-test`'s `failcrt.dll` aborts init so `pe-dllfail.exe`'s entry never
       runs (`THOS: pe dllfail ok`).
-  - **Then:** the real `ntdll` lower boundary (the `__wine_unix_call` seam +
-    a wineserver-equivalent on the executive) so Wine's PE DLLs can sit on
-    THOS; process isolation / integrity for the security phase.
+  - **`ntdll` lower boundary — started.** `NTDLL_EXPORTS` is now framed as
+    THOS's **SSDT**: the stub index *is* the service number, `dispatch_ntdll`
+    the table-driven switch. First query primitives a real `ntdll` startup
+    touches: `NtQueryInformationProcess(ProcessBasicInformation)` (→ PEB, the
+    bootstrap call — `pe-test` `PE NtQIP OK`), `NtQueryVirtualMemory`
+    (`MemoryBasicInformation`, placeholder region), `NtSetInformationThread` /
+    `NtSetInformationProcess` (accept-all).
+  - **Waitable objects + unified HANDLE table — started.** `Task.fds` now holds
+    a `HandleObject` per slot — `File(Arc<dyn FileOps>)` or
+    `Event(Arc<wait::Event>)` — so a POSIX fd and a Win32 `HANDLE` are the same
+    integer into the same table (the "one object, many views" model; no tag
+    bits). `NtCreateEvent` allocates in that table; `NtClose` / `CloseHandle`
+    close any handle; `NtWaitForSingleObject` (NULL timeout → block, `0` →
+    poll), `NtSetEvent` / `NtResetEvent` (`PreviousState`) resolve through
+    `current_event`. `pe-test`: create → poll `TIMEOUT` → set → poll `WAIT_0` →
+    block (already set) `WAIT_0` → close (`PE event OK`).
+  - **Auto-reset + relative timed wait.** `wait::Event` gains
+    `EventMode { Manual, Auto }`; auto-reset releases one waiter per signal and
+    self-clears, via the race-free `WaitQueue::wake_one_or`. `NtCreateEvent`
+    honours `EventType`. `NtWaitForSingleObject` with a negative `*Timeout`
+    spins a bounded number of yields (a PE syscall runs IF=0, so no tick clock
+    / no safe block yet) and returns `STATUS_TIMEOUT` (`pe-test` `PE evt2 OK`).
+  - **SEH ↔ trap dispatch.** `crate::seh`: a ring-3 CPU fault in a PE process
+    is delivered like on Windows. Two GPR-saving stub shapes —
+    no-error-code (`#UD`, `#DE`) and error-code (`#GP`, `#PF`) — converge on
+    `thos_fault_common` → `thos_fault_dispatch`, which (if the process armed a
+    vectored handler) has `deliver` write an `EXCEPTION_RECORD` + x64 `CONTEXT`
+    onto the user stack and re-point execution at a `KiUserExceptionDispatcher`
+    stub page; `#PF` fills the record's params (access type + faulting VA from
+    CR2). The dispatcher calls the handler
+    (`RtlAddVectoredExceptionHandler`, one slot for now) and either
+    `NtContinue`s (kernel rebuilds the frame, `iretq`, IF kept 0) or
+    `NtTerminateProcess`es; no handler ⇒ the process is killed. `pe-test` arms
+    a handler and resumes through a `ud2` (`PE SEH OK`) and a `mov al,[0]`
+    (`PE SEH2 OK`). Frame-based `.pdata` / `.xdata` SEH is then just a smarter
+    `KiUserExceptionDispatcher`.
+  - **User-mode APC delivery.** `crate::apc`: `NtQueueApcThread` appends a
+    per-task `ApcEntry`; `NtTestAlert` (and the `TestAlert` tail of
+    `NtContinue`) delivers it by staging a `CONTEXT` on the user stack with the
+    APC params in its `P1..P4` home area and redirecting the thread through a
+    `KiUserApcDispatcher` stub page (`pe::map_apc_page`). The dispatcher calls
+    the routine then `NtContinue(&ctx, TestAlert=TRUE)`, so a run of queued APCs
+    unwinds one dispatcher call at a time before the interrupted code resumes.
+    `pe-test` queues an APC to itself, `NtTestAlert`s, checks the handler ran
+    (`PE APC OK`). Kernel-mode APCs / alertable `NtWaitForSingleObject` land
+    with the timer wheel. `QueueUserAPC` (Win32) layers straight on top.
+  - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
+    unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
+    unmodified), or a from-scratch `ntdll` — an **executive timer wheel** for a
+    real timed block (and a preemption-safe path out of a PE syscall), more
+    `HandleObject` kinds (mutant, semaphore, section, thread), a minimal
+    registry; then process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a

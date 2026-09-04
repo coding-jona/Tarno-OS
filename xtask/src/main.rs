@@ -584,6 +584,34 @@ fn write_pe_hello(path: &Path) {
     let msg_fwd_tag = u32::MAX - 23;
     let tls_index_tag = u32::MAX - 24;
     let msg_tls_tag = u32::MAX - 25;
+    let ntqipname_tag = u32::MAX - 26;
+    let pbi_tag = u32::MAX - 27;
+    let msg_ntqip_tag = u32::MAX - 28;
+    let cename_tag = u32::MAX - 29;
+    let wfsoname_tag = u32::MAX - 30;
+    let sename_tag = u32::MAX - 31;
+    let closename_tag = u32::MAX - 32;
+    let ce_slot_tag = u32::MAX - 33;
+    let wfso_slot_tag = u32::MAX - 34;
+    let se_slot_tag = u32::MAX - 35;
+    let close_slot_tag = u32::MAX - 36;
+    let evh_tag = u32::MAX - 37;
+    let tzero_tag = u32::MAX - 38;
+    let msg_event_tag = u32::MAX - 39;
+    let evh2_tag = u32::MAX - 40;
+    let tneg_tag = u32::MAX - 41;
+    let msg_evt2_tag = u32::MAX - 42;
+    let ravename_tag = u32::MAX - 43;
+    let seh_handler_tag = u32::MAX - 44;
+    let msg_seh_tag = u32::MAX - 45;
+    let msg_seh2_tag = u32::MAX - 46;
+    let apcqueuename_tag = u32::MAX - 47;
+    let testalertname_tag = u32::MAX - 48;
+    let apcq_slot_tag = u32::MAX - 49;
+    let ta_slot_tag = u32::MAX - 50;
+    let apc_flag_tag = u32::MAX - 51;
+    let apc_handler_tag = u32::MAX - 52;
+    let msg_apc_tag = u32::MAX - 53;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -788,6 +816,259 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0xFF, 0xD6]); // call rsi
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x58]); // add rsp, 0x58
 
+    // 2m2) NtQueryInformationProcess(ProcessBasicInformation): the call a real
+    //      ntdll uses first, to find the PEB. Verify Pbi.PebBaseAddress matches
+    //      the PEB reached via gs:[0x30]->[0x60].
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag); // lea rcx, [rip+ntdllname]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh); // call [rip+iat_GetModuleHandleA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (hNtdll)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], ntqipname_tag); // lea rdx, [rip+ntqipname]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa); // call [rip+iat_GetProcAddress]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax  (NtQueryInformationProcess)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rcx, -1  (current process)
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx  (ProcessBasicInformation)
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], pbi_tag); // lea r8, [rip+pbi]
+    code.extend_from_slice(&[0x41, 0xB9, 0x30, 0, 0, 0]); // mov r9d, 0x30
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // sub rsp,0x38; [rsp+0x20]=0
+    code.extend_from_slice(&[0xFF, 0xD6]); // call rsi
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0, 0, 0]); // mov rax, gs:[0x30]
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x60]); // mov rax, [rax+0x60]  (PEB)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], pbi_tag); // lea rcx, [rip+pbi]
+    code.extend_from_slice(&[0x48, 0x3B, 0x41, 0x08]); // cmp rax, [rcx+8]  (Pbi.PebBaseAddress)
+    code.extend_from_slice(&[0x74, 0x01]); // je +1
+    code.extend_from_slice(&[0xCC]); // int3
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_ntqip_tag); // lea rdx, [rip+msg_ntqip]
+    let ntqip_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2m3) executive-backed events. rbx still holds hNtdll. Resolve the four
+    //      Nt* event calls into slots, then: create an unsignalled event,
+    //      poll -> STATUS_TIMEOUT; NtSetEvent; poll -> STATUS_WAIT_0; block on
+    //      a NULL timeout (already signalled) -> STATUS_WAIT_0; NtClose.
+    for (name_tag, slot_tag) in [
+        (cename_tag, ce_slot_tag),
+        (wfsoname_tag, wfso_slot_tag),
+        (sename_tag, se_slot_tag),
+        (closename_tag, close_slot_tag),
+    ] {
+        code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx  (hNtdll)
+        rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], name_tag); // lea rdx, [rip+name]
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+        rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa); // call [rip+iat_GetProcAddress]
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+        rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], slot_tag); // mov [rip+slot], rax
+    }
+    // NtCreateEvent(&evh, 0, 0, 0, FALSE)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], evh_tag); // lea rcx, [rip+evh]
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9]); // xor edx,edx; xor r8d,r8d; xor r9d,r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // sub rsp,0x38; [rsp+0x20]=0
+    rel!([0xFF, 0x15, 0, 0, 0, 0], ce_slot_tag); // call [rip+ce_slot]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0x85, 0xC0, 0x74, 0x01, 0xCC]); // add rsp,0x38; test eax,eax; je +1; int3
+    // NtWaitForSingleObject(evh, 0, &tzero) -> STATUS_TIMEOUT
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag); // mov rcx, [rip+evh]
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], tzero_tag); // lea r8, [rip+tzero]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag); // call [rip+wfso_slot]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x3D, 0x02, 0x01, 0, 0, 0x74, 0x01, 0xCC]); // cmp eax,0x102; je +1; int3
+    // NtSetEvent(evh, 0)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag); // mov rcx, [rip+evh]
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], se_slot_tag); // call [rip+se_slot]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    // NtWaitForSingleObject(evh, 0, &tzero) -> STATUS_WAIT_0
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag);
+    code.extend_from_slice(&[0x31, 0xD2]);
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], tzero_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]); // test eax,eax; je +1; int3
+    // NtWaitForSingleObject(evh, 0, NULL) -> blocking fast path, already signalled
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag);
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0]); // xor edx,edx; xor r8d,r8d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtClose(evh)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], close_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // WriteFile(1, msg_event, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_event_tag);
+    let event_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2m4) auto-reset event + timed wait. Auto: create signalled, poll ->
+    //      WAIT_0 (consumes), poll -> TIMEOUT (auto-reset). Timed: create an
+    //      unsignalled manual event, wait a relative -10ms -> TIMEOUT after a
+    //      short spin (must return, not hang).
+    // NtCreateEvent(&evh2, 0, 0, EventType=1, InitialState=TRUE)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], evh2_tag); // lea rcx, [rip+evh2]
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0]); // xor edx,edx; xor r8d,r8d
+    code.extend_from_slice(&[0x41, 0xB9, 0x01, 0, 0, 0]); // mov r9d, 1  (SynchronizationEvent)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0x01, 0, 0, 0]); // sub rsp,0x38; [rsp+0x20]=1
+    rel!([0xFF, 0x15, 0, 0, 0, 0], ce_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0x85, 0xC0, 0x74, 0x01, 0xCC]); // add rsp,0x38; test eax,eax; je+1; int3
+    // wait(evh2, 0, &tzero) -> WAIT_0 (consumes)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh2_tag);
+    code.extend_from_slice(&[0x31, 0xD2]);
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], tzero_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // wait(evh2, 0, &tzero) -> TIMEOUT (auto-reset already consumed it)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh2_tag);
+    code.extend_from_slice(&[0x31, 0xD2]);
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], tzero_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x3D, 0x02, 0x01, 0, 0, 0x74, 0x01, 0xCC]); // cmp eax,0x102; je+1; int3
+    // NtClose(evh2)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh2_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], close_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    // NtCreateEvent(&evh2, 0, 0, 0, FALSE)  — reuse the slot, manual, unsignalled
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], evh2_tag);
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9]); // xor edx,edx; xor r8d,r8d; xor r9d,r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], ce_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    // NtWaitForSingleObject(evh2, 0, &tneg)  — relative -10ms -> TIMEOUT
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh2_tag);
+    code.extend_from_slice(&[0x31, 0xD2]);
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], tneg_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x3D, 0x02, 0x01, 0, 0, 0x74, 0x01, 0xCC]); // cmp eax,0x102; je+1; int3
+    // NtClose(evh2)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh2_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], close_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    // WriteFile(1, msg_evt2, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_evt2_tag);
+    let evt2_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2m5) SEH: arm a vectored handler, execute `ud2` (#UD). The kernel
+    //      delivers it to KiUserExceptionDispatcher; the handler bumps
+    //      CONTEXT.Rip past the 2-byte ud2 and returns
+    //      EXCEPTION_CONTINUE_EXECUTION; NtContinue resumes here.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag); // lea rcx, [rip+ntdllname]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh); // GetModuleHandleA("ntdll.dll")
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (hNtdll)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], ravename_tag); // lea rdx, [rip+ravename]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa); // GetProcAddress -> RtlAddVectoredExceptionHandler
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1  (First)
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], seh_handler_tag); // lea rdx, [rip+seh_handler]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    code.extend_from_slice(&[0xFF, 0xD6]); // call rsi
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x0F, 0x0B]); // ud2  <-- #UD; execution resumes right after
+    // WriteFile(1, msg_seh, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_seh_tag);
+    let seh_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2m6) #PF: the same armed handler skips the 2-byte load. Exercises the
+    //      error-code fault stub (`thos_pf_entry`) + CR2 capture.
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    code.extend_from_slice(&[0x8A, 0x00]); // mov al, [rax]  <-- #PF read at 0
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_seh2_tag);
+    let seh2_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2m7) user APC. Queue an APC to the current thread, then NtTestAlert; the
+    //      kernel redirects the return through KiUserApcDispatcher, which calls
+    //      apc_handler(arg=0x1234) — it stores 0x1234 to apc_flag — then
+    //      NtContinue(TestAlert) resumes here. rbx still holds hNtdll.
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx  (hNtdll)
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], apcqueuename_tag); // lea rdx, [rip+"NtQueueApcThread"]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa); // GetProcAddress
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], apcq_slot_tag); // mov [rip+apcq_slot], rax
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], testalertname_tag); // lea rdx, [rip+"NtTestAlert"]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], ta_slot_tag); // mov [rip+ta_slot], rax
+    // apc_flag = 0
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], apc_flag_tag); // mov [rip+apc_flag], rax
+    // NtQueueApcThread(NtCurrentThread=-2, apc_handler, 0x1234, 0, 0)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFE, 0xFF, 0xFF, 0xFF]); // mov rcx, -2
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], apc_handler_tag); // lea rdx, [rip+apc_handler]
+    code.extend_from_slice(&[0x41, 0xB8, 0x34, 0x12, 0, 0]); // mov r8d, 0x1234
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // sub rsp,0x38; [rsp+0x20]=0
+    rel!([0xFF, 0x15, 0, 0, 0, 0], apcq_slot_tag); // call [rip+apcq_slot]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]); // test eax,eax; je +1; int3
+    // NtTestAlert() — delivers the queued APC, then resumes right here
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], ta_slot_tag); // call [rip+ta_slot]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    // apc_flag must now be 0x1234
+    rel!([0x48, 0x8B, 0x05, 0, 0, 0, 0], apc_flag_tag); // mov rax, [rip+apc_flag]
+    code.extend_from_slice(&[0x3D, 0x34, 0x12, 0, 0, 0x74, 0x01, 0xCC]); // cmp eax,0x1234; je +1; int3
+    // WriteFile(1, msg_apc, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_apc_tag);
+    let apc_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -919,6 +1200,21 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0xC7, 0x40, 0x04, 0x5A, 0x5A, 0x5A, 0x5A]); // mov dword [rax+4], 0x5A5A5A5A
     code.extend_from_slice(&[0xC3]); // .cbret: ret
 
+    // seh_handler — reached only via the vectored-handler pointer.
+    // LONG seh_handler(PEXCEPTION_POINTERS ep in rcx). ep->ContextRecord->Rip
+    // += 2 (skip the ud2); return EXCEPTION_CONTINUE_EXECUTION (-1).
+    let seh_handler_off = code.len();
+    code.extend_from_slice(&[0x48, 0x8B, 0x41, 0x08]); // mov rax, [rcx+8]  (PCONTEXT)
+    code.extend_from_slice(&[0x48, 0x83, 0x80, 0xF8, 0, 0, 0, 0x02]); // add qword [rax+0xF8], 2
+    code.extend_from_slice(&[0xB8, 0xFF, 0xFF, 0xFF, 0xFF]); // mov eax, -1
+    code.extend_from_slice(&[0xC3]); // ret
+
+    // apc_handler — reached only via KiUserApcDispatcher. void apc_handler(
+    // ULONG_PTR arg in rcx): store the argument to apc_flag, return.
+    let apc_handler_off = code.len();
+    rel!([0x48, 0x89, 0x0D, 0, 0, 0, 0], apc_flag_tag); // mov [rip+apc_flag], rcx
+    code.extend_from_slice(&[0xC3]); // ret
+
     // --- data slots at the end of .text ---
     while code.len() % 8 != 0 {
         code.push(0);
@@ -947,11 +1243,51 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"thoscrt.dll\0");
     let thosaddname_off = code.len();
     code.extend_from_slice(b"thos_add\0");
+    let ntqipname_off = code.len();
+    code.extend_from_slice(b"NtQueryInformationProcess\0");
+    let ravename_off = code.len();
+    code.extend_from_slice(b"RtlAddVectoredExceptionHandler\0");
+    let cename_off = code.len();
+    code.extend_from_slice(b"NtCreateEvent\0");
+    let wfsoname_off = code.len();
+    code.extend_from_slice(b"NtWaitForSingleObject\0");
+    let sename_off = code.len();
+    code.extend_from_slice(b"NtSetEvent\0");
+    let closename_off = code.len();
+    code.extend_from_slice(b"NtClose\0");
+    let apcqueuename_off = code.len();
+    code.extend_from_slice(b"NtQueueApcThread\0");
+    let testalertname_off = code.len();
+    code.extend_from_slice(b"NtTestAlert\0");
     while code.len() % 8 != 0 {
         code.push(0);
     }
     let iosb_off = code.len();
     code.extend_from_slice(&[0u8; 16]); // IO_STATUS_BLOCK { NTSTATUS; ULONG_PTR }
+    let pbi_off = code.len();
+    code.extend_from_slice(&[0u8; 48]); // PROCESS_BASIC_INFORMATION
+    let ce_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtCreateEvent
+    let wfso_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtWaitForSingleObject
+    let se_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtSetEvent
+    let close_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtClose
+    let apcq_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtQueueApcThread
+    let ta_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtTestAlert
+    let apc_flag_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // apc_handler stores its argument here
+    let evh_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // event HANDLE
+    let evh2_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // second event HANDLE (auto-reset / timed)
+    let tzero_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // LARGE_INTEGER timeout = 0 (poll)
+    let tneg_off = code.len();
+    code.extend_from_slice(&(-100_000i64).to_le_bytes()); // -10ms relative
     let tls_dir_off = code.len();
     code.extend_from_slice(&[0u8; 40]); // IMAGE_TLS_DIRECTORY64 (fields filled + DIR64-relocated)
     let tls_raw_off = code.len();
@@ -997,7 +1333,31 @@ fn write_pe_hello(path: &Path) {
     let msg_tls: &[u8] = b"PE TLS OK\n";
     let msg_tls_off = code.len();
     code.extend_from_slice(msg_tls);
+    let msg_ntqip: &[u8] = b"PE NtQIP OK\n";
+    let msg_ntqip_off = code.len();
+    code.extend_from_slice(msg_ntqip);
+    let msg_event: &[u8] = b"PE event OK\n";
+    let msg_event_off = code.len();
+    code.extend_from_slice(msg_event);
+    let msg_evt2: &[u8] = b"PE evt2 OK\n";
+    let msg_evt2_off = code.len();
+    code.extend_from_slice(msg_evt2);
+    let msg_seh: &[u8] = b"PE SEH OK\n";
+    let msg_seh_off = code.len();
+    code.extend_from_slice(msg_seh);
+    let msg_seh2: &[u8] = b"PE SEH2 OK\n";
+    let msg_seh2_off = code.len();
+    code.extend_from_slice(msg_seh2);
+    let msg_apc: &[u8] = b"PE APC OK\n";
+    let msg_apc_off = code.len();
+    code.extend_from_slice(msg_apc);
 
+    code[apc_r8..apc_r8 + 4].copy_from_slice(&(msg_apc.len() as u32).to_le_bytes());
+    code[seh2_r8..seh2_r8 + 4].copy_from_slice(&(msg_seh2.len() as u32).to_le_bytes());
+    code[seh_r8..seh_r8 + 4].copy_from_slice(&(msg_seh.len() as u32).to_le_bytes());
+    code[evt2_r8..evt2_r8 + 4].copy_from_slice(&(msg_evt2.len() as u32).to_le_bytes());
+    code[event_r8..event_r8 + 4].copy_from_slice(&(msg_event.len() as u32).to_le_bytes());
+    code[ntqip_r8..ntqip_r8 + 4].copy_from_slice(&(msg_ntqip.len() as u32).to_le_bytes());
     code[tls_r8..tls_r8 + 4].copy_from_slice(&(msg_tls.len() as u32).to_le_bytes());
     code[dll_r8..dll_r8 + 4].copy_from_slice(&(msg_dll.len() as u32).to_le_bytes());
     code[dll_ldr_r8..dll_ldr_r8 + 4].copy_from_slice(&(msg_dll_ldr.len() as u32).to_le_bytes());
@@ -1049,6 +1409,34 @@ fn write_pe_hello(path: &Path) {
             t if t == msg_fwd_tag => text_rva + msg_fwd_off as u32,
             t if t == tls_index_tag => text_rva + tls_index_off as u32,
             t if t == msg_tls_tag => text_rva + msg_tls_off as u32,
+            t if t == ntqipname_tag => text_rva + ntqipname_off as u32,
+            t if t == pbi_tag => text_rva + pbi_off as u32,
+            t if t == msg_ntqip_tag => text_rva + msg_ntqip_off as u32,
+            t if t == cename_tag => text_rva + cename_off as u32,
+            t if t == wfsoname_tag => text_rva + wfsoname_off as u32,
+            t if t == sename_tag => text_rva + sename_off as u32,
+            t if t == closename_tag => text_rva + closename_off as u32,
+            t if t == ce_slot_tag => text_rva + ce_slot_off as u32,
+            t if t == wfso_slot_tag => text_rva + wfso_slot_off as u32,
+            t if t == se_slot_tag => text_rva + se_slot_off as u32,
+            t if t == close_slot_tag => text_rva + close_slot_off as u32,
+            t if t == evh_tag => text_rva + evh_off as u32,
+            t if t == evh2_tag => text_rva + evh2_off as u32,
+            t if t == tzero_tag => text_rva + tzero_off as u32,
+            t if t == tneg_tag => text_rva + tneg_off as u32,
+            t if t == msg_event_tag => text_rva + msg_event_off as u32,
+            t if t == msg_evt2_tag => text_rva + msg_evt2_off as u32,
+            t if t == ravename_tag => text_rva + ravename_off as u32,
+            t if t == seh_handler_tag => text_rva + seh_handler_off as u32,
+            t if t == msg_seh_tag => text_rva + msg_seh_off as u32,
+            t if t == msg_seh2_tag => text_rva + msg_seh2_off as u32,
+            t if t == apcqueuename_tag => text_rva + apcqueuename_off as u32,
+            t if t == testalertname_tag => text_rva + testalertname_off as u32,
+            t if t == apcq_slot_tag => text_rva + apcq_slot_off as u32,
+            t if t == ta_slot_tag => text_rva + ta_slot_off as u32,
+            t if t == apc_flag_tag => text_rva + apc_flag_off as u32,
+            t if t == apc_handler_tag => text_rva + apc_handler_off as u32,
+            t if t == msg_apc_tag => text_rva + msg_apc_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -2342,6 +2730,12 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE VirtualAlloc+Heap OK") // VirtualAlloc + GetProcessHeap + HeapAlloc
         && serial.contains("PE GetProcAddress OK") // LoadLibraryA + synthetic kernel32 export table
         && serial.contains("PE ntdll OK") // ntdll boundary: GetModuleHandleA + GetProcAddress + 9-arg NtWriteFile
+        && serial.contains("PE NtQIP OK") // NtQueryInformationProcess(ProcessBasicInformation) -> PebBaseAddress
+        && serial.contains("PE event OK") // NtCreateEvent/NtWaitForSingleObject/NtSetEvent/NtClose on the executive
+        && serial.contains("PE evt2 OK") // auto-reset event consume + relative timed wait -> STATUS_TIMEOUT
+        && serial.contains("PE SEH OK") // #UD -> KiUserExceptionDispatcher -> vectored handler -> NtContinue
+        && serial.contains("PE SEH2 OK") // #PF via the error-code fault stub, same handler resumes
+        && serial.contains("PE APC OK") // NtQueueApcThread + NtTestAlert -> KiUserApcDispatcher -> NtContinue
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
