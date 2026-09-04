@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Track A P1 — a ~30M-parameter byte-BPE GPT. Trainable on the i7-13700KF CPU
+# over a long run (order of a day). Bump max_steps as the loss allows.
+#
+#   CONFIG=ml/train/config/small-30m.toml ml/train/run.sh train-bg
+
+[model]
+n_layer    = 8
+n_head     = 8
+n_embd     = 512
+block_size = 256
+vocab_size = 16384     # set by prepare.py --bpe 16384
+dropout    = 0.1
+norm_eps   = 1e-5
+
+[train]
+seed          = 20260904
+batch_size    = 24
+grad_accum    = 8        # effective batch 192
+max_steps     = 60000
+warmup_steps  = 800
+lr            = 6e-4
+min_lr        = 6e-5
+weight_decay  = 0.1
+grad_clip     = 1.0
+eval_interval = 1000
+eval_batches  = 60
+ckpt_interval = 2000
+num_threads   = 0        # 0 => torch default (all cores)
+
+[data]
+train_bin = "data/train.bin"
+val_bin   = "data/val.bin"

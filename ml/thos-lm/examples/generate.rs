@@ -7,7 +7,7 @@
 
 use std::io::Read;
 
-use thos_lm::{decode_bytes, encode_bytes, Model, Sampler, SamplerConfig};
+use thos_lm::{Model, Sampler, SamplerConfig};
 
 fn main() {
     let mut weights = String::new();
@@ -41,10 +41,9 @@ fn main() {
         model.cfg.vocab_size
     );
 
-    let mut toks = Vec::new();
-    encode_bytes(prompt.as_bytes(), &mut toks);
+    let mut toks = model.encode(prompt.as_bytes());
     Sampler::new(cfg, seed).generate(&model, &mut toks);
 
-    let text = decode_bytes(&toks);
+    let text = model.decode(&toks);
     println!("{}", String::from_utf8_lossy(&text));
 }

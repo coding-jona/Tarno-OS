@@ -13,6 +13,7 @@ Then cross-check the Rust engine against the numpy reference on the real weights
 from __future__ import annotations
 
 import argparse
+import json
 import os
 
 import torch
@@ -20,12 +21,22 @@ import torch
 from model import GPT, ModelConfig
 from tlm import Config, write_tlm
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="out/latest.pt")
     ap.add_argument("--out", default="spike.tlm")
+    ap.add_argument("--tokenizer", default=os.path.join(HERE, "data", "tokenizer.json"))
     args = ap.parse_args()
+
+    tok_kind, merges = 0, None
+    if os.path.exists(args.tokenizer):
+        with open(args.tokenizer) as fh:
+            td = json.load(fh)
+        tok_kind = td.get("kind", 0)
+        merges = td.get("merges") or None
 
     blob = torch.load(args.ckpt, map_location="cpu")
     mc = blob["cfg"]["model"]
@@ -41,9 +52,11 @@ def main() -> None:
         n_layer=mc["n_layer"], n_head=mc["n_head"], n_embd=mc["n_embd"],
         block_size=mc["block_size"], vocab_size=mc["vocab_size"],
         norm_eps=mc.get("norm_eps", 1e-5),
+        tokenizer_kind=tok_kind, merges=merges,
     )
     write_tlm(args.out, cfg, model.export_tensors())
-    print(f"wrote {args.out} ({os.path.getsize(args.out):,} bytes) from step {blob['step']}")
+    print(f"wrote {args.out} ({os.path.getsize(args.out):,} bytes) from step {blob['step']} "
+          f"(tokenizer kind {tok_kind}, vocab {cfg.vocab_size})")
 
 
 if __name__ == "__main__":

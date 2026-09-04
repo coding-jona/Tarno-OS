@@ -13,12 +13,15 @@
 #   ml/train/run.sh train-bg       same, in the background -> out/train.log
 #   ml/train/run.sh status         show background training progress
 #   ml/train/run.sh stop           stop background training
-#   ml/train/run.sh export         out/latest.pt  ->  spike-1m.tlm
+#   ml/train/run.sh export         out/latest.pt  ->  $TLM (spike-1m.tlm)
+#   ml/train/run.sh eval           perplexity + next-token probe + a sample
 #   ml/train/run.sh sample "Text"  build the Rust engine + generate from the .tlm
 #   ml/train/run.sh test           no_std build + golden cross-check + fixture
 #   ml/train/run.sh clean          remove .venv, data/, out/, *.tlm
 #
-# Overridable via env:  CONFIG=  TLM=  PROMPT=  MAXTOK=  PYTORCH_INDEX=
+# Overridable via env:  CONFIG=  TLM=  PROMPT=  MAXTOK=  BPE=  PYTORCH_INDEX=
+# P1 recipe:  BPE=16384 ml/train/run.sh data
+#             CONFIG=ml/train/config/small-30m.toml TLM=small-30m.tlm ml/train/run.sh train-bg
 
 set -euo pipefail
 
@@ -62,8 +65,15 @@ cmd_data() {
   need_venv
   say "fetch corpus (resumable)"
   "$PY" "$HERE/fetch.py"
-  say "prepare (tokenize + pack)"
-  "$PY" "$HERE/prepare.py"
+  say "prepare (tokenize + pack)  BPE=${BPE:-0}"
+  "$PY" "$HERE/prepare.py" --bpe "${BPE:-0}"
+}
+
+cmd_eval() {
+  need_venv
+  [ -f "$TLM" ] || die "no weights at $TLM — run 'run.sh export'"
+  say "eval  ($TLM)"
+  "$PY" "$HERE/eval.py" --weights "$TLM"
 }
 
 _train_ready() { [ -f "$HERE/data/train.bin" ] && [ -f "$HERE/data/val.bin" ]; }
@@ -152,6 +162,7 @@ case "${1:-help}" in
   status)    cmd_status ;;
   stop)      cmd_stop ;;
   export)    cmd_export ;;
+  eval)      cmd_eval ;;
   sample)    shift || true; cmd_sample "${1:-}" ;;
   test)      cmd_test ;;
   all)       cmd_all ;;

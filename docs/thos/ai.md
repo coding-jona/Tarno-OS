@@ -107,9 +107,12 @@ Gutenberg, arXiv/PMC-OA, StackExchange) are the legitimate growth path.
   on CPU (`config/spike-1m.toml`); `.tlm` export; `thos-lm` loads + samples;
   committed golden test (Rust `forward` ≈ numpy ref on fixed weights, Rust
   sampler deterministic).
-- **P1 — usable tiny LM**: BPE tokenizer (~8–16k); ~10–50M params; larger open
-  corpus (windowed multi-day fetch); longer CPU runs; eval (perplexity + probes);
-  optional `q8` weights.
+- **P1 — usable tiny LM** *(in progress — pipeline done, long CPU run pending)*:
+  from-scratch byte-level **BPE** tokenizer (`ml/train/bpe.py`, merges embedded in
+  `.tlm` v2, mirrored in `thos-lm`'s `tokenizer.rs`); `config/small-30m.toml`
+  (~30M: L8 H8 C512 T256 V16384); `fetch.py` grown to ~35 Gutenberg titles;
+  `eval.py` (perplexity / bits-per-byte + teacher-forced next-token accuracy +
+  a sample). `q8` weights still to come.
 - **P2 — host-side THOS integration**: `thos-lm` kept `#![no_std]`-clean for
   `x86_64-unknown-none`; a host `cargo xtask lm-demo` that runs generation;
   decide `include_bytes!` vs ext2-file weight delivery.

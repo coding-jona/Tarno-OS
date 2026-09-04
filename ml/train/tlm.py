@@ -19,6 +19,13 @@ MAGIC = b"TLM1"
 VERSION = 1
 HEADER_LEN = 44
 
+# `.tlm` v2: the 44-byte header's last u32 (offset 40) is `tok_bytes` — the
+# size of a tokenizer blob that follows the header and precedes the tensors.
+#   tokenizer_kind 0 = raw byte (tok_bytes == 0)
+#   tokenizer_kind 1 = byte-level BPE: blob = u32 n_merges, then
+#                      n_merges * (u32 left_id, u32 right_id), in merge order
+#                      (new token id = 256 + merge_index).
+
 # Tensor order, one entry per tensor. Per-layer tensors are expanded n_layer
 # times between `wpe` and `lnf`. Shapes use PyTorch nn.Linear convention:
 # weight is [out, in], y = x @ weight.T + bias.
@@ -44,6 +51,8 @@ class Config:
     block_size: int
     vocab_size: int
     norm_eps: float = 1e-5
+    tokenizer_kind: int = 0
+    merges: list = None  # list[(int, int)] when tokenizer_kind == 1
 
     @property
     def head_dim(self) -> int:
@@ -73,21 +82,32 @@ class Config:
         return keys
 
 
+def _tok_blob(cfg: Config) -> bytes:
+    if cfg.tokenizer_kind != 1 or not cfg.merges:
+        return b""
+    out = struct.pack("<I", len(cfg.merges))
+    for a, b in cfg.merges:
+        out += struct.pack("<II", int(a), int(b))
+    return out
+
+
 def write_tlm(path: str, cfg: Config, tensors: dict[str, np.ndarray]) -> None:
     shapes = cfg.shapes()
+    blob = _tok_blob(cfg)
     hdr = (
         MAGIC
         + struct.pack("<I", VERSION)
         + struct.pack("<IIIII", cfg.n_layer, cfg.n_head, cfg.n_embd,
                       cfg.block_size, cfg.vocab_size)
-        + struct.pack("<I", 1)          # flags
-        + struct.pack("<I", 0)          # tokenizer_kind
+        + struct.pack("<I", 1)                       # flags
+        + struct.pack("<I", cfg.tokenizer_kind)      # tokenizer_kind
         + struct.pack("<f", cfg.norm_eps)
-        + struct.pack("<I", 0)          # reserved
+        + struct.pack("<I", len(blob))               # tok_bytes
     )
     assert len(hdr) == HEADER_LEN, len(hdr)
     with open(path, "wb") as fh:
         fh.write(hdr)
+        fh.write(blob)
         for key in cfg.ordered_keys():
             arr = np.ascontiguousarray(tensors[key], dtype="<f4")
             assert arr.shape == shapes[key], (key, arr.shape, shapes[key])
@@ -101,10 +121,18 @@ def read_tlm(path: str) -> tuple[Config, dict[str, np.ndarray]]:
     (version,) = struct.unpack_from("<I", blob, 4)
     assert version == VERSION, version
     n_layer, n_head, n_embd, block_size, vocab_size = struct.unpack_from("<IIIII", blob, 8)
+    (tok_kind,) = struct.unpack_from("<I", blob, 32)
     (norm_eps,) = struct.unpack_from("<f", blob, 36)
-    cfg = Config(n_layer, n_head, n_embd, block_size, vocab_size, float(norm_eps))
+    (tok_bytes,) = struct.unpack_from("<I", blob, 40)
+    merges = []
+    if tok_bytes:
+        (nm,) = struct.unpack_from("<I", blob, HEADER_LEN)
+        for k in range(nm):
+            merges.append(struct.unpack_from("<II", blob, HEADER_LEN + 4 + k * 8))
+    cfg = Config(n_layer, n_head, n_embd, block_size, vocab_size, float(norm_eps),
+                 tokenizer_kind=tok_kind, merges=merges or None)
     shapes = cfg.shapes()
-    off = HEADER_LEN
+    off = HEADER_LEN + tok_bytes
     tensors: dict[str, np.ndarray] = {}
     for key in cfg.ordered_keys():
         shp = shapes[key]

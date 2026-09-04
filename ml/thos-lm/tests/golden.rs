@@ -84,3 +84,25 @@ fn sampler_is_deterministic() {
     assert_eq!(a, b, "same seed -> same sequence");
     assert_eq!(a.len(), g.prompt.len() + cfg.max_tokens);
 }
+
+const BPE_TLM: &[u8] = include_bytes!("fixtures/bpe.tlm");
+const BPE_GOLDEN: &str = include_str!("fixtures/bpe.golden.txt");
+
+fn hex_to_bytes(h: &str) -> Vec<u8> {
+    (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
+}
+
+#[test]
+fn bpe_tokenizer_matches_python() {
+    let model = Model::load(BPE_TLM).expect("parse bpe.tlm");
+    for line in BPE_GOLDEN.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("case ") else { continue };
+        let (hex, ids) = rest.split_once(" => ").expect("case syntax");
+        let input = hex_to_bytes(hex);
+        let want: Vec<u16> = ids.split_whitespace().map(|t| t.parse().unwrap()).collect();
+        let got = model.encode(&input);
+        assert_eq!(got, want, "encode {input:?}");
+        assert_eq!(model.decode(&got), input, "decode·encode round-trip {input:?}");
+    }
+}

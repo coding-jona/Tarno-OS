@@ -12,11 +12,14 @@
 //!  16      4    u32 n_embd            (C)
 //!  20      4    u32 block_size        (T, max context)
 //!  24      4    u32 vocab_size        (V)
-//!  28      4    u32 flags             bit0 tied-output (always 1 for v0)
-//!  32      4    u32 tokenizer_kind    0 = raw byte
+//!  28      4    u32 flags             bit0 tied-output (always 1)
+//!  32      4    u32 tokenizer_kind    0 = raw byte, 1 = byte-level BPE
 //!  36      4    f32 norm_eps
-//!  40      4    u32 reserved = 0
-//!  44     ...   f32 tensors, back to back, in `TENSOR ORDER` below
+//!  40      4    u32 tok_bytes         size of the tokenizer blob (0 for kind 0)
+//!  44     ...   tokenizer blob (`tok_bytes`): for kind 1, `u32 n_merges` then
+//!               `n_merges * (u32 left_id, u32 right_id)` in merge order —
+//!               new token id = 256 + merge_index
+//!  44+tb  ...   f32 tensors, back to back, in `TENSOR ORDER` below
 //! ```
 //!
 //! TENSOR ORDER (shapes as PyTorch `nn.Linear`: `weight` is `[out, in]`,
@@ -90,6 +93,10 @@ fn rd_u32(b: &[u8], at: usize) -> u32 {
 pub struct Weights {
     pub cfg: Config,
     pub data: Vec<f32>,
+    /// `tokenizer_kind` from the header (0 = byte, 1 = byte-BPE).
+    pub tok_kind: u8,
+    /// BPE merges in order; empty for kind 0. Token id `256 + k` == merge `k`.
+    pub merges: Vec<(u32, u32)>,
 }
 
 impl Weights {
@@ -122,8 +129,27 @@ impl Weights {
             return Err(TlmError::BadConfig);
         }
 
+        // Tokenizer blob (between the header and the tensors).
+        let tok_kind = rd_u32(bytes, 32) as u8;
+        let tok_bytes = rd_u32(bytes, 40) as usize;
+        if bytes.len() < HEADER_LEN + tok_bytes {
+            return Err(TlmError::SizeMismatch);
+        }
+        let mut merges = Vec::new();
+        if tok_bytes >= 4 {
+            let n = rd_u32(bytes, HEADER_LEN) as usize;
+            if 4 + n * 8 > tok_bytes {
+                return Err(TlmError::SizeMismatch);
+            }
+            merges.reserve(n);
+            for k in 0..n {
+                let o = HEADER_LEN + 4 + k * 8;
+                merges.push((rd_u32(bytes, o), rd_u32(bytes, o + 4)));
+            }
+        }
+
         let want = cfg.total_elems();
-        let body = &bytes[HEADER_LEN..];
+        let body = &bytes[HEADER_LEN + tok_bytes..];
         if body.len() < want * 4 {
             return Err(TlmError::SizeMismatch);
         }
@@ -132,7 +158,7 @@ impl Weights {
             let o = i * 4;
             data.push(f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]));
         }
-        Ok(Weights { cfg, data })
+        Ok(Weights { cfg, data, tok_kind, merges })
     }
 }
 

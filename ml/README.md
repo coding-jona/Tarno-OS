@@ -5,9 +5,11 @@ the dev box; ship a hand-written `#![no_std]` Rust inference engine with frozen
 weights. Grow from small to large step by step. Design + rationale:
 [`docs/thos/ai.md`](../docs/thos/ai.md).
 
-**Status:** P0 "Proof of Life". The pipeline (fetch → tokenize → train → export →
-Rust inference) is wired end to end and cross-checked; no usable model is trained
-yet.
+**Status:** P1 in progress. The pipeline (fetch → **byte-BPE** tokenize → train →
+export → Rust inference → eval) is wired end to end and cross-checked. P0 (the
+~1M byte-level spike) trained to val ≈ 1.20 nats/byte. P1 = a ~30M byte-BPE model
+on a larger open corpus — config + tooling ready, the long CPU run is the user's
+to kick off.
 
 ## Layout
 
@@ -49,12 +51,28 @@ ml/train/run.sh setup               # .venv + torch(CPU) + numpy + tqdm
 ml/train/run.sh data                # fetch corpus (resumable) + tokenize/pack
 ml/train/run.sh train-bg            # train on CPU in the background
 ml/train/run.sh status              # progress (loss, step, tok/s)
-ml/train/run.sh export              # out/latest.pt -> spike-1m.tlm
+ml/train/run.sh export              # out/latest.pt -> $TLM
+ml/train/run.sh eval                # perplexity + next-token probe + a sample
 ml/train/run.sh sample "The "       # build the Rust engine + generate
 ```
 
 `run.sh help` lists everything. Overridable via env: `CONFIG=` (default
-`config/spike-1m.toml`), `TLM=`, `PROMPT=`, `MAXTOK=`.
+`config/spike-1m.toml`), `TLM=`, `PROMPT=`, `MAXTOK=`, `BPE=` (BPE vocab, 0 = raw
+byte).
+
+**P1 — a ~30M byte-BPE model:**
+
+```sh
+BPE=16384 ml/train/run.sh data
+CONFIG=ml/train/config/small-30m.toml TLM=small-30m.tlm ml/train/run.sh train-bg
+# ... hours later ...
+CONFIG=ml/train/config/small-30m.toml TLM=small-30m.tlm ml/train/run.sh export
+TLM=small-30m.tlm ml/train/run.sh eval
+```
+
+The `data` step downloads ~35 Project Gutenberg titles (resumable) and trains the
+BPE tokenizer; `config/small-30m.toml` is `n_layer=8 n_head=8 n_embd=512
+block_size=256 vocab=16384`.
 
 The `train/*.py` scripts still run standalone if you prefer; `run.sh` just wires
 them together with the right paths and resume flags.

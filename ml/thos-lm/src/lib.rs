@@ -9,9 +9,10 @@
 //! `Model::forward` call runs to completion, so it is unaffected by the THOS
 //! kernel's lack of FPU-state save across a preemption.
 //!
-//! See `docs/thos/ai.md` for the wider plan. This is the P0 "Proof of Life"
-//! slice: byte-level tokenizer, `f32` weights, learned positional embeddings,
-//! tied output projection, tanh-approximation GELU.
+//! See `docs/thos/ai.md` for the wider plan. Model: `f32` weights, learned
+//! positional embeddings, tied output projection, tanh-approximation GELU;
+//! tokenizer is raw byte (kind 0) or byte-level BPE with the merge table
+//! embedded in the `.tlm` file (kind 1).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -22,19 +23,9 @@ pub mod math;
 pub mod model;
 pub mod sample;
 pub mod tlm;
+pub mod tokenizer;
 
 pub use model::Model;
 pub use sample::{Sampler, SamplerConfig};
 pub use tlm::{Config, TlmError};
-
-/// Encode a UTF-8 / byte string to token ids (v0: identity byte tokenizer).
-pub fn encode_bytes(s: &[u8], out: &mut alloc::vec::Vec<u16>) {
-    out.clear();
-    out.extend(s.iter().map(|&b| b as u16));
-}
-
-/// Decode token ids back to bytes (v0: identity byte tokenizer). Ids >= 256 are
-/// dropped.
-pub fn decode_bytes(tokens: &[u16]) -> alloc::vec::Vec<u8> {
-    tokens.iter().filter(|&&t| t < 256).map(|&t| t as u8).collect()
-}
+pub use tokenizer::Tokenizer;

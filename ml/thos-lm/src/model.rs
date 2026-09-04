@@ -14,14 +14,25 @@ pub struct Model {
     w: Vec<f32>,
     lay: Layout,
     lref: LayerRef,
+    tok: crate::tokenizer::Tokenizer,
 }
 
 impl Model {
     pub fn load(bytes: &[u8]) -> Result<Model, TlmError> {
-        let Weights { cfg, data } = Weights::parse(bytes)?;
+        let Weights { cfg, data, merges, .. } = Weights::parse(bytes)?;
         let lay = Layout::new(cfg);
         let lref = LayerRef::new(cfg.n_embd);
-        Ok(Model { cfg, w: data, lay, lref })
+        let tok = crate::tokenizer::Tokenizer::new(merges);
+        Ok(Model { cfg, w: data, lay, lref, tok })
+    }
+
+    /// Encode a byte string to token ids with the model's own tokenizer.
+    pub fn encode(&self, s: &[u8]) -> alloc::vec::Vec<u16> {
+        self.tok.encode(s)
+    }
+    /// Decode token ids to bytes.
+    pub fn decode(&self, tokens: &[u16]) -> alloc::vec::Vec<u8> {
+        self.tok.decode(tokens)
     }
 
     fn s(&self, start: usize, len: usize) -> &[f32] {
