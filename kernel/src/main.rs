@@ -654,6 +654,17 @@ fn storage_milestone() {
             sched::yield_now();
         }
         kprintln!("THOS: wincon exited    real toolchain PE ran to exit");
+
+        // Milestone 3+: a full mingw CRT `int main` .exe — imports msvcrt.dll,
+        // runs against THOS's synthetic C runtime (printf / __getmainargs / ...).
+        let ce = fs.read_path("/crt.exe").expect("read /crt.exe from ext2");
+        kprintln!("THOS: crt ok           /crt.exe = {} bytes (mingw CRT)", ce.len());
+        let cpid = process::spawn_pe(&ce).expect("spawn_pe: /crt.exe rejected");
+        while !process::pid_exited(cpid) {
+            sched::yield_now();
+        }
+        kprintln!("THOS: crt exited       mingw C runtime ran to exit");
+
         // ELF and PE processes in one `ps` view.
         process::ps_dump();
     }

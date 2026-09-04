@@ -317,6 +317,18 @@ fn disk_image() -> PathBuf {
         img.to_str().unwrap(),
     ]));
 
+    // Milestone 3+: a full mingw CRT `int main` .exe — imports msvcrt.dll on
+    // top of KERNEL32 -> /crt.exe. Runs against THOS's synthetic msvcrt.
+    let crt_src = root.join("xtask/testdata/crt.c");
+    let crt = root.join("target/crt.exe");
+    run(Command::new("x86_64-w64-mingw32-gcc").args([
+        "-O2", "-o", crt.to_str().unwrap(), crt_src.to_str().unwrap(),
+    ]));
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} crt.exe", crt.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+
     // A real on-disk PE DLL at C:\Windows\System32\thoscrt.dll — the exe imports
     // thoscrt!thos_add, and thoscrt itself imports KERNEL32!GetLastError.
     let thoscrt = root.join("target/thoscrt.dll");
@@ -3421,6 +3433,12 @@ fn pe_test(iso: &Path) {
         && serial.contains("WINCON: WaitForSingleObject ok")
         && serial.contains("WINCON: exit ok")
         && serial.contains("THOS: wincon exited")
+        // Milestone 3+: mingw CRT `int main` on the synthetic msvcrt.
+        && serial.contains("CRT: hello from the mingw C runtime")
+        && serial.contains("CRT: row 2 dec=14 hex=0xe pad=0014")
+        && serial.contains("CRT: str=trun width=[      hi] neg=-42")
+        && serial.contains("CRT: fprintf works too")
+        && serial.contains("THOS: crt exited")
         && serial.contains("ELF + ") // ps: both personalities in one listing
         && serial.lines().any(|l| l.contains("THOS: ps ok") && !l.contains("0 PE") && !l.contains("0 ELF"));
     if ok {

@@ -124,6 +124,17 @@ const TLS_BLOCKS_OFF: usize = 0x100; // blocks start here; ptr array is [0, 0x10
 const PE_KERNEL32_ADDR: u64 = NT_STUB_BASE + 0x4000;
 const PE_NTDLL_ADDR: u64 = NT_STUB_BASE + 0x5000;
 
+/// Synthetic `msvcrt.dll` trampoline page (rwx — `_fmode` / `_commode` /
+/// `__initenv` are data exports the CRT writes) + its rw scratch page
+/// (`__iob_func` FILE array, `errno`, `lconv`, `__getmainargs` argv).
+const PE_MSVCRT_ADDR: u64 = NT_STUB_BASE + 0xE000;
+pub const PE_CRT_ADDR: u64 = NT_STUB_BASE + 0xF000;
+/// r-x stub for `msvcrt!_initterm` — a ring-3 loop that calls each non-null
+/// function pointer in `[pfbegin, pfend)` (C++ static ctors / mingw's own
+/// init, incl. the one that fills `_argv`). Bound in place of a syscall
+/// trampoline by [`Loader::new`].
+pub const PE_INITTERM_ADDR: u64 = NT_STUB_BASE + 0x10000;
+
 /// A single worker thread's TEB + entry stub + stack. One extra thread per PE
 /// process for now (fixed regions); a real per-thread allocator comes later.
 const PE_TEB2_ADDR: u64 = NT_STUB_BASE + 0xC000;
@@ -213,6 +224,7 @@ impl<'a> Loader<'a> {
         for (name, base, table) in [
             ("kernel32.dll", PE_KERNEL32_ADDR, &crate::nt::NT_EXPORTS[..]),
             ("ntdll.dll", PE_NTDLL_ADDR, &crate::nt::NTDLL_EXPORTS[..]),
+            ("msvcrt.dll", PE_MSVCRT_ADDR, &crate::nt::MSVCRT_EXPORTS[..]),
         ] {
             // Matches `map_synth_dll`'s export directory: Base 1, EAT[i] = stub i.
             let mut eat = Vec::with_capacity(table.len());
@@ -232,6 +244,11 @@ impl<'a> Loader<'a> {
                 names,
                 is_file: false,
             });
+        }
+        // `msvcrt!_initterm` is a userspace loop, not a syscall — point it at the
+        // r-x stub page instead of trampoline 12.
+        if let Some(m) = mods.iter_mut().find(|m| m.name == "msvcrt.dll") {
+            m.eat[12] = Export::Addr(PE_INITTERM_ADDR);
         }
         Loader {
             proc,
@@ -760,6 +777,9 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     }
     map_kernel32_page(proc)?;
     map_ntdll_page(proc)?;
+    map_msvcrt_page(proc)?;
+    map_crt_page(proc)?;
+    map_initterm_page(proc)?;
     map_seh_pages(proc)?;
     map_apc_page(proc)?;
     map_thread_start_page(proc)?;
@@ -1336,7 +1356,7 @@ pub fn spawn_thread(
 }
 
 fn map_kernel32_page(proc: &Process) -> Result<(), &'static str> {
-    map_synth_dll(proc, PE_KERNEL32_ADDR, "KERNEL32.DLL", &crate::nt::NT_EXPORTS, 0)
+    map_synth_dll(proc, PE_KERNEL32_ADDR, "KERNEL32.DLL", &crate::nt::NT_EXPORTS, 0, &[])
 }
 fn map_ntdll_page(proc: &Process) -> Result<(), &'static str> {
     map_synth_dll(
@@ -1345,7 +1365,80 @@ fn map_ntdll_page(proc: &Process) -> Result<(), &'static str> {
         "NTDLL.DLL",
         &crate::nt::NTDLL_EXPORTS,
         crate::nt::NT_NTDLL_FLAG,
+        &[],
     )
+}
+fn map_msvcrt_page(proc: &Process) -> Result<(), &'static str> {
+    map_synth_dll(
+        proc,
+        PE_MSVCRT_ADDR,
+        "msvcrt.dll",
+        &crate::nt::MSVCRT_EXPORTS,
+        crate::nt::NT_MSVCRT_FLAG,
+        &crate::nt::MSVCRT_DATA_EXPORTS,
+    )
+}
+
+/// Build the r-x `_initterm` stub page (see [`PE_INITTERM_ADDR`]).
+fn map_initterm_page(proc: &Process) -> Result<(), &'static str> {
+    let f = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (initterm)")?;
+    let page = unsafe {
+        let p = phys_to_virt(f.start_address()).as_mut_ptr::<u8>();
+        core::ptr::write_bytes(p, 0, 4096);
+        core::slice::from_raw_parts_mut(p, 4096)
+    };
+    // void _initterm(void (**pfbegin)(void) /*rcx*/, void (**pfend)(void) /*rdx*/)
+    #[rustfmt::skip]
+    let code: [u8; 44] = [
+        0x53,                   // push rbx
+        0x56,                   // push rsi
+        0x57,                   // push rdi
+        0x48, 0x89, 0xCB,       // mov rbx, rcx        ; pfbegin
+        0x48, 0x89, 0xD7,       // mov rdi, rdx        ; pfend
+        0x48, 0x83, 0xEC, 0x20, // sub rsp, 0x20       ; shadow space
+        0x48, 0x39, 0xFB,       // .loop: cmp rbx, rdi
+        0x73, 0x10,             // jae .done
+        0x48, 0x8B, 0x03,       // mov rax, [rbx]
+        0x48, 0x83, 0xC3, 0x08, // add rbx, 8
+        0x48, 0x85, 0xC0,       // test rax, rax
+        0x74, 0xEF,             // jz .loop
+        0xFF, 0xD0,             // call rax
+        0xEB, 0xEB,             // jmp .loop
+        0x48, 0x83, 0xC4, 0x20, // .done: add rsp, 0x20
+        0x5F,                   // pop rdi
+        0x5E,                   // pop rsi
+        0x5B,                   // pop rbx
+        0x31, 0xC0,             // xor eax, eax
+        0xC3,                   // ret
+    ];
+    page[..code.len()].copy_from_slice(&code);
+    proc.map(PE_INITTERM_ADDR, f.start_address().as_u64(), false, true);
+    Ok(())
+}
+
+/// The CRT scratch page (rw): `msvcrt`'s `__iob_func` `FILE[3]` (fd at
+/// `_file`/+28), `errno`, a near-empty `struct lconv`, and the `__getmainargs`
+/// `argv` array + strings.
+fn map_crt_page(proc: &Process) -> Result<(), &'static str> {
+    let f = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (crt)")?;
+    unsafe {
+        let p = phys_to_virt(f.start_address()).as_mut_ptr::<u8>();
+        core::ptr::write_bytes(p, 0, 4096);
+        // FILE[3] with _file (offset 28) = 0/1/2.
+        for i in 0..3usize {
+            *((p.add(i * 48 + 28)) as *mut i32) = i as i32;
+        }
+        // lconv @ 0x108: every `char *` field -> "" (the NUL at 0x181);
+        // `decimal_point` (first field) -> "." at 0x180.
+        *(p.add(0x180)) = b'.';
+        *(p.add(0x181)) = 0;
+        *((p.add(0x108)) as *mut u64) = PE_CRT_ADDR + 0x180; // decimal_point
+        for k in 1..8u64 {
+            *((p.add(0x108 + (k * 8) as usize)) as *mut u64) = PE_CRT_ADDR + 0x181;
+        }
+    }
+    proc.map(PE_CRT_ADDR, f.start_address().as_u64(), true, false);
+    Ok(())
 }
 
 /// Build a synthetic system DLL image at `image_base` (one page, exec +
@@ -1360,6 +1453,7 @@ fn map_synth_dll(
     dll_name: &str,
     exports: &[&str],
     sel_flag: u16,
+    data_exports: &[u16],
 ) -> Result<(), &'static str> {
     let frame = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (synth dll)")?;
     let phys = frame.start_address();
@@ -1397,8 +1491,12 @@ fn map_synth_dll(
 
     let n = exports.len();
 
-    // Trampolines.
+    // Trampolines — except for *data* exports, whose EAT slot stays writable
+    // zero bytes (the CRT reads/writes `*_fmode` etc., all default 0).
     for idx in 0..n {
+        if data_exports.contains(&(idx as u16)) {
+            continue;
+        }
         let mut stub = [0xB8u8, 0, 0, 0, 0, 0x49, 0x89, 0xCA, 0x0F, 0x05, 0xC3];
         let sel = (crate::nt::NT_BASE | sel_flag as u64 | idx as u64) as u32;
         stub[1..5].copy_from_slice(&sel.to_le_bytes());
@@ -1442,7 +1540,8 @@ fn map_synth_dll(
     p32(page, opt + 112, expdir as u32);
     p32(page, opt + 116, (cur - expdir) as u32);
 
-    proc.map(image_base, phys.as_u64(), false, true); // r-x
+    // rwx when the module has data exports the CRT writes through; else r-x.
+    proc.map(image_base, phys.as_u64(), !data_exports.is_empty(), true);
     Ok(())
 }
 

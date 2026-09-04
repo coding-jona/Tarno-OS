@@ -43,7 +43,18 @@ pub const NT_GETPROCADDRESS: u16 = 16;
 pub const NT_LOADLIBRARYA: u16 = 17;
 pub const NT_CREATEEVENTA: u16 = 18;
 pub const NT_WAITFORSINGLEOBJECT_K: u16 = 19;
-pub const NT_STUB_COUNT: u16 = 20;
+pub const NT_INITIALIZECRITICALSECTION: u16 = 20;
+pub const NT_DELETECRITICALSECTION: u16 = 21;
+pub const NT_ENTERCRITICALSECTION: u16 = 22;
+pub const NT_LEAVECRITICALSECTION: u16 = 23;
+pub const NT_TLSGETVALUE: u16 = 24;
+pub const NT_ISDBCSLEADBYTEEX: u16 = 25;
+pub const NT_MULTIBYTETOWIDECHAR: u16 = 26;
+pub const NT_WIDECHARTOMULTIBYTE: u16 = 27;
+pub const NT_SETUNHANDLEDEXCEPTIONFILTER: u16 = 28;
+pub const NT_VIRTUALQUERY: u16 = 29;
+pub const NT_SLEEP: u16 = 30;
+pub const NT_STUB_COUNT: u16 = 31;
 
 /// The `kernel32` export table, in stub-index order. Drives both
 /// [`crate::pe::resolve_import`] (import → stub index) and the synthetic
@@ -71,6 +82,17 @@ pub const NT_EXPORTS: [&str; NT_STUB_COUNT as usize] = [
     "LoadLibraryA",
     "CreateEventA",
     "WaitForSingleObject",
+    "InitializeCriticalSection",
+    "DeleteCriticalSection",
+    "EnterCriticalSection",
+    "LeaveCriticalSection",
+    "TlsGetValue",
+    "IsDBCSLeadByteEx",
+    "MultiByteToWideChar",
+    "WideCharToMultiByte",
+    "SetUnhandledExceptionFilter",
+    "VirtualQuery",
+    "Sleep",
 ];
 
 /// Selector bit OR-ed into a stub's index when it belongs to the **native NT**
@@ -215,10 +237,96 @@ fn get_last_error() -> u32 {
 pub fn dispatch(sel: u16, frame: &mut UserFrame) -> i64 {
     if sel & NT_NTDLL_FLAG != 0 {
         dispatch_ntdll(sel & !NT_NTDLL_FLAG, frame)
+    } else if sel & NT_MSVCRT_FLAG != 0 {
+        dispatch_msvcrt(sel & !NT_MSVCRT_FLAG, frame)
     } else {
         dispatch_kernel32(sel, frame)
     }
 }
+
+/// Selector bit for the synthetic `msvcrt.dll` C-runtime layer (`0x4000`), the
+/// third personality alongside `kernel32` and `ntdll`. A mingw-w64 `int main`
+/// `.exe` imports `msvcrt.dll` for its CRT startup + stdio; these are just
+/// enough of it to run.
+pub const NT_MSVCRT_FLAG: u16 = 0x4000;
+
+/// The synthetic `msvcrt.dll` export table — index **is** the service number.
+/// `_commode` / `_fmode` / `__initenv` are *data* exports (an `int` / `char***`
+/// the CRT reads and writes); their trampoline slot is left as writable zero
+/// bytes (both default to 0), see `pe::map_synth_dll`.
+pub const MSVCRT_EXPORTS: [&str; MSVCRT_STUB_COUNT as usize] = [
+    "memcpy",               // 0
+    "memset",               // 1
+    "strlen",               // 2
+    "strncmp",              // 3
+    "wcslen",               // 4
+    "malloc",               // 5
+    "calloc",               // 6
+    "free",                 // 7
+    "exit",                 // 8
+    "abort",                // 9
+    "_amsg_exit",           // 10
+    "_cexit",               // 11
+    "_initterm",            // 12
+    "_onexit",              // 13
+    "_lock",                // 14
+    "_unlock",              // 15
+    "__iob_func",           // 16
+    "_errno",               // 17
+    "__getmainargs",        // 18
+    "__set_app_type",       // 19
+    "__setusermatherr",     // 20
+    "___lc_codepage_func",  // 21
+    "___mb_cur_max_func",   // 22
+    "localeconv",           // 23
+    "signal",               // 24
+    "strerror",             // 25
+    "fwrite",               // 26
+    "fputc",                // 27
+    "fflush",               // 28
+    "fprintf",              // 29
+    "vfprintf",             // 30
+    "__C_specific_handler", // 31
+    "_commode",             // 32  (data)
+    "_fmode",               // 33  (data)
+    "__initenv",            // 34  (data)
+];
+pub const MSVCRT_STUB_COUNT: u16 = 35;
+/// Indices whose EAT slot is a writable data cell, not a call trampoline.
+pub const MSVCRT_DATA_EXPORTS: [u16; 3] = [32, 33, 34];
+
+const MSV_MEMCPY: u16 = 0;
+const MSV_MEMSET: u16 = 1;
+const MSV_STRLEN: u16 = 2;
+const MSV_STRNCMP: u16 = 3;
+const MSV_WCSLEN: u16 = 4;
+const MSV_MALLOC: u16 = 5;
+const MSV_CALLOC: u16 = 6;
+const MSV_FREE: u16 = 7;
+const MSV_EXIT: u16 = 8;
+const MSV_ABORT: u16 = 9;
+const MSV_AMSG_EXIT: u16 = 10;
+const MSV_CEXIT: u16 = 11;
+const MSV_INITTERM: u16 = 12;
+const MSV_ONEXIT: u16 = 13;
+const MSV_LOCK: u16 = 14;
+const MSV_UNLOCK: u16 = 15;
+const MSV_IOB_FUNC: u16 = 16;
+const MSV_ERRNO: u16 = 17;
+const MSV_GETMAINARGS: u16 = 18;
+const MSV_SET_APP_TYPE: u16 = 19;
+const MSV_SETUSERMATHERR: u16 = 20;
+const MSV_LC_CODEPAGE: u16 = 21;
+const MSV_MB_CUR_MAX: u16 = 22;
+const MSV_LOCALECONV: u16 = 23;
+const MSV_SIGNAL: u16 = 24;
+const MSV_STRERROR: u16 = 25;
+const MSV_FWRITE: u16 = 26;
+const MSV_FPUTC: u16 = 27;
+const MSV_FFLUSH: u16 = 28;
+const MSV_FPRINTF: u16 = 29;
+const MSV_VFPRINTF: u16 = 30;
+const MSV_C_SPECIFIC_HANDLER: u16 = 31;
 
 // --- shared cores: one implementation, reached from either personality ---
 
@@ -994,6 +1102,7 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
     let a1 = frame.rdx;
     let a2 = frame.r8;
     let a3 = frame.r9;
+    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
 
     match idx {
         // ExitProcess(UINT uExitCode)
@@ -1180,8 +1289,435 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
             if w.try_take(tid) { 0 } else { WAIT_TIMEOUT }
         }
 
+        // CRT-startup helpers. CriticalSection is a no-op (the CRT locks it
+        // around single-threaded init); TlsGetValue → NULL; the code-page
+        // converters do a plain ASCII widen/narrow.
+        NT_INITIALIZECRITICALSECTION
+        | NT_DELETECRITICALSECTION
+        | NT_ENTERCRITICALSECTION
+        | NT_LEAVECRITICALSECTION
+        | NT_SETUNHANDLEDEXCEPTIONFILTER => 0,
+        NT_TLSGETVALUE => 0,
+        NT_ISDBCSLEADBYTEEX => 0, // no lead bytes in our single-byte code page
+        NT_SLEEP => {
+            if a0 != 0 {
+                crate::timer::sleep_until(
+                    crate::timer::now().saturating_add((a0 * crate::timer::TICK_HZ / 1000).max(1)),
+                );
+            } else {
+                sched::yield_now();
+            }
+            0
+        }
+        // MultiByteToWideChar(cp, flags, src, srclen, dst, dstlen)
+        NT_MULTIBYTETOWIDECHAR => {
+            let (src, srclen) = (a2, a3 as i32);
+            let (dst, dstlen) = (stack(0), stack(1) as usize);
+            let n = if srclen < 0 { user_cstr_len(src) + 1 } else { srclen as usize };
+            if dst == 0 || dstlen == 0 {
+                return n as i64;
+            }
+            let m = n.min(dstlen);
+            for k in 0..m {
+                unsafe { *((dst + (k * 2) as u64) as *mut u16) = *((src + k as u64) as *const u8) as u16 };
+            }
+            m as i64
+        }
+        // WideCharToMultiByte(cp, flags, src, srclen, dst, dstlen, defchar, used)
+        NT_WIDECHARTOMULTIBYTE => {
+            let (src, srclen) = (a2, a3 as i32);
+            let (dst, dstlen) = (stack(0), stack(1) as usize);
+            let mut n = 0usize;
+            if srclen < 0 {
+                while unsafe { *((src + (n * 2) as u64) as *const u16) } != 0 {
+                    n += 1;
+                }
+                n += 1;
+            } else {
+                n = srclen as usize;
+            }
+            if dst == 0 || dstlen == 0 {
+                return n as i64;
+            }
+            let m = n.min(dstlen);
+            for k in 0..m {
+                let wc = unsafe { *((src + (k * 2) as u64) as *const u16) };
+                unsafe { *((dst + k as u64) as *mut u8) = if wc < 0x100 { wc as u8 } else { b'?' } };
+            }
+            m as i64
+        }
+        // VirtualQuery(addr, *MEMORY_BASIC_INFORMATION, len) — one committed RWX
+        // private region per page, like NtQueryVirtualMemory.
+        NT_VIRTUALQUERY => {
+            let (addr, buf, len) = (a0, a1, a2 as usize);
+            if buf == 0 || len < 0x30 {
+                return 0;
+            }
+            let page = addr & !0xFFF;
+            unsafe {
+                let b = buf as *mut u64;
+                *b.add(0) = page;
+                *b.add(1) = page;
+                *(b.add(2) as *mut u32) = 0x40;
+                *b.add(3) = 0x1000;
+                *(b.add(4) as *mut u32) = 0x1000;
+                *(b.add(4) as *mut u32).add(1) = 0x40;
+                *(b.add(5) as *mut u32) = 0x2_0000;
+            }
+            0x30
+        }
+
         _ => {
             crate::kprintln!("THOS: nt unhandled call {}", idx);
+            0
+        }
+    }
+}
+
+// --- synthetic msvcrt.dll: just enough C runtime for a mingw `int main` ---
+
+/// `PE_CRT_ADDR` layout (one rw page mapped by `pe::map_crt_page`).
+const CRT_IOB_OFF: u64 = 0x000; // FILE[3], 48 bytes each; `_file` fd at +28
+const CRT_ERRNO_OFF: u64 = 0x100;
+const CRT_LCONV_OFF: u64 = 0x108; // struct lconv (zeroed; char* fields -> CRT_DOT)
+const CRT_DOT_OFF: u64 = 0x180; // "." then "" for the empty lconv strings
+const CRT_ARGV_OFF: u64 = 0x200; // argv pointer array then the arg strings
+
+fn crt(off: u64) -> u64 {
+    crate::pe::PE_CRT_ADDR + off
+}
+
+/// Length of a NUL-terminated user string, capped.
+fn user_cstr_len(p: u64) -> usize {
+    let mut n = 0usize;
+    while n < 1 << 20 && unsafe { *((p + n as u64) as *const u8) } != 0 {
+        n += 1;
+    }
+    n
+}
+
+/// Minimal `printf`-family formatter. Writes into `out`, returns the byte count.
+/// `ap` points at the first vararg (Win64: consecutive 8-byte slots). No
+/// closures — plain procedural code to keep the borrow checker happy.
+fn cfmt(fmt: u64, ap: *const u64, out: &mut [u8]) -> usize {
+    let rb = |p: u64| unsafe { *(p as *const u8) };
+    let mut o = 0usize;
+    let mut w = |b: u8, o: &mut usize| {
+        if *o < out.len() {
+            out[*o] = b;
+        }
+        *o += 1;
+    };
+    let mut arg = 0isize;
+    let nextarg = |arg: &mut isize| -> u64 {
+        let v = unsafe { *ap.offset(*arg) };
+        *arg += 1;
+        v
+    };
+
+    let mut i = 0u64;
+    loop {
+        let c = rb(fmt + i);
+        i += 1;
+        if c == 0 {
+            break;
+        }
+        if c != b'%' {
+            w(c, &mut o);
+            continue;
+        }
+        let (mut left, mut zero) = (false, false);
+        loop {
+            match rb(fmt + i) {
+                b'-' => left = true,
+                b'0' => zero = true,
+                b'+' | b' ' | b'#' => {}
+                _ => break,
+            }
+            i += 1;
+        }
+        let mut width = 0usize;
+        while rb(fmt + i).is_ascii_digit() {
+            width = width * 10 + (rb(fmt + i) - b'0') as usize;
+            i += 1;
+        }
+        let mut prec: Option<usize> = None;
+        if rb(fmt + i) == b'.' {
+            i += 1;
+            let mut p = 0usize;
+            while rb(fmt + i).is_ascii_digit() {
+                p = p * 10 + (rb(fmt + i) - b'0') as usize;
+                i += 1;
+            }
+            prec = Some(p);
+        }
+        while matches!(rb(fmt + i), b'h' | b'l' | b'L' | b'z' | b'j' | b't') {
+            i += 1;
+        }
+        let conv = rb(fmt + i);
+        i += 1;
+
+        // Render the body into `tmp`, then pad to `width`.
+        let mut tmp = [0u8; 40];
+        let mut tn = 0usize;
+        let digits = |u: u64, radix: u64, upper: bool, tmp: &mut [u8], tn: &mut usize| {
+            let hx: &[u8] = if upper { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
+            let mut u = u;
+            if u == 0 {
+                tmp[*tn] = b'0';
+                *tn += 1;
+            }
+            while u > 0 {
+                tmp[*tn] = hx[(u % radix) as usize];
+                *tn += 1;
+                u /= radix;
+            }
+            tmp[..*tn].reverse();
+        };
+
+        match conv {
+            b'%' => {
+                w(b'%', &mut o);
+                continue;
+            }
+            b'c' => {
+                tmp[0] = nextarg(&mut arg) as u8;
+                tn = 1;
+            }
+            b's' => {
+                let p = nextarg(&mut arg);
+                let mut len = user_cstr_len(p);
+                if let Some(pr) = prec {
+                    len = len.min(pr);
+                }
+                if !left {
+                    for _ in len..width {
+                        w(b' ', &mut o);
+                    }
+                }
+                for k in 0..len {
+                    w(rb(p + k as u64), &mut o);
+                }
+                if left {
+                    for _ in len..width {
+                        w(b' ', &mut o);
+                    }
+                }
+                continue;
+            }
+            b'd' | b'i' => {
+                let v = nextarg(&mut arg) as i64;
+                if v < 0 {
+                    tmp[tn] = b'-';
+                    tn += 1;
+                }
+                let mut body = [0u8; 24];
+                let mut bn = 0usize;
+                digits(v.unsigned_abs(), 10, false, &mut body, &mut bn);
+                tmp[tn..tn + bn].copy_from_slice(&body[..bn]);
+                tn += bn;
+            }
+            b'u' => digits(nextarg(&mut arg), 10, false, &mut tmp, &mut tn),
+            b'x' => digits(nextarg(&mut arg), 16, false, &mut tmp, &mut tn),
+            b'X' => digits(nextarg(&mut arg), 16, true, &mut tmp, &mut tn),
+            b'p' => {
+                tmp[0] = b'0';
+                tmp[1] = b'x';
+                tn = 2;
+                let mut body = [0u8; 24];
+                let mut bn = 0usize;
+                digits(nextarg(&mut arg), 16, false, &mut body, &mut bn);
+                tmp[tn..tn + bn].copy_from_slice(&body[..bn]);
+                tn += bn;
+            }
+            b'f' | b'F' | b'g' | b'G' | b'e' | b'E' => {
+                let _ = nextarg(&mut arg); // consume the f64 slot
+                tmp[..7].copy_from_slice(b"<float>");
+                tn = 7;
+            }
+            _ => {
+                w(b'%', &mut o);
+                w(conv, &mut o);
+                continue;
+            }
+        }
+
+        let pad = if zero { b'0' } else { b' ' };
+        if !left {
+            for _ in tn..width {
+                w(pad, &mut o);
+            }
+        }
+        for k in 0..tn {
+            w(tmp[k], &mut o);
+        }
+        if left {
+            for _ in tn..width {
+                w(b' ', &mut o);
+            }
+        }
+    }
+    o.min(out.len())
+}
+
+/// `FILE*` -> the fd stored at `_iobuf._file` (offset 28). Falls back to stdout.
+fn file_fd(file_ptr: u64) -> i32 {
+    if file_ptr == 0 {
+        return 1;
+    }
+    unsafe { *((file_ptr + 28) as *const i32) }
+}
+
+fn dispatch_msvcrt(idx: u16, frame: &mut UserFrame) -> i64 {
+    let a0 = frame.r10;
+    let a1 = frame.rdx;
+    let a2 = frame.r8;
+    let a3 = frame.r9;
+    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
+
+    match idx {
+        MSV_MEMCPY => {
+            unsafe { core::ptr::copy(a1 as *const u8, a0 as *mut u8, a2 as usize) };
+            a0 as i64
+        }
+        MSV_MEMSET => {
+            unsafe { core::ptr::write_bytes(a0 as *mut u8, a1 as u8, a2 as usize) };
+            a0 as i64
+        }
+        MSV_STRLEN => user_cstr_len(a0) as i64,
+        MSV_WCSLEN => {
+            let mut n = 0u64;
+            while unsafe { *((a0 + n * 2) as *const u16) } != 0 {
+                n += 1;
+            }
+            n as i64
+        }
+        MSV_STRNCMP => {
+            for k in 0..a2 {
+                let (x, y) = unsafe {
+                    (*((a0 + k) as *const u8) as i32, *((a1 + k) as *const u8) as i32)
+                };
+                if x != y {
+                    return (x - y) as i64;
+                }
+                if x == 0 {
+                    break;
+                }
+            }
+            0
+        }
+        MSV_MALLOC => mem_alloc_core(a0.max(1)) as i64,
+        MSV_CALLOC => mem_alloc_core(a0.saturating_mul(a1).max(1)) as i64, // mmap_anon zeroes
+        MSV_FREE => 0,
+        MSV_EXIT => proc_terminate(a0 as i32),
+        MSV_ABORT => proc_terminate(134),
+        MSV_AMSG_EXIT => {
+            crate::kprintln!("THOS: msvcrt _amsg_exit({})", a0 as i32);
+            proc_terminate(255)
+        }
+        MSV_CEXIT => 0,
+        // _initterm(fp, end): call each non-null fn ptr. A plain C program has an
+        // empty range; C++ static ctors / __attribute__((constructor)) would
+        // need a ring-3 loop stub (not built yet).
+        MSV_INITTERM => {
+            if a1.saturating_sub(a0) >= 8 {
+                crate::kprintln!("THOS: msvcrt _initterm — non-empty init range ignored");
+            }
+            0
+        }
+        MSV_ONEXIT => a0 as i64, // pretend the atexit registration succeeded
+        MSV_LOCK | MSV_UNLOCK => 0,
+        MSV_IOB_FUNC => crt(CRT_IOB_OFF) as i64,
+        MSV_ERRNO => crt(CRT_ERRNO_OFF) as i64,
+        MSV_SET_APP_TYPE | MSV_SETUSERMATHERR | MSV_SIGNAL => 0,
+        MSV_LC_CODEPAGE => 1252,
+        MSV_MB_CUR_MAX => 1,
+        MSV_LOCALECONV => crt(CRT_LCONV_OFF) as i64,
+        MSV_STRERROR => {
+            // point at "." (a non-empty NUL-terminated string) — good enough.
+            crt(CRT_DOT_OFF) as i64
+        }
+        MSV_C_SPECIFIC_HANDLER => 1, // ExceptionContinueSearch
+
+        // __getmainargs(*argc, *argv, *env, expandWildcards, *startupinfo)
+        MSV_GETMAINARGS => {
+            let cmdline = crate::pe::PE_ANSI_CMDLINE_ADDR;
+            let argv_base = crt(CRT_ARGV_OFF);
+            let strs = argv_base + 32 * 8; // room for 32 argv pointers
+            let mut argc = 0u64;
+            let mut sp = strs;
+            let mut p = cmdline;
+            unsafe {
+                loop {
+                    while *(p as *const u8) == b' ' {
+                        p += 1;
+                    }
+                    if *(p as *const u8) == 0 || argc >= 32 {
+                        break;
+                    }
+                    *((argv_base + argc * 8) as *mut u64) = sp;
+                    argc += 1;
+                    while *(p as *const u8) != 0 && *(p as *const u8) != b' ' {
+                        *(sp as *mut u8) = *(p as *const u8);
+                        sp += 1;
+                        p += 1;
+                    }
+                    *(sp as *mut u8) = 0;
+                    sp += 1;
+                }
+                *((argv_base + argc * 8) as *mut u64) = 0; // argv[argc] = NULL
+                *(a0 as *mut i32) = argc as i32;
+                *(a1 as *mut u64) = argv_base;
+                if a2 != 0 {
+                    *(a2 as *mut u64) = argv_base + argc * 8; // env -> the NULL slot
+                }
+            }
+            0
+        }
+
+        MSV_FWRITE => {
+            // fwrite(ptr, size, nmemb, FILE*)
+            let (ptr, size, nmemb) = (a0, a1, a2);
+            let fd = file_fd(a3);
+            if size == 0 {
+                return 0;
+            }
+            let n = file_write_core(fd, ptr, (size * nmemb) as usize);
+            if n <= 0 {
+                0
+            } else {
+                (n as u64 / size) as i64
+            }
+        }
+        MSV_FPUTC => {
+            let ch = a0 as u8;
+            let fd = file_fd(a1);
+            let _ = file_write_core(fd, &ch as *const u8 as u64, 1);
+            a0 as i64
+        }
+        MSV_FFLUSH => 0,
+        MSV_FPRINTF => {
+            // fprintf(FILE*, fmt, ...) — varargs are r8/r9 then the stack;
+            // gather them into one contiguous array for the formatter.
+            let fd = file_fd(a0);
+            let args: [u64; 8] =
+                [a2, a3, stack(0), stack(1), stack(2), stack(3), stack(4), stack(5)];
+            let mut buf = [0u8; 1024];
+            let n = cfmt(a1, args.as_ptr(), &mut buf);
+            file_write_core(fd, buf.as_ptr() as u64, n);
+            n as i64
+        }
+        MSV_VFPRINTF => {
+            // vfprintf(FILE*, fmt, va_list) — a2 is the va_list pointer.
+            let fd = file_fd(a0);
+            let mut buf = [0u8; 1024];
+            let n = cfmt(a1, a2 as *const u64, &mut buf);
+            file_write_core(fd, buf.as_ptr() as u64, n);
+            n as i64
+        }
+
+        _ => {
+            crate::kprintln!("THOS: msvcrt unhandled call {}", idx);
             0
         }
     }
