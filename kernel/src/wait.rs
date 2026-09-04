@@ -51,17 +51,14 @@ impl WaitQueue {
         });
     }
 
-    /// Wake one blocked thread, if any. Returns whether one was woken. Skips
-    /// entries that another waker (e.g. a timeout) already ran.
+    /// Wake one blocked thread, if any. Returns whether one was woken.
     pub fn wake_one(&self) -> bool {
-        loop {
-            let t = match self.waiters.lock().pop_front() {
-                Some(t) => t,
-                None => return false,
-            };
-            if sched::unblock(t) {
-                return true;
+        match self.waiters.lock().pop_front() {
+            Some(t) => {
+                sched::unblock(t);
+                true
             }
+            None => false,
         }
     }
 
@@ -150,9 +147,13 @@ impl Event {
 
     pub fn wait(&self) {
         match self.mode {
+            // `wait_if` holds the queue lock across the check + enqueue, and
+            // `signal`'s `wake_all` takes the same lock — closing the
+            // check-then-sleep window for a manual event signalled by another
+            // thread (e.g. a worker signalling its exit event).
             EventMode::Manual => {
                 while !self.signaled.load(Ordering::Acquire) {
-                    self.queue.wait();
+                    self.queue.wait_if(|| !self.signaled.load(Ordering::Acquire));
                 }
             }
             // `wait_if` holds the queue lock across the check + enqueue, and

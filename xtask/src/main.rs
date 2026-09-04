@@ -660,6 +660,15 @@ fn write_pe_hello(path: &Path) {
     let thread_fn_tag = u32::MAX - 95;
     let msg_thread_tag = u32::MAX - 96;
     let msg_thr_tag = u32::MAX - 97;
+    let csecname_tag = u32::MAX - 98;
+    let mvsname_tag = u32::MAX - 99;
+    let csec_slot_tag = u32::MAX - 100;
+    let mvs_slot_tag = u32::MAX - 101;
+    let sh_tag = u32::MAX - 102;
+    let secsize_tag = u32::MAX - 103;
+    let vbase_tag = u32::MAX - 104;
+    let vsize_tag = u32::MAX - 105;
+    let msg_sec_tag = u32::MAX - 106;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -1431,6 +1440,63 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2m12) section objects: create an anonymous 8 KiB section, map a view,
+    //       write + read a sentinel through the mapped VA.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
+    for (name_tag, slot_tag) in [(csecname_tag, csec_slot_tag), (mvsname_tag, mvs_slot_tag)] {
+        code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+        rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], name_tag);
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+        rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa);
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+        rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], slot_tag);
+    }
+    // NtCreateSection(&sh, 0, 0, &secsize, PAGE_READWRITE=4, SEC_COMMIT, FileHandle=0)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], sh_tag); // lea rcx, [rip+sh]
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0]); // xor edx,edx; xor r8d,r8d
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], secsize_tag); // lea r9, [rip+secsize]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]);
+    code.extend_from_slice(&[0xC7, 0x44, 0x24, 0x20, 0x04, 0, 0, 0]); // [rsp+0x20]=4 (PAGE_READWRITE)
+    code.extend_from_slice(&[0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0x08]); // [rsp+0x28]=0x08000000 (SEC_COMMIT)
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x30, 0, 0, 0, 0]); // [rsp+0x30]=0 FileHandle
+    rel!([0xFF, 0x15, 0, 0, 0, 0], csec_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtMapViewOfSection(sh, -1, &vbase, 0, 0, 0, &vsize, 1, 0, 4)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], sh_tag); // mov rcx, [rip+sh]
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rdx, -1
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], vbase_tag); // lea r8, [rip+vbase]
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x58]);
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // [rsp+0x20]=0 CommitSize
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]); // [rsp+0x28]=0 SectionOffset*
+    rel!([0x48, 0x8D, 0x05, 0, 0, 0, 0], vsize_tag); // lea rax, [rip+vsize]
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // [rsp+0x30]=&ViewSize
+    code.extend_from_slice(&[0xB8, 0x01, 0, 0, 0]); // mov eax, 1
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x38]); // [rsp+0x38]=1 InheritDisposition
+    code.extend_from_slice(&[0x31, 0xC0, 0x48, 0x89, 0x44, 0x24, 0x40]); // [rsp+0x40]=0 AllocationType
+    code.extend_from_slice(&[0xB8, 0x04, 0, 0, 0, 0x48, 0x89, 0x44, 0x24, 0x48]); // [rsp+0x48]=4 Win32Protect
+    rel!([0xFF, 0x15, 0, 0, 0, 0], mvs_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x58, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // sentinel round-trip through the mapped view
+    rel!([0x48, 0x8B, 0x05, 0, 0, 0, 0], vbase_tag); // mov rax, [rip+vbase]
+    code.extend_from_slice(&[0xC7, 0x00, 0x01, 0xEF, 0xCD, 0xAB]); // mov dword [rax], 0xABCDEF01
+    code.extend_from_slice(&[0x8B, 0x08]); // mov ecx, [rax]
+    code.extend_from_slice(&[0x81, 0xF9, 0x01, 0xEF, 0xCD, 0xAB, 0x74, 0x01, 0xCC]); // cmp ecx,0xABCDEF01; je+1; int3
+    // WriteFile(1, msg_sec, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_sec_tag);
+    let sec_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -1658,6 +1724,10 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"NtDelayExecution\0");
     let ctename_off = code.len();
     code.extend_from_slice(b"NtCreateThreadEx\0");
+    let csecname_off = code.len();
+    code.extend_from_slice(b"NtCreateSection\0");
+    let mvsname_off = code.len();
+    code.extend_from_slice(b"NtMapViewOfSection\0");
     // registry key/value UTF-16LE names + their UNICODE_STRING headers.
     let keyname16: Vec<u8> = "\\Registry\\Machine\\Software\\THOSREG"
         .encode_utf16()
@@ -1754,11 +1824,23 @@ fn write_pe_hello(path: &Path) {
     let nde_slot_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // resolved NtDelayExecution
     let tneg200_off = code.len();
-    code.extend_from_slice(&(-2_000_000i64).to_le_bytes()); // -200 ms, 100 ns units
+    code.extend_from_slice(&(-300_000i64).to_le_bytes()); // -30 ms, 100 ns units
     let cte_slot_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // resolved NtCreateThreadEx
     let thh_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // worker thread HANDLE (exit event)
+    let csec_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtCreateSection
+    let mvs_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtMapViewOfSection
+    let sh_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // section HANDLE
+    let secsize_off = code.len();
+    code.extend_from_slice(&0x2000i64.to_le_bytes()); // MaximumSize = 8 KiB
+    let vbase_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // mapped view base (out)
+    let vsize_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // view size (in 0 = whole section / out)
     let evh_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // event HANDLE
     let evh2_off = code.len();
@@ -1845,7 +1927,11 @@ fn write_pe_hello(path: &Path) {
     let msg_thr: &[u8] = b"PE thread OK\n";
     let msg_thr_off = code.len();
     code.extend_from_slice(msg_thr);
+    let msg_sec: &[u8] = b"PE section OK\n";
+    let msg_sec_off = code.len();
+    code.extend_from_slice(msg_sec);
 
+    code[sec_r8..sec_r8 + 4].copy_from_slice(&(msg_sec.len() as u32).to_le_bytes());
     code[thread_fn_r8..thread_fn_r8 + 4].copy_from_slice(&(msg_thread.len() as u32).to_le_bytes());
     code[thr_r8..thr_r8 + 4].copy_from_slice(&(msg_thr.len() as u32).to_le_bytes());
     code[delay_r8..delay_r8 + 4].copy_from_slice(&(msg_delay.len() as u32).to_le_bytes());
@@ -1988,6 +2074,15 @@ fn write_pe_hello(path: &Path) {
             t if t == thread_fn_tag => text_rva + thread_fn_off as u32,
             t if t == msg_thread_tag => text_rva + msg_thread_off as u32,
             t if t == msg_thr_tag => text_rva + msg_thr_off as u32,
+            t if t == csecname_tag => text_rva + csecname_off as u32,
+            t if t == mvsname_tag => text_rva + mvsname_off as u32,
+            t if t == csec_slot_tag => text_rva + csec_slot_off as u32,
+            t if t == mvs_slot_tag => text_rva + mvs_slot_off as u32,
+            t if t == sh_tag => text_rva + sh_off as u32,
+            t if t == secsize_tag => text_rva + secsize_off as u32,
+            t if t == vbase_tag => text_rva + vbase_off as u32,
+            t if t == vsize_tag => text_rva + vsize_off as u32,
+            t if t == msg_sec_tag => text_rva + msg_sec_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -3030,7 +3125,10 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
         })
     };
 
-    let deadline = Instant::now() + Duration::from_secs(240);
+    // The PE milestone has grown a lot (SEH / APC / registry / sync objects /
+    // real timed waits / a worker thread / sections) and now spends real
+    // wall-clock time in NtDelayExecution — give it headroom over the old 240 s.
+    let deadline = Instant::now() + Duration::from_secs(420);
     let status = loop {
         if let Some(s) = child.try_wait().expect("wait qemu") {
             break Some(s);
@@ -3295,6 +3393,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE delay OK") // NtDelayExecution -> real executive block on the timer wheel
         && serial.contains("PE thread ran") // NtCreateThreadEx worker ran its StartRoutine
         && serial.contains("PE thread OK") // main thread waited on the thread handle + resumed
+        && serial.contains("PE section OK") // NtCreateSection + NtMapViewOfSection, sentinel round-trip
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL

@@ -162,17 +162,6 @@ impl Thread {
     fn state(&self) -> State {
         *self.state.lock()
     }
-    /// `Blocked → Ready` in one step; `true` if this call did the transition
-    /// (so a second waker — a timer wheel vs. an object signal — is a no-op).
-    fn try_wake(&self) -> bool {
-        let mut s = self.state.lock();
-        if *s == State::Blocked {
-            *s = State::Ready;
-            true
-        } else {
-            false
-        }
-    }
     fn ctx_ptr(&self) -> *mut u64 {
         self.ctx.get()
     }
@@ -530,16 +519,10 @@ pub fn block_current() {
     interrupts::without_interrupts(|| reschedule(true));
 }
 
-/// Make a previously-blocked thread runnable again. Idempotent: a no-op (returns
-/// `false`) if the thread is not currently `Blocked` — so a timer-wheel wakeup
-/// and an object-signal wakeup racing on the same thread are both safe.
-pub fn unblock(t: Arc<Thread>) -> bool {
-    if t.try_wake() {
-        SCHED.lock().ready.push_back(t);
-        true
-    } else {
-        false
-    }
+/// Make a previously-blocked thread runnable again.
+pub fn unblock(t: Arc<Thread>) {
+    t.set_state(State::Ready);
+    SCHED.lock().ready.push_back(t);
 }
 
 /// Terminate the current thread. Never returns.

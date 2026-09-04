@@ -112,7 +112,9 @@ pub const NT_NTWAITFORMULTIPLEOBJECTS: u16 = 31;
 pub const NT_NTDELAYEXECUTION: u16 = 32;
 pub const NT_NTCREATETHREADEX: u16 = 33;
 pub const NT_NTTERMINATETHREAD: u16 = 34;
-pub const NTDLL_STUB_COUNT: u16 = 35;
+pub const NT_NTCREATESECTION: u16 = 35;
+pub const NT_NTMAPVIEWOFSECTION: u16 = 36;
+pub const NTDLL_STUB_COUNT: u16 = 37;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -155,6 +157,8 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtDelayExecution",
     "NtCreateThreadEx",
     "NtTerminateThread",
+    "NtCreateSection",
+    "NtMapViewOfSection",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -577,6 +581,80 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 sched::exit();
             }
             proc_terminate(a1 as i32)
+        }
+
+        // NtCreateSection(*Handle, DesiredAccess, *ObjectAttributes,
+        //                 *MaximumSize, PageProtection, AllocationAttributes,
+        //                 FileHandle). FileHandle 0 = anonymous zeroed section;
+        // otherwise a copy of the file's bytes at create time. No shared
+        // writeback / COW; protection is not enforced yet.
+        NT_NTCREATESECTION => {
+            const CAP: usize = 16 * 1024 * 1024;
+            let file_h = stack(2) as i32;
+            let data: alloc::vec::Vec<u8> = if file_h != 0 {
+                let Some(f) = process::current_fd(file_h) else {
+                    return STATUS_INVALID_HANDLE as i64;
+                };
+                let mut buf = alloc::vec::Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = f.read(&mut chunk);
+                    if n <= 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n as usize]);
+                    if buf.len() > CAP {
+                        return STATUS_INVALID_PARAMETER as i64;
+                    }
+                }
+                buf
+            } else {
+                let max = if a3 != 0 { (unsafe { *(a3 as *const i64) }) as usize } else { 0 };
+                if max == 0 || max > CAP {
+                    return STATUS_INVALID_PARAMETER as i64;
+                }
+                alloc::vec![0u8; max]
+            };
+            let sec = Arc::new(process::Section { size: data.len(), data });
+            let h = process::current_alloc_section(sec);
+            if h < 0 {
+                return STATUS_NO_MEMORY as i64;
+            }
+            unsafe { *(a0 as *mut u64) = h as u64 };
+            STATUS_SUCCESS as i64
+        }
+
+        // NtMapViewOfSection(SectionHandle, ProcessHandle, *BaseAddress,
+        //                    ZeroBits, CommitSize, *SectionOffset, *ViewSize,
+        //                    InheritDisposition, AllocationType, Win32Protect).
+        // Copies the requested range into fresh private RW pages (CR3 is this
+        // process's here, so the copy writes straight into the user VA).
+        NT_NTMAPVIEWOFSECTION => {
+            let Some(sec) = process::current_section(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            if a2 == 0 {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let (off_pp, vsize_pp) = (stack(1), stack(2));
+            let offset = if off_pp != 0 { (unsafe { *(off_pp as *const i64) }) as usize } else { 0 };
+            if offset >= sec.size {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let want = if vsize_pp != 0 { (unsafe { *(vsize_pp as *const u64) }) as usize } else { 0 };
+            let view = if want != 0 { want.min(sec.size - offset) } else { sec.size - offset };
+            let base = mem_alloc_core(view as u64);
+            if base == 0 {
+                return STATUS_NO_MEMORY as i64;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(sec.data.as_ptr().add(offset), base as *mut u8, view);
+                *(a2 as *mut u64) = base;
+                if vsize_pp != 0 {
+                    *(vsize_pp as *mut u64) = view as u64;
+                }
+            }
+            STATUS_SUCCESS as i64
         }
 
         // NtContinue(*Context, TestAlert) — resume ring 3 from the CONTEXT the

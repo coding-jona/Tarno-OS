@@ -314,12 +314,21 @@ pub fn current_uid() -> u32 {
 /// What a HANDLE / file descriptor points at. Both personalities share one
 /// per-process table: a POSIX fd and a Win32 `HANDLE` are the same integer
 /// into the same `Vec` — a file, or an executive object.
+/// A section object's backing store. Anonymous ⇒ zeroed; file-backed ⇒ a copy
+/// of the file's bytes at create time. No shared writeback / copy-on-write yet —
+/// `NtMapViewOfSection` copies the range into fresh private pages.
+pub struct Section {
+    pub size: usize,
+    pub data: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub enum HandleObject {
     File(Arc<dyn FileOps>),
     Event(Arc<Event>),
     Semaphore(Arc<Semaphore>),
     Mutant(Arc<Mutant>),
+    Section(Arc<Section>),
     /// A registry key — the canonical `\`-joined path into [`crate::registry`]'s
     /// global tree (ops re-walk under that module's lock).
     RegKey(String),
@@ -457,6 +466,15 @@ impl Task {
     }
     pub fn handle_alloc_mutant(&self, m: Arc<Mutant>) -> i32 {
         self.handle_alloc(HandleObject::Mutant(m), false)
+    }
+    pub fn handle_alloc_section(&self, s: Arc<Section>) -> i32 {
+        self.handle_alloc(HandleObject::Section(s), false)
+    }
+    pub fn handle_section(&self, h: i32) -> Option<Arc<Section>> {
+        match &self.fds.lock().get(h as usize)?.as_ref()?.obj {
+            HandleObject::Section(s) => Some(s.clone()),
+            _ => None,
+        }
     }
 
     /// The dispatcher object a HANDLE names, as a [`Waitable`], if it is one.
@@ -664,6 +682,12 @@ pub fn current_alloc_semaphore(s: Arc<Semaphore>) -> i32 {
 }
 pub fn current_alloc_mutant(m: Arc<Mutant>) -> i32 {
     sched::current().task().map_or(-1, |t| t.handle_alloc_mutant(m))
+}
+pub fn current_alloc_section(s: Arc<Section>) -> i32 {
+    sched::current().task().map_or(-1, |t| t.handle_alloc_section(s))
+}
+pub fn current_section(h: i32) -> Option<Arc<Section>> {
+    sched::current().task().and_then(|t| t.handle_section(h))
 }
 
 /// The current task's [`Waitable`] for HANDLE `h`, if it names a dispatcher
