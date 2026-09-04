@@ -127,21 +127,42 @@ def fmt_dur(seconds: float) -> str:
     return f"{s}s"
 
 
+def resolve_tlm(tlm: str) -> str | None:
+    """Find the weights file regardless of whether `tlm` was given relative
+    to the repo root, ml/train/, or as an absolute path — returns None (not
+    an exception) if it genuinely doesn't exist anywhere sensible yet."""
+    for base in (None, ROOT, HERE):
+        p = tlm if base is None else os.path.join(base, tlm)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 def generate_reply(tlm: str, prompt: str, max_tokens: int = 180, temp: float = 0.9) -> str:
     """One-shot call into the same Rust engine 'run.sh shell' uses. Blocking —
     a few seconds for a small model. Returns just the new continuation (the
     binary prints prompt+continuation decoded together)."""
+    found = resolve_tlm(tlm)
+    if found is None:
+        return (
+            f"(no weights at '{tlm}' yet — the model hasn't been exported. "
+            f"Train further, then 'run.sh export' or 'run.sh watch-export'.)"
+        )
     try:
         out = subprocess.run(
             ["cargo", "run", "-q", "--release", "-p", "thos-lm", "--example", "generate",
-             "--target", RUST_TARGET, "--", "--weights", tlm, "--prompt", prompt,
+             "--target", RUST_TARGET, "--", "--weights", found, "--prompt", prompt,
              "--max-tokens", str(max_tokens), "--temp", str(temp), "--seed", str(int(time.time()))],
             cwd=ROOT, capture_output=True, text=True, timeout=120,
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         return f"(generation failed: {e})"
     if out.returncode != 0:
-        return f"(generation failed: {out.stderr.strip()[-300:] or 'unknown error'})"
+        msg = out.stderr.strip()
+        # Trim the raw Rust panic down to just the human-relevant message.
+        if "panicked at" in msg:
+            msg = msg.split("panicked at", 1)[1].split(":", 2)[-1].strip()
+        return f"(generation failed: {msg[-300:] or 'unknown error'})"
     full = out.stdout.rstrip("\n")
     return full[len(prompt):] if full.startswith(prompt) else full
 
@@ -164,6 +185,13 @@ class ChatPane:
         if not msg:
             return
         self.push(f"you> {msg}", width, curses.A_BOLD)
+        if msg.startswith("/"):
+            self.push(
+                "  (slash-commands like /temp, /lang, /train aren't available in this "
+                "chat pane — use 'run.sh shell' for those; this box just talks to the model)",
+                width, curses.A_DIM,
+            )
+            return
         self.ctx = (self.ctx + "\n" + msg + "\n") if self.ctx else msg + "\n"
         if len(self.ctx) > 3000:
             self.ctx = self.ctx[-3000:]

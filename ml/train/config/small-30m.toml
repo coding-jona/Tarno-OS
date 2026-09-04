@@ -18,19 +18,19 @@ seed          = 20260904
 batch_size    = 24
 grad_accum    = 8        # effective batch 192
 # ~30 s/optimizer-step on the i7-13700KF (CPU). 20k steps ~ 6-7 days of compute;
-# stop any time — checkpoints every 500 steps (~4 h) export + run in the shell.
+# stop any time — checkpoints keep progress, export + run in the shell.
 max_steps     = 20000
 warmup_steps  = 800
 lr            = 6e-4
 min_lr        = 6e-5
 weight_decay  = 0.1
 grad_clip     = 1.0
-eval_interval = 300
-eval_batches  = 40
-# 200 steps ~ 100 min at ~30 s/step — cheap (torch.save of a 30M model is a
-# fraction of a second) and frequent enough that 'run.sh watch-export' keeps
-# the exported .tlm reasonably fresh for chatting with it mid-training.
-ckpt_interval = 200
+# 30 steps ~ 15 min at ~30 s/step — the dashboard felt "dead" at 300/200
+# (2.5h / 1.7h between updates); this keeps live feedback actually live.
+# eval_batches trimmed too — each is a real forward pass, not free.
+eval_interval = 30
+eval_batches  = 10
+ckpt_interval = 30
 num_threads   = 0        # 0 => torch default (all cores)
 
 [data]
