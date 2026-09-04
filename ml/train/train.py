@@ -105,6 +105,16 @@ def main() -> None:
     #   {"lr_scale": 0.5}    multiply the scheduled LR (sticky until changed)
     #   {"max_steps": N}     shrink/extend the run without restarting
     ctl_path = os.path.join(OUT, "control.json")
+    progress_path = os.path.join(OUT, "progress.json")
+
+    def write_progress(step_now: int, micro: int, of: int) -> None:
+        # A tiny, cheap-to-write sidecar so a live viewer (the dashboard) can
+        # show a sub-bar for the micro-batch within the *current* step,
+        # instead of only updating once per full (multi-second) step.
+        tmp = progress_path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"step": step_now, "micro": micro, "of": of, "t": time.time()}, fh)
+        os.replace(tmp, progress_path)
 
     def read_control() -> dict:
         try:
@@ -144,11 +154,12 @@ def main() -> None:
         model.train()
         opt.zero_grad(set_to_none=True)
         loss_acc = 0.0
-        for _ in range(accum):
+        for micro in range(accum):
             x, y = get_batch(train_data, block, bs, rng)
             _, loss = model(x, y)
             (loss / accum).backward()
             loss_acc += loss.item() / accum
+            write_progress(step, micro + 1, accum)
         torch.nn.utils.clip_grad_norm_(model.parameters(), tc["grad_clip"])
         opt.step()
 

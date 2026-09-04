@@ -213,6 +213,7 @@ def run(stdscr, args) -> None:
     out_dir = os.path.join(HERE, "out", stem)
     log_path = os.path.join(out_dir, "log.csv")
     ctl_path = os.path.join(out_dir, "control.json")
+    progress_path = os.path.join(out_dir, "progress.json")
     report_path = os.path.join(out_dir, "self_report.log")
     unlock_path = os.path.join(HERE, "out", "staged", "unlock_at")
 
@@ -273,6 +274,13 @@ def run(stdscr, args) -> None:
         putL("")
         putL(f" step {step:,} / {max_steps:,}")
         putL(f" {bar(step / max_steps if max_steps else 0, max(4, left_w - 4))}", CYAN)
+
+        prog = read_control(progress_path)  # generic JSON reader, works for this too
+        if prog and now - prog.get("t", 0) < 30:  # stale (job restarted/stalled) -> hide
+            of = max(1, prog.get("of", 1))
+            micro = min(prog.get("micro", 0), of)
+            putL(f" step {prog.get('step', step) + 1} micro {micro}/{of}", curses.A_DIM)
+            putL(f" {bar(micro / of, max(4, left_w - 4))}", GREEN)
 
         if last:
             tps = last["tps"]

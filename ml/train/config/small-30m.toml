@@ -16,7 +16,9 @@ norm_eps   = 1e-5
 [train]
 seed          = 20260904
 batch_size    = 24
-grad_accum    = 8        # effective batch 192
+grad_accum    = 2        # effective batch 48 -- lowered from 8 for faster/more
+                         # frequent steps (more gradient noise, but 48 is
+                         # still a reasonable batch for a 30M model)
 # ~30 s/optimizer-step on the i7-13700KF (CPU). 20k steps ~ 6-7 days of compute;
 # stop any time — checkpoints keep progress, export + run in the shell.
 max_steps     = 20000
