@@ -5,6 +5,13 @@ tarno-devuan-live/config/includes.chroot/usr/bin/tarno-disk-install
 tarno-devuan-live/config/includes.chroot/usr/bin/tarnoctl
 __pycache__/
 
+# ML subproject: downloaded corpora, training checkpoints, weight blobs.
+# The one exception is the tiny committed golden-test fixture.
+/ml/train/data/
+/ml/train/out/
+*.tlm
+!/ml/thos-lm/tests/fixtures/*.tlm
+
 # THOS kernel build
 /target/
 /target/iso_root/

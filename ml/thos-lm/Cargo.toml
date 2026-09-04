@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[package]
+name = "thos-lm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "From-scratch no_std inference for a small THOS language model (.tlm weights)."
+
+[lib]
+# no_std library; the test + example are host-only (cfg-gated).
+test = true
+bench = false
+
+[dependencies]
+# Pure-Rust, no_std soft-float transcendentals (expf / tanhf / sqrtf). Same
+# "soft, no CPU-feature dispatch" stance as the kernel's `sha2 force-soft`.
+libm = { version = "0.2", default-features = false }

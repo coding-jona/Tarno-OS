@@ -706,6 +706,23 @@ exec gate reuses the loader internals that are being built now. Designed in
 from the start (loaders already hostile-input hardened; identity model already
 capability-shaped), implemented as its own phase once M3 lands.
 
+### In-system AI
+
+THOS grows its own AI, built from scratch (*user, 2026-09-04*): a small
+**decoder-only language model** trained off-device (PyTorch, CPU) and run by a
+hand-written `#![no_std]` Rust engine (`ml/thos-lm`) over a first-party `.tlm`
+weight format — no external model runtime, no API. Training data is **only** open
+/ permissively-licensed / public-domain. Start ~1M params byte-level, grow step by
+step. Full plan + phases (P0–P6) and open decisions:
+[`ai.md`](ai.md); code + datasets: [`../../ml/`](../../ml/) /
+[`../../ml/DATASETS.md`](../../ml/DATASETS.md).
+
+The former standalone "in-kernel exec-gate classifier" is **folded in** as
+Application B of this stack — a classifier head reusing the LM's tensor + loader
+code to score PE/ELF statically for the native-exec gate above. Running any of
+this *inside* THOS is gated on kernel work not yet present (userland file writes,
+a kernel↔userspace channel, RAM budget) and is a later phase, not near-term.
+
 ## Phase 6 — Research track: real `.sys` drivers (after M5)
 
 - Scope **hard-limited to one device class** (recommended: NDIS networking, as
@@ -812,3 +829,8 @@ ASRock board; and the risks below.
 5. **Driver model** — monolithic-with-loadable-modules vs userspace drivers.
    Only forces a decision at **Phase 7** (hardware breadth); until then everything
    is compiled in for the one target machine.
+6. **In-system AI** — model class beyond the v0 byte GPT, tokenizer for P1,
+   `f32` vs fixed-point for the in-kernel exec-gate head, weight delivery
+   (`include_bytes!` vs ext2 file), the kernel↔userspace query channel, and the
+   `ml/` licence. Enumerated in [`ai.md`](ai.md) → Open decisions
+   (*user, 2026-09-04*).

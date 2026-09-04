@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# The P0 "Proof of Life" spike: a ~1M-parameter byte-level GPT, small enough to
+# train on the i7-13700KF CPU in a reasonable time.
+
+[model]
+n_layer    = 4
+n_head     = 4
+n_embd     = 128
+block_size = 128
+vocab_size = 256      # raw byte tokenizer
+dropout    = 0.0
+norm_eps   = 1e-5
+
+[train]
+seed             = 20260904
+batch_size       = 32
+grad_accum       = 4          # effective batch 128
+max_steps        = 20000
+warmup_steps     = 400
+lr               = 3e-4
+min_lr           = 3e-5
+weight_decay     = 0.1
+grad_clip        = 1.0
+eval_interval    = 500
+eval_batches     = 40
+ckpt_interval    = 1000
+num_threads      = 0          # 0 => torch default (all cores)
+
+[data]
+train_bin = "data/train.bin"
+val_bin   = "data/val.bin"
