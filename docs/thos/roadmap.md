@@ -387,12 +387,23 @@ late.
     `pe-test` queues an APC to itself, `NtTestAlert`s, checks the handler ran
     (`PE APC OK`). Kernel-mode APCs / alertable `NtWaitForSingleObject` land
     with the timer wheel. `QueueUserAPC` (Win32) layers straight on top.
+  - **Minimal configuration registry.** `crate::registry`: one global key tree
+    of typed values addressed by `\`-separated path, seeded with
+    `\Registry\Machine` + `\Registry\User` on first use. Backs `NtCreateKey`,
+    `NtOpenKey`, `NtSetValueKey`, `NtQueryValueKey`
+    (`KeyValuePartialInformation`) and `NtDeleteKey` on the SSDT;
+    `OBJECT_ATTRIBUTES.ObjectName` (+ `RootDirectory`) resolves to a path. A key
+    HANDLE is a `HandleObject::RegKey(path)` in the unified table. `pe-test`
+    round-trips create → set → close → reopen → query → delete → reopen-fails
+    (`PE registry OK`). Not transactional / persisted / enumerable yet —
+    hive files, `NtEnumerateKey`/`Value`, change-notify and per-key security
+    come with the registry phase.
   - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
     unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
     unmodified), or a from-scratch `ntdll` — an **executive timer wheel** for a
     real timed block (and a preemption-safe path out of a PE syscall), more
-    `HandleObject` kinds (mutant, semaphore, section, thread), a minimal
-    registry; then process isolation / integrity for the security phase.
+    `HandleObject` kinds (mutant, semaphore, section, thread), the registry
+    grown to hives; then process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
