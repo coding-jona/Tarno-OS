@@ -247,14 +247,20 @@ def run(stdscr, args) -> None:
         putL(f" {bar(step / max_steps if max_steps else 0, max(4, left_w - 4))}", CYAN)
 
         if last:
-            tps = last["tps"] or 1.0
+            tps = last["tps"]
+            if not tps:
+                # step 0's row has no throughput measurement yet (nothing to
+                # divide by) — fall back to the most recent row that does
+                # have one, rather than a tiny placeholder that turns into a
+                # multi-year ETA.
+                tps = next((r["tps"] for r in reversed(rows) if r["tps"]), 0)
             steps_per_s = tps / tokens_per_step if tokens_per_step else 0
-            eta = (max_steps - step) / steps_per_s if steps_per_s > 0 else float("nan")
+            eta = (max_steps - step) / steps_per_s if steps_per_s > 0 else None
             best_val = min(r["val"] for r in rows)
             putL("")
             putL(f" train {last['train']:.4f}  val {last['val']:.4f} (best {best_val:.4f})")
             putL(f" lr {last['lr']:.1e}  {tps:,.0f} tok/s")
-            putL(f" ETA {fmt_dur(eta)}")
+            putL(f" ETA {fmt_dur(eta) if eta is not None else '? (noch keine Messung)'}")
             putL("")
             spark_w = max(4, left_w - 8)
             putL(f" val  {sparkline([r['val'] for r in rows], spark_w)}", GREEN)
