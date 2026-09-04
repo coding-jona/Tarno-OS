@@ -650,6 +650,10 @@ fn write_pe_hello(path: &Path) {
     let harr_tag = u32::MAX - 85;
     let harr8_tag = u32::MAX - 86;
     let msg_sync_tag = u32::MAX - 87;
+    let ndename_tag = u32::MAX - 88;
+    let nde_slot_tag = u32::MAX - 89;
+    let tneg200_tag = u32::MAX - 90;
+    let msg_delay_tag = u32::MAX - 91;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -1333,6 +1337,43 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2m10) NtDelayExecution on the executive timer wheel. A real block from a
+    //       cooperative PE syscall — if the wheel doesn't wake the thread the
+    //       whole test hangs. rbx <- hNtdll.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], ndename_tag); // lea rdx, [rip+"NtDelayExecution"]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], nde_slot_tag); // mov [rip+nde_slot], rax
+    // NtDelayExecution(FALSE, &tneg200)  -> real ~200 ms block, returns SUCCESS
+    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], tneg200_tag); // lea rdx, [rip+tneg200]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], nde_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]); // test eax,eax; je+1; int3
+    // NtDelayExecution(FALSE, NULL) -> yield path, returns SUCCESS
+    code.extend_from_slice(&[0x31, 0xC9, 0x31, 0xD2]); // xor ecx,ecx; xor edx,edx
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], nde_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // WriteFile(1, msg_delay, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_delay_tag);
+    let delay_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -1543,6 +1584,8 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"NtReleaseMutant\0");
     let wfmoname_off = code.len();
     code.extend_from_slice(b"NtWaitForMultipleObjects\0");
+    let ndename_off = code.len();
+    code.extend_from_slice(b"NtDelayExecution\0");
     // registry key/value UTF-16LE names + their UNICODE_STRING headers.
     let keyname16: Vec<u8> = "\\Registry\\Machine\\Software\\THOSREG"
         .encode_utf16()
@@ -1636,6 +1679,10 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0u8; 8]); // PreviousCount out (semaphore + mutant)
     let harr_off = code.len();
     code.extend_from_slice(&[0u8; 16]); // HANDLE[2] for NtWaitForMultipleObjects
+    let nde_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtDelayExecution
+    let tneg200_off = code.len();
+    code.extend_from_slice(&(-2_000_000i64).to_le_bytes()); // -200 ms, 100 ns units
     let evh_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // event HANDLE
     let evh2_off = code.len();
@@ -1713,7 +1760,11 @@ fn write_pe_hello(path: &Path) {
     let msg_sync: &[u8] = b"PE sync OK\n";
     let msg_sync_off = code.len();
     code.extend_from_slice(msg_sync);
+    let msg_delay: &[u8] = b"PE delay OK\n";
+    let msg_delay_off = code.len();
+    code.extend_from_slice(msg_delay);
 
+    code[delay_r8..delay_r8 + 4].copy_from_slice(&(msg_delay.len() as u32).to_le_bytes());
     code[sync_r8..sync_r8 + 4].copy_from_slice(&(msg_sync.len() as u32).to_le_bytes());
     code[reg_r8..reg_r8 + 4].copy_from_slice(&(msg_reg.len() as u32).to_le_bytes());
     code[apc_r8..apc_r8 + 4].copy_from_slice(&(msg_apc.len() as u32).to_le_bytes());
@@ -1843,6 +1894,10 @@ fn write_pe_hello(path: &Path) {
             t if t == harr_tag => text_rva + harr_off as u32,
             t if t == harr8_tag => text_rva + harr_off as u32 + 8,
             t if t == msg_sync_tag => text_rva + msg_sync_off as u32,
+            t if t == ndename_tag => text_rva + ndename_off as u32,
+            t if t == nde_slot_tag => text_rva + nde_slot_off as u32,
+            t if t == tneg200_tag => text_rva + tneg200_off as u32,
+            t if t == msg_delay_tag => text_rva + msg_delay_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -3147,6 +3202,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE APC OK") // NtQueueApcThread + NtTestAlert -> KiUserApcDispatcher -> NtContinue
         && serial.contains("PE registry OK") // NtCreateKey/SetValue/OpenKey/QueryValue/DeleteKey round-trip
         && serial.contains("PE sync OK") // semaphore + mutant + NtWaitForMultipleObjects
+        && serial.contains("PE delay OK") // NtDelayExecution -> real executive block on the timer wheel
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL

@@ -51,14 +51,17 @@ impl WaitQueue {
         });
     }
 
-    /// Wake one blocked thread, if any. Returns whether one was woken.
+    /// Wake one blocked thread, if any. Returns whether one was woken. Skips
+    /// entries that another waker (e.g. a timeout) already ran.
     pub fn wake_one(&self) -> bool {
-        match self.waiters.lock().pop_front() {
-            Some(t) => {
-                sched::unblock(t);
-                true
+        loop {
+            let t = match self.waiters.lock().pop_front() {
+                Some(t) => t,
+                None => return false,
+            };
+            if sched::unblock(t) {
+                return true;
             }
-            None => false,
         }
     }
 

@@ -109,7 +109,8 @@ pub const NT_NTRELEASEMUTANT: u16 = 28;
 pub const NT_NTCREATESEMAPHORE: u16 = 29;
 pub const NT_NTRELEASESEMAPHORE: u16 = 30;
 pub const NT_NTWAITFORMULTIPLEOBJECTS: u16 = 31;
-pub const NTDLL_STUB_COUNT: u16 = 32;
+pub const NT_NTDELAYEXECUTION: u16 = 32;
+pub const NTDLL_STUB_COUNT: u16 = 33;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -149,6 +150,7 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtCreateSemaphore",
     "NtReleaseSemaphore",
     "NtWaitForMultipleObjects",
+    "NtDelayExecution",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -402,14 +404,19 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             if timeout >= 0 {
                 return if w.try_take(tid) { STATUS_SUCCESS as i64 } else { STATUS_TIMEOUT as i64 };
             }
-            let spins = (((-timeout) as u64) / 50).clamp(20_000, 4_000_000);
-            for _ in 0..spins {
+            // Relative timeout: real wall-clock deadline off the timer wheel.
+            // The wait itself still yield-polls the object between ticks (a
+            // fully-blocking timed object wait — dual-enqueue on the object's
+            // queue *and* the wheel — is the remaining refinement); the
+            // *duration* is now accurate.
+            let deadline = crate::timer::deadline_from_relative_100ns(timeout);
+            while crate::timer::now() < deadline {
                 if w.try_take(tid) {
                     return STATUS_SUCCESS as i64;
                 }
                 sched::yield_now();
             }
-            STATUS_TIMEOUT as i64
+            if w.try_take(tid) { STATUS_SUCCESS as i64 } else { STATUS_TIMEOUT as i64 }
         }
 
         // NtCreateMutant(*Handle, DesiredAccess, *ObjectAttributes, InitialOwner)
@@ -490,17 +497,16 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 }
             }
             let tptr = stack(0);
-            let timeout = if tptr == 0 { i64::MIN } else { unsafe { *(tptr as *const i64) } };
-            let poll_only = timeout >= 0 && tptr != 0;
-            let spins: u64 = if tptr == 0 {
-                u64::MAX
-            } else if poll_only {
-                1
+            // NULL timeout = wait forever; `*t == 0` = poll once; `*t < 0` =
+            // relative wall-clock deadline off the timer wheel.
+            let timeout = if tptr == 0 { -1 } else { unsafe { *(tptr as *const i64) } };
+            let deadline = if tptr != 0 && timeout < 0 {
+                Some(crate::timer::deadline_from_relative_100ns(timeout))
             } else {
-                (((-timeout) as u64) / 50).clamp(20_000, 4_000_000)
+                None
             };
+            let poll_once = tptr != 0 && timeout >= 0;
 
-            let mut n = 0u64;
             loop {
                 if wait_all {
                     if objs.iter().all(|w| w.is_signaled(tid)) {
@@ -516,12 +522,24 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                         }
                     }
                 }
-                n += 1;
-                if n >= spins {
+                if poll_once || deadline.is_some_and(|d| crate::timer::now() >= d) {
                     return STATUS_TIMEOUT as i64;
                 }
                 sched::yield_now();
             }
+        }
+
+        // NtDelayExecution(Alertable, *Interval). Negative interval = relative
+        // 100 ns units — a real executive block on the timer wheel. 0 or
+        // positive (absolute) = just yield.
+        NT_NTDELAYEXECUTION => {
+            let interval = if a1 == 0 { 0 } else { unsafe { *(a1 as *const i64) } };
+            if interval < 0 {
+                crate::timer::sleep_until(crate::timer::deadline_from_relative_100ns(interval));
+            } else {
+                sched::yield_now();
+            }
+            STATUS_SUCCESS as i64
         }
 
         // NtContinue(*Context, TestAlert) — resume ring 3 from the CONTEXT the

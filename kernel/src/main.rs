@@ -54,6 +54,7 @@ mod seh;
 mod serial;
 mod smp;
 mod syscall;
+mod timer;
 mod vfs;
 mod vmm;
 mod xhci;
