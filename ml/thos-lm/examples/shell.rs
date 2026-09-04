@@ -35,6 +35,11 @@ struct Settings {
     seed: u64,
     /// Stop generation early when the running output ends with one of these.
     stops: Vec<String>,
+    /// Never stop on a /stops match before this many tokens — a base model
+    /// has no notion of "how long a reply should be" on its own, so without
+    /// a floor a one-word prompt like "hi" could hit a stop-sequence after a
+    /// couple of tokens. This is a heuristic, not real length awareness.
+    min_tokens: usize,
     /// Keep at most this many bytes of rolling context fed back into the model.
     ctx_bytes: usize,
     /// When set (e.g. "de"), converse in this language: your input is
@@ -51,11 +56,102 @@ impl Default for Settings {
             top_k: 40,
             max_tokens: 400,
             seed: rand_seed(),
-            stops: vec![], // no default stop — a small model hits blank lines fast; /stops to opt in
+            // Sentence-ish enders, gated by min_tokens below — /tokens is a
+            // ceiling for long replies, this is what stops a short one early.
+            stops: vec![". ".into(), "! ".into(), "? ".into(), "\n\n".into()],
+            min_tokens: 24,
             ctx_bytes: 4096,
             lang: None,
         }
     }
+}
+
+/// Where settings persist across sessions — a plain `key=value` file, no
+/// serde/toml dependency needed for six scalar-ish fields.
+fn settings_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::Path::new(&home).join(".config/thos-shell/settings.conf"))
+}
+
+fn escape_field(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('|', "\\|").replace('\n', "\\n").replace('\r', "\\r")
+}
+
+fn unescape_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some(other) => out.push(other), // '|', '\\', or anything unexpected
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Called after every command that can change a setting — cheap enough
+/// (a few dozen bytes) to just always rewrite rather than track dirtiness.
+fn save_settings(set: &Settings) {
+    let Some(path) = settings_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stops = set.stops.iter().map(|s| escape_field(s)).collect::<Vec<_>>().join("|");
+    let body = format!(
+        "temperature={}\ntop_k={}\nmax_tokens={}\nmin_tokens={}\nctx_bytes={}\nlang={}\nstops={}\n",
+        set.temperature, set.top_k, set.max_tokens, set.min_tokens, set.ctx_bytes,
+        set.lang.as_deref().unwrap_or(""), stops
+    );
+    let _ = std::fs::write(&path, body);
+}
+
+/// Loads saved settings on top of `Settings::default()`, if a settings file
+/// exists. Returns whether anything was loaded (for the startup banner).
+fn load_settings(set: &mut Settings) -> bool {
+    let Some(path) = settings_path() else { return false };
+    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        match k {
+            "temperature" => {
+                if let Ok(x) = v.parse() {
+                    set.temperature = x;
+                }
+            }
+            "top_k" => {
+                if let Ok(x) = v.parse() {
+                    set.top_k = x;
+                }
+            }
+            "max_tokens" => {
+                if let Ok(x) = v.parse() {
+                    set.max_tokens = x;
+                }
+            }
+            "min_tokens" => {
+                if let Ok(x) = v.parse() {
+                    set.min_tokens = x;
+                }
+            }
+            "ctx_bytes" => {
+                if let Ok(x) = v.parse() {
+                    set.ctx_bytes = x;
+                }
+            }
+            "lang" => set.lang = if v.is_empty() { None } else { Some(v.to_string()) },
+            "stops" => {
+                set.stops = if v.is_empty() { vec![] } else { v.split('|').map(unescape_field).collect() }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// A cheap non-crypto seed so each session differs without pulling in `rand`.
@@ -110,8 +206,18 @@ fn main() {
     let mut model_mtime = mtime(&weights);
 
     let mut set = Settings::default();
-    set.lang = lang;
+    let restored = load_settings(&mut set);
+    if lang.is_some() {
+        set.lang = lang; // --lang on the command line overrides a saved value
+    }
     banner(&weights, model_size, &model, &set);
+    if let Some(p) = settings_path() {
+        if restored {
+            println!("  {C_DIM}settings restored from {}{C_RESET}", p.display());
+        } else {
+            println!("  {C_DIM}settings will be saved to {} as you change them{C_RESET}", p.display());
+        }
+    }
     if model_mtime.is_some() {
         println!(
             "  {C_DIM}live: this file is checked before every turn — a checkpoint that\n  \
@@ -313,11 +419,31 @@ fn run_inherit(mut cmd: Command) {
 /// `/train start|staged|stop|pause|resume|status [config-stem|hours]` — lets
 /// the shell double as a control surface for the same training run the
 /// dashboard and `run.sh ctl` talk to (same control.json).
-fn handle_train(sub: &str, extra: Option<&str>) {
+/// Which config /train should act on when no stem is given explicitly: the
+/// one matching the currently loaded `--weights` file, if such a config
+/// exists, else whichever run was most recently active. Guessing "most
+/// recent" alone caused a real bug: `/train start` with a P0 spike loaded
+/// once silently retrained the already-finished spike-1m config instead of
+/// the 30M one actually being worked on.
+fn default_stem(weights: &str, dir: &str) -> Option<String> {
+    let from_weights = std::path::Path::new(weights)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string);
+    if let Some(stem) = &from_weights {
+        if std::path::Path::new(&format!("{dir}/config/{stem}.toml")).is_file() {
+            return from_weights;
+        }
+    }
+    most_recent_run(dir)
+}
+
+fn handle_train(sub: &str, extra: Option<&str>, weights: &str) {
     let Some((run_sh, dir)) = run_sh_and_config_dir() else {
         println!("  {C_YELLOW}can't find ml/train/run.sh from here{C_RESET}");
         return;
     };
+    let stem = || extra.map(str::to_string).or_else(|| default_stem(weights, &dir));
     match sub {
         "" => println!(
             "  {C_YELLOW}usage: /train start|staged|stop|pause|resume|status [config-stem|hours]{C_RESET}"
@@ -325,9 +451,16 @@ fn handle_train(sub: &str, extra: Option<&str>) {
         "start" => {
             let mut cmd = Command::new("bash");
             cmd.arg(&run_sh).arg("train-bg");
-            if let Some(stem) = extra {
-                cmd.env("CONFIG", format!("{dir}/config/{stem}.toml"));
-                cmd.env("TLM", format!("{stem}.tlm"));
+            match stem() {
+                Some(s) => {
+                    cmd.env("CONFIG", format!("{dir}/config/{s}.toml"));
+                    cmd.env("TLM", format!("{s}.tlm"));
+                    println!("  {C_DIM}starting {s} ({dir}/config/{s}.toml){C_RESET}");
+                }
+                None => println!(
+                    "  {C_YELLOW}couldn't infer a config from {weights} — pass one: \
+                     /train start <config-stem>{C_RESET}"
+                ),
             }
             run_inherit(cmd);
         }
@@ -340,22 +473,18 @@ fn handle_train(sub: &str, extra: Option<&str>) {
             run_inherit(cmd);
         }
         "stop" | "pause" | "resume" => {
-            // Default to whichever run is most recently active (same rule as
-            // /train status) rather than run.sh's static default config —
-            // otherwise this would silently target the wrong job once more
-            // than one config has ever been trained.
-            let stem = extra.map(str::to_string).or_else(|| most_recent_run(&dir));
             let mut cmd = Command::new("bash");
             cmd.arg(&run_sh).arg("ctl").arg(sub);
-            match &stem {
+            match stem() {
                 Some(s) => {
+                    println!("  {C_DIM}targeting {s}{C_RESET}");
                     cmd.env("CONFIG", format!("{dir}/config/{s}.toml"));
                 }
                 None => println!("  {C_YELLOW}no active run found — defaulting to run.sh's own default config{C_RESET}"),
             }
             run_inherit(cmd);
         }
-        "status" => print_train_status(&dir),
+        "status" => print_train_status(&dir, stem()),
         other => println!(
             "  {C_YELLOW}unknown /train {other} — start|staged|stop|pause|resume|status{C_RESET}"
         ),
@@ -379,8 +508,8 @@ fn most_recent_run(train_dir: &str) -> Option<String> {
     best.map(|(_, s)| s)
 }
 
-fn print_train_status(train_dir: &str) {
-    let Some(stem) = most_recent_run(train_dir) else {
+fn print_train_status(train_dir: &str, wanted: Option<String>) {
+    let Some(stem) = wanted.or_else(|| most_recent_run(train_dir)) else {
         println!("  {C_YELLOW}no training run found under {train_dir}/out{C_RESET}");
         return;
     };
@@ -553,16 +682,21 @@ fn handle_command(
         "help" | "?" => print_help(),
         "params" | "info" => {
             println!(
-                "  {C_DIM}temp{C_RESET} {:.2}  {C_DIM}top-k{C_RESET} {}  {C_DIM}tokens{C_RESET} {}  \
-                 {C_DIM}seed{C_RESET} {}  {C_DIM}ctx{C_RESET} {} B  {C_DIM}stops{C_RESET} {:?}",
-                set.temperature, set.top_k, set.max_tokens, set.seed, set.ctx_bytes, set.stops
+                "  {C_DIM}temp{C_RESET} {:.2}  {C_DIM}top-k{C_RESET} {}  {C_DIM}tokens{C_RESET} {} \
+                 {C_DIM}(min {}){C_RESET}  {C_DIM}seed{C_RESET} {}  {C_DIM}ctx{C_RESET} {} B",
+                set.temperature, set.top_k, set.max_tokens, set.min_tokens, set.seed, set.ctx_bytes
             );
+            println!("  {C_DIM}stops{C_RESET} {:?}", set.stops);
+            if let Some(p) = settings_path() {
+                println!("  {C_DIM}settings persist to{C_RESET} {}", p.display());
+            }
             println!("  {C_DIM}context held{C_RESET} {} chars", ctx.len());
             println!("  {C_DIM}model{C_RESET} {weights}  {C_DIM}vocab{C_RESET} {}", model.cfg.vocab_size);
         }
         "temp" | "temperature" => set_f32(&mut set.temperature, arg, "temp", 0.0, 5.0),
         "topk" | "top-k" => set_usize(&mut set.top_k, arg, "top-k", 1, model.cfg.vocab_size),
         "tokens" | "max" => set_usize(&mut set.max_tokens, arg, "tokens", 1, 8192),
+        "mintokens" => set_usize(&mut set.min_tokens, arg, "mintokens", 0, 8192),
         "seed" => match arg.parse() {
             Ok(v) => {
                 set.seed = v;
@@ -599,7 +733,7 @@ fn handle_command(
             }
         }
         "reload" => return Cmd::Reload,
-        "train" => handle_train(arg, it.next()),
+        "train" => handle_train(arg, it.next(), weights),
         "lang" => {
             if arg.is_empty() {
                 match &set.lang {
@@ -620,6 +754,7 @@ fn handle_command(
         "exit" | "quit" | "q" => return Cmd::Quit,
         other => println!("  {C_YELLOW}unknown command /{other} — try /help{C_RESET}"),
     }
+    save_settings(set); // every branch above that can reach here only ever reads or changes settings
     Cmd::Continue
 }
 
@@ -649,7 +784,8 @@ fn print_help() {
         ("/multi", "enter a multi-line prompt (end with a lone '.')"),
         ("/temp <f>", "sampling temperature (0 = greedy/argmax)"),
         ("/topk <n>", "top-k cutoff"),
-        ("/tokens <n>", "max new tokens per turn"),
+        ("/tokens <n>", "max new tokens per turn (a ceiling, not a target)"),
+        ("/mintokens <n>", "don't honour a stop-sequence before this many tokens (default 24)"),
         ("/seed <n>", "fix the RNG seed"),
         ("/stops \"..\"", "stop when output ends with this (\\n allowed); /stops none"),
         ("/params", "show current settings + context size"),
@@ -739,7 +875,9 @@ fn run_turn(model: &Model, set: &Settings, ctx: &mut String, user: &str) -> Stri
             pending.drain(..good);
         }
 
-        if set.stops.iter().any(|s| !s.is_empty() && text_so_far.ends_with(s.as_str())) {
+        if produced.len() >= set.min_tokens
+            && set.stops.iter().any(|s| !s.is_empty() && text_so_far.ends_with(s.as_str()))
+        {
             stopped = "stop-seq";
             break;
         }
