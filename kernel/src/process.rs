@@ -10,7 +10,7 @@
 //! No `fork` sharing / COW yet, no address-space teardown (a reaper frees the
 //! frames later) — this is here to give ELF programs real isolation.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -329,6 +329,17 @@ pub struct FdEntry {
 }
 type Fd = Option<FdEntry>;
 
+/// One queued user-mode APC (see [`crate::apc`]). `routine` is the
+/// `PKNORMAL_ROUTINE`; `arg1..arg3` are `NtQueueApcThread`'s `ApcArgument1..3`
+/// (NormalContext / SystemArgument1 / SystemArgument2).
+#[derive(Clone, Copy)]
+pub struct ApcEntry {
+    pub routine: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+    pub arg3: u64,
+}
+
 pub struct Task {
     pub pid: u64,
     pub ppid: u64,
@@ -340,6 +351,8 @@ pub struct Task {
     fds: Mutex<Vec<Fd>>,
     /// Current working directory, always a normalised absolute path.
     cwd: Mutex<String>,
+    /// Pending user-mode APCs, delivered when the thread next goes alertable.
+    apcs: Mutex<VecDeque<ApcEntry>>,
 }
 
 fn seed_fds() -> Vec<Fd> {
@@ -360,6 +373,7 @@ impl Task {
             exited: AtomicBool::new(false),
             fds: Mutex::new(seed_fds()),
             cwd: Mutex::new(String::from("/")),
+            apcs: Mutex::new(VecDeque::new()),
         });
         TASKS.lock().insert(t.pid, t.clone());
         t
@@ -396,6 +410,19 @@ impl Task {
     }
     pub fn handle_alloc_event(&self, ev: Arc<Event>) -> i32 {
         self.handle_alloc(HandleObject::Event(ev), false)
+    }
+
+    /// Append a user APC to this task's queue.
+    pub fn apc_queue(&self, e: ApcEntry) {
+        self.apcs.lock().push_back(e);
+    }
+    /// Dequeue the oldest pending user APC, if any.
+    pub fn apc_take(&self) -> Option<ApcEntry> {
+        self.apcs.lock().pop_front()
+    }
+    /// `true` if at least one user APC is queued.
+    pub fn apc_pending(&self) -> bool {
+        !self.apcs.lock().is_empty()
     }
 
     /// Install `obj` at the lowest free descriptor, with the given cloexec flag.
@@ -563,6 +590,29 @@ pub fn current_event(h: i32) -> Option<Arc<Event>> {
 /// Install `ev` in the current task's HANDLE table; returns the HANDLE, or -1.
 pub fn current_alloc_event(ev: Arc<Event>) -> i32 {
     sched::current().task().map_or(-1, |t| t.handle_alloc_event(ev))
+}
+
+/// Queue a user APC on the current task; `false` if there is no current task.
+pub fn current_queue_apc(e: ApcEntry) -> bool {
+    match sched::current().task() {
+        Some(t) => {
+            t.apc_queue(e);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Dequeue one pending user APC for the current task.
+pub fn current_take_apc() -> Option<ApcEntry> {
+    sched::current().task().and_then(|t| t.apc_take())
+}
+
+/// `true` if the current task has a user APC queued. (Used by the alertable
+/// wait path, which lands with the executive timer wheel.)
+#[allow(dead_code)]
+pub fn current_apc_pending() -> bool {
+    sched::current().task().map(|t| t.apc_pending()).unwrap_or(false)
 }
 
 pub fn current_pid() -> u64 {

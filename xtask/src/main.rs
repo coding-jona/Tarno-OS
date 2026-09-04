@@ -605,6 +605,13 @@ fn write_pe_hello(path: &Path) {
     let seh_handler_tag = u32::MAX - 44;
     let msg_seh_tag = u32::MAX - 45;
     let msg_seh2_tag = u32::MAX - 46;
+    let apcqueuename_tag = u32::MAX - 47;
+    let testalertname_tag = u32::MAX - 48;
+    let apcq_slot_tag = u32::MAX - 49;
+    let ta_slot_tag = u32::MAX - 50;
+    let apc_flag_tag = u32::MAX - 51;
+    let apc_handler_tag = u32::MAX - 52;
+    let msg_apc_tag = u32::MAX - 53;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -1017,6 +1024,51 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2m7) user APC. Queue an APC to the current thread, then NtTestAlert; the
+    //      kernel redirects the return through KiUserApcDispatcher, which calls
+    //      apc_handler(arg=0x1234) — it stores 0x1234 to apc_flag — then
+    //      NtContinue(TestAlert) resumes here. rbx still holds hNtdll.
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx  (hNtdll)
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], apcqueuename_tag); // lea rdx, [rip+"NtQueueApcThread"]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa); // GetProcAddress
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], apcq_slot_tag); // mov [rip+apcq_slot], rax
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], testalertname_tag); // lea rdx, [rip+"NtTestAlert"]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], ta_slot_tag); // mov [rip+ta_slot], rax
+    // apc_flag = 0
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], apc_flag_tag); // mov [rip+apc_flag], rax
+    // NtQueueApcThread(NtCurrentThread=-2, apc_handler, 0x1234, 0, 0)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFE, 0xFF, 0xFF, 0xFF]); // mov rcx, -2
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], apc_handler_tag); // lea rdx, [rip+apc_handler]
+    code.extend_from_slice(&[0x41, 0xB8, 0x34, 0x12, 0, 0]); // mov r8d, 0x1234
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // sub rsp,0x38; [rsp+0x20]=0
+    rel!([0xFF, 0x15, 0, 0, 0, 0], apcq_slot_tag); // call [rip+apcq_slot]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]); // test eax,eax; je +1; int3
+    // NtTestAlert() — delivers the queued APC, then resumes right here
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], ta_slot_tag); // call [rip+ta_slot]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    // apc_flag must now be 0x1234
+    rel!([0x48, 0x8B, 0x05, 0, 0, 0, 0], apc_flag_tag); // mov rax, [rip+apc_flag]
+    code.extend_from_slice(&[0x3D, 0x34, 0x12, 0, 0, 0x74, 0x01, 0xCC]); // cmp eax,0x1234; je +1; int3
+    // WriteFile(1, msg_apc, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_apc_tag);
+    let apc_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -1157,6 +1209,12 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0xB8, 0xFF, 0xFF, 0xFF, 0xFF]); // mov eax, -1
     code.extend_from_slice(&[0xC3]); // ret
 
+    // apc_handler — reached only via KiUserApcDispatcher. void apc_handler(
+    // ULONG_PTR arg in rcx): store the argument to apc_flag, return.
+    let apc_handler_off = code.len();
+    rel!([0x48, 0x89, 0x0D, 0, 0, 0, 0], apc_flag_tag); // mov [rip+apc_flag], rcx
+    code.extend_from_slice(&[0xC3]); // ret
+
     // --- data slots at the end of .text ---
     while code.len() % 8 != 0 {
         code.push(0);
@@ -1197,6 +1255,10 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"NtSetEvent\0");
     let closename_off = code.len();
     code.extend_from_slice(b"NtClose\0");
+    let apcqueuename_off = code.len();
+    code.extend_from_slice(b"NtQueueApcThread\0");
+    let testalertname_off = code.len();
+    code.extend_from_slice(b"NtTestAlert\0");
     while code.len() % 8 != 0 {
         code.push(0);
     }
@@ -1212,6 +1274,12 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0u8; 8]); // resolved NtSetEvent
     let close_slot_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // resolved NtClose
+    let apcq_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtQueueApcThread
+    let ta_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtTestAlert
+    let apc_flag_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // apc_handler stores its argument here
     let evh_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // event HANDLE
     let evh2_off = code.len();
@@ -1280,7 +1348,11 @@ fn write_pe_hello(path: &Path) {
     let msg_seh2: &[u8] = b"PE SEH2 OK\n";
     let msg_seh2_off = code.len();
     code.extend_from_slice(msg_seh2);
+    let msg_apc: &[u8] = b"PE APC OK\n";
+    let msg_apc_off = code.len();
+    code.extend_from_slice(msg_apc);
 
+    code[apc_r8..apc_r8 + 4].copy_from_slice(&(msg_apc.len() as u32).to_le_bytes());
     code[seh2_r8..seh2_r8 + 4].copy_from_slice(&(msg_seh2.len() as u32).to_le_bytes());
     code[seh_r8..seh_r8 + 4].copy_from_slice(&(msg_seh.len() as u32).to_le_bytes());
     code[evt2_r8..evt2_r8 + 4].copy_from_slice(&(msg_evt2.len() as u32).to_le_bytes());
@@ -1358,6 +1430,13 @@ fn write_pe_hello(path: &Path) {
             t if t == seh_handler_tag => text_rva + seh_handler_off as u32,
             t if t == msg_seh_tag => text_rva + msg_seh_off as u32,
             t if t == msg_seh2_tag => text_rva + msg_seh2_off as u32,
+            t if t == apcqueuename_tag => text_rva + apcqueuename_off as u32,
+            t if t == testalertname_tag => text_rva + testalertname_off as u32,
+            t if t == apcq_slot_tag => text_rva + apcq_slot_off as u32,
+            t if t == ta_slot_tag => text_rva + ta_slot_off as u32,
+            t if t == apc_flag_tag => text_rva + apc_flag_off as u32,
+            t if t == apc_handler_tag => text_rva + apc_handler_off as u32,
+            t if t == msg_apc_tag => text_rva + msg_apc_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -2656,6 +2735,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE evt2 OK") // auto-reset event consume + relative timed wait -> STATUS_TIMEOUT
         && serial.contains("PE SEH OK") // #UD -> KiUserExceptionDispatcher -> vectored handler -> NtContinue
         && serial.contains("PE SEH2 OK") // #PF via the error-code fault stub, same handler resumes
+        && serial.contains("PE APC OK") // NtQueueApcThread + NtTestAlert -> KiUserApcDispatcher -> NtContinue
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL

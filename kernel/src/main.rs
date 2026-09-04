@@ -27,6 +27,7 @@ extern crate alloc;
 
 mod acpi;
 mod ahci;
+mod apc;
 mod apic;
 mod console;
 mod cpu;

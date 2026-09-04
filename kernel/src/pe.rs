@@ -754,6 +754,7 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     map_kernel32_page(proc)?;
     map_ntdll_page(proc)?;
     map_seh_pages(proc)?;
+    map_apc_page(proc)?;
 
     // Static-TLS page (if any module used `.tls`); TEB.ThreadLocalStoragePointer
     // gets its VA below.
@@ -1214,6 +1215,37 @@ fn map_seh_pages(proc: &Process) -> Result<(), &'static str> {
     c.extend_from_slice(&[0x49, 0x89, 0xCA, 0x0F, 0x05, 0x0F, 0x0B]); // mov r10,rcx; syscall; ud2
     page[..c.len()].copy_from_slice(&c);
     proc.map(crate::seh::PE_KIUSER_ADDR, f.start_address().as_u64(), false, true);
+    Ok(())
+}
+
+/// The `KiUserApcDispatcher` page (r-x): on entry `rsp` -> a `CONTEXT` whose
+/// home area holds the APC parameters ([`crate::apc::stage`] lays it out). Load
+/// them, call the routine, then `NtContinue(&ctx, TestAlert=TRUE)` — which
+/// drains any further queued APC before resuming the interrupted code.
+fn map_apc_page(proc: &Process) -> Result<(), &'static str> {
+    let f = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (KiUserApc)")?;
+    let page = unsafe {
+        let p = phys_to_virt(f.start_address()).as_mut_ptr::<u8>();
+        core::ptr::write_bytes(p, 0, 4096);
+        core::slice::from_raw_parts_mut(p, 4096)
+    };
+    let cont = (crate::nt::NT_BASE
+        | crate::nt::NT_NTDLL_FLAG as u64
+        | crate::nt::NT_NTCONTINUE as u64) as u32;
+    let mut c: Vec<u8> = Vec::new();
+    c.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x18]); // mov rax, [rsp+0x18]  NormalRoutine
+    c.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]); // mov rcx, [rsp]       NormalContext
+    c.extend_from_slice(&[0x48, 0x8B, 0x54, 0x24, 0x08]); // mov rdx, [rsp+0x08]  SystemArgument1
+    c.extend_from_slice(&[0x4C, 0x8B, 0x44, 0x24, 0x10]); // mov r8,  [rsp+0x10]  SystemArgument2
+    c.extend_from_slice(&[0x48, 0x89, 0xE3]); // mov rbx, rsp  (save &CONTEXT; callee-saved)
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    c.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx  (&CONTEXT)
+    c.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1  (TestAlert = TRUE)
+    c.extend_from_slice(&[0xB8]);
+    c.extend_from_slice(&cont.to_le_bytes()); // mov eax, <NtContinue sel>
+    c.extend_from_slice(&[0x49, 0x89, 0xCA, 0x0F, 0x05, 0x0F, 0x0B]); // mov r10,rcx; syscall; ud2
+    page[..c.len()].copy_from_slice(&c);
+    proc.map(crate::apc::PE_KIUSERAPC_ADDR, f.start_address().as_u64(), false, true);
     Ok(())
 }
 

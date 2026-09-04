@@ -97,7 +97,9 @@ pub const NT_NTRESETEVENT: u16 = 16;
 pub const NT_NTCONTINUE: u16 = 17;
 pub const NT_RTLADDVECTOREDEXCEPTIONHANDLER: u16 = 18;
 pub const NT_RTLREMOVEVECTOREDEXCEPTIONHANDLER: u16 = 19;
-pub const NTDLL_STUB_COUNT: u16 = 20;
+pub const NT_NTQUEUEAPCTHREAD: u16 = 20;
+pub const NT_NTTESTALERT: u16 = 21;
+pub const NTDLL_STUB_COUNT: u16 = 22;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -125,6 +127,8 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtContinue",
     "RtlAddVectoredExceptionHandler",
     "RtlRemoveVectoredExceptionHandler",
+    "NtQueueApcThread",
+    "NtTestAlert",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -396,12 +400,15 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         }
 
         // NtContinue(*Context, TestAlert) — resume ring 3 from the CONTEXT the
-        // exception dispatcher (maybe) fixed up. Does not return.
+        // exception / APC dispatcher (maybe) fixed up. When `TestAlert` is set
+        // (the `KiUserApcDispatcher` tail passes it), drain the next queued user
+        // APC before resuming, so a run of APCs unwinds one dispatcher call at a
+        // time. Does not return.
         NT_NTCONTINUE => {
             let c = a0;
             let (cs, ss) = process::user_selectors();
             let rd = |off: u64| unsafe { *((c + off) as *const u64) };
-            let f = crate::seh::ExcFrame {
+            let mut f = crate::seh::ExcFrame {
                 rax: rd(0x78),
                 rcx: rd(0x80),
                 rdx: rd(0x88),
@@ -425,7 +432,62 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 cs,
                 ss,
             };
+            if a1 != 0 {
+                if let Some((rsp, rip)) = crate::apc::take_and_stage(&exc_frame_regs(&f)) {
+                    f.rsp = rsp;
+                    f.rip = rip;
+                }
+            }
             unsafe { crate::seh::thos_exc_resume(&f) }
+        }
+
+        // NtQueueApcThread(ThreadHandle, ApcRoutine, ApcArgument1, ApcArgument2,
+        //                  ApcArgument3). Only the current thread is a valid
+        // target while a PE process is single-threaded: NtCurrentThread (-2) or
+        // NtCurrentProcess (-1).
+        NT_NTQUEUEAPCTHREAD => {
+            if a0 as i64 != -2 && a0 as i64 != -1 {
+                return STATUS_INVALID_HANDLE as i64;
+            }
+            if a1 == 0 {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let e = process::ApcEntry { routine: a1, arg1: a2, arg2: a3, arg3: stack(0) };
+            status(process::current_queue_apc(e), STATUS_INVALID_HANDLE)
+        }
+
+        // NtTestAlert() — if a user APC is queued, deliver it now by redirecting
+        // this thread's return through `KiUserApcDispatcher`; the staged CONTEXT
+        // carries STATUS_SUCCESS in `Rax` so the eventual resume returns it.
+        NT_NTTESTALERT => {
+            let (cs, ss) = process::user_selectors();
+            let r = crate::apc::Regs {
+                rax: STATUS_SUCCESS as u64,
+                rcx: 0,
+                rdx: frame.rdx,
+                rbx: frame.rbx,
+                rsp: frame.rsp,
+                rbp: frame.rbp,
+                rsi: frame.rsi,
+                rdi: frame.rdi,
+                r8: frame.r8,
+                r9: frame.r9,
+                r10: frame.r10,
+                r11: frame.r11,
+                r12: frame.r12,
+                r13: frame.r13,
+                r14: frame.r14,
+                r15: frame.r15,
+                rip: frame.rip,
+                rflags: frame.rflags,
+                cs,
+                ss,
+            };
+            if let Some((rsp, rip)) = crate::apc::take_and_stage(&r) {
+                frame.rsp = rsp;
+                frame.rip = rip;
+            }
+            STATUS_SUCCESS as i64
         }
 
         // RtlAddVectoredExceptionHandler(First, Handler) — one slot for now
@@ -495,6 +557,33 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
 
 fn status(ok: bool, err: u32) -> i64 {
     if ok { STATUS_SUCCESS as i64 } else { err as i64 }
+}
+
+/// Snapshot a rebuilt `seh::ExcFrame` as [`crate::apc::Regs`] so a pending APC
+/// can be staged on top of the state `NtContinue` is about to resume.
+fn exc_frame_regs(f: &crate::seh::ExcFrame) -> crate::apc::Regs {
+    crate::apc::Regs {
+        rax: f.rax,
+        rcx: f.rcx,
+        rdx: f.rdx,
+        rbx: f.rbx,
+        rsp: f.rsp,
+        rbp: f.rbp,
+        rsi: f.rsi,
+        rdi: f.rdi,
+        r8: f.r8,
+        r9: f.r9,
+        r10: f.r10,
+        r11: f.r11,
+        r12: f.r12,
+        r13: f.r13,
+        r14: f.r14,
+        r15: f.r15,
+        rip: f.rip,
+        rflags: f.rflags,
+        cs: f.cs,
+        ss: f.ss,
+    }
 }
 
 /// Fill an `IO_STATUS_BLOCK` (`{ NTSTATUS Status; ULONG_PTR Information; }`).
