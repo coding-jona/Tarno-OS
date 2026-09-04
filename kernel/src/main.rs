@@ -48,6 +48,7 @@ mod object;
 mod pci;
 mod pe;
 mod process;
+mod registry;
 mod sched;
 mod seh;
 mod serial;

@@ -318,6 +318,9 @@ pub fn current_uid() -> u32 {
 pub enum HandleObject {
     File(Arc<dyn FileOps>),
     Event(Arc<Event>),
+    /// A registry key — the canonical `\`-joined path into [`crate::registry`]'s
+    /// global tree (ops re-walk under that module's lock).
+    RegKey(String),
 }
 
 /// One table slot: the object plus its close-on-exec flag (per-descriptor, not
@@ -410,6 +413,17 @@ impl Task {
     }
     pub fn handle_alloc_event(&self, ev: Arc<Event>) -> i32 {
         self.handle_alloc(HandleObject::Event(ev), false)
+    }
+
+    /// The registry-key path a HANDLE names, if it is one.
+    pub fn handle_regkey(&self, h: i32) -> Option<String> {
+        match &self.fds.lock().get(h as usize)?.as_ref()?.obj {
+            HandleObject::RegKey(p) => Some(p.clone()),
+            _ => None,
+        }
+    }
+    pub fn handle_alloc_regkey(&self, path: String) -> i32 {
+        self.handle_alloc(HandleObject::RegKey(path), false)
     }
 
     /// Append a user APC to this task's queue.
@@ -590,6 +604,16 @@ pub fn current_event(h: i32) -> Option<Arc<Event>> {
 /// Install `ev` in the current task's HANDLE table; returns the HANDLE, or -1.
 pub fn current_alloc_event(ev: Arc<Event>) -> i32 {
     sched::current().task().map_or(-1, |t| t.handle_alloc_event(ev))
+}
+
+/// The current task's registry-key path for HANDLE `h`, if it names one.
+pub fn current_regkey(h: i32) -> Option<String> {
+    sched::current().task().and_then(|t| t.handle_regkey(h))
+}
+
+/// Install a registry-key HANDLE (by canonical path) in the current task.
+pub fn current_alloc_regkey(path: String) -> i32 {
+    sched::current().task().map_or(-1, |t| t.handle_alloc_regkey(path))
 }
 
 /// Queue a user APC on the current task; `false` if there is no current task.

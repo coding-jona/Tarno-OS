@@ -441,8 +441,12 @@ fn write_pe_hello(path: &Path) {
     const SECT_ALIGN: u32 = 0x1000;
     const FILE_ALIGN: u32 = 0x200;
     let text_rva = 0x1000u32;
-    let reloc_rva = 0x2000u32;
-    let idata_rva = 0x3000u32;
+    // `.text` holds all the hand-assembled code *and* its data slots/strings, so
+    // give it a 3-page budget before `.reloc` / `.idata` (RVAs must not collide
+    // with where `.text`'s materialised bytes land, or the loader's per-section
+    // copy into the image buffer corrupts the import table).
+    let reloc_rva = 0x4000u32;
+    let idata_rva = 0x5000u32;
 
     // --- .idata: imports from KERNEL32.dll and the on-disk thoscrt.dll ---
     let k32_funcs: &[&[u8]] = &[
@@ -612,6 +616,24 @@ fn write_pe_hello(path: &Path) {
     let apc_flag_tag = u32::MAX - 51;
     let apc_handler_tag = u32::MAX - 52;
     let msg_apc_tag = u32::MAX - 53;
+    let nckname_tag = u32::MAX - 54;
+    let nokname_tag = u32::MAX - 55;
+    let nsvkname_tag = u32::MAX - 56;
+    let nqvkname_tag = u32::MAX - 57;
+    let ndkname_tag = u32::MAX - 58;
+    let nck_slot_tag = u32::MAX - 59;
+    let nok_slot_tag = u32::MAX - 60;
+    let nsvk_slot_tag = u32::MAX - 61;
+    let nqvk_slot_tag = u32::MAX - 62;
+    let ndk_slot_tag = u32::MAX - 63;
+    let rhkey_tag = u32::MAX - 64;
+    let rdisp_tag = u32::MAX - 65;
+    let rval_tag = u32::MAX - 66;
+    let rbuf_tag = u32::MAX - 67;
+    let rrl_tag = u32::MAX - 68;
+    let roa_tag = u32::MAX - 69;
+    let rvalname_us_tag = u32::MAX - 70;
+    let msg_reg_tag = u32::MAX - 71;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -1069,6 +1091,113 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2m8) minimal registry. Resolve the five Nt* key calls, then: create
+    //      \Registry\Machine\Software\THOSREG, set a REG_DWORD value, close,
+    //      re-open, query the value back (type + data), delete the key, close,
+    //      and confirm a fresh open now fails with OBJECT_NAME_NOT_FOUND.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag); // lea rcx, [rip+"ntdll.dll"]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh); // GetModuleHandleA
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (hNtdll)
+    for (name_tag, slot_tag) in [
+        (nckname_tag, nck_slot_tag),
+        (nokname_tag, nok_slot_tag),
+        (nsvkname_tag, nsvk_slot_tag),
+        (nqvkname_tag, nqvk_slot_tag),
+        (ndkname_tag, ndk_slot_tag),
+    ] {
+        code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+        rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], name_tag); // lea rdx, [rip+name]
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+        rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa);
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+        rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], slot_tag); // mov [rip+slot], rax
+    }
+    // NtCreateKey(&hkey, 0, &oa, 0, 0, 0, &disp)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // [rsp+0x20]=0 Class
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0]); // [rsp+0x28]=0 CreateOptions
+    rel!([0x48, 0x8D, 0x05, 0, 0, 0, 0], rdisp_tag); // lea rax, [rip+disp]
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // [rsp+0x30]=&disp
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], rhkey_tag); // lea rcx, [rip+hkey]
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], roa_tag); // lea r8, [rip+oa]
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    rel!([0xFF, 0x15, 0, 0, 0, 0], nck_slot_tag); // call [rip+nck_slot]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]); // test eax,eax; je +1; int3
+    // NtSetValueKey(hkey, &valname, 0, REG_DWORD=4, &val, 4)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], rhkey_tag); // mov rcx, [rip+hkey]
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], rvalname_us_tag); // lea rdx, [rip+valname_us]
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+    code.extend_from_slice(&[0x41, 0xB9, 0x04, 0, 0, 0]); // mov r9d, 4
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]);
+    rel!([0x48, 0x8D, 0x05, 0, 0, 0, 0], rval_tag); // lea rax, [rip+val]
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // [rsp+0x20]=&val
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0x04, 0, 0, 0]); // [rsp+0x28]=4
+    rel!([0xFF, 0x15, 0, 0, 0, 0], nsvk_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtClose(hkey)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], rhkey_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], close_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    // NtOpenKey(&hkey, 0, &oa)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], rhkey_tag); // lea rcx, [rip+hkey]
+    code.extend_from_slice(&[0x31, 0xD2]);
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], roa_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], nok_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtQueryValueKey(hkey, &valname, KeyValuePartialInformation=2, &buf, 32, &rl)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], rhkey_tag);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], rvalname_us_tag);
+    code.extend_from_slice(&[0x41, 0xB8, 0x02, 0, 0, 0]); // mov r8d, 2
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], rbuf_tag); // lea r9, [rip+buf]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]);
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x20, 0, 0, 0]); // [rsp+0x20]=32
+    rel!([0x48, 0x8D, 0x05, 0, 0, 0, 0], rrl_tag); // lea rax, [rip+rl]
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]); // [rsp+0x28]=&rl
+    rel!([0xFF, 0x15, 0, 0, 0, 0], nqvk_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // check buf: Type(+4)==4, DataLength(+8)==4, Data(+12)==0xCAFEBABE
+    rel!([0x48, 0x8D, 0x05, 0, 0, 0, 0], rbuf_tag); // lea rax, [rip+buf]
+    code.extend_from_slice(&[0x83, 0x78, 0x04, 0x04, 0x74, 0x01, 0xCC]); // cmp dword [rax+4],4; je+1; int3
+    code.extend_from_slice(&[0x83, 0x78, 0x08, 0x04, 0x74, 0x01, 0xCC]); // cmp dword [rax+8],4; je+1; int3
+    code.extend_from_slice(&[0x8B, 0x48, 0x0C]); // mov ecx, [rax+12]
+    code.extend_from_slice(&[0x81, 0xF9, 0xBE, 0xBA, 0xFE, 0xCA, 0x74, 0x01, 0xCC]); // cmp ecx,0xCAFEBABE; je+1; int3
+    // NtDeleteKey(hkey) ; NtClose(hkey)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], rhkey_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], ndk_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], rhkey_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], close_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    // NtOpenKey(&hkey, 0, &oa) -> STATUS_OBJECT_NAME_NOT_FOUND (0xC0000034)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], rhkey_tag);
+    code.extend_from_slice(&[0x31, 0xD2]);
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], roa_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], nok_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x3D, 0x34, 0x00, 0x00, 0xC0, 0x74, 0x01, 0xCC]); // cmp eax,0xC0000034; je+1; int3
+    // WriteFile(1, msg_reg, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_reg_tag);
+    let reg_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -1259,6 +1388,49 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"NtQueueApcThread\0");
     let testalertname_off = code.len();
     code.extend_from_slice(b"NtTestAlert\0");
+    let nckname_off = code.len();
+    code.extend_from_slice(b"NtCreateKey\0");
+    let nokname_off = code.len();
+    code.extend_from_slice(b"NtOpenKey\0");
+    let nsvkname_off = code.len();
+    code.extend_from_slice(b"NtSetValueKey\0");
+    let nqvkname_off = code.len();
+    code.extend_from_slice(b"NtQueryValueKey\0");
+    let ndkname_off = code.len();
+    code.extend_from_slice(b"NtDeleteKey\0");
+    // registry key/value UTF-16LE names + their UNICODE_STRING headers.
+    let keyname16: Vec<u8> = "\\Registry\\Machine\\Software\\THOSREG"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let valname16: Vec<u8> = "tval".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    while code.len() % 8 != 0 {
+        code.push(0);
+    }
+    let keyname_u16_off = code.len();
+    code.extend_from_slice(&keyname16);
+    let valname_u16_off = code.len();
+    code.extend_from_slice(&valname16);
+    while code.len() % 8 != 0 {
+        code.push(0);
+    }
+    let keyname_us_off = code.len(); // UNICODE_STRING { Length; Max; pad; Buffer(DIR64) }
+    code.extend_from_slice(&(keyname16.len() as u16).to_le_bytes());
+    code.extend_from_slice(&(keyname16.len() as u16).to_le_bytes());
+    code.extend_from_slice(&[0u8; 4]);
+    code.extend_from_slice(&[0u8; 8]);
+    let rvalname_us_off = code.len();
+    code.extend_from_slice(&(valname16.len() as u16).to_le_bytes());
+    code.extend_from_slice(&(valname16.len() as u16).to_le_bytes());
+    code.extend_from_slice(&[0u8; 4]);
+    code.extend_from_slice(&[0u8; 8]);
+    let roa_off = code.len(); // OBJECT_ATTRIBUTES (48 bytes)
+    {
+        let mut oa = [0u8; 48];
+        oa[0..4].copy_from_slice(&0x30u32.to_le_bytes()); // Length
+        oa[0x18..0x1C].copy_from_slice(&0x40u32.to_le_bytes()); // Attributes = OBJ_CASE_INSENSITIVE
+        code.extend_from_slice(&oa); // ObjectName (+0x10) is a DIR64 slot
+    }
     while code.len() % 8 != 0 {
         code.push(0);
     }
@@ -1280,6 +1452,27 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0u8; 8]); // resolved NtTestAlert
     let apc_flag_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // apc_handler stores its argument here
+    let nck_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtCreateKey
+    let nok_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtOpenKey
+    let nsvk_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtSetValueKey
+    let nqvk_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtQueryValueKey
+    let ndk_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtDeleteKey
+    let rhkey_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // registry key HANDLE
+    let rdisp_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // NtCreateKey disposition out
+    let rval_off = code.len();
+    code.extend_from_slice(&0xCAFE_BABEu32.to_le_bytes()); // REG_DWORD payload
+    code.extend_from_slice(&[0u8; 4]);
+    let rbuf_off = code.len();
+    code.extend_from_slice(&[0u8; 32]); // KEY_VALUE_PARTIAL_INFORMATION out
+    let rrl_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // NtQueryValueKey ResultLength out
     let evh_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // event HANDLE
     let evh2_off = code.len();
@@ -1351,7 +1544,11 @@ fn write_pe_hello(path: &Path) {
     let msg_apc: &[u8] = b"PE APC OK\n";
     let msg_apc_off = code.len();
     code.extend_from_slice(msg_apc);
+    let msg_reg: &[u8] = b"PE registry OK\n";
+    let msg_reg_off = code.len();
+    code.extend_from_slice(msg_reg);
 
+    code[reg_r8..reg_r8 + 4].copy_from_slice(&(msg_reg.len() as u32).to_le_bytes());
     code[apc_r8..apc_r8 + 4].copy_from_slice(&(msg_apc.len() as u32).to_le_bytes());
     code[seh2_r8..seh2_r8 + 4].copy_from_slice(&(msg_seh2.len() as u32).to_le_bytes());
     code[seh_r8..seh_r8 + 4].copy_from_slice(&(msg_seh.len() as u32).to_le_bytes());
@@ -1380,6 +1577,14 @@ fn write_pe_hello(path: &Path) {
     code[tls_dir_off + 24..tls_dir_off + 32]
         .copy_from_slice(&(ib + tls_cbs_off as u64).to_le_bytes());
     code[tls_cbs_off..tls_cbs_off + 8].copy_from_slice(&(ib + tls_cb_off as u64).to_le_bytes());
+    // registry: OBJECT_ATTRIBUTES.ObjectName and the two UNICODE_STRING.Buffer
+    // fields hold preferred-base VAs; DIR64-relocated at load like the TLS ones.
+    code[roa_off + 0x10..roa_off + 0x18]
+        .copy_from_slice(&(ib + keyname_us_off as u64).to_le_bytes());
+    code[keyname_us_off + 8..keyname_us_off + 16]
+        .copy_from_slice(&(ib + keyname_u16_off as u64).to_le_bytes());
+    code[rvalname_us_off + 8..rvalname_us_off + 16]
+        .copy_from_slice(&(ib + valname_u16_off as u64).to_le_bytes());
 
     for (pos, target) in fixups {
         let target_rva = match target {
@@ -1437,6 +1642,24 @@ fn write_pe_hello(path: &Path) {
             t if t == apc_flag_tag => text_rva + apc_flag_off as u32,
             t if t == apc_handler_tag => text_rva + apc_handler_off as u32,
             t if t == msg_apc_tag => text_rva + msg_apc_off as u32,
+            t if t == nckname_tag => text_rva + nckname_off as u32,
+            t if t == nokname_tag => text_rva + nokname_off as u32,
+            t if t == nsvkname_tag => text_rva + nsvkname_off as u32,
+            t if t == nqvkname_tag => text_rva + nqvkname_off as u32,
+            t if t == ndkname_tag => text_rva + ndkname_off as u32,
+            t if t == nck_slot_tag => text_rva + nck_slot_off as u32,
+            t if t == nok_slot_tag => text_rva + nok_slot_off as u32,
+            t if t == nsvk_slot_tag => text_rva + nsvk_slot_off as u32,
+            t if t == nqvk_slot_tag => text_rva + nqvk_slot_off as u32,
+            t if t == ndk_slot_tag => text_rva + ndk_slot_off as u32,
+            t if t == rhkey_tag => text_rva + rhkey_off as u32,
+            t if t == rdisp_tag => text_rva + rdisp_off as u32,
+            t if t == rval_tag => text_rva + rval_off as u32,
+            t if t == rbuf_tag => text_rva + rbuf_off as u32,
+            t if t == rrl_tag => text_rva + rrl_off as u32,
+            t if t == roa_tag => text_rva + roa_off as u32,
+            t if t == rvalname_us_tag => text_rva + rvalname_us_off as u32,
+            t if t == msg_reg_tag => text_rva + msg_reg_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -1451,6 +1674,9 @@ fn write_pe_hello(path: &Path) {
         text_rva + tls_dir_off as u32 + 16, // AddressOfIndex
         text_rva + tls_dir_off as u32 + 24, // AddressOfCallBacks
         text_rva + tls_cbs_off as u32,      // callback[0]
+        text_rva + roa_off as u32 + 0x10,   // OBJECT_ATTRIBUTES.ObjectName
+        text_rva + keyname_us_off as u32 + 8, // key UNICODE_STRING.Buffer
+        text_rva + rvalname_us_off as u32 + 8, // value UNICODE_STRING.Buffer
     ];
     dir64.sort_unstable();
     let mut reloc: Vec<u8> = Vec::new();
@@ -2736,6 +2962,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE SEH OK") // #UD -> KiUserExceptionDispatcher -> vectored handler -> NtContinue
         && serial.contains("PE SEH2 OK") // #PF via the error-code fault stub, same handler resumes
         && serial.contains("PE APC OK") // NtQueueApcThread + NtTestAlert -> KiUserApcDispatcher -> NtContinue
+        && serial.contains("PE registry OK") // NtCreateKey/SetValue/OpenKey/QueryValue/DeleteKey round-trip
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
