@@ -10,6 +10,7 @@ Training needs no internet, so it can run through the nightly cut-off.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import time
@@ -25,7 +26,6 @@ import torch
 from model import GPT, ModelConfig
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "out")
 
 
 def load_cfg(path: str) -> dict:
@@ -57,6 +57,10 @@ def main() -> None:
 
     cfg = load_cfg(args.config)
     mc, tc, dc = cfg["model"], cfg["train"], cfg["data"]
+    # Per-config output dir (out/<config-stem>/) so different configs never
+    # collide on the same checkpoint — matches run.sh / staged.sh.
+    config_stem = os.path.splitext(os.path.basename(args.config))[0]
+    OUT = os.path.join(HERE, "out", config_stem)
     os.makedirs(OUT, exist_ok=True)
 
     if tc.get("num_threads", 0):
@@ -95,10 +99,45 @@ def main() -> None:
         with open(log_path, "w") as fh:
             fh.write("step,train_loss,val_loss,lr,tok_per_s\n")
 
+    # Live control, polled once per step from `run.sh ctl` / the dashboard:
+    #   {"stop": true}       finish this step, checkpoint, exit cleanly
+    #   {"pause": true}      hold before the next step until cleared
+    #   {"lr_scale": 0.5}    multiply the scheduled LR (sticky until changed)
+    #   {"max_steps": N}     shrink/extend the run without restarting
+    ctl_path = os.path.join(OUT, "control.json")
+
+    def read_control() -> dict:
+        try:
+            with open(ctl_path) as fh:
+                return json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def save_ckpt(step_done: int) -> None:
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                    "step": step_done, "cfg": cfg}, ckpt)
+
     block, bs, accum = mc["block_size"], tc["batch_size"], tc["grad_accum"]
     t_last = time.time()
-    for step in range(step0, tc["max_steps"]):
-        lr = lr_at(step, tc)
+    step = step0
+    while step < tc["max_steps"]:
+        ctl = read_control()
+        if ctl.get("pause"):
+            print(f"[paused at step {step}] waiting for control.json pause=false ...", flush=True)
+            while read_control().get("pause") and not read_control().get("stop"):
+                time.sleep(2)
+            t_last = time.time()
+            continue
+        if ctl.get("stop"):
+            print(f"[stop requested] checkpointing at step {step} and exiting", flush=True)
+            save_ckpt(step)
+            return
+        if "max_steps" in ctl:
+            tc["max_steps"] = int(ctl["max_steps"])
+            if step >= tc["max_steps"]:
+                break
+
+        lr = lr_at(step, tc) * float(ctl.get("lr_scale", 1.0))
         for g in opt.param_groups:
             g["lr"] = lr
 
@@ -128,11 +167,11 @@ def main() -> None:
                 fh.write(f"{step+1},{loss_acc:.5f},{vl:.5f},{lr:.3e},{tps:.0f}\n")
 
         if (step + 1) % tc["ckpt_interval"] == 0:
-            torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                        "step": step + 1, "cfg": cfg}, ckpt)
+            save_ckpt(step + 1)
 
-    torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                "step": tc["max_steps"], "cfg": cfg}, ckpt)
+        step += 1
+
+    save_ckpt(tc["max_steps"])
     print(f"done — checkpoint at {ckpt}; export with:  python ml/train/export.py --ckpt {ckpt} --out spike-1m.tlm")
 
 

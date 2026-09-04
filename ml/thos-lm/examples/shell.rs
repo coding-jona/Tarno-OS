@@ -93,13 +93,21 @@ fn main() {
         eprintln!("thos-shell: cannot read {weights}: {e}");
         std::process::exit(1);
     });
-    let model = Model::load(&bytes).unwrap_or_else(|e| {
+    let mut model = Model::load(&bytes).unwrap_or_else(|e| {
         eprintln!("thos-shell: {weights} is not a valid .tlm ({e:?})");
         std::process::exit(1);
     });
+    let mut model_size = bytes.len();
+    let mut model_mtime = mtime(&weights);
 
     let mut set = Settings::default();
-    banner(&weights, bytes.len(), &model, &set);
+    banner(&weights, model_size, &model, &set);
+    if model_mtime.is_some() {
+        println!(
+            "  {C_DIM}live: this file is checked before every turn — a checkpoint that\n  \
+             'run.sh watch-export' refreshes mid-training is picked up automatically.{C_RESET}\n"
+        );
+    }
 
     // Rolling context: everything said so far, model output included.
     let mut ctx = String::new();
@@ -129,18 +137,61 @@ fn main() {
                     println!("{C_DIM}bye.{C_RESET}");
                     break;
                 }
+                Cmd::Reload => {
+                    reload(&weights, &mut model, &mut model_mtime, &mut model_size, true);
+                }
                 Cmd::MultiLine => {
                     line = read_multiline(&mut lines);
                     if line.trim().is_empty() {
                         continue;
                     }
+                    reload(&weights, &mut model, &mut model_mtime, &mut model_size, false);
                     run_turn(&model, &set, &mut ctx, &line);
                 }
             }
             continue;
         }
 
+        reload(&weights, &mut model, &mut model_mtime, &mut model_size, false);
         run_turn(&model, &set, &mut ctx, &line);
+    }
+}
+
+fn mtime(path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Re-read `path` if it changed on disk (or if `force`) — this is what makes
+/// "chat with the model while it trains" work: `run.sh watch-export` rewrites
+/// the .tlm on disk every time a fresh checkpoint lands, and the shell just
+/// notices before the next turn.
+fn reload(
+    path: &str,
+    model: &mut Model,
+    last_mtime: &mut Option<std::time::SystemTime>,
+    last_size: &mut usize,
+    force: bool,
+) {
+    let current = mtime(path);
+    if !force && current == *last_mtime {
+        return;
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => match Model::load(&bytes) {
+            Ok(m) => {
+                *model = m;
+                *last_size = bytes.len();
+                *last_mtime = current;
+                println!(
+                    "{C_DIM}↻ reloaded {path} ({:.1} MB) — newer checkpoint on disk{C_RESET}",
+                    *last_size as f64 / 1e6
+                );
+            }
+            Err(e) if force => println!("{C_YELLOW}reload failed: not a valid .tlm ({e:?}){C_RESET}"),
+            Err(_) => {} // mid-write of a partial file — keep the old model, try again next turn
+        },
+        Err(e) if force => println!("{C_YELLOW}reload failed: {e}{C_RESET}"),
+        Err(_) => {}
     }
 }
 
@@ -191,6 +242,7 @@ enum Cmd {
     Continue,
     Quit,
     MultiLine,
+    Reload,
 }
 
 fn handle_command(
@@ -252,6 +304,7 @@ fn handle_command(
                 Err(e) => println!("  {C_YELLOW}save failed: {e}{C_RESET}"),
             }
         }
+        "reload" => return Cmd::Reload,
         "exit" | "quit" | "q" => return Cmd::Quit,
         other => println!("  {C_YELLOW}unknown command /{other} — try /help{C_RESET}"),
     }
@@ -290,6 +343,7 @@ fn print_help() {
         ("/params", "show current settings + context size"),
         ("/reset", "forget the rolling context"),
         ("/save [file]", "write the context transcript to a file"),
+        ("/reload", "force-reload the weights file now (auto-checked every turn anyway)"),
         ("/exit", "quit (also Ctrl-D)"),
     ];
     println!("  {C_BOLD}commands{C_RESET}");

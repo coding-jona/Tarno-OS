@@ -27,7 +27,10 @@ weight_decay  = 0.1
 grad_clip     = 1.0
 eval_interval = 300
 eval_batches  = 40
-ckpt_interval = 500
+# 200 steps ~ 100 min at ~30 s/step — cheap (torch.save of a 30M model is a
+# fraction of a second) and frequent enough that 'run.sh watch-export' keeps
+# the exported .tlm reasonably fresh for chatting with it mid-training.
+ckpt_interval = 200
 num_threads   = 0        # 0 => torch default (all cores)
 
 [data]

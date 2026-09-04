@@ -15,13 +15,29 @@ Downloaded corpora live in `train/data/` and are **git-ignored**. `train/fetch.p
 keeps a SHA-256 manifest (`train/data/manifest.json`) so a re-run reproduces the
 exact bytes.
 
-## v0 corpus (P0 spike — active)
+## v0 corpus (P0 spike)
 
 | Source | What | Licence | Obligations |
 |---|---|---|---|
 | Project Gutenberg | ~12 English public-domain novels (`train/fetch.py` `SOURCES`) | Public domain in the US (works pre-1929). The Gutenberg **trademark licence** covers only the added header/footer. | `train/prepare.py` strips the `*** START/END OF THE PROJECT GUTENBERG ***` boilerplate so nothing but the public-domain text remains. Do not redistribute with the Gutenberg header or the "Project Gutenberg" name attached. |
 
 Total ≈ 5–10 MB — fits one nightly internet window.
+
+## P1b/P1c corpus (active — the `staged.sh` run)
+
+| Source | What | Licence | Obligations |
+|---|---|---|---|
+| Project Gutenberg (English) | ~80 English public-domain novels/plays/philosophy (`train/fetch.py` `SOURCES`, P1/P1b blocks) | Public domain in the US. Trademark licence covers only header/footer. | Same header-stripping as above. |
+| Project Gutenberg (German) | 10 German-language public-domain classics — Goethe (*Faust*, *Werther*), Grimm (*Kinder- und Hausmärchen*, original German), Nietzsche (*Also sprach Zarathustra*), Kafka (*Die Verwandlung*, *Der Prozess*), Kant (*Kritik der reinen Vernunft*), Schiller (*Wilhelm Tell*), Heine (*Buch der Lieder*), Fontane (*Effi Briest*) — IDs prefixed `de_` in `SOURCES` | Public domain in the US (pre-1929 / author's death 70+ years ago). Same Gutenberg trademark carve-out. | Same header-stripping. Ebook IDs were looked up and confirmed against gutenberg.org before adding — see commit history for the search trail. |
+
+Total ≈ 70–100 MB (English) + a few MB (German) — the German slice is intentionally
+small relative to English for now (~10 titles vs. ~90); it gives the tokenizer and
+model *some* real German exposure (umlauts, grammar, vocabulary) rather than none,
+without claiming this makes the model fluent in German. A byte-level BPE
+tokenizer needs no special handling for German — the merge learner just sees
+UTF-8 bytes and will pick up German-specific merges (e.g. `ü`, `sch`, `-ung`) on
+its own from whatever fraction of the corpus is German. Growing that fraction is
+future work if German output quality matters more than a first proof of it.
 
 ## Planned additions (P1+, not yet wired)
 

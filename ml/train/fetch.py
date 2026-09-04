@@ -125,6 +125,19 @@ SOURCES: dict[str, str] = {
     "pg1080b_paradise_lost.txt": "https://www.gutenberg.org/cache/epub/26/pg26.txt",
     "pg1400c_the_scarlet_letter.txt": "https://www.gutenberg.org/cache/epub/25344/pg25344.txt",
     "pg2148b_the_prince_and_the_pauper.txt": "https://www.gutenberg.org/cache/epub/1837/pg1837.txt",
+    # --- German-language slice (P1c) — public-domain classics, so the model
+    #     sees real German prose/verse instead of only English. IDs verified
+    #     against gutenberg.org search results before adding. ---
+    "de_pg21000_faust.txt": "https://www.gutenberg.org/cache/epub/21000/pg21000.txt",
+    "de_pg2407_werther_band1.txt": "https://www.gutenberg.org/cache/epub/2407/pg2407.txt",
+    "de_pg77905_grimm_maerchen.txt": "https://www.gutenberg.org/cache/epub/77905/pg77905.txt",
+    "de_pg7205_zarathustra.txt": "https://www.gutenberg.org/cache/epub/7205/pg7205.txt",
+    "de_pg22367_die_verwandlung.txt": "https://www.gutenberg.org/cache/epub/22367/pg22367.txt",
+    "de_pg69327_der_prozess.txt": "https://www.gutenberg.org/cache/epub/69327/pg69327.txt",
+    "de_pg6343_kritik_der_reinen_vernunft.txt": "https://www.gutenberg.org/cache/epub/6343/pg6343.txt",
+    "de_pg2782_wilhelm_tell.txt": "https://www.gutenberg.org/cache/epub/2782/pg2782.txt",
+    "de_pg3498_buch_der_lieder.txt": "https://www.gutenberg.org/cache/epub/3498/pg3498.txt",
+    "de_pg5323_effi_briest.txt": "https://www.gutenberg.org/cache/epub/5323/pg5323.txt",
 }
 
 CHUNK = 1 << 16

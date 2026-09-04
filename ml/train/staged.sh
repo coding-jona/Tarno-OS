@@ -124,8 +124,10 @@ cmd_run() {
   [ -f "$outdir/latest.pt" ] && resume=(--resume) || true
   say "training"
   echo "[staged] config $(basename "$CONFIG")  ->  checkpoints in $outdir/  ->  export $TLM"
-  echo "[staged] ~30 s/step on this CPU; checkpoints are usable mid-run:"
-  echo "         CONFIG=$CONFIG TLM=$TLM ml/train/run.sh export && ml/train/run.sh shell"
+  echo "[staged] ~30 s/step on this CPU; a checkpoint lands every ckpt_interval steps."
+  echo "[staged] auto-exporting to $TLM whenever one lands (chat with it live via 'run.sh shell'):"
+  CONFIG="$CONFIG" TLM="$TLM" "$HERE/run.sh" watch-export >> "$STATE/watch-export.log" 2>&1 &
+  echo $! > "$STATE/watch-export.pid"
   "$PY" -u "$HERE/train.py" --config "$CONFIG" "${resume[@]}" 2>&1 | tee "$STATE/train.log"
 }
 
