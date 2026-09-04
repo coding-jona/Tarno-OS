@@ -6,6 +6,39 @@ from-scratch LM there is unaffected and proceeds independently.
 *(direction: user, 2026-09-04 — "develop our own way to run a big model in very
 little RAM; excessive research".)*
 
+## Target machine (fixes the numbers)
+
+- **16 GB RAM, DDR4-3600 (OC), dual channel** ⇒ ~57.6 GB/s peak, ~45 GB/s
+  sustained. This is the resident-inference ceiling.
+- CPU: i7-13700KF (AVX2, no AVX-512), 24 threads.
+- No GPU driver in THOS ⇒ CPU inference only.
+- SSD generation is the other decisive number and is **still unknown** — NVMe
+  Gen4 (~5–7 GB/s) vs Gen3 (~3.5) vs SATA (~0.55) changes the streaming tier by
+  10×. *(need from user)*
+
+### What 16 GB actually allows
+
+| Model | Bits | Weights | Fits resident? | CPU speed (est.) |
+|---|---|---|---|---|
+| ~7–8 B | 4-bit | ~4 GB | yes, easily | ~6–10 tok/s |
+| ~13 B | 4-bit | ~7 GB | yes | ~4–7 tok/s |
+| **~20 B** | **2-bit** | **~5–6 GB** | **yes, ~10 GB headroom** | **~3–5 tok/s** |
+| ~30 B | 2-bit | ~8 GB | yes, tight-ish | ~2–4 tok/s |
+| gpt-oss-20b | MXFP4 | ~13 GB | barely, no headroom | ~3–5 tok/s |
+| 70 B+ | 2-bit | ~20–35 GB | **no → must stream** | SSD-bound (below) |
+
+**Key consequence:** with sub-2-bit quantisation a **20–30 B model is resident on
+this box** — no paging, no AirLLM. Streaming is only forced above ~30 B. So the
+research splits cleanly:
+- **Near-ish term (resident tier):** get a good open ~20 B model quantised hard
+  enough to sit in ~6 GB. This needs only R1 (quant) + a big-allocation
+  allocator + KV compression — *not* the full pager / sparsity / prefetch stack.
+- **Long term (streaming tier):** 70 B+ via layer streaming, speed
+  SSD-bound: Gen4 ≈ 0.3–0.6 tok/s, Gen3 ≈ 0.2–0.4, SATA ≈ 0.05 → a 200-token
+  answer is 5–20 min. Only viable as a **rare, deliberate "deep think"** call,
+  which the cascade (F) makes acceptable — the always-resident small LM handles
+  the interactive 90 %.
+
 ## The goal, and why it's hard
 
 Run a 10–20B-class model on THOS with a small resident footprint (target
@@ -148,16 +181,20 @@ reads against the already-present **AHCI NCQ depth 32**.
 
 ## Open decisions
 
-1. **Target-machine RAM** — still unknown, and it decides whether 20B is even
-   plausible resident-with-headroom vs. capped at ~7–13B. *(need from user)*
-2. **Own weights vs. open weights** — training a 10–20B from scratch on CPU is
+1. ~~Target-machine RAM~~ — **16 GB DDR4-3600** (*user, 2026-09-04*). ⇒ 20–30 B
+   resident at 2-bit; streaming only forced above ~30 B (see table above).
+2. **SSD generation** — decides the streaming tier's speed by ~10×. *(need from
+   user)*
+3. **Own weights vs. open weights** — training a 10–20B from scratch on CPU is
    impossible; "like gpt-oss" ⇒ run its (Apache-2.0) open weights, which relaxes
    the [`ai.md`](ai.md) "own weights from zero" rule for *this* track. The
    from-scratch small LM keeps that rule. Confirm the split. *(need from user)*
 3. Bit-width / weight format (R1).
-4. Dense + sparsity vs. MoE + expert-prefetch as the primary structure (R2/R3) —
+5. Dense + sparsity vs. MoE + expert-prefetch as the primary structure (R2/R3) —
    or both, via the cascade in F.
-5. How much of the pager is general-purpose MM (useful anyway) vs. AI-specific.
+6. How much of the pager is general-purpose MM (useful anyway) vs. AI-specific.
+7. Where to draw the resident/streaming line — ship the ~20 B resident tier
+   first (much sooner, no pager) and treat 70 B+ streaming as a later add-on?
 
 ## Honesty
 
