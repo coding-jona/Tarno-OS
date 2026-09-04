@@ -377,13 +377,22 @@ late.
     a handler and resumes through a `ud2` (`PE SEH OK`) and a `mov al,[0]`
     (`PE SEH2 OK`). Frame-based `.pdata` / `.xdata` SEH is then just a smarter
     `KiUserExceptionDispatcher`.
+  - **User-mode APC delivery.** `crate::apc`: `NtQueueApcThread` appends a
+    per-task `ApcEntry`; `NtTestAlert` (and the `TestAlert` tail of
+    `NtContinue`) delivers it by staging a `CONTEXT` on the user stack with the
+    APC params in its `P1..P4` home area and redirecting the thread through a
+    `KiUserApcDispatcher` stub page (`pe::map_apc_page`). The dispatcher calls
+    the routine then `NtContinue(&ctx, TestAlert=TRUE)`, so a run of queued APCs
+    unwinds one dispatcher call at a time before the interrupted code resumes.
+    `pe-test` queues an APC to itself, `NtTestAlert`s, checks the handler ran
+    (`PE APC OK`). Kernel-mode APCs / alertable `NtWaitForSingleObject` land
+    with the timer wheel. `QueueUserAPC` (Win32) layers straight on top.
   - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
     unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
     unmodified), or a from-scratch `ntdll` — an **executive timer wheel** for a
     real timed block (and a preemption-safe path out of a PE syscall), more
-    `HandleObject` kinds (mutant, semaphore, section, thread), the rest of the
-    fault vectors through `crate::seh`, APC delivery, a minimal registry; then
-    process isolation / integrity for the security phase.
+    `HandleObject` kinds (mutant, semaphore, section, thread), a minimal
+    registry; then process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
