@@ -99,7 +99,12 @@ pub const NT_RTLADDVECTOREDEXCEPTIONHANDLER: u16 = 18;
 pub const NT_RTLREMOVEVECTOREDEXCEPTIONHANDLER: u16 = 19;
 pub const NT_NTQUEUEAPCTHREAD: u16 = 20;
 pub const NT_NTTESTALERT: u16 = 21;
-pub const NTDLL_STUB_COUNT: u16 = 22;
+pub const NT_NTCREATEKEY: u16 = 22;
+pub const NT_NTOPENKEY: u16 = 23;
+pub const NT_NTSETVALUEKEY: u16 = 24;
+pub const NT_NTQUERYVALUEKEY: u16 = 25;
+pub const NT_NTDELETEKEY: u16 = 26;
+pub const NTDLL_STUB_COUNT: u16 = 27;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -129,6 +134,11 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "RtlRemoveVectoredExceptionHandler",
     "NtQueueApcThread",
     "NtTestAlert",
+    "NtCreateKey",
+    "NtOpenKey",
+    "NtSetValueKey",
+    "NtQueryValueKey",
+    "NtDeleteKey",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -156,6 +166,7 @@ const STATUS_TIMEOUT: u32 = 0x0000_0102;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 
 /// `TEB.LastErrorValue` lives at `gs:[0x68]`. The kernel runs with `gs` swapped
 /// to the per-CPU block, so reach the TEB through the thread's saved `%gs` base.
@@ -518,6 +529,101 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             STATUS_SUCCESS as i64
         }
 
+        // NtCreateKey(*KeyHandle, DesiredAccess, *ObjectAttributes, TitleIndex,
+        //             *Class, CreateOptions, *Disposition). Creates missing
+        // ancestors; class / security / options ignored.
+        NT_NTCREATEKEY => {
+            let Some(path) = (unsafe { oa_path(a2) }) else {
+                return STATUS_INVALID_PARAMETER as i64;
+            };
+            let existed = crate::registry::open(&path);
+            if !crate::registry::create(&path) {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let h = process::current_alloc_regkey(crate::registry::canon(&path));
+            if h < 0 {
+                return STATUS_NO_MEMORY as i64;
+            }
+            unsafe { *(a0 as *mut u64) = h as u64 };
+            let disp = stack(2);
+            if disp != 0 {
+                unsafe { *(disp as *mut u32) = if existed { 2 } else { 1 } }; // OPENED_EXISTING / CREATED_NEW
+            }
+            STATUS_SUCCESS as i64
+        }
+
+        // NtOpenKey(*KeyHandle, DesiredAccess, *ObjectAttributes)
+        NT_NTOPENKEY => {
+            let Some(path) = (unsafe { oa_path(a2) }) else {
+                return STATUS_INVALID_PARAMETER as i64;
+            };
+            if !crate::registry::open(&path) {
+                return STATUS_OBJECT_NAME_NOT_FOUND as i64;
+            }
+            let h = process::current_alloc_regkey(crate::registry::canon(&path));
+            if h < 0 {
+                return STATUS_NO_MEMORY as i64;
+            }
+            unsafe { *(a0 as *mut u64) = h as u64 };
+            STATUS_SUCCESS as i64
+        }
+
+        // NtSetValueKey(KeyHandle, *ValueName(UNICODE_STRING), TitleIndex, Type,
+        //               *Data, DataSize)
+        NT_NTSETVALUEKEY => {
+            let Some(path) = process::current_regkey(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            let name = unsafe { unicode_string_ascii(a1) };
+            let (data_ptr, size) = (stack(0), stack(1) as usize);
+            let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, size) };
+            status(
+                crate::registry::set_value(&path, &name, a3 as u32, data),
+                STATUS_OBJECT_NAME_NOT_FOUND,
+            )
+        }
+
+        // NtQueryValueKey(KeyHandle, *ValueName, InfoClass, *Info, Length,
+        //                 *ResultLength). Only KeyValuePartialInformation
+        // (class 2): { u32 TitleIndex; u32 Type; u32 DataLength; u8 Data[]; }.
+        NT_NTQUERYVALUEKEY => {
+            let Some(path) = process::current_regkey(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            let name = unsafe { unicode_string_ascii(a1) };
+            if a2 != 2 {
+                return STATUS_INVALID_INFO_CLASS as i64;
+            }
+            let Some((ty, data)) = crate::registry::query_value(&path, &name) else {
+                return STATUS_OBJECT_NAME_NOT_FOUND as i64;
+            };
+            let need = 12 + data.len();
+            let ret_len = stack(1);
+            if ret_len != 0 {
+                unsafe { *(ret_len as *mut u32) = need as u32 };
+            }
+            if (stack(0) as usize) < need {
+                return STATUS_INFO_LENGTH_MISMATCH as i64;
+            }
+            unsafe {
+                let b = a3 as *mut u8;
+                *(b as *mut u32) = 0; // TitleIndex
+                *(b.add(4) as *mut u32) = ty; // Type
+                *(b.add(8) as *mut u32) = data.len() as u32; // DataLength
+                core::ptr::copy_nonoverlapping(data.as_ptr(), b.add(12), data.len());
+            }
+            STATUS_SUCCESS as i64
+        }
+
+        // NtDeleteKey(KeyHandle) — "mini": drop the key from its parent now
+        // (a real one defers until the last handle closes).
+        NT_NTDELETEKEY => {
+            let Some(path) = process::current_regkey(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            status(crate::registry::delete_key(&path), STATUS_OBJECT_NAME_NOT_FOUND)
+        }
+
         // LdrGetProcedureAddress(DllHandle, *AnsiName(STRING), Ordinal, *Address)
         NT_LDRGETPROCEDUREADDRESS => {
             let addr = if a1 != 0 {
@@ -591,6 +697,26 @@ unsafe fn write_iosb(iosb: u64, status: u32, information: u64) {
     if iosb != 0 {
         *(iosb as *mut u32) = status;
         *((iosb + 8) as *mut u64) = information;
+    }
+}
+
+/// Resolve an `OBJECT_ATTRIBUTES` to a registry path string: its `ObjectName`
+/// (`+0x10`, a `PUNICODE_STRING`), prefixed with the `RootDirectory` (`+0x08`)
+/// key's path when that handle is set.
+unsafe fn oa_path(oa: u64) -> Option<alloc::string::String> {
+    if oa == 0 {
+        return None;
+    }
+    let root = *((oa + 0x08) as *const u64);
+    let name = unicode_string_ascii(*((oa + 0x10) as *const u64));
+    if name.is_empty() && root == 0 {
+        return None;
+    }
+    if root != 0 {
+        let base = process::current_regkey(root as i32)?;
+        Some(alloc::format!("{base}\\{name}"))
+    } else {
+        Some(name)
     }
 }
 
