@@ -8,3 +8,9 @@
 numpy>=1.26,<3
 tqdm>=4.66
 torch>=2.2 ; platform_machine == "x86_64"
+
+# Optional, only for thos-shell's '/lang' translation layer (not the model
+# itself — see translate.py). Apache-2.0, fully offline at translate time.
+# Install manually if you want it: pip install argostranslate
+#   argostranslate>=1.9
+

@@ -14,7 +14,8 @@
 //! /seed /stops /reset /multi /save /exit
 #![cfg(not(target_os = "none"))]
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
 use thos_lm::{Model, Sampler, SamplerConfig};
@@ -36,6 +37,11 @@ struct Settings {
     stops: Vec<String>,
     /// Keep at most this many bytes of rolling context fed back into the model.
     ctx_bytes: usize,
+    /// When set (e.g. "de"), converse in this language: your input is
+    /// translated to English before the model sees it, its English output is
+    /// translated back before you see it. The model itself stays English-only
+    /// — see `Translator`.
+    lang: Option<String>,
 }
 
 impl Default for Settings {
@@ -43,10 +49,11 @@ impl Default for Settings {
         Settings {
             temperature: 0.9,
             top_k: 40,
-            max_tokens: 200,
+            max_tokens: 400,
             seed: rand_seed(),
-            stops: vec!["\n\n".into()],
+            stops: vec![], // no default stop — a small model hits blank lines fast; /stops to opt in
             ctx_bytes: 4096,
+            lang: None,
         }
     }
 }
@@ -61,13 +68,15 @@ fn rand_seed() -> u64 {
 fn main() {
     let mut weights = String::new();
     let mut sys_prompt = String::new();
+    let mut lang: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--weights" | "--model" | "-m" => weights = args.next().unwrap_or_default(),
             "--system" | "-s" => sys_prompt = args.next().unwrap_or_default(),
+            "--lang" | "-l" => lang = args.next().filter(|c| c != "en" && c != "off"),
             "--help" | "-h" => {
-                eprintln!("usage: thos-shell --weights <path.tlm> [--system <text>]");
+                eprintln!("usage: thos-shell --weights <path.tlm> [--system <text>] [--lang de]");
                 return;
             }
             other => {
@@ -101,6 +110,7 @@ fn main() {
     let mut model_mtime = mtime(&weights);
 
     let mut set = Settings::default();
+    set.lang = lang;
     banner(&weights, model_size, &model, &set);
     if model_mtime.is_some() {
         println!(
@@ -108,6 +118,7 @@ fn main() {
              'run.sh watch-export' refreshes mid-training is picked up automatically.{C_RESET}\n"
         );
     }
+    let mut translator: Option<Translator> = None;
 
     // Rolling context: everything said so far, model output included.
     let mut ctx = String::new();
@@ -146,14 +157,168 @@ fn main() {
                         continue;
                     }
                     reload(&weights, &mut model, &mut model_mtime, &mut model_size, false);
-                    run_turn(&model, &set, &mut ctx, &line);
+                    converse(&model, &set, &mut ctx, &mut translator, &line);
                 }
             }
             continue;
         }
 
         reload(&weights, &mut model, &mut model_mtime, &mut model_size, false);
-        run_turn(&model, &set, &mut ctx, &line);
+        converse(&model, &set, &mut ctx, &mut translator, &line);
+    }
+}
+
+/// A long-lived coprocess wrapping `ml/train/translate.py` (argos-translate:
+/// Apache-2.0, fully offline, no API key). Not part of the model — a text
+/// in/out utility layer, spoken to over JSON lines so the translation models
+/// load once instead of per call.
+struct Translator {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl Translator {
+    fn spawn() -> Option<Translator> {
+        let py = first_existing(&[
+            "ml/train/.venv/bin/python",
+            "../train/.venv/bin/python",
+            "../../ml/train/.venv/bin/python",
+        ])
+        .unwrap_or_else(|| "python3".to_string());
+        let script = first_existing(&[
+            "ml/train/translate.py",
+            "../train/translate.py",
+            "../../ml/train/translate.py",
+            "translate.py",
+        ])?;
+        let mut child = Command::new(&py)
+            .arg(&script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdin = child.stdin.take()?;
+        let stdout = BufReader::new(child.stdout.take()?);
+        let mut t = Translator { child, stdin, stdout };
+        // First call also lazy-loads the translation models inside the
+        // coprocess, so it's slow (a few seconds) — that's expected.
+        if t.call(r#"{"ping": true}"#).is_none() {
+            return None;
+        }
+        Some(t)
+    }
+
+    fn call(&mut self, request: &str) -> Option<String> {
+        writeln!(self.stdin, "{request}").ok()?;
+        self.stdin.flush().ok()?;
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).ok()?;
+        if line.is_empty() {
+            None
+        } else {
+            Some(line)
+        }
+    }
+
+    fn translate(&mut self, from: &str, to: &str, text: &str) -> Option<String> {
+        if from == to || text.trim().is_empty() {
+            return Some(text.to_string());
+        }
+        let req = format!(
+            r#"{{"from": "{}", "to": "{}", "text": "{}"}}"#,
+            json_escape(from),
+            json_escape(to),
+            json_escape(text)
+        );
+        json_extract_text(&self.call(&req)?)
+    }
+}
+
+impl Drop for Translator {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Pulls the `"text"` field out of a `{"text": "..."}` response line. Not a
+/// general JSON parser — we control both ends of this protocol.
+fn json_extract_text(line: &str) -> Option<String> {
+    let key = "\"text\": \"";
+    let start = line.find(key)? + key.len();
+    let rest = &line[start..];
+    let mut out = String::with_capacity(rest.len());
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// Ensures a translator is running if `set.lang` is set, then runs one turn:
+/// translate the user's text to English, generate, translate the answer back.
+/// The model itself only ever sees/produces English.
+fn converse(
+    model: &Model,
+    set: &Settings,
+    ctx: &mut String,
+    translator: &mut Option<Translator>,
+    text: &str,
+) {
+    let Some(code) = set.lang.clone() else {
+        run_turn(model, set, ctx, text);
+        return;
+    };
+    if translator.is_none() {
+        println!("{C_DIM}starting local translator (argos-translate, offline) ...{C_RESET}");
+        *translator = Translator::spawn();
+        if translator.is_none() {
+            println!(
+                "{C_YELLOW}couldn't start the translator — is argostranslate installed \
+                 (ml/train/translate.py --install)? Falling back to English.{C_RESET}"
+            );
+        }
+    }
+    let Some(tr) = translator else {
+        run_turn(model, set, ctx, text);
+        return;
+    };
+    let english = tr.translate(&code, "en", text).unwrap_or_else(|| text.to_string());
+    if english != text {
+        println!("{C_DIM}[en] {english}{C_RESET}");
+    }
+    let out = run_turn(model, set, ctx, &english);
+    match tr.translate("en", &code, &out) {
+        Some(back) => println!("{C_MAGENTA}[{code}] {back}{C_RESET}"),
+        None => println!("{C_YELLOW}(translation back to {code} failed — see the English above){C_RESET}"),
     }
 }
 
@@ -305,6 +470,23 @@ fn handle_command(
             }
         }
         "reload" => return Cmd::Reload,
+        "lang" => {
+            if arg.is_empty() {
+                match &set.lang {
+                    Some(c) => println!("  {C_DIM}lang{C_RESET} {c}  {C_DIM}(/lang off to disable, /lang <code> to switch){C_RESET}"),
+                    None => println!("  {C_DIM}lang{C_RESET} off  {C_DIM}(model speaks English; /lang de to converse in German){C_RESET}"),
+                }
+            } else if arg == "off" || arg == "en" {
+                set.lang = None;
+                println!("  {C_GREEN}lang off — talking to the model directly in English{C_RESET}");
+            } else {
+                set.lang = Some(arg.to_string());
+                println!(
+                    "  {C_GREEN}lang = {arg}{C_RESET}  {C_DIM}(translated via argos-translate, offline; \
+                     first use starts the translator, a few seconds){C_RESET}"
+                );
+            }
+        }
         "exit" | "quit" | "q" => return Cmd::Quit,
         other => println!("  {C_YELLOW}unknown command /{other} — try /help{C_RESET}"),
     }
@@ -344,6 +526,7 @@ fn print_help() {
         ("/reset", "forget the rolling context"),
         ("/save [file]", "write the context transcript to a file"),
         ("/reload", "force-reload the weights file now (auto-checked every turn anyway)"),
+        ("/lang <code|off>", "converse in <code> (e.g. de) via a local offline translator"),
         ("/exit", "quit (also Ctrl-D)"),
     ];
     println!("  {C_BOLD}commands{C_RESET}");
@@ -368,7 +551,7 @@ fn read_multiline<I: Iterator<Item = io::Result<String>>>(lines: &mut I) -> Stri
 }
 
 /// Feed `user` + rolling context into the model and stream the continuation.
-fn run_turn(model: &Model, set: &Settings, ctx: &mut String, user: &str) {
+fn run_turn(model: &Model, set: &Settings, ctx: &mut String, user: &str) -> String {
     if !ctx.is_empty() && !ctx.ends_with('\n') {
         ctx.push('\n');
     }
@@ -445,6 +628,8 @@ fn run_turn(model: &Model, set: &Settings, ctx: &mut String, user: &str) {
     )
     .ok();
 
-    ctx.push_str(text_so_far.trim_end());
+    let trimmed = text_so_far.trim_end().to_string();
+    ctx.push_str(&trimmed);
     ctx.push('\n');
+    trimmed
 }

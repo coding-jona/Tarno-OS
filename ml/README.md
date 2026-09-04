@@ -86,6 +86,23 @@ To run the pieces by hand instead: `BPE=16384 ml/train/run.sh data` then
 The `train/*.py` scripts still run standalone if you prefer; `run.sh` just wires
 them together with the right paths and resume flags.
 
+## Talking to it in another language
+
+`thos-shell` can converse in a language other than English via a local, offline
+translation layer (`argos-translate`, Apache-2.0, no API key, no network at
+translate time) — **not** part of the model itself, which stays English-only:
+
+```sh
+ml/train/.venv/bin/pip install argostranslate
+python ml/train/translate.py --install     # downloads the en<->de packages once
+ml/train/run.sh shell                       # then inside: /lang de
+```
+
+Your input is translated to English before the model sees it; its English
+output is translated back before you see it (shown as `[en] ...` / `[de] ...`
+so you can see both). `/lang off` switches back to talking to the model
+directly.
+
 ## Tests
 
 ```sh
