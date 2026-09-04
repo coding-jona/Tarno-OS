@@ -138,6 +138,19 @@ SOURCES: dict[str, str] = {
     "de_pg77182_wilhelm_tell.txt": "https://www.gutenberg.org/cache/epub/77182/pg77182.txt",
     "de_pg3498_buch_der_lieder.txt": "https://www.gutenberg.org/cache/epub/3498/pg3498.txt",
     "de_pg5323_effi_briest.txt": "https://www.gutenberg.org/cache/epub/5323/pg5323.txt",
+    # --- Dialogue-heavy slice: plays + Socratic dialogues, all in a clean
+    #     SPEAKER-cue format prepare_dialogue.py can parse into chat-style
+    #     turns (a: b: ...) — see docs/thos/ai.md Application A follow-up. ---
+    "pg1513_romeo_and_juliet.txt": "https://www.gutenberg.org/cache/epub/1513/pg1513.txt",
+    "pg1514_midsummer_nights_dream.txt": "https://www.gutenberg.org/cache/epub/1514/pg1514.txt",
+    "pg1515_merchant_of_venice.txt": "https://www.gutenberg.org/cache/epub/1515/pg1515.txt",
+    "pg1519_much_ado_about_nothing.txt": "https://www.gutenberg.org/cache/epub/1519/pg1519.txt",
+    "pg1524_hamlet.txt": "https://www.gutenberg.org/cache/epub/1524/pg1524.txt",
+    "pg1533_macbeth.txt": "https://www.gutenberg.org/cache/epub/1533/pg1533.txt",
+    "pg1656_apology.txt": "https://www.gutenberg.org/cache/epub/1656/pg1656.txt",
+    "pg1657_crito.txt": "https://www.gutenberg.org/cache/epub/1657/pg1657.txt",
+    "pg1658_phaedo.txt": "https://www.gutenberg.org/cache/epub/1658/pg1658.txt",
+    "pg1600_symposium.txt": "https://www.gutenberg.org/cache/epub/1600/pg1600.txt",
 }
 
 CHUNK = 1 << 16

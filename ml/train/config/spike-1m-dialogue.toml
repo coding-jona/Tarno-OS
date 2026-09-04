@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# A short (~1h CPU) fine-tune of the finished P0 spike checkpoint on the
+# extracted play/dialogue corpus — teaches turn-taking FORMAT ("Name: text"),
+# not new facts. [model] must exactly match config/spike-1m.toml (same
+# checkpoint shape) or --resume will refuse to load it.
+#
+# Setup (once): copy the finished base checkpoint into this config's own
+# output dir so --resume picks it up:
+#   mkdir -p ml/train/out/spike-1m-dialogue
+#   cp ml/train/out/spike-1m/latest.pt ml/train/out/spike-1m-dialogue/latest.pt
+#
+#   python ml/train/dialogue_extract.py && python ml/train/prepare_dialogue.py
+#   CONFIG=ml/train/config/spike-1m-dialogue.toml TLM=spike-1m-dialogue.tlm \
+#       ml/train/run.sh train-bg
+
+[model]
+n_layer    = 4
+n_head     = 4
+n_embd     = 128
+block_size = 128
+vocab_size = 256
+dropout    = 0.0
+norm_eps   = 1e-5
+
+[train]
+seed          = 20260904
+batch_size    = 32
+grad_accum    = 4
+# base run finished at step 20000; this extends the SAME run for ~7000 more
+# steps of fine-tuning (~1h measured at ~10k steps/h on this CPU, minus
+# eval/ckpt overhead and headroom for other load on the box).
+max_steps     = 27000
+warmup_steps  = 0
+# lr == min_lr: a flat, low fine-tune rate rather than a fresh cosine decay
+# (the schedule's "progress" would otherwise be computed from the *absolute*
+# step count including the 20000 already-trained steps, which is wrong here).
+lr            = 5e-5
+min_lr        = 5e-5
+weight_decay  = 0.1
+grad_clip     = 1.0
+eval_interval = 200
+eval_batches  = 20
+ckpt_interval = 500
+num_threads   = 0
+
+[data]
+train_bin = "data/dialogue_train.bin"
+val_bin   = "data/dialogue_val.bin"
