@@ -705,6 +705,33 @@ pub fn current_apc_pending() -> bool {
     sched::current().task().map(|t| t.apc_pending()).unwrap_or(false)
 }
 
+/// This thread's id (distinct per thread within a process — unlike
+/// [`current_pid`], which is the shared `Task` id).
+pub fn current_tid() -> u64 {
+    sched::current().id
+}
+
+/// Per-worker-thread exit events, keyed by thread id. A thread's
+/// `NtCreateThreadEx` registers one; `NtTerminateThread` signals + removes it,
+/// so a `NtWaitForSingleObject` on the returned handle completes on exit.
+static THREAD_EXITS: Mutex<BTreeMap<u64, Arc<Event>>> = Mutex::new(BTreeMap::new());
+
+pub fn register_thread_exit(tid: u64, ev: Arc<Event>) {
+    THREAD_EXITS.lock().insert(tid, ev);
+}
+
+/// Signal + forget `tid`'s exit event. `false` if none was registered (i.e. the
+/// caller is the process's original thread).
+pub fn signal_thread_exit(tid: u64) -> bool {
+    match THREAD_EXITS.lock().remove(&tid) {
+        Some(ev) => {
+            ev.signal();
+            true
+        }
+        None => false,
+    }
+}
+
 pub fn current_pid() -> u64 {
     sched::current().task().map(|t| t.pid).unwrap_or(0)
 }

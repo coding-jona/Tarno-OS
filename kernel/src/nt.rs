@@ -110,7 +110,9 @@ pub const NT_NTCREATESEMAPHORE: u16 = 29;
 pub const NT_NTRELEASESEMAPHORE: u16 = 30;
 pub const NT_NTWAITFORMULTIPLEOBJECTS: u16 = 31;
 pub const NT_NTDELAYEXECUTION: u16 = 32;
-pub const NTDLL_STUB_COUNT: u16 = 33;
+pub const NT_NTCREATETHREADEX: u16 = 33;
+pub const NT_NTTERMINATETHREAD: u16 = 34;
+pub const NTDLL_STUB_COUNT: u16 = 35;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -151,6 +153,8 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtReleaseSemaphore",
     "NtWaitForMultipleObjects",
     "NtDelayExecution",
+    "NtCreateThreadEx",
+    "NtTerminateThread",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -395,7 +399,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let Some(w) = process::current_waitable(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
             };
-            let tid = process::current_pid();
+            let tid = process::current_tid();
             if a2 == 0 {
                 w.wait(tid);
                 return STATUS_SUCCESS as i64;
@@ -421,7 +425,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
 
         // NtCreateMutant(*Handle, DesiredAccess, *ObjectAttributes, InitialOwner)
         NT_NTCREATEMUTANT => {
-            let owner = if a3 & 0xFF != 0 { process::current_pid() } else { 0 };
+            let owner = if a3 & 0xFF != 0 { process::current_tid() } else { 0 };
             let h = process::current_alloc_mutant(Arc::new(crate::wait::Mutant::new(owner)));
             if h < 0 {
                 return STATUS_NO_MEMORY as i64;
@@ -435,7 +439,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let Some(process::Waitable::Mutant(m)) = process::current_waitable(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
             };
-            match m.release(process::current_pid()) {
+            match m.release(process::current_tid()) {
                 Ok(prev) => {
                     if a1 != 0 {
                         unsafe { *(a1 as *mut u32) = prev };
@@ -487,7 +491,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 return STATUS_INVALID_PARAMETER as i64;
             }
             let wait_all = a2 == 0;
-            let tid = process::current_pid();
+            let tid = process::current_tid();
             let mut objs: alloc::vec::Vec<process::Waitable> = alloc::vec::Vec::with_capacity(count);
             for i in 0..count {
                 let h = unsafe { *((a1 + (i * 8) as u64) as *const u64) } as i32;
@@ -540,6 +544,39 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 sched::yield_now();
             }
             STATUS_SUCCESS as i64
+        }
+
+        // NtCreateThreadEx(*Handle, DesiredAccess, *ObjAttr, ProcessHandle,
+        //                  StartRoutine, Argument, CreateFlags, ZeroBits,
+        //                  StackSize, MaxStackSize, *AttrList). One worker per
+        // process for now; CREATE_SUSPENDED is ignored (starts immediately).
+        // The returned handle is a manual-reset event signalled on thread exit.
+        NT_NTCREATETHREADEX => {
+            let (start, arg) = (stack(0), stack(1));
+            if start == 0 {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            match crate::pe::spawn_thread(start, arg) {
+                Ok((_tid, ev)) => {
+                    let h = process::current_alloc_event(ev);
+                    if h < 0 {
+                        return STATUS_NO_MEMORY as i64;
+                    }
+                    unsafe { *(a0 as *mut u64) = h as u64 };
+                    STATUS_SUCCESS as i64
+                }
+                Err(_) => STATUS_NO_MEMORY as i64,
+            }
+        }
+
+        // NtTerminateThread(ThreadHandle, ExitStatus). A worker thread signals
+        // its exit event and dies; the process's original thread takes the whole
+        // process down (matching `ExitProcess` on the last thread).
+        NT_NTTERMINATETHREAD => {
+            if process::signal_thread_exit(process::current_tid()) {
+                sched::exit();
+            }
+            proc_terminate(a1 as i32)
         }
 
         // NtContinue(*Context, TestAlert) — resume ring 3 from the CONTEXT the

@@ -654,6 +654,12 @@ fn write_pe_hello(path: &Path) {
     let nde_slot_tag = u32::MAX - 89;
     let tneg200_tag = u32::MAX - 90;
     let msg_delay_tag = u32::MAX - 91;
+    let ctename_tag = u32::MAX - 92;
+    let cte_slot_tag = u32::MAX - 93;
+    let thh_tag = u32::MAX - 94;
+    let thread_fn_tag = u32::MAX - 95;
+    let msg_thread_tag = u32::MAX - 96;
+    let msg_thr_tag = u32::MAX - 97;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -1374,6 +1380,57 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2m11) NtCreateThreadEx: spawn a worker running thread_fn, wait on its
+    //       thread handle (a manual event signalled on exit), then continue.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], ctename_tag); // lea rdx, [rip+"NtCreateThreadEx"]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], cte_slot_tag); // mov [rip+cte_slot], rax
+    // NtCreateThreadEx(&thh, 0, 0, -1, thread_fn, 0, 0, 0, 0, 0, 0)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], thh_tag); // lea rcx, [rip+thh]
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0]); // xor edx,edx; xor r8d,r8d
+    code.extend_from_slice(&[0x49, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF]); // mov r9, -1
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x58]); // sub rsp, 0x58
+    rel!([0x48, 0x8D, 0x05, 0, 0, 0, 0], thread_fn_tag); // lea rax, [rip+thread_fn]
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // [rsp+0x20] = StartRoutine
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]); // [rsp+0x28] = Argument
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // [rsp+0x30] = CreateFlags
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x38]);
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x40]);
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x48]);
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x50]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], cte_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x58]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]); // test eax,eax; je+1; int3
+    // NtWaitForSingleObject(thh, 0, NULL) -> blocks until the worker exits
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], thh_tag);
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0]); // xor edx,edx; xor r8d,r8d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtClose(thh)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], thh_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], close_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    // WriteFile(1, msg_thr, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_thr_tag);
+    let thr_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -1520,6 +1577,19 @@ fn write_pe_hello(path: &Path) {
     rel!([0x48, 0x89, 0x0D, 0, 0, 0, 0], apc_flag_tag); // mov [rip+apc_flag], rcx
     code.extend_from_slice(&[0xC3]); // ret
 
+    // thread_fn — a worker thread's StartRoutine (arg in rcx, ignored):
+    // WriteFile(1, msg_thread, len, &written, 0); return 0.
+    let thread_fn_off = code.len();
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_thread_tag); // lea rdx, [rip+msg_thread]
+    let thread_fn_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    code.extend_from_slice(&[0x31, 0xC0, 0xC3]); // xor eax, eax; ret
+
     // --- data slots at the end of .text ---
     while code.len() % 8 != 0 {
         code.push(0);
@@ -1586,6 +1656,8 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"NtWaitForMultipleObjects\0");
     let ndename_off = code.len();
     code.extend_from_slice(b"NtDelayExecution\0");
+    let ctename_off = code.len();
+    code.extend_from_slice(b"NtCreateThreadEx\0");
     // registry key/value UTF-16LE names + their UNICODE_STRING headers.
     let keyname16: Vec<u8> = "\\Registry\\Machine\\Software\\THOSREG"
         .encode_utf16()
@@ -1683,6 +1755,10 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0u8; 8]); // resolved NtDelayExecution
     let tneg200_off = code.len();
     code.extend_from_slice(&(-2_000_000i64).to_le_bytes()); // -200 ms, 100 ns units
+    let cte_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtCreateThreadEx
+    let thh_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // worker thread HANDLE (exit event)
     let evh_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // event HANDLE
     let evh2_off = code.len();
@@ -1763,7 +1839,15 @@ fn write_pe_hello(path: &Path) {
     let msg_delay: &[u8] = b"PE delay OK\n";
     let msg_delay_off = code.len();
     code.extend_from_slice(msg_delay);
+    let msg_thread: &[u8] = b"PE thread ran\n";
+    let msg_thread_off = code.len();
+    code.extend_from_slice(msg_thread);
+    let msg_thr: &[u8] = b"PE thread OK\n";
+    let msg_thr_off = code.len();
+    code.extend_from_slice(msg_thr);
 
+    code[thread_fn_r8..thread_fn_r8 + 4].copy_from_slice(&(msg_thread.len() as u32).to_le_bytes());
+    code[thr_r8..thr_r8 + 4].copy_from_slice(&(msg_thr.len() as u32).to_le_bytes());
     code[delay_r8..delay_r8 + 4].copy_from_slice(&(msg_delay.len() as u32).to_le_bytes());
     code[sync_r8..sync_r8 + 4].copy_from_slice(&(msg_sync.len() as u32).to_le_bytes());
     code[reg_r8..reg_r8 + 4].copy_from_slice(&(msg_reg.len() as u32).to_le_bytes());
@@ -1898,6 +1982,12 @@ fn write_pe_hello(path: &Path) {
             t if t == nde_slot_tag => text_rva + nde_slot_off as u32,
             t if t == tneg200_tag => text_rva + tneg200_off as u32,
             t if t == msg_delay_tag => text_rva + msg_delay_off as u32,
+            t if t == ctename_tag => text_rva + ctename_off as u32,
+            t if t == cte_slot_tag => text_rva + cte_slot_off as u32,
+            t if t == thh_tag => text_rva + thh_off as u32,
+            t if t == thread_fn_tag => text_rva + thread_fn_off as u32,
+            t if t == msg_thread_tag => text_rva + msg_thread_off as u32,
+            t if t == msg_thr_tag => text_rva + msg_thr_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -3203,6 +3293,8 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE registry OK") // NtCreateKey/SetValue/OpenKey/QueryValue/DeleteKey round-trip
         && serial.contains("PE sync OK") // semaphore + mutant + NtWaitForMultipleObjects
         && serial.contains("PE delay OK") // NtDelayExecution -> real executive block on the timer wheel
+        && serial.contains("PE thread ran") // NtCreateThreadEx worker ran its StartRoutine
+        && serial.contains("PE thread OK") // main thread waited on the thread handle + resumed
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
