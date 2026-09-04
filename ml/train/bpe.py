@@ -5,76 +5,91 @@ No external tokenizer library — the base vocabulary is the 256 byte values, an
 merges are learned greedily by adjacent-pair frequency. Token id `256 + k` is
 the result of merge `k` — the same shape GPT-2 uses.
 
-Training works on a *word-frequency table* (the corpus split into maximal
-space / non-space runs, deduplicated with counts) rather than the raw stream,
-which keeps a 16k-merge run over tens of MB to minutes, not hours. Merges never
-cross a chunk boundary.
+Training works on a word-frequency table (the corpus split into maximal
+whitespace / non-whitespace runs, deduplicated with counts), with incremental
+pair-count maintenance and a lazy max-heap, so a 16k-merge run over tens of MB
+takes a minute or two, not hours. Merges never cross a chunk boundary.
 
-The ordered merge list is what gets embedded in the `.tlm` file so `thos-lm`
-(Rust) can encode prompts and decode output with no side data.
+The ordered merge list is embedded in the `.tlm` file so `thos-lm` (Rust) can
+encode prompts and decode output with no side data.
 """
 
 from __future__ import annotations
 
+import heapq
 import json
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 
 _CHUNK_RE = re.compile(rb"\s+|\S+")
 
 
-def _words(data: bytes) -> Counter:
-    """Corpus -> {chunk-as-tuple-of-byte-ids: count}."""
-    wf: Counter = Counter()
-    for m in _CHUNK_RE.finditer(data):
-        wf[tuple(m.group())] += 1
-    return wf
-
-
-def _pair_stats(wf: dict) -> Counter:
-    st: Counter = Counter()
-    for word, c in wf.items():
-        for a, b in zip(word, word[1:]):
-            st[(a, b)] += c
-    return st
-
-
-def _merge_word(word: tuple, pair: tuple, new_id: int) -> tuple:
+def _apply(ids: list[int], pair: tuple, new_id: int) -> list[int]:
     out = []
     i = 0
-    n = len(word)
+    n = len(ids)
     while i < n:
-        if i + 1 < n and word[i] == pair[0] and word[i + 1] == pair[1]:
+        if i + 1 < n and ids[i] == pair[0] and ids[i + 1] == pair[1]:
             out.append(new_id)
             i += 2
         else:
-            out.append(word[i])
+            out.append(ids[i])
             i += 1
-    return tuple(out)
+    return out
 
 
 def train_bpe(data: bytes, vocab_size: int, verbose: bool = True) -> list[tuple[int, int]]:
     """Learn merges until the vocabulary reaches `vocab_size` (>= 256)."""
     assert vocab_size >= 256
-    wf = _words(data)
+    wc: Counter = Counter(bytes(m.group()) for m in _CHUNK_RE.finditer(data))
+    words = [[list(w), c] for w, c in wc.items()]
     if verbose:
-        print(f"  bpe: {len(wf):,} unique chunks from {len(data):,} bytes")
+        print(f"  bpe: {len(words):,} unique chunks from {len(data):,} bytes", flush=True)
+
+    stats: Counter = Counter()
+    where: dict = defaultdict(set)
+    for i, (ids, c) in enumerate(words):
+        for p in zip(ids, ids[1:]):
+            stats[p] += c
+            where[p].add(i)
+    heap = [(-v, p) for p, v in stats.items()]
+    heapq.heapify(heap)
+
     merges: list[tuple[int, int]] = []
     target = vocab_size - 256
     while len(merges) < target:
-        stats = _pair_stats(wf)
-        if not stats:
+        pair = None
+        while heap:
+            negc, cand = heap[0]
+            if stats.get(cand, 0) == -negc:
+                pair = cand
+                break
+            heapq.heappop(heap)
+        if pair is None or stats[pair] < 2:
             break
-        pair, freq = stats.most_common(1)[0]
-        if freq < 2:
-            break
+
         new_id = 256 + len(merges)
         merges.append(pair)
-        wf = Counter(
-            {(_merge_word(w, pair, new_id) if pair[0] in w else w): c for w, c in wf.items()}
-        )
+        touched: set = set()
+        for i in list(where.get(pair, ())):
+            ids, c = words[i]
+            for p in zip(ids, ids[1:]):
+                stats[p] -= c
+                where[p].discard(i)
+                touched.add(p)
+            ids = _apply(ids, pair, new_id)
+            words[i][0] = ids
+            for p in zip(ids, ids[1:]):
+                stats[p] += c
+                where[p].add(i)
+                touched.add(p)
+        for p in touched:
+            v = stats.get(p, 0)
+            if v >= 2:
+                heapq.heappush(heap, (-v, p))
+        where.pop(pair, None)
         if verbose and len(merges) % 1000 == 0:
-            print(f"  bpe: {len(merges)}/{target} merges (last freq {freq})")
+            print(f"  bpe: {len(merges)}/{target} merges", flush=True)
     return merges
 
 
