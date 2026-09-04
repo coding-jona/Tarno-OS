@@ -168,7 +168,11 @@ passes (Rust forward matches the numpy reference; sampler deterministic) **and**
 
 **Milestone AI-1:** a byte-level ~1M model trained on the CPU spike corpus
 reaches val loss well below the uniform-byte baseline (ln 256 ≈ 5.55) and
-`ml/thos-lm --example generate` emits recognisable English fragments.
+`ml/thos-lm --example generate` emits recognisable English fragments. *(met —
+0.84 M params, 20 k steps in ~2¼ h on 16 threads at ~42 k tok/s, final val loss
+**1.197 nats/byte ≈ 1.73 bits/byte**; the `thos-lm` Rust engine generates
+grammatical clauses, dialogue with attribution, and training-corpus vocabulary
+("Rostóv", "the whale", "Chapter").)*
 
 ## Open decisions
 
