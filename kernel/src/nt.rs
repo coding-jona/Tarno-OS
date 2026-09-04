@@ -41,7 +41,9 @@ pub const NT_HEAPALLOC: u16 = 14;
 pub const NT_HEAPFREE: u16 = 15;
 pub const NT_GETPROCADDRESS: u16 = 16;
 pub const NT_LOADLIBRARYA: u16 = 17;
-pub const NT_STUB_COUNT: u16 = 18;
+pub const NT_CREATEEVENTA: u16 = 18;
+pub const NT_WAITFORSINGLEOBJECT_K: u16 = 19;
+pub const NT_STUB_COUNT: u16 = 20;
 
 /// The `kernel32` export table, in stub-index order. Drives both
 /// [`crate::pe::resolve_import`] (import → stub index) and the synthetic
@@ -67,6 +69,8 @@ pub const NT_EXPORTS: [&str; NT_STUB_COUNT as usize] = [
     "HeapFree",
     "GetProcAddress",
     "LoadLibraryA",
+    "CreateEventA",
+    "WaitForSingleObject",
 ];
 
 /// Selector bit OR-ed into a stub's index when it belongs to the **native NT**
@@ -1132,6 +1136,49 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
         // for tiny allocations but correct; a real heap allocator comes later.
         NT_HEAPALLOC => mem_alloc_core(a2.max(1)) as i64,
         NT_HEAPFREE => 1,
+
+        // CreateEventA(lpEventAttributes, bManualReset, bInitialState, lpName).
+        // Unnamed only. The HANDLE is just the fd.
+        NT_CREATEEVENTA => {
+            let mode = if a1 & 0xFF != 0 { EventMode::Manual } else { EventMode::Auto };
+            let ev = Arc::new(Event::with_mode(mode));
+            if a2 & 0xFF != 0 {
+                ev.signal();
+            }
+            match process::current_alloc_event(ev) {
+                h if h >= 0 => h as i64,
+                _ => 0,
+            }
+        }
+
+        // WaitForSingleObject(hHandle, dwMilliseconds) on any dispatcher object.
+        // INFINITE (0xFFFFFFFF) blocks; 0 polls; else a real wall-clock wait.
+        // Returns WAIT_OBJECT_0 (0), WAIT_TIMEOUT (0x102), or WAIT_FAILED.
+        NT_WAITFORSINGLEOBJECT_K => {
+            const WAIT_TIMEOUT: i64 = 0x102;
+            const WAIT_FAILED: i64 = 0xFFFF_FFFF;
+            let Some(w) = process::current_waitable(a0 as i32) else {
+                return WAIT_FAILED;
+            };
+            let tid = process::current_tid();
+            let ms = a1 as u32;
+            if ms == 0xFFFF_FFFF {
+                w.wait(tid);
+                return 0;
+            }
+            if ms == 0 {
+                return if w.try_take(tid) { 0 } else { WAIT_TIMEOUT };
+            }
+            let deadline =
+                crate::timer::now().saturating_add(((ms as u64) * crate::timer::TICK_HZ / 1000).max(1));
+            while crate::timer::now() < deadline {
+                if w.try_take(tid) {
+                    return 0;
+                }
+                sched::yield_now();
+            }
+            if w.try_take(tid) { 0 } else { WAIT_TIMEOUT }
+        }
 
         _ => {
             crate::kprintln!("THOS: nt unhandled call {}", idx);

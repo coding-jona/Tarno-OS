@@ -403,6 +403,8 @@ pub struct Task {
     cwd: Mutex<String>,
     /// Pending user-mode APCs, delivered when the thread next goes alertable.
     apcs: Mutex<VecDeque<ApcEntry>>,
+    /// `true` for a native PE image, `false` for an ELF — for a `ps` view.
+    is_pe: AtomicBool,
 }
 
 fn seed_fds() -> Vec<Fd> {
@@ -424,9 +426,14 @@ impl Task {
             fds: Mutex::new(seed_fds()),
             cwd: Mutex::new(String::from("/")),
             apcs: Mutex::new(VecDeque::new()),
+            is_pe: AtomicBool::new(false),
         });
         TASKS.lock().insert(t.pid, t.clone());
         t
+    }
+
+    pub fn mark_pe(&self) {
+        self.is_pe.store(true, Ordering::Relaxed);
     }
 
     pub fn space(&self) -> Arc<Process> {
@@ -756,6 +763,26 @@ pub fn signal_thread_exit(tid: u64) -> bool {
     }
 }
 
+/// A `ps`-style dump of every spawned task (ELF and PE alike), for the
+/// Milestone 3 check that both personalities show up in one listing.
+#[allow(dead_code)] // only the `petest` milestone calls this
+pub fn ps_dump() {
+    let (mut elf, mut pe) = (0u32, 0u32);
+    crate::kprintln!("THOS: ps    PID PPID KIND STATE");
+    for (pid, t) in TASKS.lock().iter() {
+        let is_pe = t.is_pe.load(Ordering::Relaxed);
+        if is_pe {
+            pe += 1;
+        } else {
+            elf += 1;
+        }
+        let kind = if is_pe { "PE " } else { "ELF" };
+        let state = if t.exited.load(Ordering::Relaxed) { "exited" } else { "run" };
+        crate::kprintln!("THOS: ps    {:>3} {:>4} {}  {}", pid, t.ppid, kind, state);
+    }
+    crate::kprintln!("THOS: ps ok  {} ELF + {} PE processes in one listing", elf, pe);
+}
+
 pub fn current_pid() -> u64 {
     sched::current().task().map(|t| t.pid).unwrap_or(0)
 }
@@ -836,6 +863,7 @@ pub fn spawn_pe(bytes: &[u8]) -> Result<u64, &'static str> {
     // MS x64 ABI: at the entry instruction RSP+8 must be 16-aligned.
     let rsp = (stack_top & !0xF) - 8;
     let task = Task::new(0, space);
+    task.mark_pe();
     sched::spawn_user_pe("pe", task.clone(), img.entry, rsp, img.teb);
     Ok(task.pid)
 }

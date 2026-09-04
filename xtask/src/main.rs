@@ -304,6 +304,19 @@ fn disk_image() -> PathBuf {
         img.to_str().unwrap(),
     ]));
 
+    // Milestone 3: a real mingw-w64 compiler-produced Win32 console `.exe`
+    // (`-nostdlib`, own entry, so its only import is KERNEL32.dll) -> /wincon.exe.
+    let wincon_src = root.join("xtask/testdata/wincon.c");
+    let wincon = root.join("target/wincon.exe");
+    run(Command::new("x86_64-w64-mingw32-gcc").args([
+        "-O2", "-nostdlib", "-Wl,-e,wincon_start", "-o",
+        wincon.to_str().unwrap(), wincon_src.to_str().unwrap(), "-lkernel32",
+    ]));
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} wincon.exe", wincon.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+
     // A real on-disk PE DLL at C:\Windows\System32\thoscrt.dll — the exe imports
     // thoscrt!thos_add, and thoscrt itself imports KERNEL32!GetLastError.
     let thoscrt = root.join("target/thoscrt.dll");
@@ -3401,7 +3414,15 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE TLS OK") // static TLS: block copied, __tls_index written, callback ran
         && serial.contains("THOS: pe dllfail ok") // a DllMain returning FALSE aborted process init
         && !serial.contains("PE DLLFAIL REACHED ENTRY") // ...so the exe entry never ran
-        && serial.contains("THOS: pe reject ok");
+        && serial.contains("THOS: pe reject ok")
+        // Milestone 3: a real mingw-w64 compiler-built Win32 console .exe.
+        && serial.contains("WINCON: hello from mingw")
+        && serial.contains("WINCON: read C:\\pe-read.txt -> PE ReadFile OK via CreateFileA")
+        && serial.contains("WINCON: WaitForSingleObject ok")
+        && serial.contains("WINCON: exit ok")
+        && serial.contains("THOS: wincon exited")
+        && serial.contains("ELF + ") // ps: both personalities in one listing
+        && serial.lines().any(|l| l.contains("THOS: ps ok") && !l.contains("0 PE") && !l.contains("0 ELF"));
     if ok {
         println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll/System32-DLL (in Ldr)");
     } else {
