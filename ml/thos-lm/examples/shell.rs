@@ -11,7 +11,7 @@
 //!       --weights spike-1m.tlm
 //!
 //! Slash-commands (type `/help` inside): /help /params /temp /topk /tokens
-//! /seed /stops /reset /multi /save /exit
+//! /seed /stops /reset /multi /save /reload /lang /train /exit
 #![cfg(not(target_os = "none"))]
 
 use std::io::{self, BufRead, BufReader, Write};
@@ -283,6 +283,135 @@ fn json_extract_text(line: &str) -> Option<String> {
     None
 }
 
+/// Finds `run.sh` and its directory (so config paths resolve regardless of
+/// where thos-shell itself was launched from).
+fn run_sh_and_config_dir() -> Option<(String, String)> {
+    let run_sh = first_existing(&[
+        "ml/train/run.sh",
+        "../train/run.sh",
+        "../../ml/train/run.sh",
+        "train/run.sh",
+        "run.sh",
+    ])?;
+    let dir = std::path::Path::new(&run_sh)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Some((run_sh, dir))
+}
+
+/// Runs a command with inherited stdio, so run.sh's own messages print
+/// straight into the shell — no separate output-capturing plumbing needed.
+fn run_inherit(mut cmd: Command) {
+    match cmd.status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => println!("  {C_YELLOW}exited with {s}{C_RESET}"),
+        Err(e) => println!("  {C_YELLOW}failed to run: {e}{C_RESET}"),
+    }
+}
+
+/// `/train start|staged|stop|pause|resume|status [config-stem|hours]` — lets
+/// the shell double as a control surface for the same training run the
+/// dashboard and `run.sh ctl` talk to (same control.json).
+fn handle_train(sub: &str, extra: Option<&str>) {
+    let Some((run_sh, dir)) = run_sh_and_config_dir() else {
+        println!("  {C_YELLOW}can't find ml/train/run.sh from here{C_RESET}");
+        return;
+    };
+    match sub {
+        "" => println!(
+            "  {C_YELLOW}usage: /train start|staged|stop|pause|resume|status [config-stem|hours]{C_RESET}"
+        ),
+        "start" => {
+            let mut cmd = Command::new("bash");
+            cmd.arg(&run_sh).arg("train-bg");
+            if let Some(stem) = extra {
+                cmd.env("CONFIG", format!("{dir}/config/{stem}.toml"));
+                cmd.env("TLM", format!("{stem}.tlm"));
+            }
+            run_inherit(cmd);
+        }
+        "staged" => {
+            let mut cmd = Command::new("bash");
+            cmd.arg(format!("{dir}/staged.sh")).arg("start");
+            if let Some(hours) = extra {
+                cmd.arg("--hours").arg(hours);
+            }
+            run_inherit(cmd);
+        }
+        "stop" | "pause" | "resume" => {
+            // Default to whichever run is most recently active (same rule as
+            // /train status) rather than run.sh's static default config —
+            // otherwise this would silently target the wrong job once more
+            // than one config has ever been trained.
+            let stem = extra.map(str::to_string).or_else(|| most_recent_run(&dir));
+            let mut cmd = Command::new("bash");
+            cmd.arg(&run_sh).arg("ctl").arg(sub);
+            match &stem {
+                Some(s) => {
+                    cmd.env("CONFIG", format!("{dir}/config/{s}.toml"));
+                }
+                None => println!("  {C_YELLOW}no active run found — defaulting to run.sh's own default config{C_RESET}"),
+            }
+            run_inherit(cmd);
+        }
+        "status" => print_train_status(&dir),
+        other => println!(
+            "  {C_YELLOW}unknown /train {other} — start|staged|stop|pause|resume|status{C_RESET}"
+        ),
+    }
+}
+
+/// Picks whichever out/<config>/ under `train_dir` has the most recently
+/// updated log.csv — i.e. whatever's actively (or most recently) training.
+fn most_recent_run(train_dir: &str) -> Option<String> {
+    let out_base = format!("{train_dir}/out");
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for e in std::fs::read_dir(&out_base).ok()?.flatten() {
+        let log = e.path().join("log.csv");
+        if let Ok(mtime) = std::fs::metadata(&log).and_then(|m| m.modified()) {
+            let stem = e.file_name().to_string_lossy().into_owned();
+            if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
+                best = Some((mtime, stem));
+            }
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+fn print_train_status(train_dir: &str) {
+    let Some(stem) = most_recent_run(train_dir) else {
+        println!("  {C_YELLOW}no training run found under {train_dir}/out{C_RESET}");
+        return;
+    };
+    let dir = std::path::Path::new(train_dir).join("out").join(&stem);
+    let last_line = std::fs::read_to_string(dir.join("log.csv"))
+        .ok()
+        .and_then(|s| s.lines().last().map(|l| l.to_string()));
+    let ctl = std::fs::read_to_string(dir.join("control.json")).unwrap_or_default();
+    let state = if ctl.contains("\"pause\": true") {
+        "PAUSED"
+    } else if ctl.contains("\"stop\": true") {
+        "STOP REQUESTED"
+    } else {
+        "running"
+    };
+    println!("  {C_CYAN}config{C_RESET} {stem}   {C_CYAN}state{C_RESET} {state}");
+    match last_line {
+        Some(l) => {
+            let p: Vec<&str> = l.split(',').collect();
+            if p.len() == 5 {
+                println!(
+                    "  {C_CYAN}step{C_RESET} {}   {C_CYAN}train{C_RESET} {}   {C_CYAN}val{C_RESET} {}   \
+                     {C_CYAN}lr{C_RESET} {}   {C_CYAN}tok/s{C_RESET} {}",
+                    p[0], p[1], p[2], p[3], p[4]
+                );
+            }
+        }
+        None => println!("  {C_DIM}no eval rows yet{C_RESET}"),
+    }
+}
+
 /// Ensures a translator is running if `set.lang` is set, then runs one turn:
 /// translate the user's text to English, generate, translate the answer back.
 /// The model itself only ever sees/produces English.
@@ -470,6 +599,7 @@ fn handle_command(
             }
         }
         "reload" => return Cmd::Reload,
+        "train" => handle_train(arg, it.next()),
         "lang" => {
             if arg.is_empty() {
                 match &set.lang {
@@ -527,6 +657,10 @@ fn print_help() {
         ("/save [file]", "write the context transcript to a file"),
         ("/reload", "force-reload the weights file now (auto-checked every turn anyway)"),
         ("/lang <code|off>", "converse in <code> (e.g. de) via a local offline translator"),
+        ("/train start", "start CPU training in the background (bg -> run.sh train-bg)"),
+        ("/train staged [h]", "start the gentle-then-full-throttle pipeline (staged.sh)"),
+        ("/train stop|pause|resume", "control the active run (writes the same control.json as run.sh ctl)"),
+        ("/train status", "step / loss / lr / tok/s of whichever run is most recently active"),
         ("/exit", "quit (also Ctrl-D)"),
     ];
     println!("  {C_BOLD}commands{C_RESET}");
