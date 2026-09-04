@@ -403,15 +403,33 @@ late.
     polymorphic `Waitable` (event / semaphore / mutant) with
     `try_take`/`wait`/`is_signaled`. SSDT: `NtCreateMutant` / `NtReleaseMutant` /
     `NtCreateSemaphore` / `NtReleaseSemaphore` / `NtWaitForMultipleObjects`
-    (WaitAny → `STATUS_WAIT_0 + i`; WaitAll acquires all when all signalled;
-    cooperative-yield spin). `NtWaitForSingleObject` now waits on any `Waitable`.
-    `pe-test` `PE sync OK`. Real block on the executive timer wheel comes later.
+    (WaitAny → `STATUS_WAIT_0 + i`; WaitAll acquires all when all signalled).
+    `NtWaitForSingleObject` now waits on any `Waitable`. `pe-test` `PE sync OK`.
+  - **Executive timer wheel + `NtDelayExecution`.** `crate::timer`: a monotonic
+    tick clock (CPU-0-driven, ~100 Hz) + a wheel. `sleep_until` does a clean
+    `block_current()` from a cooperative PE syscall; the timer IRQ fires on
+    whatever runs next with `IF=1` (another thread / a CPU's `sti;hlt` idle) and
+    wakes the sleeper. `NtDelayExecution` (negative interval) is a real block;
+    `NtWaitFor*` relative timeouts use a real wall-clock deadline. `PE delay OK`.
+  - **Thread creation.** `pe::spawn_thread` makes one ring-3 worker per PE
+    process: shares the address space + `Task`, own TEB (`PE_TEB2_ADDR`) + 32 KiB
+    stack + kernel stack, enters a `PE_THREADSTART_ADDR` stub with `[routine]
+    [arg]` on its stack → calls the routine → `NtTerminateThread`. `current_tid`
+    (`sched::current().id`) distinguishes threads within a process; a `THREAD_EXITS`
+    map gives each worker a manual exit event, so `NtWaitForSingleObject` on the
+    returned handle completes on exit. `PE thread ran` / `PE thread OK`.
+  - **Section objects.** `HandleObject::Section` — anonymous (zeroed) or a copy
+    of a file's bytes at create time. `NtCreateSection` / `NtMapViewOfSection`
+    (copies the range into fresh private RW pages; CR3 is the process's so the
+    copy writes straight to the user VA). No shared writeback / COW yet.
+    `PE section OK`.
   - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
     unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
-    unmodified), or a from-scratch `ntdll` — an **executive timer wheel** for a
-    real timed block (and a preemption-safe path out of a PE syscall),
-    `section` + `thread` `HandleObject` kinds, the registry grown to hives; then
-    process isolation / integrity for the security phase.
+    unmodified), or a from-scratch `ntdll` — a preemption-safe path out of a PE
+    syscall (ring-3 IRQ `swapgs` shim so PE threads can run `IF=1`), a
+    fully-blocking timed object wait (dual-enqueue: object queue + wheel),
+    multiple threads per process, shared-writeback sections, the registry grown
+    to hives; then process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
