@@ -24,7 +24,7 @@ use x86_64::PhysAddr;
 use crate::elf::{self, Image};
 use crate::file::{ConsoleFile, FileOps, KeyboardFile};
 use crate::mm::{hhdm_offset, phys_to_virt, FRAME_ALLOC};
-use crate::wait::Event;
+use crate::wait::{Event, Mutant, Semaphore};
 use crate::syscall::{self, UserFrame};
 use crate::{gdt, sched, vmm};
 
@@ -318,9 +318,47 @@ pub fn current_uid() -> u32 {
 pub enum HandleObject {
     File(Arc<dyn FileOps>),
     Event(Arc<Event>),
+    Semaphore(Arc<Semaphore>),
+    Mutant(Arc<Mutant>),
     /// A registry key — the canonical `\`-joined path into [`crate::registry`]'s
     /// global tree (ops re-walk under that module's lock).
     RegKey(String),
+}
+
+/// A polymorphic view of the dispatcher objects a `NtWaitFor*` call can wait on.
+/// `tid` is threaded through only for the mutant's ownership check.
+#[derive(Clone)]
+pub enum Waitable {
+    Event(Arc<Event>),
+    Semaphore(Arc<Semaphore>),
+    Mutant(Arc<Mutant>),
+}
+
+impl Waitable {
+    /// Non-blocking: take/consume the signal if present.
+    pub fn try_take(&self, tid: u64) -> bool {
+        match self {
+            Waitable::Event(e) => e.try_take(),
+            Waitable::Semaphore(s) => s.try_take(),
+            Waitable::Mutant(m) => m.try_acquire(tid),
+        }
+    }
+    /// Block until signalled, then consume it.
+    pub fn wait(&self, tid: u64) {
+        match self {
+            Waitable::Event(e) => e.wait(),
+            Waitable::Semaphore(s) => s.wait(),
+            Waitable::Mutant(m) => m.acquire(tid),
+        }
+    }
+    /// Would `try_take` succeed right now? (No consume.)
+    pub fn is_signaled(&self, tid: u64) -> bool {
+        match self {
+            Waitable::Event(e) => e.is_signaled(),
+            Waitable::Semaphore(s) => s.is_signaled(),
+            Waitable::Mutant(m) => m.is_signaled(tid),
+        }
+    }
 }
 
 /// One table slot: the object plus its close-on-exec flag (per-descriptor, not
@@ -413,6 +451,22 @@ impl Task {
     }
     pub fn handle_alloc_event(&self, ev: Arc<Event>) -> i32 {
         self.handle_alloc(HandleObject::Event(ev), false)
+    }
+    pub fn handle_alloc_semaphore(&self, s: Arc<Semaphore>) -> i32 {
+        self.handle_alloc(HandleObject::Semaphore(s), false)
+    }
+    pub fn handle_alloc_mutant(&self, m: Arc<Mutant>) -> i32 {
+        self.handle_alloc(HandleObject::Mutant(m), false)
+    }
+
+    /// The dispatcher object a HANDLE names, as a [`Waitable`], if it is one.
+    pub fn handle_waitable(&self, h: i32) -> Option<Waitable> {
+        match &self.fds.lock().get(h as usize)?.as_ref()?.obj {
+            HandleObject::Event(e) => Some(Waitable::Event(e.clone())),
+            HandleObject::Semaphore(s) => Some(Waitable::Semaphore(s.clone())),
+            HandleObject::Mutant(m) => Some(Waitable::Mutant(m.clone())),
+            _ => None,
+        }
     }
 
     /// The registry-key path a HANDLE names, if it is one.
@@ -604,6 +658,18 @@ pub fn current_event(h: i32) -> Option<Arc<Event>> {
 /// Install `ev` in the current task's HANDLE table; returns the HANDLE, or -1.
 pub fn current_alloc_event(ev: Arc<Event>) -> i32 {
     sched::current().task().map_or(-1, |t| t.handle_alloc_event(ev))
+}
+pub fn current_alloc_semaphore(s: Arc<Semaphore>) -> i32 {
+    sched::current().task().map_or(-1, |t| t.handle_alloc_semaphore(s))
+}
+pub fn current_alloc_mutant(m: Arc<Mutant>) -> i32 {
+    sched::current().task().map_or(-1, |t| t.handle_alloc_mutant(m))
+}
+
+/// The current task's [`Waitable`] for HANDLE `h`, if it names a dispatcher
+/// object (event / semaphore / mutant).
+pub fn current_waitable(h: i32) -> Option<Waitable> {
+    sched::current().task().and_then(|t| t.handle_waitable(h))
 }
 
 /// The current task's registry-key path for HANDLE `h`, if it names one.

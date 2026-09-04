@@ -104,7 +104,12 @@ pub const NT_NTOPENKEY: u16 = 23;
 pub const NT_NTSETVALUEKEY: u16 = 24;
 pub const NT_NTQUERYVALUEKEY: u16 = 25;
 pub const NT_NTDELETEKEY: u16 = 26;
-pub const NTDLL_STUB_COUNT: u16 = 27;
+pub const NT_NTCREATEMUTANT: u16 = 27;
+pub const NT_NTRELEASEMUTANT: u16 = 28;
+pub const NT_NTCREATESEMAPHORE: u16 = 29;
+pub const NT_NTRELEASESEMAPHORE: u16 = 30;
+pub const NT_NTWAITFORMULTIPLEOBJECTS: u16 = 31;
+pub const NTDLL_STUB_COUNT: u16 = 32;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -139,6 +144,11 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtSetValueKey",
     "NtQueryValueKey",
     "NtDeleteKey",
+    "NtCreateMutant",
+    "NtReleaseMutant",
+    "NtCreateSemaphore",
+    "NtReleaseSemaphore",
+    "NtWaitForMultipleObjects",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -167,6 +177,8 @@ const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_MUTANT_NOT_OWNED: u32 = 0xC000_0046;
+const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = 0xC000_005F;
 
 /// `TEB.LastErrorValue` lives at `gs:[0x68]`. The kernel runs with `gs` swapped
 /// to the per-CPU block, so reach the TEB through the thread's saved `%gs` base.
@@ -372,42 +384,144 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             STATUS_SUCCESS as i64
         }
 
-        // NtWaitForSingleObject(Handle, Alertable, *Timeout). NULL = block
-        // forever; `*Timeout == 0` = poll; a negative `*Timeout` is a relative
-        // wait in 100 ns units — spun against the 100 Hz APIC tick until the
-        // event fires or the deadline passes (a real timed block on the
-        // executive timer wheel comes later). Positive (absolute) = poll.
+        // NtWaitForSingleObject(Handle, Alertable, *Timeout) on any dispatcher
+        // object (event / semaphore / mutant). NULL = block forever;
+        // `*Timeout == 0` = poll; a negative `*Timeout` is a relative wait in
+        // 100 ns units — a bounded cooperative-yield spin (a real timed block on
+        // the executive timer wheel comes later). Positive (absolute) = poll.
         NT_NTWAITFORSINGLEOBJECT => {
-            let Some(ev) = process::current_event(a0 as i32) else {
+            let Some(w) = process::current_waitable(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
             };
+            let tid = process::current_pid();
             if a2 == 0 {
-                ev.wait();
+                w.wait(tid);
                 return STATUS_SUCCESS as i64;
             }
             let timeout = unsafe { *(a2 as *const i64) };
             if timeout >= 0 {
-                // 0 = poll; positive (absolute deadline) is not tracked, so
-                // also just check the current state.
-                return if ev.try_take() {
-                    STATUS_SUCCESS as i64
-                } else {
-                    STATUS_TIMEOUT as i64
-                };
+                return if w.try_take(tid) { STATUS_SUCCESS as i64 } else { STATUS_TIMEOUT as i64 };
             }
-            // Relative timeout. A PE thread's syscall runs with IF=0 (they are
-            // cooperatively scheduled), so we can't rely on the timer tick or
-            // block — spin a bounded number of cooperative yields scaled to the
-            // requested interval and return `STATUS_TIMEOUT`. A true timed
-            // block lands with the executive timer wheel.
             let spins = (((-timeout) as u64) / 50).clamp(20_000, 4_000_000);
             for _ in 0..spins {
-                if ev.try_take() {
+                if w.try_take(tid) {
                     return STATUS_SUCCESS as i64;
                 }
                 sched::yield_now();
             }
             STATUS_TIMEOUT as i64
+        }
+
+        // NtCreateMutant(*Handle, DesiredAccess, *ObjectAttributes, InitialOwner)
+        NT_NTCREATEMUTANT => {
+            let owner = if a3 & 0xFF != 0 { process::current_pid() } else { 0 };
+            let h = process::current_alloc_mutant(Arc::new(crate::wait::Mutant::new(owner)));
+            if h < 0 {
+                return STATUS_NO_MEMORY as i64;
+            }
+            unsafe { *(a0 as *mut u64) = h as u64 };
+            STATUS_SUCCESS as i64
+        }
+
+        // NtReleaseMutant(Handle, *PreviousCount) — one recursion level.
+        NT_NTRELEASEMUTANT => {
+            let Some(process::Waitable::Mutant(m)) = process::current_waitable(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            match m.release(process::current_pid()) {
+                Ok(prev) => {
+                    if a1 != 0 {
+                        unsafe { *(a1 as *mut u32) = prev };
+                    }
+                    STATUS_SUCCESS as i64
+                }
+                Err(()) => STATUS_MUTANT_NOT_OWNED as i64,
+            }
+        }
+
+        // NtCreateSemaphore(*Handle, DesiredAccess, *ObjectAttributes,
+        //                   InitialCount, MaximumCount)
+        NT_NTCREATESEMAPHORE => {
+            let (initial, max) = (a3 as i32, stack(0) as i32);
+            if max < 1 || initial < 0 || initial > max {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let h = process::current_alloc_semaphore(Arc::new(crate::wait::Semaphore::new(initial, max)));
+            if h < 0 {
+                return STATUS_NO_MEMORY as i64;
+            }
+            unsafe { *(a0 as *mut u64) = h as u64 };
+            STATUS_SUCCESS as i64
+        }
+
+        // NtReleaseSemaphore(Handle, ReleaseCount, *PreviousCount)
+        NT_NTRELEASESEMAPHORE => {
+            let Some(process::Waitable::Semaphore(s)) = process::current_waitable(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            match s.release(a1 as i32) {
+                Some(prev) => {
+                    if a2 != 0 {
+                        unsafe { *(a2 as *mut u32) = prev as u32 };
+                    }
+                    STATUS_SUCCESS as i64
+                }
+                None => STATUS_SEMAPHORE_LIMIT_EXCEEDED as i64,
+            }
+        }
+
+        // NtWaitForMultipleObjects(Count, Handles[], WaitType, Alertable,
+        //                          *Timeout). WaitType 0 = WaitAll, 1 = WaitAny.
+        // WaitAny returns STATUS_WAIT_0 + index. Cooperative-yield spin, same
+        // timeout rules as NtWaitForSingleObject; NULL timeout spins until ready.
+        NT_NTWAITFORMULTIPLEOBJECTS => {
+            let count = a0 as usize;
+            if count == 0 || count > 64 {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let wait_all = a2 == 0;
+            let tid = process::current_pid();
+            let mut objs: alloc::vec::Vec<process::Waitable> = alloc::vec::Vec::with_capacity(count);
+            for i in 0..count {
+                let h = unsafe { *((a1 + (i * 8) as u64) as *const u64) } as i32;
+                match process::current_waitable(h) {
+                    Some(w) => objs.push(w),
+                    None => return STATUS_INVALID_HANDLE as i64,
+                }
+            }
+            let tptr = stack(0);
+            let timeout = if tptr == 0 { i64::MIN } else { unsafe { *(tptr as *const i64) } };
+            let poll_only = timeout >= 0 && tptr != 0;
+            let spins: u64 = if tptr == 0 {
+                u64::MAX
+            } else if poll_only {
+                1
+            } else {
+                (((-timeout) as u64) / 50).clamp(20_000, 4_000_000)
+            };
+
+            let mut n = 0u64;
+            loop {
+                if wait_all {
+                    if objs.iter().all(|w| w.is_signaled(tid)) {
+                        for w in &objs {
+                            w.try_take(tid);
+                        }
+                        return STATUS_SUCCESS as i64;
+                    }
+                } else {
+                    for (i, w) in objs.iter().enumerate() {
+                        if w.try_take(tid) {
+                            return (STATUS_SUCCESS as i64) + i as i64; // STATUS_WAIT_0 + i
+                        }
+                    }
+                }
+                n += 1;
+                if n >= spins {
+                    return STATUS_TIMEOUT as i64;
+                }
+                sched::yield_now();
+            }
         }
 
         // NtContinue(*Context, TestAlert) — resume ring 3 from the CONTEXT the
