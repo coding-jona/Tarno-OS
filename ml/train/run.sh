@@ -9,13 +9,14 @@
 #   ml/train/run.sh all            setup -> data -> train -> export -> sample
 #   ml/train/run.sh setup          create .venv, install torch(CPU)/numpy/tqdm
 #   ml/train/run.sh data           fetch the open corpus + build train/val bins
-#   ml/train/run.sh train          train (auto-resumes from out/latest.pt)
-#   ml/train/run.sh train-bg       same, in the background -> out/train.log
+#   ml/train/run.sh train          train (auto-resumes from out/<config>/latest.pt)
+#   ml/train/run.sh train-bg       same, in the background -> out/<config>/train.log
 #   ml/train/run.sh status         show background training progress
 #   ml/train/run.sh stop           stop background training
-#   ml/train/run.sh export         out/latest.pt  ->  $TLM (spike-1m.tlm)
+#   ml/train/run.sh export         out/<config>/latest.pt  ->  $TLM (spike-1m.tlm)
 #   ml/train/run.sh eval           perplexity + next-token probe + a sample
 #   ml/train/run.sh sample "Text"  build the Rust engine + generate from the .tlm
+#   ml/train/run.sh shell          launch the interactive local AI shell (thos-shell)
 #   ml/train/run.sh test           no_std build + golden cross-check + fixture
 #   ml/train/run.sh clean          remove .venv, data/, out/, *.tlm
 #
@@ -29,8 +30,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 VENV="$HERE/.venv"
 PY="$VENV/bin/python"
-OUT="$HERE/out"
 CONFIG="${CONFIG:-$HERE/config/spike-1m.toml}"
+# checkpoints/logs are per-config so a new model never resumes another's latest.pt
+OUT="$HERE/out/$(basename "${CONFIG%.toml}")"
 TLM="${TLM:-$ROOT/spike-1m.tlm}"
 PROMPT="${PROMPT:-The }"
 MAXTOK="${MAXTOK:-200}"
@@ -84,7 +86,7 @@ cmd_train() {
   local resume=()
   [ -f "$OUT/latest.pt" ] && { resume=(--resume); echo "resuming from $OUT/latest.pt"; }
   say "train  ($(basename "$CONFIG"))"
-  exec "$PY" "$HERE/train.py" --config "$CONFIG" "${resume[@]}"
+  exec "$PY" -u "$HERE/train.py" --config "$CONFIG" "${resume[@]}"
 }
 
 cmd_train_bg() {
@@ -96,7 +98,7 @@ cmd_train_bg() {
   fi
   local resume=()
   [ -f "$OUT/latest.pt" ] && resume=(--resume)
-  nohup "$PY" "$HERE/train.py" --config "$CONFIG" "${resume[@]}" > "$OUT/train.log" 2>&1 &
+  nohup "$PY" -u "$HERE/train.py" --config "$CONFIG" "${resume[@]}" > "$OUT/train.log" 2>&1 &
   echo $! > "$OUT/train.pid"
   say "training in background — pid $(cat "$OUT/train.pid")"
   echo "watch:  ml/train/run.sh status    (or: tail -f $OUT/train.log)"
@@ -135,6 +137,15 @@ cmd_sample() {
       --weights "$TLM" --prompt "$p" --max-tokens "$MAXTOK" )
 }
 
+cmd_shell() {
+  local w="$TLM"
+  [ -f "$w" ] || w="$ROOT/spike-1m.tlm"
+  [ -f "$w" ] || die "no weights — train + 'run.sh export' first (looked for $TLM, spike-1m.tlm)"
+  say "thos-shell  ($w)"
+  ( cd "$ROOT" && cargo run -q --release -p thos-lm --example shell --target "$RUST_TARGET" -- \
+      --weights "$w" )
+}
+
 cmd_test() {
   say "no_std build"
   ( cd "$ROOT" && cargo build -p thos-lm --target x86_64-unknown-none )
@@ -150,7 +161,7 @@ cmd_all() { cmd_setup; cmd_data; "$0" train; cmd_export; cmd_sample; }
 
 cmd_clean() {
   say "clean"
-  rm -rf "$VENV" "$HERE/data" "$OUT" "$ROOT"/*.tlm
+  rm -rf "$VENV" "$HERE/data" "$HERE/out" "$ROOT"/*.tlm
   echo "removed .venv, data/, out/, *.tlm  (committed fixture under ml/thos-lm/ is untouched)"
 }
 
@@ -164,6 +175,7 @@ case "${1:-help}" in
   export)    cmd_export ;;
   eval)      cmd_eval ;;
   sample)    shift || true; cmd_sample "${1:-}" ;;
+  shell)     cmd_shell ;;
   test)      cmd_test ;;
   all)       cmd_all ;;
   clean)     cmd_clean ;;

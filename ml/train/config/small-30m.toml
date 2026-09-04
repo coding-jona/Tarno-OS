@@ -17,15 +17,17 @@ norm_eps   = 1e-5
 seed          = 20260904
 batch_size    = 24
 grad_accum    = 8        # effective batch 192
-max_steps     = 60000
+# ~30 s/optimizer-step on the i7-13700KF (CPU). 20k steps ~ 6-7 days of compute;
+# stop any time — checkpoints every 500 steps (~4 h) export + run in the shell.
+max_steps     = 20000
 warmup_steps  = 800
 lr            = 6e-4
 min_lr        = 6e-5
 weight_decay  = 0.1
 grad_clip     = 1.0
-eval_interval = 1000
-eval_batches  = 60
-ckpt_interval = 2000
+eval_interval = 300
+eval_batches  = 40
+ckpt_interval = 500
 num_threads   = 0        # 0 => torch default (all cores)
 
 [data]

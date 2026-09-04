@@ -81,10 +81,14 @@ def main() -> None:
     ckpt = os.path.join(OUT, "latest.pt")
     if args.resume and os.path.exists(ckpt):
         blob = torch.load(ckpt, map_location="cpu")
-        model.load_state_dict(blob["model"])
-        opt.load_state_dict(blob["opt"])
-        step0 = blob["step"]
-        print(f"resumed from step {step0}")
+        if blob.get("cfg", {}).get("model") != mc:
+            print(f"ignoring {ckpt}: checkpoint config differs from {os.path.basename(args.config)} "
+                  "— starting fresh")
+        else:
+            model.load_state_dict(blob["model"])
+            opt.load_state_dict(blob["opt"])
+            step0 = blob["step"]
+            print(f"resumed from step {step0}")
 
     log_path = os.path.join(OUT, "log.csv")
     if step0 == 0:

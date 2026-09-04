@@ -7,9 +7,10 @@ weights. Grow from small to large step by step. Design + rationale:
 
 **Status:** P1 in progress. The pipeline (fetch → **byte-BPE** tokenize → train →
 export → Rust inference → eval) is wired end to end and cross-checked. P0 (the
-~1M byte-level spike) trained to val ≈ 1.20 nats/byte. P1 = a ~30M byte-BPE model
-on a larger open corpus — config + tooling ready, the long CPU run is the user's
-to kick off.
+~1M byte-level spike) trained to val ≈ 1.20 nats/byte. P1b = a ~30M byte-BPE model
+on an **~80-book open corpus**, kicked off by `ml/train/staged.sh` (fetch now,
+full-throttle training after a one-time headroom window). Talk to any checkpoint
+with `ml/train/run.sh shell` — a small standalone REPL (`thos-lm/examples/shell.rs`).
 
 ## Layout
 
@@ -54,25 +55,33 @@ ml/train/run.sh status              # progress (loss, step, tok/s)
 ml/train/run.sh export              # out/latest.pt -> $TLM
 ml/train/run.sh eval                # perplexity + next-token probe + a sample
 ml/train/run.sh sample "The "       # build the Rust engine + generate
+ml/train/run.sh shell               # interactive local AI shell (thos-shell)
 ```
 
 `run.sh help` lists everything. Overridable via env: `CONFIG=` (default
 `config/spike-1m.toml`), `TLM=`, `PROMPT=`, `MAXTOK=`, `BPE=` (BPE vocab, 0 = raw
 byte).
 
-**P1 — a ~30M byte-BPE model:**
+**P1b — a ~30M byte-BPE model on the bigger corpus, staged:**
 
 ```sh
-BPE=16384 ml/train/run.sh data
-CONFIG=ml/train/config/small-30m.toml TLM=small-30m.tlm ml/train/run.sh train-bg
-# ... hours later ...
+ml/train/staged.sh start --hours 6   # phase 1: fetch only, niced + thread-capped
+                                     # phase 2 (auto, after 6 h): prepare + train, full throttle
+ml/train/staged.sh status            # which phase, corpus size, last loss rows
 CONFIG=ml/train/config/small-30m.toml TLM=small-30m.tlm ml/train/run.sh export
-TLM=small-30m.tlm ml/train/run.sh eval
+TLM=small-30m.tlm ml/train/run.sh shell
 ```
 
-The `data` step downloads ~35 Project Gutenberg titles (resumable) and trains the
-BPE tokenizer; `config/small-30m.toml` is `n_layer=8 n_head=8 n_embd=512
-block_size=256 vocab=16384`.
+`staged.sh` exists because CPU training of the 30M stack is ~30 s/step (≈ a week
+for the full 20k-step schedule). The one-time gentle window leaves CPU/RAM (and
+the untouched GPU) for other work; then it runs flat out. Checkpoints land every
+500 steps and each is independently `export`-able and usable in the shell.
+`config/small-30m.toml` is `n_layer=8 n_head=8 n_embd=512 block_size=256
+vocab=16384`. `fetch.py` pulls ~80 public-domain Project Gutenberg titles
+(resumable across the nightly cut-off).
+
+To run the pieces by hand instead: `BPE=16384 ml/train/run.sh data` then
+`CONFIG=… TLM=… ml/train/run.sh train-bg`.
 
 The `train/*.py` scripts still run standalone if you prefer; `run.sh` just wires
 them together with the right paths and resume flags.
