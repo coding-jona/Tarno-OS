@@ -445,10 +445,12 @@ late.
     `C:\pe-read.txt` (`CreateFileA`/`ReadFile`), writes stdout
     (`GetStdHandle`/`WriteFile`), `WaitForSingleObject`s a `CreateEventA` event,
     then `ExitProcess`. Runs on the synthetic `kernel32`, no Wine.
-    `process::ps_dump` prints every task with an ELF/PE kind → `2 ELF + 3 PE
-    processes in one listing`. `cargo xtask pe-test`. The **CRT-heavy path**
-    (a `msvcrt.dll` / UCRT `int main` exe with `_initterm` / `__getmainargs` /
-    the `printf` family) is M3+ follow-up — needs a synthetic `msvcrt`.
+    `process::ps_dump` prints every task with an ELF/PE kind. `cargo xtask
+    pe-test`. **Full mingw CRT path also done:** a synthetic `msvcrt.dll`
+    (third `nt::dispatch` personality) — own `printf` formatter,
+    `__getmainargs` + a ring-3 `_initterm` stub (so `argc`/`argv` work),
+    `malloc`/`memcpy`/... — runs `/crt.exe`, a normal 244 KB `int main` mingw
+    build, to exit. `ps`: `2 ELF + 4 PE`.
 
 ### Product goal — "download it and it runs", zero user config
 
