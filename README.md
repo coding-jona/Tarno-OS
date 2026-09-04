@@ -300,6 +300,7 @@ This is the same rule Wine and ReactOS enforce, for the same reason.
 | [`docs/thos/hw-target.md`](docs/thos/hw-target.md) | exact hardware inventory + per-chip driver notes |
 | [`docs/thos/licensing.md`](docs/thos/licensing.md) | the GPL-2.0 ↔ LGPL/AGPL decision and matrix |
 | [`docs/thos/ai.md`](docs/thos/ai.md) | in-system AI: a from-scratch small LM (`ml/`), trained off-device, run by a `no_std` Rust engine; open data only |
+| [`docs/thos/ai-large.md`](docs/thos/ai-large.md) | research track: running a large open model on little RAM (CPU, SSD-paged) — literature map + open problems |
 | [`FROZEN.md`](FROZEN.md) | what the pivot froze and why |
 
 ---

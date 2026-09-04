@@ -107,8 +107,13 @@ Gutenberg, arXiv/PMC-OA, StackExchange) are the legitimate growth path.
   loader parsing in `pe.rs` / `elf.rs`); labelled *open* dataset (EMBER-style,
   licensed); classifier head; wire into `elf::load` / `pe::load` behind an
   `execgate` feature; log verdicts, then enforce.
-- **P6+ — grow** as compute / RAM allow. A billions-of-params LLM stays blocked
-  on the GPU driver (Phase 4) + compute.
+- **P6+ — grow** as compute / RAM allow.
+
+**Large open models on little RAM** — running a 10–20B-class model on the CPU
+with most of it paged to SSD (sub-2-bit weights + activation-sparsity prediction
++ speculative prefetch + a purpose-built THOS pager) is its own **research
+track**, not scheduled: [`ai-large.md`](ai-large.md). It relaxes "own weights
+from zero" (it would run open weights); this small-LM track keeps that rule.
 
 **Milestone AI-0:** `cargo test -p thos-lm --target x86_64-unknown-linux-gnu`
 passes (Rust forward matches the numpy reference; sampler deterministic) **and**
@@ -138,8 +143,11 @@ reaches val loss well below the uniform-byte baseline (ln 256 ≈ 5.55) and
   (llama.cpp / ONNX / a bundled GGUF).
 - No training in the kernel; no GPU assumption for training.
 - Not a chatbot product in the near term.
-- A billions-of-params LLM is out of scope until the GPU driver
-  ([`feasibility.md`](feasibility.md) Phase 4) and the compute exist.
+- A billions-of-params LLM trained from scratch is out of scope until the GPU
+  driver ([`feasibility.md`](feasibility.md) Phase 4) and the compute exist.
+  *Running* a large open model on little RAM is a separate research track
+  ([`ai-large.md`](ai-large.md)), also unscheduled.
 
 See [`roadmap.md`](roadmap.md) · [`architecture.md`](architecture.md) ·
-[`feasibility.md`](feasibility.md) · [`../../ml/README.md`](../../ml/README.md).
+[`feasibility.md`](feasibility.md) · [`ai-large.md`](ai-large.md) ·
+[`../../ml/README.md`](../../ml/README.md).
