@@ -573,11 +573,40 @@ fn converse(
     if english != text {
         println!("{C_DIM}[en] {english}{C_RESET}");
     }
-    let out = run_turn(model, set, ctx, &english);
-    match tr.translate("en", &code, &out) {
-        Some(back) => println!("{C_MAGENTA}[{code}] {back}{C_RESET}"),
-        None => println!("{C_YELLOW}(translation back to {code} failed — see the English above){C_RESET}"),
+
+    // Genuinely incremental: translate each finished sentence as soon as the
+    // model produces it and print only the translation — not the whole
+    // English reply first and a translated copy after (slower, and you'd see
+    // everything twice). A long run-on without punctuation still flushes
+    // every ~240 chars so it can't stall until the very end either.
+    let out = io::stdout();
+    let mut lock = out.lock();
+    write!(lock, "{C_MAGENTA}").ok();
+    let mut buf = String::new();
+    let r = generate(model, set, ctx, &english, |chunk| {
+        buf.push_str(chunk);
+        let at_boundary = buf.ends_with(". ") || buf.ends_with("! ") || buf.ends_with("? ") || buf.ends_with('\n');
+        if (at_boundary && !buf.trim().is_empty()) || buf.len() > 240 {
+            let piece = std::mem::take(&mut buf);
+            let shown = tr.translate("en", &code, &piece).unwrap_or(piece);
+            write!(lock, "{shown}").ok();
+            lock.flush().ok();
+        }
+    });
+    if !buf.trim().is_empty() {
+        let shown = tr.translate("en", &code, &buf).unwrap_or_else(|| buf.clone());
+        write!(lock, "{shown}").ok();
     }
+    write!(lock, "{C_RESET}").ok();
+    writeln!(
+        lock,
+        "\n{C_DIM}— {} tok · {:.2}s · {:.1} tok/s · {} · en\u{2192}{code}{C_RESET}",
+        r.tokens,
+        r.elapsed,
+        r.tokens as f64 / r.elapsed.max(1e-6),
+        r.stopped
+    )
+    .ok();
 }
 
 fn mtime(path: &str) -> Option<std::time::SystemTime> {
@@ -820,8 +849,25 @@ fn read_multiline<I: Iterator<Item = io::Result<String>>>(lines: &mut I) -> Stri
     buf
 }
 
-/// Feed `user` + rolling context into the model and stream the continuation.
-fn run_turn(model: &Model, set: &Settings, ctx: &mut String, user: &str) -> String {
+struct GenResult {
+    text: String,
+    tokens: usize,
+    elapsed: f64,
+    stopped: &'static str,
+}
+
+/// The core generation loop, shared by the normal scrolling REPL (`run_turn`,
+/// which prints each chunk as it arrives) and `/live` split-screen mode
+/// (which instead appends each chunk into a redrawn pane) — `on_chunk` is
+/// called once per decoded, UTF-8-boundary-safe piece of output. Also used to
+/// feed `user` + the rolling context into the model.
+fn generate(
+    model: &Model,
+    set: &Settings,
+    ctx: &mut String,
+    user: &str,
+    mut on_chunk: impl FnMut(&str),
+) -> GenResult {
     if !ctx.is_empty() && !ctx.ends_with('\n') {
         ctx.push('\n');
     }
@@ -844,14 +890,10 @@ fn run_turn(model: &Model, set: &Settings, ctx: &mut String, user: &str) -> Stri
     let mut sampler = Sampler::new(cfg, set.seed);
     let bs = model.cfg.block_size;
 
-    let out = io::stdout();
-    let mut lock = out.lock();
-    write!(lock, "{C_GREEN}").ok();
-
     let mut produced: Vec<u16> = Vec::new();
     let mut pending: Vec<u8> = Vec::new(); // bytes not yet on a UTF-8 boundary
     let mut text_so_far = String::new();
-    let start = Instant::now();
+    let t0 = Instant::now();
     let mut stopped = "length";
 
     for _ in 0..set.max_tokens {
@@ -869,8 +911,7 @@ fn run_turn(model: &Model, set: &Settings, ctx: &mut String, user: &str) -> Stri
         };
         if good > 0 {
             let chunk = String::from_utf8_lossy(&pending[..good]).into_owned();
-            write!(lock, "{chunk}").ok();
-            lock.flush().ok();
+            on_chunk(&chunk);
             text_so_far.push_str(&chunk);
             pending.drain(..good);
         }
@@ -884,24 +925,35 @@ fn run_turn(model: &Model, set: &Settings, ctx: &mut String, user: &str) -> Stri
     }
     if !pending.is_empty() {
         let chunk = String::from_utf8_lossy(&pending).into_owned();
-        write!(lock, "{chunk}").ok();
+        on_chunk(&chunk);
         text_so_far.push_str(&chunk);
     }
-    write!(lock, "{C_RESET}").ok();
-
-    let dt = start.elapsed().as_secs_f64();
-    let n = produced.len();
-    writeln!(
-        lock,
-        "\n{C_DIM}— {n} tok · {:.2}s · {:.1} tok/s · {}{C_RESET}",
-        dt,
-        n as f64 / dt.max(1e-6),
-        stopped
-    )
-    .ok();
 
     let trimmed = text_so_far.trim_end().to_string();
     ctx.push_str(&trimmed);
     ctx.push('\n');
-    trimmed
+    GenResult { text: trimmed, tokens: produced.len(), elapsed: t0.elapsed().as_secs_f64(), stopped }
+}
+
+/// Feed `user` + rolling context into the model and stream the continuation
+/// straight to stdout, coloured, with a footer stats line.
+fn run_turn(model: &Model, set: &Settings, ctx: &mut String, user: &str) -> String {
+    let out = io::stdout();
+    let mut lock = out.lock();
+    write!(lock, "{C_GREEN}").ok();
+    let r = generate(model, set, ctx, user, |chunk| {
+        write!(lock, "{chunk}").ok();
+        lock.flush().ok();
+    });
+    write!(lock, "{C_RESET}").ok();
+    writeln!(
+        lock,
+        "\n{C_DIM}— {} tok · {:.2}s · {:.1} tok/s · {}{C_RESET}",
+        r.tokens,
+        r.elapsed,
+        r.tokens as f64 / r.elapsed.max(1e-6),
+        r.stopped
+    )
+    .ok();
+    r.text
 }

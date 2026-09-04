@@ -55,16 +55,16 @@ def serve() -> int:
         try:
             req = json.loads(line)
         except json.JSONDecodeError as e:
-            print(json.dumps({"error": str(e)}), flush=True)
+            print(json.dumps({"error": str(e)}, ensure_ascii=False), flush=True)
             continue
         if req.get("ping"):
-            print(json.dumps({"ok": True}), flush=True)
+            print(json.dumps({"ok": True}, ensure_ascii=False), flush=True)
             continue
         try:
             out = tr.translate(req["text"], req["from"], req["to"])
-            print(json.dumps({"text": out}), flush=True)
+            print(json.dumps({"text": out}, ensure_ascii=False), flush=True)
         except Exception as e:  # keep the coprocess alive on any single bad request
-            print(json.dumps({"error": str(e)}), flush=True)
+            print(json.dumps({"error": str(e)}, ensure_ascii=False), flush=True)
     return 0
 
 
