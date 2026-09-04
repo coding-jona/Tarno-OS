@@ -135,7 +135,7 @@ SOURCES: dict[str, str] = {
     "de_pg22367_die_verwandlung.txt": "https://www.gutenberg.org/cache/epub/22367/pg22367.txt",
     "de_pg69327_der_prozess.txt": "https://www.gutenberg.org/cache/epub/69327/pg69327.txt",
     "de_pg6343_kritik_der_reinen_vernunft.txt": "https://www.gutenberg.org/cache/epub/6343/pg6343.txt",
-    "de_pg2782_wilhelm_tell.txt": "https://www.gutenberg.org/cache/epub/2782/pg2782.txt",
+    "de_pg77182_wilhelm_tell.txt": "https://www.gutenberg.org/cache/epub/77182/pg77182.txt",
     "de_pg3498_buch_der_lieder.txt": "https://www.gutenberg.org/cache/epub/3498/pg3498.txt",
     "de_pg5323_effi_briest.txt": "https://www.gutenberg.org/cache/epub/5323/pg5323.txt",
 }
