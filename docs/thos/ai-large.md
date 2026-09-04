@@ -12,9 +12,10 @@ little RAM; excessive research".)*
   sustained. This is the resident-inference ceiling.
 - CPU: i7-13700KF (AVX2, no AVX-512), 24 threads.
 - No GPU driver in THOS ⇒ CPU inference only.
-- SSD generation is the other decisive number and is **still unknown** — NVMe
-  Gen4 (~5–7 GB/s) vs Gen3 (~3.5) vs SATA (~0.55) changes the streaming tier by
-  10×. *(need from user)*
+- **Boot/root disk: Kingston A400 240 GB SATA SSD** (`KINGSTON SA400S37240G`,
+  per [`hw-target.md`](hw-target.md)). SATA 6 Gb/s, **DRAM-less controller**, seq
+  read ~450–500 MB/s *peak*, random / sustained far worse. This is near the
+  slowest SSD still sold — and it is the decisive number for the streaming tier.
 
 ### What 16 GB actually allows
 
@@ -27,40 +28,48 @@ little RAM; excessive research".)*
 | gpt-oss-20b | MXFP4 | ~13 GB | barely, no headroom | ~3–5 tok/s |
 | 70 B+ | 2-bit | ~20–35 GB | **no → must stream** | SSD-bound (below) |
 
-**Key consequence:** with sub-2-bit quantisation a **20–30 B model is resident on
-this box** — no paging, no AirLLM. Streaming is only forced above ~30 B. So the
-research splits cleanly:
-- **Near-ish term (resident tier):** get a good open ~20 B model quantised hard
-  enough to sit in ~6 GB. This needs only R1 (quant) + a big-allocation
-  allocator + KV compression — *not* the full pager / sparsity / prefetch stack.
-- **Long term (streaming tier):** 70 B+ via layer streaming, speed
-  SSD-bound: Gen4 ≈ 0.3–0.6 tok/s, Gen3 ≈ 0.2–0.4, SATA ≈ 0.05 → a 200-token
-  answer is 5–20 min. Only viable as a **rare, deliberate "deep think"** call,
-  which the cascade (F) makes acceptable — the always-resident small LM handles
-  the interactive 90 %.
+**Key consequences:**
 
-## The goal, and why it's hard
+1. With sub-2-bit quantisation a **20–30 B model is resident on this box** — no
+   paging, no AirLLM. The SSD is touched only for the one-time weight load
+   (~6 GB ÷ ~0.45 GB/s ≈ 13 s). This tier needs only **R1 (quant) + a
+   big-allocation allocator + KV compression** — *not* the pager / sparsity /
+   prefetch stack. It is achievable comparatively soon and a 20–30 B open model
+   at 2-bit is genuinely capable, not a toy.
+2. The **streaming tier (70 B+) is not viable on the A400.** ~20 GB streamed per
+   token ÷ ~0.45 GB/s (and worse — the access pattern is not purely sequential,
+   and the controller is DRAM-less) ⇒ **~40–90 s/token → a 200-token answer is
+   1.5–5 h**. That is not a "deep think" call, it is a batch job you submit and
+   read tomorrow. Documented, but it needs a **different disk (NVMe)** to be
+   worth building.
 
-Run a 10–20B-class model on THOS with a small resident footprint (target
-discussion: 6–8 GB RAM + the rest paged to SSD), interactively (low latency,
-single stream), on the target machine's **CPU** — THOS has no GPU driver
-(Phase 4, years out).
+So on the actual target hardware the plan is the **resident 20–30 B tier**, plus
+the cascade (F): the always-resident small from-scratch LM handles the
+interactive 90 %, the resident 20–30 B model is the "think harder" step. A third
+huge-streamed tier is deferred until/unless the disk changes.
 
-The naïve "MoE: keep active experts in RAM, rest in swap" does **not** work:
-routing is per-token and near-random across a sequence, so a few tokens touch
-most experts. Measured reality from the offload literature: SSD-mapped layers hit
-**~1 s/token latency, ~80 % of it storage→RAM transfer, ~0 % compute**; offload
-I/O is dominated by small (~128 KiB) reads. MoE saves **compute**, not resident
-memory.
+## The goal
 
-Baselines to beat:
-- **Fully resident** gpt-oss-20b-class (MXFP4, ~12–13 GB, 3.6B active/token): on a
-  desktop CPU with dual-channel DDR5 (~80 GB/s), ~1.8 GB read/token ⇒ **~15–25
-  tok/s** ceiling. Usable — but needs the whole model in RAM.
-- **Layer streaming** (AirLLM-style: load layer, compute, discard): runs 70B on
-  4 GB, but **5–30× slower**, I/O-bound, "batch not interactive".
-- So the question is the middle: *most* of a big model on disk, *usable*
-  latency, on CPU.
+Run the largest useful open model THOS can on this exact machine (16 GB
+DDR4-3600, i7-13700KF, Kingston A400 SATA), CPU-only, as the "think harder" step
+behind the always-resident small from-scratch LM.
+
+Two ideas the user raised and where they land:
+- **"MoE: active experts in RAM, rest in swap"** — does **not** work: routing is
+  per-token and near-random, so a few tokens touch most experts. MoE saves
+  *compute*, not resident memory. Offload literature: SSD-mapped layers hit
+  ~1 s/token, ~80 % of it storage→RAM transfer, ~0 % compute, dominated by small
+  (~128 KiB) reads. On the A400 (slower than those NVMe setups) it is worse.
+- **"Tokens don't matter because the small local model handles the fast stuff"**
+  — correct, and it is what makes a *slow* big model acceptable. But on the A400
+  the streamed 70 B+ path is 1.5–5 h per answer (above), which is past
+  "acceptable" into "different disk required". So the big model has to be one
+  that **fits in RAM** — which, at 2-bit, is 20–30 B.
+
+Reference point: fully-resident gpt-oss-20b-class (MXFP4, ~13 GB) on DDR5
+(~80 GB/s) gets ~15–25 tok/s; on this box's DDR4-3600 (~45 GB/s sustained) and at
+2-bit for ~20 B, expect **~3–5 tok/s**. Slow, but it is a deliberate deep-think
+step, not the interactive surface.
 
 ## What the field already has (build on, don't reinvent)
 
@@ -159,51 +168,56 @@ reads against the already-present **AHCI NCQ depth 32**.
 
 ## Rough research agenda (order, not schedule)
 
-- **R0 — measure.** On the target machine, off THOS: NVMe seq/random read
-  bandwidth + latency at 4K/128K/1M; DDR5 bandwidth; CPU matmul throughput at
-  int2/int4/int8 (AVX2). Establishes the real budget every later number depends
-  on.
-- **R1 — quantisation choice.** Reproduce a sub-2-bit PTQ (AQLM / PTQ1.61 / QuIP#)
-  on a small open model; measure quality vs. bits vs. CPU-kernel speed. Decide the
-  target bit-width and format (must be *contiguous-read-friendly*, cf. Endor).
-- **R2 — sparsity predictor.** Reproduce PowerInfer/DejaVu-style activation
-  prediction on an open dense model; measure hit rate and the resident-set
-  fraction it buys. For MoE, reproduce speculative expert prefetch.
-- **R3 — access-pattern spec.** Turn R1+R2 into a concrete, deterministic-ish
-  memory access trace: what must be pinned, what is prefetchable how far ahead,
-  eviction order. This is the contract with the kernel.
-- **R4 — THOS pager spike.** Minimal file-backed demand-paged `mmap` + CLOCK
-  eviction + a `prefetch(range)` / `pin(range)` syscall, NVMe reads via NCQ.
-  Benchmark against the R3 trace with a stub "model" that just touches memory.
-- **R5 — end to end.** The R1 quantised + R2-sparse model, its R3 access pattern,
-  on the R4 pager. Target: a 10–20B-class open model, ≥ a few tok/s interactive,
-  ≤ ~8 GB resident. Go / no-go on the whole approach.
+Primary path = the **resident 20–30 B tier** (R0–R2). The pager/sparsity/prefetch
+work (R3–R5) is only for a later, NVMe-dependent streaming tier.
+
+- **R0 — measure.** On the target machine, off THOS: DDR4-3600 sustained
+  bandwidth; CPU matmul throughput at int2/int4/int8 (AVX2, 24 threads); A400 seq
+  + random read (informs load time, not a hot path). Establishes the real budget.
+- **R1 — quantisation choice.** Reproduce a sub-2-bit PTQ (AQLM / PTQ1.61 /
+  QuIP# / ParetoQ) on a small open model; measure quality vs. bits vs. CPU-kernel
+  speed. Decide the target bit-width so a ~20–30 B open model lands in ~5–8 GB
+  with acceptable quality.
+- **R2 — CPU inference engine.** A `no_std`-friendly forward pass for the chosen
+  open architecture at the chosen bit-width (int2/int4 matmul kernels, GQA, RoPE,
+  RMSNorm, SwiGLU; MoE routing if the chosen model is MoE). Plus KV-cache
+  quantisation (KIVI-style) so context doesn't eat the headroom. Target on this
+  box: ~3–5 tok/s, ≤ ~8 GB. **This is the go/no-go for a usable big local model.**
+- **R2.5 — activation sparsity (optional).** PowerInfer/DejaVu-style prediction
+  to cut the per-token FLOPs/bandwidth further — pure speedup, still resident.
+- **R3–R5 — streaming tier (deferred, needs NVMe).** Access-pattern spec →
+  THOS file-backed demand-paged `mmap` + CLOCK eviction + `prefetch`/`pin`
+  hints + NCQ async reads → 70 B+ end to end. Only if the disk changes.
 
 ## Open decisions
 
 1. ~~Target-machine RAM~~ — **16 GB DDR4-3600** (*user, 2026-09-04*). ⇒ 20–30 B
    resident at 2-bit; streaming only forced above ~30 B (see table above).
-2. **SSD generation** — decides the streaming tier's speed by ~10×. *(need from
+2. ~~SSD generation~~ — **Kingston A400 SATA** (*user, 2026-09-04*), one of the
+   slowest SSDs sold ⇒ the 70 B+ streaming tier is impractical on this box
+   (hours/answer). Resident 20–30 B is the plan; revisit streaming only if the
+   disk becomes NVMe.
+3. **Own weights vs. open weights** — training a 20–30B from scratch on CPU is
+   impossible; this tier runs an **open** model (Apache-2.0 / similar), which
+   relaxes the [`ai.md`](ai.md) "own weights from zero" rule for *this* track.
+   The from-scratch small LM keeps that rule. Confirm the split. *(need from
    user)*
-3. **Own weights vs. open weights** — training a 10–20B from scratch on CPU is
-   impossible; "like gpt-oss" ⇒ run its (Apache-2.0) open weights, which relaxes
-   the [`ai.md`](ai.md) "own weights from zero" rule for *this* track. The
-   from-scratch small LM keeps that rule. Confirm the split. *(need from user)*
-3. Bit-width / weight format (R1).
-5. Dense + sparsity vs. MoE + expert-prefetch as the primary structure (R2/R3) —
-   or both, via the cascade in F.
-6. How much of the pager is general-purpose MM (useful anyway) vs. AI-specific.
-7. Where to draw the resident/streaming line — ship the ~20 B resident tier
-   first (much sooner, no pager) and treat 70 B+ streaming as a later add-on?
+4. Which open base model (R1) — a dense ~24–30 B (simpler engine) vs. an MoE like
+   gpt-oss-20b (needs routing, ~13 GB at MXFP4 leaves little headroom at 16 GB).
+5. Bit-width / weight format (R1); KV-cache quantisation scheme (R2).
+6. Whether R2.5 activation sparsity is worth the extra machinery for the speedup.
 
 ## Honesty
 
-- This is **12–24 months** of research + systems work sitting on top of kernel MM
-  that also has to be built, on the slowest possible hardware path (CPU, no GPU
-  driver). It is defensible, not scheduled.
-- If R0/R1/R2 show the numbers don't close on this hardware, the fallback is the
-  cascade (F): a small resident model does most of the work, the big model is an
-  occasional, slow, deliberate call — which is still "using the RAM sensibly",
-  just honest about the big model being cold.
+- The **resident 20–30 B tier** (R0–R2) is a bounded engineering project — a
+  quant pipeline + a CPU inference engine + KV compression. No new kernel MM. A
+  2-bit ~24 B open model at ~3–5 tok/s on this box is realistic and genuinely
+  capable. This is the plan.
+- The **streaming tier** (70 B+, R3–R5) is 12–24 months of research + kernel MM
+  and is **not viable on the Kingston A400** (hours per answer). Deferred until
+  the disk is NVMe, or dropped.
+- Either way the interactive surface is the always-resident small from-scratch
+  LM; the big model is a deliberate "think harder" call. That is "using the RAM
+  sensibly", honestly scoped.
 
 See [`ai.md`](ai.md) · [`feasibility.md`](feasibility.md) · [`roadmap.md`](roadmap.md).
