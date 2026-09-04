@@ -398,12 +398,20 @@ late.
     (`PE registry OK`). Not transactional / persisted / enumerable yet —
     hive files, `NtEnumerateKey`/`Value`, change-notify and per-key security
     come with the registry phase.
+  - **Mutant + semaphore + `NtWaitForMultipleObjects`.** `wait.rs` gains a
+    counting `Semaphore` and a recursive thread-owned `Mutant`; `process.rs` a
+    polymorphic `Waitable` (event / semaphore / mutant) with
+    `try_take`/`wait`/`is_signaled`. SSDT: `NtCreateMutant` / `NtReleaseMutant` /
+    `NtCreateSemaphore` / `NtReleaseSemaphore` / `NtWaitForMultipleObjects`
+    (WaitAny → `STATUS_WAIT_0 + i`; WaitAll acquires all when all signalled;
+    cooperative-yield spin). `NtWaitForSingleObject` now waits on any `Waitable`.
+    `pe-test` `PE sync OK`. Real block on the executive timer wheel comes later.
   - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
     unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
     unmodified), or a from-scratch `ntdll` — an **executive timer wheel** for a
-    real timed block (and a preemption-safe path out of a PE syscall), more
-    `HandleObject` kinds (mutant, semaphore, section, thread), the registry
-    grown to hives; then process isolation / integrity for the security phase.
+    real timed block (and a preemption-safe path out of a PE syscall),
+    `section` + `thread` `HandleObject` kinds, the registry grown to hives; then
+    process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
