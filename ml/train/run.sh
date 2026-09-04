@@ -35,6 +35,14 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 VENV="$HERE/.venv"
 PY="$VENV/bin/python"
 CONFIG="${CONFIG:-$HERE/config/spike-1m.toml}"
+# Resolve now, while $PWD is still wherever the caller invoked this from —
+# several subcommands 'cd' into $HERE before reading $CONFIG, which silently
+# breaks a relative CONFIG typed from the repo root (e.g.
+# CONFIG=ml/train/config/x.toml run from /repo instead of /repo/ml/train).
+case "$CONFIG" in
+  /*) : ;;
+  *)  CONFIG="$PWD/$CONFIG" ;;
+esac
 # checkpoints/logs are per-config so a new model never resumes another's latest.pt
 OUT="$HERE/out/$(basename "${CONFIG%.toml}")"
 TLM="${TLM:-$ROOT/spike-1m.tlm}"
