@@ -1,8 +1,25 @@
 # THOS – In-system AI
 
-**Status:** planning + a P0 "Proof of Life" spike (`ml/`). No kernel code. A
-near-separate subproject — it gets a plan before scope leaks into the OS work.
-*(direction set by user, 2026-09-04)*
+**Status:** P0 "Proof of Life" done (`ml/` — pipeline trained + cross-checked).
+A near-separate subproject. *(direction set by user, 2026-09-04)*
+
+## The three tracks
+
+This doc is the entry point. The AI effort has three tracks that share the `ml/`
+stack and the `.tlm` format:
+
+| Track | What | Doc | State |
+|---|---|---|---|
+| **A — small LM from scratch** | Own architecture + weights + `#![no_std]` Rust inference. Byte→BPE, ~1M→tens of M params, CPU-trained on open data. The interactive surface + the exec-gate/AV head. | *this doc* | P0 done |
+| **B — rethink context** | A learned active-memory mechanism (window + gated memory + retrieval over cold KV) so a small resident footprint behaves like a huge context. Trained into Track A's model. | [`ai-context.md`](ai-context.md) | research, not scheduled |
+| **C — big open model, resident** | A ~20–30 B *open* model quantised to ~2-bit so it fits in the 16 GB RAM (~3–5 tok/s on CPU). The "think harder" step. Relaxes "own weights" — for this track only. | [`ai-large.md`](ai-large.md) | research, R0–R2 |
+
+**Product shape = a cascade.** Track A's always-resident small LM answers the
+interactive 90 %; when it punts, Track C's resident 2-bit ~24 B open model does
+the deliberate deep-think. Track B's memory work applies to A first and can later
+inform how C's KV is managed. There is **no fourth "stream a 70 B from disk"
+tier** — the target's Kingston A400 SATA SSD makes it hours-per-answer
+([`ai-large.md`](ai-large.md)).
 
 ## Decision
 
@@ -109,11 +126,41 @@ Gutenberg, arXiv/PMC-OA, StackExchange) are the legitimate growth path.
   `execgate` feature; log verdicts, then enforce.
 - **P6+ — grow** as compute / RAM allow.
 
-**Large open models on little RAM** — running a 10–20B-class model on the CPU
-with most of it paged to SSD (sub-2-bit weights + activation-sparsity prediction
-+ speculative prefetch + a purpose-built THOS pager) is its own **research
-track**, not scheduled: [`ai-large.md`](ai-large.md). It relaxes "own weights
-from zero" (it would run open weights); this small-LM track keeps that rule.
+## Consolidated build order — what we actually build
+
+Best pieces from all three tracks, in dependency order. Only the first three are
+shovel-ready; the rest are gated on THOS kernel work or research outcomes.
+
+1. **Track A P1 — a real small LM.** *(next)* Byte-level BPE (~8–16 k), ~20–40 M
+   params, a larger open corpus (`ml/train/fetch.py` windowed), longer CPU runs,
+   a proper eval (perplexity + a needle probe). Ship as `.tlm`. This is the
+   spine everything else hangs off.
+2. **Track C R0 — measure the box.** *(parallel, cheap)* A benchmark script:
+   DDR4-3600 sustained bandwidth, AVX2 int2/int4/int8 matmul throughput on 24
+   threads, A400 read profile. No commitment — it makes every later number real.
+3. **Track B v1 experiment.** *(after 1)* `ml/train/model_mem.py`: sliding-window
+   attention + a learned gated memory (Titans/RMT-style) + kNN retrieval over an
+   on-disk KV store. Train vs. the vanilla baseline on the same corpus/CPU-time;
+   score on a synthetic needle-in-a-haystack at 1 K–512 K logical context with a
+   ≤ 32 K resident footprint. Winner's forward path goes into `thos-lm` as an
+   alternate model kind.
+4. **Track C R1–R2 — the big-model engine.** A sub-2-bit PTQ (AQLM / QuIP# /
+   ParetoQ) on a chosen ~24–30 B open base, plus a `no_std`-friendly CPU
+   inference engine (int2/int4 kernels, GQA, RoPE, RMSNorm, MoE routing if
+   applicable) + KV-cache quantisation. Target: ~3–5 tok/s, ≤ ~8 GB resident.
+5. **Track A P2 — host integration.** `thos-lm` verified `#![no_std]`-clean for
+   `x86_64-unknown-none`; `cargo xtask lm-demo` host command.
+6. **THOS runtime prerequisites (P3).** Userland `O_CREAT` + write; a
+   kernel↔userspace query channel; a RAM budget for a resident model. Each is its
+   own roadmap item.
+7. **THOS AI service (P4)** and **exec-gate head (P5)** — as below.
+
+**Deferred / dropped:** streaming a 70 B+ model from the A400 (hours/answer —
+needs NVMe); training anything ≥ 1 B from scratch (no GPU).
+
+**Large open models — the wider picture** — see [`ai-large.md`](ai-large.md) for
+the full analysis (why MoE-in-swap fails, the resident-vs-streaming split, the
+KV-budget / long-context stack).
 
 **Milestone AI-0:** `cargo test -p thos-lm --target x86_64-unknown-linux-gnu`
 passes (Rust forward matches the numpy reference; sampler deterministic) **and**
@@ -136,6 +183,9 @@ reaches val loss well below the uniform-byte baseline (ln 256 ≈ 5.55) and
    `thos-lm` may be vendored into it); revisit if a permissive licence is wanted.
 7. Whether CC BY-SA source text imposes share-alike on distributed *weights*
    (see `ml/DATASETS.md`).
+8. Track B: whether the v1 learned-memory architecture beats the eviction
+   baseline at small scale, and whether it transfers ([`ai-context.md`](ai-context.md)).
+9. Track C: which open base model, and target bit-width ([`ai-large.md`](ai-large.md)).
 
 ## Non-goals
 
@@ -150,4 +200,4 @@ reaches val loss well below the uniform-byte baseline (ln 256 ≈ 5.55) and
 
 See [`roadmap.md`](roadmap.md) · [`architecture.md`](architecture.md) ·
 [`feasibility.md`](feasibility.md) · [`ai-large.md`](ai-large.md) ·
-[`../../ml/README.md`](../../ml/README.md).
+[`ai-context.md`](ai-context.md) · [`../../ml/README.md`](../../ml/README.md).

@@ -723,10 +723,13 @@ code to score PE/ELF statically for the native-exec gate above. Running any of
 this *inside* THOS is gated on kernel work not yet present (userland file writes,
 a kernel↔userspace channel, RAM budget) and is a later phase, not near-term.
 
-Running a **large (10–20B) open model on little RAM** — sub-2-bit weights +
-activation-sparsity prediction + speculative prefetch + a purpose-built
-demand-paging pager, CPU-only — is a separate **research track**, not scheduled:
-[`ai-large.md`](ai-large.md).
+Two research tracks hang off this, both unscheduled: **a ~20–30 B open model
+quantised to 2-bit and held resident** in the 16 GB target
+([`ai-large.md`](ai-large.md) — streaming a bigger model from the SATA disk is
+not viable), and **a from-scratch rework of the context mechanism** (learned
+active memory so a small resident footprint behaves like a huge context,
+[`ai-context.md`](ai-context.md)). The consolidated build order is in
+[`ai.md`](ai.md).
 
 ## Phase 6 — Research track: real `.sys` drivers (after M5)
 
