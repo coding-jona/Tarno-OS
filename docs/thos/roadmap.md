@@ -439,6 +439,16 @@ late.
 - **Milestone 3:** a statically linked Win32 **console** `.exe` (`CreateFile`,
   `WriteFile(stdout)`, `WaitForSingleObject`) runs through the THOS NT path — **with no
   wine process in the tree**. ELF and PE processes appear in one `ps` output.
+  - Status: **met.** `xtask/testdata/wincon.c` — a real `x86_64-w64-mingw32-gcc`
+    console `.exe` (`-nostdlib` + own entry, only `KERNEL32.dll` imports; a
+    genuine toolchain PE with a real import table + `.pdata`) — opens
+    `C:\pe-read.txt` (`CreateFileA`/`ReadFile`), writes stdout
+    (`GetStdHandle`/`WriteFile`), `WaitForSingleObject`s a `CreateEventA` event,
+    then `ExitProcess`. Runs on the synthetic `kernel32`, no Wine.
+    `process::ps_dump` prints every task with an ELF/PE kind → `2 ELF + 3 PE
+    processes in one listing`. `cargo xtask pe-test`. The **CRT-heavy path**
+    (a `msvcrt.dll` / UCRT `int main` exe with `_initterm` / `__getmainargs` /
+    the `printf` family) is M3+ follow-up — needs a synthetic `msvcrt`.
 
 ### Product goal — "download it and it runs", zero user config
 
