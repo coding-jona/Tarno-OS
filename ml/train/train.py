@@ -33,10 +33,20 @@ def load_cfg(path: str) -> dict:
         return tomllib.load(fh)
 
 
-def get_batch(data: np.ndarray, block: int, bs: int, rng: np.random.Generator):
+def get_batch(data: np.ndarray, block: int, bs: int, rng: np.random.Generator,
+              mask: np.ndarray | None = None):
     ix = rng.integers(0, len(data) - block - 1, size=bs)
     x = np.stack([data[i : i + block] for i in ix]).astype(np.int64)
     y = np.stack([data[i + 1 : i + 1 + block] for i in ix]).astype(np.int64)
+    if mask is not None:
+        # SFT: mask[k] says whether token k carries loss when it's the
+        # *target* — i.e. it's part of an assistant turn (see
+        # prepare_sft.py). Everything else becomes ignore_index=-100 so
+        # F.cross_entropy skips it — gradients only ever come from the
+        # assistant's own words, not the user's prompt or the ChatML
+        # scaffolding around it.
+        m = np.stack([mask[i + 1 : i + 1 + block] for i in ix]).astype(bool)
+        y = np.where(m, y, -100)
     return torch.from_numpy(x), torch.from_numpy(y)
 
 
@@ -53,6 +63,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=os.path.join(HERE, "config", "spike-1m.toml"))
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--init-from", default="",
+                     help="SFT: seed model weights (not optimizer/step) from a base .pt checkpoint "
+                          "the first time this run starts fresh; ignored once its own latest.pt exists")
     args = ap.parse_args()
 
     cfg = load_cfg(args.config)
@@ -70,6 +83,13 @@ def main() -> None:
 
     train_data = np.fromfile(os.path.join(HERE, dc["train_bin"]), dtype=np.uint16)
     val_data = np.fromfile(os.path.join(HERE, dc["val_bin"]), dtype=np.uint16)
+    train_mask = val_mask = None
+    if dc.get("train_mask"):
+        train_mask = np.fromfile(os.path.join(HERE, dc["train_mask"]), dtype=np.uint8)
+        val_mask = np.fromfile(os.path.join(HERE, dc["val_mask"]), dtype=np.uint8)
+        assert len(train_mask) == len(train_data) and len(val_mask) == len(val_data), \
+            "mask/token length mismatch — regenerate with prepare_sft.py"
+        print(f"SFT mode: loss masked to assistant turns only ({train_mask.mean():.1%} of tokens)")
     print(f"data: train {len(train_data):,} / val {len(val_data):,} tokens, {torch.get_num_threads()} threads")
 
     model = GPT(ModelConfig(
@@ -93,6 +113,17 @@ def main() -> None:
             opt.load_state_dict(blob["opt"])
             step0 = blob["step"]
             print(f"resumed from step {step0}")
+    elif args.init_from:
+        # SFT: seed weights from the finished/in-progress base run, fresh
+        # optimizer state and step 0 for this SFT run's own out dir/log.
+        base = torch.load(args.init_from, map_location="cpu")
+        if base.get("cfg", {}).get("model") != mc:
+            raise SystemExit(
+                f"--init-from {args.init_from}: model config doesn't match {os.path.basename(args.config)} "
+                "— SFT config's [model] must exactly match the base checkpoint's"
+            )
+        model.load_state_dict(base["model"])
+        print(f"initialised from {args.init_from} (base step {base['step']}) — fresh optimizer, step 0")
 
     log_path = os.path.join(OUT, "log.csv")
     if step0 == 0:
@@ -155,7 +186,7 @@ def main() -> None:
         opt.zero_grad(set_to_none=True)
         loss_acc = 0.0
         for micro in range(accum):
-            x, y = get_batch(train_data, block, bs, rng)
+            x, y = get_batch(train_data, block, bs, rng, train_mask)
             _, loss = model(x, y)
             (loss / accum).backward()
             loss_acc += loss.item() / accum
@@ -167,7 +198,7 @@ def main() -> None:
             model.eval()
             with torch.no_grad():
                 vl = np.mean([
-                    model(*get_batch(val_data, block, bs, rng))[1].item()
+                    model(*get_batch(val_data, block, bs, rng, val_mask))[1].item()
                     for _ in range(tc["eval_batches"])
                 ])
             now = time.time()
