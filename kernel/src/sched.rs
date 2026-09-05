@@ -64,25 +64,16 @@ thos_thread_trampoline:
 .globl thos_user_thread_start
 // entered via `ret` from thos_ctx_switch with
 //   r12=user rip, r13=user rsp, r14=user cs, r15=user ss
+//
+// IF=1: the thread is timer-preemptible in ring 3. This is now used for PE
+// threads too — the conditional-`swapgs` shim on the timer / AHCI IRQ entry
+// stubs (`crate::idt`) makes a ring-3 preemption of a PE thread (with
+// `%gs` = TEB) safe, which it wasn't when PE threads had to run IF=0.
 thos_user_thread_start:
     call thos_finish_switch        // release the thread that yielded to us
     push r15
     push r13
     push 0x202          // RFLAGS with IF=1 -> the user thread is preemptible
-    push r14
-    push r12
-    swapgs
-    iretq
-
-// Same, but IF=0: the thread is *not* timer-preemptible in user mode. Used for
-// PE threads so the ring-3 `swapgs` discipline stays trivial (a preempted PE
-// thread would need a ring-3 IRQ swapgs shim — a later item).
-.globl thos_user_thread_start_coop
-thos_user_thread_start_coop:
-    call thos_finish_switch
-    push r15
-    push r13
-    push 0x002          // RFLAGS with IF=0
     push r14
     push r12
     swapgs
@@ -94,7 +85,6 @@ extern "C" {
     fn thos_ctx_switch(save_to: *mut u64, load_from: *const u64);
     fn thos_thread_trampoline() -> !;
     fn thos_user_thread_start() -> !;
-    fn thos_user_thread_start_coop() -> !;
 }
 
 #[no_mangle]
@@ -238,18 +228,12 @@ impl Thread {
         task: Arc<Task>,
         entry: u64,
         user_rsp: u64,
-        cooperative: bool,
         gsbase: u64,
     ) -> Arc<Self> {
         let s = gdt::selectors();
         let cr3 = task.space().pml4_phys();
-        let trampoline = if cooperative {
-            thos_user_thread_start_coop as *const () as u64
-        } else {
-            thos_user_thread_start as *const () as u64
-        };
         let (stack, sp, top) = Self::build_stack(
-            trampoline,
+            thos_user_thread_start as *const () as u64,
             entry,
             user_rsp,
             (s.user_code.0 | 3) as u64,
@@ -444,16 +428,17 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -
 /// the first time it is scheduled, in `proc`'s address space.
 pub fn spawn_user(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
-    let t = Thread::spawned_user(id, name, task, entry, user_rsp, false, 0);
+    let t = Thread::spawned_user(id, name, task, entry, user_rsp, 0);
     SCHED.lock().ready.push_back(t);
     id
 }
 
-/// A user thread for a native PE image: cooperatively scheduled (IF=0 in ring 3)
+/// A user thread for a native PE image: preemptible (IF=1) like any other user
+/// thread — the timer / AHCI IRQ entry stubs carry the conditional `swapgs` —
 /// and carrying `teb` as its `%gs` base.
 pub fn spawn_user_pe(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64, teb: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
-    let t = Thread::spawned_user(id, name, task, entry, user_rsp, true, teb);
+    let t = Thread::spawned_user(id, name, task, entry, user_rsp, teb);
     SCHED.lock().ready.push_back(t);
     id
 }
