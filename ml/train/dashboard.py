@@ -132,16 +132,21 @@ def fmt_dur(seconds: float) -> str:
 def resolve_tlm(tlm: str) -> str | None:
     """Find the weights file regardless of whether `tlm` was given relative
     to the repo root, ml/train/, or as an absolute path — returns None (not
-    an exception) if it genuinely doesn't exist anywhere sensible yet."""
+    an exception) if it genuinely doesn't exist anywhere sensible yet.
+
+    When the same name exists in more than one place (the repo keeps a copy
+    of each .tlm in both the root and ml/train/), return the *newest* — that
+    is the one 'run.sh watch-export' just refreshed. Returning the first hit
+    by search order instead would silently pin the chat to a stale copy.
+    Always absolute: generate_reply's subprocess runs with cwd=ROOT."""
+    hits = []
     for base in (None, ROOT, HERE):
         p = tlm if base is None else os.path.join(base, tlm)
         if os.path.isfile(p):
-            # Always return an absolute path: callers (generate_reply's
-            # subprocess) run with cwd=ROOT, not whatever cwd this process
-            # happens to have, so a relative hit here silently resolved
-            # against the wrong directory downstream.
-            return os.path.abspath(p)
-    return None
+            hits.append(os.path.abspath(p))
+    if not hits:
+        return None
+    return max(set(hits), key=os.path.getmtime)
 
 
 GENERATE_BIN = os.path.join(ROOT, "target", RUST_TARGET, "release", "examples", "generate")
@@ -194,7 +199,7 @@ def generate_reply(tlm: str, prompt: str, max_tokens: int = 100, temp: float = 0
     return reply.split("<|im_end|>", 1)[0].rstrip()
 
 
-def run_sh(config_path: str, *args: str, timeout: float = 30.0) -> str:
+def run_sh(config_path: str, *args: str, timeout: float = 90.0) -> str:
     """Shell out to run.sh the same way thos-shell's /game and /run do, with
     CONFIG pointed at whichever config this dashboard is watching. Returns
     combined, trimmed output for display in the chat pane."""
@@ -227,16 +232,22 @@ HELP_ROWS = [
 
 
 def find_models() -> list[str]:
-    """All .tlm files under the repo root or ml/train/, deduped, newest first."""
-    seen: dict[str, None] = {}
+    """All .tlm files under the repo root or ml/train/, deduped by *basename*
+    (the same weights are often copied to both dirs — keep only the newest
+    copy of each name), newest first."""
+    best: dict[str, str] = {}
     for base in (ROOT, HERE):
         try:
             for name in os.listdir(base):
-                if name.endswith(".tlm"):
-                    seen[os.path.abspath(os.path.join(base, name))] = None
+                if not name.endswith(".tlm"):
+                    continue
+                p = os.path.join(base, name)
+                cur = best.get(name)
+                if cur is None or os.path.getmtime(p) > os.path.getmtime(cur):
+                    best[name] = os.path.abspath(p)
         except OSError:
             pass
-    return sorted(seen, key=lambda p: -os.path.getmtime(p))
+    return sorted(best.values(), key=lambda p: -os.path.getmtime(p))
 
 
 class ChatPane:
@@ -320,17 +331,27 @@ class ChatPane:
                 self.push(f"{mark}{os.path.basename(p):<22} {size_mb:>7.1f} MB  {age} old",
                           width, curses.A_BOLD if p == current else curses.A_DIM)
         elif name == "model":
-            if not arg:
-                self.push(f"  current model: {self.tlm}  (usage: /model <stem|path>)", width, curses.A_DIM)
+            # Take everything after "/model" and drop stray spaces, so a
+            # fat-fingered "/model spike -1m" still resolves to "spike-1m"
+            # (.tlm stems never contain spaces).
+            stem = "".join(parts[1:])
+            if not stem:
+                self.push(f"  current model: {os.path.basename(self.tlm)}  "
+                          f"(usage: /model <stem|path>; /models to list)", width, curses.A_DIM)
             else:
-                candidate = arg if arg.endswith(".tlm") else f"{arg}.tlm"
+                candidate = stem if stem.endswith(".tlm") else f"{stem}.tlm"
                 found = resolve_tlm(candidate)
                 if found is None:
-                    self.push(f"  no weights found for '{candidate}' (looked next to the repo root, ml/train/, and as given)", width, curses.A_DIM)
+                    self.push(f"  no weights named '{candidate}'. Available:", width, curses.A_DIM)
+                    models = find_models()
+                    if not models:
+                        self.push("    (none — train + 'run.sh export' first)", width, curses.A_DIM)
+                    for p in models:
+                        self.push(f"    {os.path.basename(p)}", width, curses.A_DIM)
                 else:
-                    self.tlm = candidate
+                    self.tlm = found
                     self.ctx = ""
-                    self.push(f"  switched to {found} — context cleared", width)
+                    self.push(f"  switched to {os.path.basename(found)} — context cleared", width)
         elif name == "run":
             if not arg:
                 self.push("  usage: /run <run.sh subcommand> [args...]", width, curses.A_DIM)
