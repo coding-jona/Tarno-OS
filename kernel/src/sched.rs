@@ -140,6 +140,14 @@ pub struct Thread {
     /// into `IA32_KERNEL_GS_BASE` on every switch in, so the exit `swapgs`
     /// brings it live for ring 3.
     gsbase: AtomicU64,
+    /// Single-wake guard. Cleared (`arm_wake`) under the wait-queue lock right
+    /// before this thread enqueues to block; every `unblock` does a
+    /// `swap(true)` and only the first caller actually requeues it. This is
+    /// what makes a *dual-enqueued* timed wait safe — parked on an object's
+    /// `WaitQueue` **and** the timer wheel, the object signal and the wheel
+    /// deadline can both fire, but the thread is readied exactly once. `true`
+    /// at rest, so a stray `unblock` on a running thread is a no-op.
+    wake_claimed: AtomicBool,
 }
 
 unsafe impl Send for Thread {}
@@ -173,6 +181,7 @@ impl Thread {
             running: AtomicBool::new(true), // it is running right now
             fsbase: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
+            wake_claimed: AtomicBool::new(true),
         })
     }
 
@@ -219,6 +228,7 @@ impl Thread {
             running: AtomicBool::new(false),
             fsbase: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
+            wake_claimed: AtomicBool::new(true),
         })
     }
 
@@ -253,6 +263,7 @@ impl Thread {
             running: AtomicBool::new(false),
             fsbase: AtomicU64::new(0),
             gsbase: AtomicU64::new(gsbase),
+            wake_claimed: AtomicBool::new(true),
         })
     }
 
@@ -287,6 +298,7 @@ impl Thread {
             running: AtomicBool::new(false),
             fsbase: AtomicU64::new(fsbase),
             gsbase: AtomicU64::new(0),
+            wake_claimed: AtomicBool::new(true),
         })
     }
 
@@ -504,8 +516,20 @@ pub fn block_current() {
     interrupts::without_interrupts(|| reschedule(true));
 }
 
-/// Make a previously-blocked thread runnable again.
+/// Arm `t`'s single-wake guard: the next `unblock` will actually requeue it.
+/// Call this under the wait-queue lock, immediately before enqueuing `t` to
+/// block, so it is serialised against the primary waker.
+pub fn arm_wake(t: &Arc<Thread>) {
+    t.wake_claimed.store(false, Ordering::Release);
+}
+
+/// Make a previously-blocked thread runnable again. Requeues at most once per
+/// [`arm_wake`]: whichever waker calls first wins the `swap`, any later
+/// caller (the other half of a dual-enqueued timed wait) is a no-op.
 pub fn unblock(t: Arc<Thread>) {
+    if t.wake_claimed.swap(true, Ordering::AcqRel) {
+        return; // already woken by someone else (or never armed)
+    }
     t.set_state(State::Ready);
     SCHED.lock().ready.push_back(t);
 }

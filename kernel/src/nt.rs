@@ -509,8 +509,10 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // NtWaitForSingleObject(Handle, Alertable, *Timeout) on any dispatcher
         // object (event / semaphore / mutant). NULL = block forever;
         // `*Timeout == 0` = poll; a negative `*Timeout` is a relative wait in
-        // 100 ns units — a bounded cooperative-yield spin (a real timed block on
-        // the executive timer wheel comes later). Positive (absolute) = poll.
+        // 100 ns units — a *fully blocking* timed wait: the thread is enqueued
+        // on the object **and** the timer wheel (`Waitable::wait_until`) and
+        // sleeps off the run queue until whichever fires first. Positive
+        // (absolute) = poll.
         NT_NTWAITFORSINGLEOBJECT => {
             let Some(w) = process::current_waitable(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
@@ -524,19 +526,12 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             if timeout >= 0 {
                 return if w.try_take(tid) { STATUS_SUCCESS as i64 } else { STATUS_TIMEOUT as i64 };
             }
-            // Relative timeout: real wall-clock deadline off the timer wheel.
-            // The wait itself still yield-polls the object between ticks (a
-            // fully-blocking timed object wait — dual-enqueue on the object's
-            // queue *and* the wheel — is the remaining refinement); the
-            // *duration* is now accurate.
             let deadline = crate::timer::deadline_from_relative_100ns(timeout);
-            while crate::timer::now() < deadline {
-                if w.try_take(tid) {
-                    return STATUS_SUCCESS as i64;
-                }
-                sched::yield_now();
+            if w.wait_until(tid, deadline) {
+                STATUS_SUCCESS as i64
+            } else {
+                STATUS_TIMEOUT as i64
             }
-            if w.try_take(tid) { STATUS_SUCCESS as i64 } else { STATUS_TIMEOUT as i64 }
         }
 
         // NtCreateMutant(*Handle, DesiredAccess, *ObjectAttributes, InitialOwner)
@@ -599,8 +594,11 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
 
         // NtWaitForMultipleObjects(Count, Handles[], WaitType, Alertable,
         //                          *Timeout). WaitType 0 = WaitAll, 1 = WaitAny.
-        // WaitAny returns STATUS_WAIT_0 + index. Cooperative-yield spin, same
-        // timeout rules as NtWaitForSingleObject; NULL timeout spins until ready.
+        // WaitAny returns STATUS_WAIT_0 + index. Re-polls each object, sleeping
+        // one tick between passes on the timer wheel (so it yields the CPU
+        // properly, not a scheduler spin); same timeout rules as
+        // NtWaitForSingleObject. A true multi-object block (a wait-block
+        // enqueued on every object's queue at once) is the remaining refinement.
         NT_NTWAITFORMULTIPLEOBJECTS => {
             let count = a0 as usize;
             if count == 0 || count > 64 {
@@ -645,7 +643,10 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 if poll_once || deadline.is_some_and(|d| crate::timer::now() >= d) {
                     return STATUS_TIMEOUT as i64;
                 }
-                sched::yield_now();
+                // Sleep to the deadline, but wake each tick to re-poll every
+                // object (no per-object enqueue yet).
+                let next = crate::timer::now() + 1;
+                crate::timer::sleep_until(deadline.map_or(next, |d| d.min(next)));
             }
         }
 
@@ -1280,13 +1281,7 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
             }
             let deadline =
                 crate::timer::now().saturating_add(((ms as u64) * crate::timer::TICK_HZ / 1000).max(1));
-            while crate::timer::now() < deadline {
-                if w.try_take(tid) {
-                    return 0;
-                }
-                sched::yield_now();
-            }
-            if w.try_take(tid) { 0 } else { WAIT_TIMEOUT }
+            if w.wait_until(tid, deadline) { 0 } else { WAIT_TIMEOUT }
         }
 
         // CRT-startup helpers. CriticalSection is a no-op (the CRT locks it

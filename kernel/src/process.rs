@@ -360,6 +360,17 @@ impl Waitable {
             Waitable::Mutant(m) => m.acquire(tid),
         }
     }
+
+    /// Timed [`wait`]: fully blocking (enqueued on the object *and* the timer
+    /// wheel — no yield-poll). `true` = signalled + consumed, `false` = timed
+    /// out at `deadline` (a timer-wheel tick count).
+    pub fn wait_until(&self, tid: u64, deadline: u64) -> bool {
+        match self {
+            Waitable::Event(e) => e.wait_until(deadline),
+            Waitable::Semaphore(s) => s.wait_until(deadline),
+            Waitable::Mutant(m) => m.acquire_until(tid, deadline),
+        }
+    }
     /// Would `try_take` succeed right now? (No consume.)
     pub fn is_signaled(&self, tid: u64) -> bool {
         match self {

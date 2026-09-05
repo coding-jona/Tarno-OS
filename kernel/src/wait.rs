@@ -28,7 +28,11 @@ impl WaitQueue {
     /// Block the current thread on this queue until woken.
     pub fn wait(&self) {
         interrupts::without_interrupts(|| {
-            self.waiters.lock().push_back(sched::current());
+            let me = sched::current();
+            let mut w = self.waiters.lock();
+            sched::arm_wake(&me); // under the lock: serialised vs. the waker
+            w.push_back(me);
+            drop(w);
             sched::block_current();
         });
     }
@@ -45,10 +49,57 @@ impl WaitQueue {
             if !should_block() {
                 return;
             }
-            w.push_back(sched::current());
+            let me = sched::current();
+            sched::arm_wake(&me);
+            w.push_back(me);
             drop(w);
             sched::block_current();
         });
+    }
+
+    /// Condition-variable wait with a timer-wheel deadline: the thread is
+    /// enqueued here **and** armed on the timer wheel, so it wakes on whichever
+    /// happens first — the object being signalled (`wake_*`) or `deadline`
+    /// passing. On return the caller re-checks its real condition, exactly as
+    /// with [`wait_if`]; the `bool` says whether the deadline has expired (so a
+    /// caller whose condition still isn't met knows to report a timeout rather
+    /// than loop again). This is the fully-blocking form of a timed
+    /// `NtWaitForSingleObject` — no yield-poll spin.
+    ///
+    /// Both the object-signal path (`wake_one` under this queue's lock) and the
+    /// wheel path (`timer::tick`) call `sched::unblock`; the single-wake guard
+    /// (`sched::arm_wake`, set here under the queue lock) means only the first
+    /// of the two actually requeues the thread. On wake we still scrub the
+    /// stale entry from whichever side didn't fire.
+    ///
+    /// Returns `true` **only** when the thread actually blocked and woke with
+    /// the deadline already past (a timeout). `should_block()` returning false
+    /// (condition already met, checked under the queue lock), or an early wake
+    /// (the object was signalled), both return `false` — the caller then
+    /// re-checks its real condition, as with any condvar.
+    pub fn wait_if_until<F: FnOnce() -> bool>(&self, deadline: u64, should_block: F) -> bool {
+        interrupts::without_interrupts(|| {
+            let mut w = self.waiters.lock();
+            if !should_block() {
+                return false;
+            }
+            let me = sched::current();
+            sched::arm_wake(&me);
+            w.push_back(me.clone());
+            drop(w);
+            crate::timer::arm(deadline, me.clone());
+            sched::block_current();
+            // Woken by signal, deadline, or spuriously — clear both entries.
+            self.remove(&me);
+            crate::timer::disarm(&me);
+            crate::timer::now() >= deadline
+        })
+    }
+
+    /// Drop a specific thread from the queue (it was woken via the timer wheel,
+    /// or its wait is otherwise over). No-op if it isn't queued.
+    pub fn remove(&self, t: &Arc<Thread>) {
+        self.waiters.lock().retain(|x| !Arc::ptr_eq(x, t));
     }
 
     /// Wake one blocked thread, if any. Returns whether one was woken.
@@ -165,6 +216,27 @@ impl Event {
             }
         }
     }
+
+    /// Timed [`wait`]: block until signalled or `deadline` (timer-wheel tick).
+    /// `true` = got the signal, `false` = timed out.
+    pub fn wait_until(&self, deadline: u64) -> bool {
+        match self.mode {
+            EventMode::Manual => loop {
+                if self.signaled.load(Ordering::Acquire) {
+                    return true;
+                }
+                if self.queue.wait_if_until(deadline, || !self.signaled.load(Ordering::Acquire)) {
+                    return false; // timed out
+                }
+            },
+            // Auto: the wakeup *is* the signal (nothing to re-check), and
+            // `should_block` consumes a latched one under the queue lock — so a
+            // non-timeout return means we got it.
+            EventMode::Auto => {
+                !self.queue.wait_if_until(deadline, || !self.signaled.swap(false, Ordering::AcqRel))
+            }
+        }
+    }
 }
 
 /// A counting semaphore (NT `KSEMAPHORE`). Signalled while `count > 0`; each
@@ -202,6 +274,18 @@ impl Semaphore {
                 return;
             }
             self.queue.wait_if(|| self.count.load(Ordering::Acquire) <= 0);
+        }
+    }
+
+    /// Timed [`wait`]: `true` = took a unit, `false` = timed out at `deadline`.
+    pub fn wait_until(&self, deadline: u64) -> bool {
+        loop {
+            if self.try_take() {
+                return true;
+            }
+            if self.queue.wait_if_until(deadline, || self.count.load(Ordering::Acquire) <= 0) {
+                return false;
+            }
         }
     }
 
@@ -270,6 +354,18 @@ impl Mutant {
                 return;
             }
             self.queue.wait_if(|| self.owner.load(Ordering::Acquire) != 0);
+        }
+    }
+
+    /// Timed [`acquire`]: `true` = acquired, `false` = timed out at `deadline`.
+    pub fn acquire_until(&self, tid: u64, deadline: u64) -> bool {
+        loop {
+            if self.try_acquire(tid) {
+                return true;
+            }
+            if self.queue.wait_if_until(deadline, || self.owner.load(Ordering::Acquire) != 0) {
+                return false;
+            }
         }
     }
 
