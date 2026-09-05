@@ -304,6 +304,31 @@ fn disk_image() -> PathBuf {
         img.to_str().unwrap(),
     ]));
 
+    // Milestone 3: a real mingw-w64 compiler-produced Win32 console `.exe`
+    // (`-nostdlib`, own entry, so its only import is KERNEL32.dll) -> /wincon.exe.
+    let wincon_src = root.join("xtask/testdata/wincon.c");
+    let wincon = root.join("target/wincon.exe");
+    run(Command::new("x86_64-w64-mingw32-gcc").args([
+        "-O2", "-nostdlib", "-Wl,-e,wincon_start", "-o",
+        wincon.to_str().unwrap(), wincon_src.to_str().unwrap(), "-lkernel32",
+    ]));
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} wincon.exe", wincon.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+
+    // Milestone 3+: a full mingw CRT `int main` .exe — imports msvcrt.dll on
+    // top of KERNEL32 -> /crt.exe. Runs against THOS's synthetic msvcrt.
+    let crt_src = root.join("xtask/testdata/crt.c");
+    let crt = root.join("target/crt.exe");
+    run(Command::new("x86_64-w64-mingw32-gcc").args([
+        "-O2", "-o", crt.to_str().unwrap(), crt_src.to_str().unwrap(),
+    ]));
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} crt.exe", crt.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
+
     // A real on-disk PE DLL at C:\Windows\System32\thoscrt.dll — the exe imports
     // thoscrt!thos_add, and thoscrt itself imports KERNEL32!GetLastError.
     let thoscrt = root.join("target/thoscrt.dll");
@@ -634,6 +659,41 @@ fn write_pe_hello(path: &Path) {
     let roa_tag = u32::MAX - 69;
     let rvalname_us_tag = u32::MAX - 70;
     let msg_reg_tag = u32::MAX - 71;
+    let csemname_tag = u32::MAX - 72;
+    let rsemname_tag = u32::MAX - 73;
+    let cmutname_tag = u32::MAX - 74;
+    let rmutname_tag = u32::MAX - 75;
+    let wfmoname_tag = u32::MAX - 76;
+    let csem_slot_tag = u32::MAX - 77;
+    let rsem_slot_tag = u32::MAX - 78;
+    let cmut_slot_tag = u32::MAX - 79;
+    let rmut_slot_tag = u32::MAX - 80;
+    let wfmo_slot_tag = u32::MAX - 81;
+    let semh_tag = u32::MAX - 82;
+    let muth_tag = u32::MAX - 83;
+    let prevcnt_tag = u32::MAX - 84;
+    let harr_tag = u32::MAX - 85;
+    let harr8_tag = u32::MAX - 86;
+    let msg_sync_tag = u32::MAX - 87;
+    let ndename_tag = u32::MAX - 88;
+    let nde_slot_tag = u32::MAX - 89;
+    let tneg200_tag = u32::MAX - 90;
+    let msg_delay_tag = u32::MAX - 91;
+    let ctename_tag = u32::MAX - 92;
+    let cte_slot_tag = u32::MAX - 93;
+    let thh_tag = u32::MAX - 94;
+    let thread_fn_tag = u32::MAX - 95;
+    let msg_thread_tag = u32::MAX - 96;
+    let msg_thr_tag = u32::MAX - 97;
+    let csecname_tag = u32::MAX - 98;
+    let mvsname_tag = u32::MAX - 99;
+    let csec_slot_tag = u32::MAX - 100;
+    let mvs_slot_tag = u32::MAX - 101;
+    let sh_tag = u32::MAX - 102;
+    let secsize_tag = u32::MAX - 103;
+    let vbase_tag = u32::MAX - 104;
+    let vsize_tag = u32::MAX - 105;
+    let msg_sec_tag = u32::MAX - 106;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -1198,6 +1258,270 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2m9) semaphore + mutant + NtWaitForMultipleObjects. rbx <- hNtdll.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
+    for (name_tag, slot_tag) in [
+        (csemname_tag, csem_slot_tag),
+        (rsemname_tag, rsem_slot_tag),
+        (cmutname_tag, cmut_slot_tag),
+        (rmutname_tag, rmut_slot_tag),
+        (wfmoname_tag, wfmo_slot_tag),
+    ] {
+        code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+        rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], name_tag); // lea rdx, [rip+name]
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+        rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa);
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+        rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], slot_tag); // mov [rip+slot], rax
+    }
+    // NtCreateSemaphore(&semh, 0, 0, InitialCount=0, MaximumCount=2)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], semh_tag);
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9]); // xor edx; xor r8d; xor r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0x02, 0, 0, 0]); // [rsp+0x20]=2
+    rel!([0xFF, 0x15, 0, 0, 0, 0], csem_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // wait(semh, 0, &tzero) -> STATUS_TIMEOUT (count 0)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], semh_tag);
+    code.extend_from_slice(&[0x31, 0xD2]);
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], tzero_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x3D, 0x02, 0x01, 0, 0, 0x74, 0x01, 0xCC]); // cmp eax,0x102; je+1; int3
+    // NtReleaseSemaphore(semh, 1, &prevcnt)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], semh_tag);
+    code.extend_from_slice(&[0xBA, 0x01, 0, 0, 0]); // mov edx, 1
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], prevcnt_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], rsem_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // wait(semh, 0, &tzero) -> WAIT_0
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], semh_tag);
+    code.extend_from_slice(&[0x31, 0xD2]);
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], tzero_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // wait(semh, 0, &tzero) -> STATUS_TIMEOUT again (consumed)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], semh_tag);
+    code.extend_from_slice(&[0x31, 0xD2]);
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], tzero_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x3D, 0x02, 0x01, 0, 0, 0x74, 0x01, 0xCC]);
+    // NtCreateMutant(&muth, 0, 0, InitialOwner=1)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], muth_tag);
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0]); // xor edx; xor r8d
+    code.extend_from_slice(&[0x41, 0xB9, 0x01, 0, 0, 0]); // mov r9d, 1
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], cmut_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtReleaseMutant(muth, &prevcnt) -> SUCCESS; prevcnt == 1
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], muth_tag);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], prevcnt_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], rmut_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    rel!([0x8B, 0x05, 0, 0, 0, 0], prevcnt_tag); // mov eax, [rip+prevcnt]
+    code.extend_from_slice(&[0x83, 0xF8, 0x01, 0x74, 0x01, 0xCC]); // cmp eax,1; je+1; int3
+    // NtReleaseMutant(muth, 0) again -> STATUS_MUTANT_NOT_OWNED (0xC0000046)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], muth_tag);
+    code.extend_from_slice(&[0x31, 0xD2]);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], rmut_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x3D, 0x46, 0x00, 0x00, 0xC0, 0x74, 0x01, 0xCC]); // cmp eax,0xC0000046; je+1; int3
+    // wait(muth, 0, NULL) -> WAIT_0 (acquire the now-free mutant)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], muth_tag);
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0]); // xor edx; xor r8d (NULL timeout)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // harr = [semh, muth]
+    rel!([0x48, 0x8B, 0x05, 0, 0, 0, 0], semh_tag);
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], harr_tag);
+    rel!([0x48, 0x8B, 0x05, 0, 0, 0, 0], muth_tag);
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], harr8_tag);
+    // NtWaitForMultipleObjects(2, &harr, WaitType=1 WaitAny, 0, &tzero) -> WAIT_0+1
+    code.extend_from_slice(&[0xB9, 0x02, 0, 0, 0]); // mov ecx, 2
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], harr_tag);
+    code.extend_from_slice(&[0x41, 0xB8, 0x01, 0, 0, 0]); // mov r8d, 1
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]);
+    rel!([0x48, 0x8D, 0x05, 0, 0, 0, 0], tzero_tag);
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // [rsp+0x20]=&tzero
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfmo_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    code.extend_from_slice(&[0x83, 0xF8, 0x01, 0x74, 0x01, 0xCC]); // cmp eax,1; je+1; int3
+    // NtClose(semh); NtClose(muth)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], semh_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], close_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], muth_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], close_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    // WriteFile(1, msg_sync, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_sync_tag);
+    let sync_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2m10) NtDelayExecution on the executive timer wheel. A real block from a
+    //       cooperative PE syscall — if the wheel doesn't wake the thread the
+    //       whole test hangs. rbx <- hNtdll.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], ndename_tag); // lea rdx, [rip+"NtDelayExecution"]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], nde_slot_tag); // mov [rip+nde_slot], rax
+    // NtDelayExecution(FALSE, &tneg200)  -> real ~200 ms block, returns SUCCESS
+    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], tneg200_tag); // lea rdx, [rip+tneg200]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], nde_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]); // test eax,eax; je+1; int3
+    // NtDelayExecution(FALSE, NULL) -> yield path, returns SUCCESS
+    code.extend_from_slice(&[0x31, 0xC9, 0x31, 0xD2]); // xor ecx,ecx; xor edx,edx
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], nde_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // WriteFile(1, msg_delay, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_delay_tag);
+    let delay_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2m11) NtCreateThreadEx: spawn a worker running thread_fn, wait on its
+    //       thread handle (a manual event signalled on exit), then continue.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], ctename_tag); // lea rdx, [rip+"NtCreateThreadEx"]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], cte_slot_tag); // mov [rip+cte_slot], rax
+    // NtCreateThreadEx(&thh, 0, 0, -1, thread_fn, 0, 0, 0, 0, 0, 0)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], thh_tag); // lea rcx, [rip+thh]
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0]); // xor edx,edx; xor r8d,r8d
+    code.extend_from_slice(&[0x49, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF]); // mov r9, -1
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x58]); // sub rsp, 0x58
+    rel!([0x48, 0x8D, 0x05, 0, 0, 0, 0], thread_fn_tag); // lea rax, [rip+thread_fn]
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // [rsp+0x20] = StartRoutine
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]); // [rsp+0x28] = Argument
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // [rsp+0x30] = CreateFlags
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x38]);
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x40]);
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x48]);
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x50]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], cte_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x58]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]); // test eax,eax; je+1; int3
+    // NtWaitForSingleObject(thh, 0, NULL) -> blocks until the worker exits
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], thh_tag);
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0]); // xor edx,edx; xor r8d,r8d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtClose(thh)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], thh_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], close_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    // WriteFile(1, msg_thr, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_thr_tag);
+    let thr_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2m12) section objects: create an anonymous 8 KiB section, map a view,
+    //       write + read a sentinel through the mapped VA.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], ntdllname_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gmh);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
+    for (name_tag, slot_tag) in [(csecname_tag, csec_slot_tag), (mvsname_tag, mvs_slot_tag)] {
+        code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+        rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], name_tag);
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+        rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gpa);
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+        rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], slot_tag);
+    }
+    // NtCreateSection(&sh, 0, 0, &secsize, PAGE_READWRITE=4, SEC_COMMIT, FileHandle=0)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], sh_tag); // lea rcx, [rip+sh]
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0]); // xor edx,edx; xor r8d,r8d
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], secsize_tag); // lea r9, [rip+secsize]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]);
+    code.extend_from_slice(&[0xC7, 0x44, 0x24, 0x20, 0x04, 0, 0, 0]); // [rsp+0x20]=4 (PAGE_READWRITE)
+    code.extend_from_slice(&[0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0x08]); // [rsp+0x28]=0x08000000 (SEC_COMMIT)
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x30, 0, 0, 0, 0]); // [rsp+0x30]=0 FileHandle
+    rel!([0xFF, 0x15, 0, 0, 0, 0], csec_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtMapViewOfSection(sh, -1, &vbase, 0, 0, 0, &vsize, 1, 0, 4)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], sh_tag); // mov rcx, [rip+sh]
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rdx, -1
+    rel!([0x4C, 0x8D, 0x05, 0, 0, 0, 0], vbase_tag); // lea r8, [rip+vbase]
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x58]);
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // [rsp+0x20]=0 CommitSize
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]); // [rsp+0x28]=0 SectionOffset*
+    rel!([0x48, 0x8D, 0x05, 0, 0, 0, 0], vsize_tag); // lea rax, [rip+vsize]
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // [rsp+0x30]=&ViewSize
+    code.extend_from_slice(&[0xB8, 0x01, 0, 0, 0]); // mov eax, 1
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x38]); // [rsp+0x38]=1 InheritDisposition
+    code.extend_from_slice(&[0x31, 0xC0, 0x48, 0x89, 0x44, 0x24, 0x40]); // [rsp+0x40]=0 AllocationType
+    code.extend_from_slice(&[0xB8, 0x04, 0, 0, 0, 0x48, 0x89, 0x44, 0x24, 0x48]); // [rsp+0x48]=4 Win32Protect
+    rel!([0xFF, 0x15, 0, 0, 0, 0], mvs_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x58, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // sentinel round-trip through the mapped view
+    rel!([0x48, 0x8B, 0x05, 0, 0, 0, 0], vbase_tag); // mov rax, [rip+vbase]
+    code.extend_from_slice(&[0xC7, 0x00, 0x01, 0xEF, 0xCD, 0xAB]); // mov dword [rax], 0xABCDEF01
+    code.extend_from_slice(&[0x8B, 0x08]); // mov ecx, [rax]
+    code.extend_from_slice(&[0x81, 0xF9, 0x01, 0xEF, 0xCD, 0xAB, 0x74, 0x01, 0xCC]); // cmp ecx,0xABCDEF01; je+1; int3
+    // WriteFile(1, msg_sec, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_sec_tag);
+    let sec_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -1344,6 +1668,19 @@ fn write_pe_hello(path: &Path) {
     rel!([0x48, 0x89, 0x0D, 0, 0, 0, 0], apc_flag_tag); // mov [rip+apc_flag], rcx
     code.extend_from_slice(&[0xC3]); // ret
 
+    // thread_fn — a worker thread's StartRoutine (arg in rcx, ignored):
+    // WriteFile(1, msg_thread, len, &written, 0); return 0.
+    let thread_fn_off = code.len();
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_thread_tag); // lea rdx, [rip+msg_thread]
+    let thread_fn_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    code.extend_from_slice(&[0x31, 0xC0, 0xC3]); // xor eax, eax; ret
+
     // --- data slots at the end of .text ---
     while code.len() % 8 != 0 {
         code.push(0);
@@ -1398,6 +1735,24 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"NtQueryValueKey\0");
     let ndkname_off = code.len();
     code.extend_from_slice(b"NtDeleteKey\0");
+    let csemname_off = code.len();
+    code.extend_from_slice(b"NtCreateSemaphore\0");
+    let rsemname_off = code.len();
+    code.extend_from_slice(b"NtReleaseSemaphore\0");
+    let cmutname_off = code.len();
+    code.extend_from_slice(b"NtCreateMutant\0");
+    let rmutname_off = code.len();
+    code.extend_from_slice(b"NtReleaseMutant\0");
+    let wfmoname_off = code.len();
+    code.extend_from_slice(b"NtWaitForMultipleObjects\0");
+    let ndename_off = code.len();
+    code.extend_from_slice(b"NtDelayExecution\0");
+    let ctename_off = code.len();
+    code.extend_from_slice(b"NtCreateThreadEx\0");
+    let csecname_off = code.len();
+    code.extend_from_slice(b"NtCreateSection\0");
+    let mvsname_off = code.len();
+    code.extend_from_slice(b"NtMapViewOfSection\0");
     // registry key/value UTF-16LE names + their UNICODE_STRING headers.
     let keyname16: Vec<u8> = "\\Registry\\Machine\\Software\\THOSREG"
         .encode_utf16()
@@ -1473,6 +1828,44 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0u8; 32]); // KEY_VALUE_PARTIAL_INFORMATION out
     let rrl_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // NtQueryValueKey ResultLength out
+    let csem_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtCreateSemaphore
+    let rsem_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtReleaseSemaphore
+    let cmut_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtCreateMutant
+    let rmut_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtReleaseMutant
+    let wfmo_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtWaitForMultipleObjects
+    let semh_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // semaphore HANDLE
+    let muth_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // mutant HANDLE
+    let prevcnt_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // PreviousCount out (semaphore + mutant)
+    let harr_off = code.len();
+    code.extend_from_slice(&[0u8; 16]); // HANDLE[2] for NtWaitForMultipleObjects
+    let nde_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtDelayExecution
+    let tneg200_off = code.len();
+    code.extend_from_slice(&(-300_000i64).to_le_bytes()); // -30 ms, 100 ns units
+    let cte_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtCreateThreadEx
+    let thh_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // worker thread HANDLE (exit event)
+    let csec_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtCreateSection
+    let mvs_slot_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // resolved NtMapViewOfSection
+    let sh_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // section HANDLE
+    let secsize_off = code.len();
+    code.extend_from_slice(&0x2000i64.to_le_bytes()); // MaximumSize = 8 KiB
+    let vbase_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // mapped view base (out)
+    let vsize_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // view size (in 0 = whole section / out)
     let evh_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // event HANDLE
     let evh2_off = code.len();
@@ -1547,7 +1940,27 @@ fn write_pe_hello(path: &Path) {
     let msg_reg: &[u8] = b"PE registry OK\n";
     let msg_reg_off = code.len();
     code.extend_from_slice(msg_reg);
+    let msg_sync: &[u8] = b"PE sync OK\n";
+    let msg_sync_off = code.len();
+    code.extend_from_slice(msg_sync);
+    let msg_delay: &[u8] = b"PE delay OK\n";
+    let msg_delay_off = code.len();
+    code.extend_from_slice(msg_delay);
+    let msg_thread: &[u8] = b"PE thread ran\n";
+    let msg_thread_off = code.len();
+    code.extend_from_slice(msg_thread);
+    let msg_thr: &[u8] = b"PE thread OK\n";
+    let msg_thr_off = code.len();
+    code.extend_from_slice(msg_thr);
+    let msg_sec: &[u8] = b"PE section OK\n";
+    let msg_sec_off = code.len();
+    code.extend_from_slice(msg_sec);
 
+    code[sec_r8..sec_r8 + 4].copy_from_slice(&(msg_sec.len() as u32).to_le_bytes());
+    code[thread_fn_r8..thread_fn_r8 + 4].copy_from_slice(&(msg_thread.len() as u32).to_le_bytes());
+    code[thr_r8..thr_r8 + 4].copy_from_slice(&(msg_thr.len() as u32).to_le_bytes());
+    code[delay_r8..delay_r8 + 4].copy_from_slice(&(msg_delay.len() as u32).to_le_bytes());
+    code[sync_r8..sync_r8 + 4].copy_from_slice(&(msg_sync.len() as u32).to_le_bytes());
     code[reg_r8..reg_r8 + 4].copy_from_slice(&(msg_reg.len() as u32).to_le_bytes());
     code[apc_r8..apc_r8 + 4].copy_from_slice(&(msg_apc.len() as u32).to_le_bytes());
     code[seh2_r8..seh2_r8 + 4].copy_from_slice(&(msg_seh2.len() as u32).to_le_bytes());
@@ -1660,6 +2073,41 @@ fn write_pe_hello(path: &Path) {
             t if t == roa_tag => text_rva + roa_off as u32,
             t if t == rvalname_us_tag => text_rva + rvalname_us_off as u32,
             t if t == msg_reg_tag => text_rva + msg_reg_off as u32,
+            t if t == csemname_tag => text_rva + csemname_off as u32,
+            t if t == rsemname_tag => text_rva + rsemname_off as u32,
+            t if t == cmutname_tag => text_rva + cmutname_off as u32,
+            t if t == rmutname_tag => text_rva + rmutname_off as u32,
+            t if t == wfmoname_tag => text_rva + wfmoname_off as u32,
+            t if t == csem_slot_tag => text_rva + csem_slot_off as u32,
+            t if t == rsem_slot_tag => text_rva + rsem_slot_off as u32,
+            t if t == cmut_slot_tag => text_rva + cmut_slot_off as u32,
+            t if t == rmut_slot_tag => text_rva + rmut_slot_off as u32,
+            t if t == wfmo_slot_tag => text_rva + wfmo_slot_off as u32,
+            t if t == semh_tag => text_rva + semh_off as u32,
+            t if t == muth_tag => text_rva + muth_off as u32,
+            t if t == prevcnt_tag => text_rva + prevcnt_off as u32,
+            t if t == harr_tag => text_rva + harr_off as u32,
+            t if t == harr8_tag => text_rva + harr_off as u32 + 8,
+            t if t == msg_sync_tag => text_rva + msg_sync_off as u32,
+            t if t == ndename_tag => text_rva + ndename_off as u32,
+            t if t == nde_slot_tag => text_rva + nde_slot_off as u32,
+            t if t == tneg200_tag => text_rva + tneg200_off as u32,
+            t if t == msg_delay_tag => text_rva + msg_delay_off as u32,
+            t if t == ctename_tag => text_rva + ctename_off as u32,
+            t if t == cte_slot_tag => text_rva + cte_slot_off as u32,
+            t if t == thh_tag => text_rva + thh_off as u32,
+            t if t == thread_fn_tag => text_rva + thread_fn_off as u32,
+            t if t == msg_thread_tag => text_rva + msg_thread_off as u32,
+            t if t == msg_thr_tag => text_rva + msg_thr_off as u32,
+            t if t == csecname_tag => text_rva + csecname_off as u32,
+            t if t == mvsname_tag => text_rva + mvsname_off as u32,
+            t if t == csec_slot_tag => text_rva + csec_slot_off as u32,
+            t if t == mvs_slot_tag => text_rva + mvs_slot_off as u32,
+            t if t == sh_tag => text_rva + sh_off as u32,
+            t if t == secsize_tag => text_rva + secsize_off as u32,
+            t if t == vbase_tag => text_rva + vbase_off as u32,
+            t if t == vsize_tag => text_rva + vsize_off as u32,
+            t if t == msg_sec_tag => text_rva + msg_sec_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -2702,7 +3150,10 @@ fn boot_kernel_headless(tag: &str, iso: &Path, disk: &Path, smp: u32) -> String 
         })
     };
 
-    let deadline = Instant::now() + Duration::from_secs(240);
+    // The PE milestone has grown a lot (SEH / APC / registry / sync objects /
+    // real timed waits / a worker thread / sections) and now spends real
+    // wall-clock time in NtDelayExecution — give it headroom over the old 240 s.
+    let deadline = Instant::now() + Duration::from_secs(420);
     let status = loop {
         if let Some(s) = child.try_wait().expect("wait qemu") {
             break Some(s);
@@ -2963,6 +3414,11 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE SEH2 OK") // #PF via the error-code fault stub, same handler resumes
         && serial.contains("PE APC OK") // NtQueueApcThread + NtTestAlert -> KiUserApcDispatcher -> NtContinue
         && serial.contains("PE registry OK") // NtCreateKey/SetValue/OpenKey/QueryValue/DeleteKey round-trip
+        && serial.contains("PE sync OK") // semaphore + mutant + NtWaitForMultipleObjects
+        && serial.contains("PE delay OK") // NtDelayExecution -> real executive block on the timer wheel
+        && serial.contains("PE thread ran") // NtCreateThreadEx worker ran its StartRoutine
+        && serial.contains("PE thread OK") // main thread waited on the thread handle + resumed
+        && serial.contains("PE section OK") // NtCreateSection + NtMapViewOfSection, sentinel round-trip
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
@@ -2970,7 +3426,21 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE TLS OK") // static TLS: block copied, __tls_index written, callback ran
         && serial.contains("THOS: pe dllfail ok") // a DllMain returning FALSE aborted process init
         && !serial.contains("PE DLLFAIL REACHED ENTRY") // ...so the exe entry never ran
-        && serial.contains("THOS: pe reject ok");
+        && serial.contains("THOS: pe reject ok")
+        // Milestone 3: a real mingw-w64 compiler-built Win32 console .exe.
+        && serial.contains("WINCON: hello from mingw")
+        && serial.contains("WINCON: read C:\\pe-read.txt -> PE ReadFile OK via CreateFileA")
+        && serial.contains("WINCON: WaitForSingleObject ok")
+        && serial.contains("WINCON: exit ok")
+        && serial.contains("THOS: wincon exited")
+        // Milestone 3+: mingw CRT `int main` on the synthetic msvcrt.
+        && serial.contains("CRT: hello from the mingw C runtime")
+        && serial.contains("CRT: row 2 dec=14 hex=0xe pad=0014")
+        && serial.contains("CRT: str=trun width=[      hi] neg=-42")
+        && serial.contains("CRT: fprintf works too")
+        && serial.contains("THOS: crt exited")
+        && serial.contains("ELF + ") // ps: both personalities in one listing
+        && serial.lines().any(|l| l.contains("THOS: ps ok") && !l.contains("0 PE") && !l.contains("0 ELF"));
     if ok {
         println!("pe-test: OK — PE loader: reloc/imports/gs+TEB+PEB/Ldr+params/file I/O/VirtualAlloc+Heap/GetProcAddress/ntdll/System32-DLL (in Ldr)");
     } else {

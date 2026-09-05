@@ -398,12 +398,38 @@ late.
     (`PE registry OK`). Not transactional / persisted / enumerable yet —
     hive files, `NtEnumerateKey`/`Value`, change-notify and per-key security
     come with the registry phase.
+  - **Mutant + semaphore + `NtWaitForMultipleObjects`.** `wait.rs` gains a
+    counting `Semaphore` and a recursive thread-owned `Mutant`; `process.rs` a
+    polymorphic `Waitable` (event / semaphore / mutant) with
+    `try_take`/`wait`/`is_signaled`. SSDT: `NtCreateMutant` / `NtReleaseMutant` /
+    `NtCreateSemaphore` / `NtReleaseSemaphore` / `NtWaitForMultipleObjects`
+    (WaitAny → `STATUS_WAIT_0 + i`; WaitAll acquires all when all signalled).
+    `NtWaitForSingleObject` now waits on any `Waitable`. `pe-test` `PE sync OK`.
+  - **Executive timer wheel + `NtDelayExecution`.** `crate::timer`: a monotonic
+    tick clock (CPU-0-driven, ~100 Hz) + a wheel. `sleep_until` does a clean
+    `block_current()` from a cooperative PE syscall; the timer IRQ fires on
+    whatever runs next with `IF=1` (another thread / a CPU's `sti;hlt` idle) and
+    wakes the sleeper. `NtDelayExecution` (negative interval) is a real block;
+    `NtWaitFor*` relative timeouts use a real wall-clock deadline. `PE delay OK`.
+  - **Thread creation.** `pe::spawn_thread` makes one ring-3 worker per PE
+    process: shares the address space + `Task`, own TEB (`PE_TEB2_ADDR`) + 32 KiB
+    stack + kernel stack, enters a `PE_THREADSTART_ADDR` stub with `[routine]
+    [arg]` on its stack → calls the routine → `NtTerminateThread`. `current_tid`
+    (`sched::current().id`) distinguishes threads within a process; a `THREAD_EXITS`
+    map gives each worker a manual exit event, so `NtWaitForSingleObject` on the
+    returned handle completes on exit. `PE thread ran` / `PE thread OK`.
+  - **Section objects.** `HandleObject::Section` — anonymous (zeroed) or a copy
+    of a file's bytes at create time. `NtCreateSection` / `NtMapViewOfSection`
+    (copies the range into fresh private RW pages; CR3 is the process's so the
+    copy writes straight to the user VA). No shared writeback / COW yet.
+    `PE section OK`.
   - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
     unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
-    unmodified), or a from-scratch `ntdll` — an **executive timer wheel** for a
-    real timed block (and a preemption-safe path out of a PE syscall), more
-    `HandleObject` kinds (mutant, semaphore, section, thread), the registry
-    grown to hives; then process isolation / integrity for the security phase.
+    unmodified), or a from-scratch `ntdll` — a preemption-safe path out of a PE
+    syscall (ring-3 IRQ `swapgs` shim so PE threads can run `IF=1`), a
+    fully-blocking timed object wait (dual-enqueue: object queue + wheel),
+    multiple threads per process, shared-writeback sections, the registry grown
+    to hives; then process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
@@ -413,6 +439,18 @@ late.
 - **Milestone 3:** a statically linked Win32 **console** `.exe` (`CreateFile`,
   `WriteFile(stdout)`, `WaitForSingleObject`) runs through the THOS NT path — **with no
   wine process in the tree**. ELF and PE processes appear in one `ps` output.
+  - Status: **met.** `xtask/testdata/wincon.c` — a real `x86_64-w64-mingw32-gcc`
+    console `.exe` (`-nostdlib` + own entry, only `KERNEL32.dll` imports; a
+    genuine toolchain PE with a real import table + `.pdata`) — opens
+    `C:\pe-read.txt` (`CreateFileA`/`ReadFile`), writes stdout
+    (`GetStdHandle`/`WriteFile`), `WaitForSingleObject`s a `CreateEventA` event,
+    then `ExitProcess`. Runs on the synthetic `kernel32`, no Wine.
+    `process::ps_dump` prints every task with an ELF/PE kind. `cargo xtask
+    pe-test`. **Full mingw CRT path also done:** a synthetic `msvcrt.dll`
+    (third `nt::dispatch` personality) — own `printf` formatter,
+    `__getmainargs` + a ring-3 `_initterm` stub (so `argc`/`argv` work),
+    `malloc`/`memcpy`/... — runs `/crt.exe`, a normal 244 KB `int main` mingw
+    build, to exit. `ps`: `2 ELF + 4 PE`.
 
 ### Product goal — "download it and it runs", zero user config
 
@@ -706,6 +744,31 @@ exec gate reuses the loader internals that are being built now. Designed in
 from the start (loaders already hostile-input hardened; identity model already
 capability-shaped), implemented as its own phase once M3 lands.
 
+### In-system AI
+
+THOS grows its own AI, built from scratch (*user, 2026-09-04*): a small
+**decoder-only language model** trained off-device (PyTorch, CPU) and run by a
+hand-written `#![no_std]` Rust engine (`ml/thos-lm`) over a first-party `.tlm`
+weight format — no external model runtime, no API. Training data is **only** open
+/ permissively-licensed / public-domain. Start ~1M params byte-level, grow step by
+step. Full plan + phases (P0–P6) and open decisions:
+[`ai.md`](ai.md); code + datasets: [`../../ml/`](../../ml/) /
+[`../../ml/DATASETS.md`](../../ml/DATASETS.md).
+
+The former standalone "in-kernel exec-gate classifier" is **folded in** as
+Application B of this stack — a classifier head reusing the LM's tensor + loader
+code to score PE/ELF statically for the native-exec gate above. Running any of
+this *inside* THOS is gated on kernel work not yet present (userland file writes,
+a kernel↔userspace channel, RAM budget) and is a later phase, not near-term.
+
+Two research tracks hang off this, both unscheduled: **a ~20–30 B open model
+quantised to 2-bit and held resident** in the 16 GB target
+([`ai-large.md`](ai-large.md) — streaming a bigger model from the SATA disk is
+not viable), and **a from-scratch rework of the context mechanism** (learned
+active memory so a small resident footprint behaves like a huge context,
+[`ai-context.md`](ai-context.md)). The consolidated build order is in
+[`ai.md`](ai.md).
+
 ## Phase 6 — Research track: real `.sys` drivers (after M5)
 
 - Scope **hard-limited to one device class** (recommended: NDIS networking, as
@@ -812,3 +875,8 @@ ASRock board; and the risks below.
 5. **Driver model** — monolithic-with-loadable-modules vs userspace drivers.
    Only forces a decision at **Phase 7** (hardware breadth); until then everything
    is compiled in for the one target machine.
+6. **In-system AI** — model class beyond the v0 byte GPT, tokenizer for P1,
+   `f32` vs fixed-point for the in-kernel exec-gate head, weight delivery
+   (`include_bytes!` vs ext2 file), the kernel↔userspace query channel, and the
+   `ml/` licence. Enumerated in [`ai.md`](ai.md) → Open decisions
+   (*user, 2026-09-04*).

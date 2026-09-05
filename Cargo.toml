@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 [workspace]
 resolver = "2"
-members = ["kernel", "loaders/thos-boot", "xtask"]
+members = ["kernel", "loaders/thos-boot", "xtask", "ml/thos-lm"]
+# Bare `cargo build` targets `x86_64-unknown-none` (see .cargo/config.toml); keep
+# it to the OS crates so existing flows are untouched. `thos-lm` is no_std and
+# builds for that target on demand (`cargo build -p thos-lm`); its host-only
+# test + example are cfg-gated.
+default-members = ["kernel", "loaders/thos-boot", "xtask"]
 
 [workspace.package]
 version = "0.0.0"

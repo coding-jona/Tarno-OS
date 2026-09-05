@@ -24,7 +24,7 @@ use x86_64::PhysAddr;
 use crate::elf::{self, Image};
 use crate::file::{ConsoleFile, FileOps, KeyboardFile};
 use crate::mm::{hhdm_offset, phys_to_virt, FRAME_ALLOC};
-use crate::wait::Event;
+use crate::wait::{Event, Mutant, Semaphore};
 use crate::syscall::{self, UserFrame};
 use crate::{gdt, sched, vmm};
 
@@ -314,13 +314,60 @@ pub fn current_uid() -> u32 {
 /// What a HANDLE / file descriptor points at. Both personalities share one
 /// per-process table: a POSIX fd and a Win32 `HANDLE` are the same integer
 /// into the same `Vec` — a file, or an executive object.
+/// A section object's backing store. Anonymous ⇒ zeroed; file-backed ⇒ a copy
+/// of the file's bytes at create time. No shared writeback / copy-on-write yet —
+/// `NtMapViewOfSection` copies the range into fresh private pages.
+pub struct Section {
+    pub size: usize,
+    pub data: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub enum HandleObject {
     File(Arc<dyn FileOps>),
     Event(Arc<Event>),
+    Semaphore(Arc<Semaphore>),
+    Mutant(Arc<Mutant>),
+    Section(Arc<Section>),
     /// A registry key — the canonical `\`-joined path into [`crate::registry`]'s
     /// global tree (ops re-walk under that module's lock).
     RegKey(String),
+}
+
+/// A polymorphic view of the dispatcher objects a `NtWaitFor*` call can wait on.
+/// `tid` is threaded through only for the mutant's ownership check.
+#[derive(Clone)]
+pub enum Waitable {
+    Event(Arc<Event>),
+    Semaphore(Arc<Semaphore>),
+    Mutant(Arc<Mutant>),
+}
+
+impl Waitable {
+    /// Non-blocking: take/consume the signal if present.
+    pub fn try_take(&self, tid: u64) -> bool {
+        match self {
+            Waitable::Event(e) => e.try_take(),
+            Waitable::Semaphore(s) => s.try_take(),
+            Waitable::Mutant(m) => m.try_acquire(tid),
+        }
+    }
+    /// Block until signalled, then consume it.
+    pub fn wait(&self, tid: u64) {
+        match self {
+            Waitable::Event(e) => e.wait(),
+            Waitable::Semaphore(s) => s.wait(),
+            Waitable::Mutant(m) => m.acquire(tid),
+        }
+    }
+    /// Would `try_take` succeed right now? (No consume.)
+    pub fn is_signaled(&self, tid: u64) -> bool {
+        match self {
+            Waitable::Event(e) => e.is_signaled(),
+            Waitable::Semaphore(s) => s.is_signaled(),
+            Waitable::Mutant(m) => m.is_signaled(tid),
+        }
+    }
 }
 
 /// One table slot: the object plus its close-on-exec flag (per-descriptor, not
@@ -356,6 +403,8 @@ pub struct Task {
     cwd: Mutex<String>,
     /// Pending user-mode APCs, delivered when the thread next goes alertable.
     apcs: Mutex<VecDeque<ApcEntry>>,
+    /// `true` for a native PE image, `false` for an ELF — for a `ps` view.
+    is_pe: AtomicBool,
 }
 
 fn seed_fds() -> Vec<Fd> {
@@ -377,9 +426,14 @@ impl Task {
             fds: Mutex::new(seed_fds()),
             cwd: Mutex::new(String::from("/")),
             apcs: Mutex::new(VecDeque::new()),
+            is_pe: AtomicBool::new(false),
         });
         TASKS.lock().insert(t.pid, t.clone());
         t
+    }
+
+    pub fn mark_pe(&self) {
+        self.is_pe.store(true, Ordering::Relaxed);
     }
 
     pub fn space(&self) -> Arc<Process> {
@@ -413,6 +467,31 @@ impl Task {
     }
     pub fn handle_alloc_event(&self, ev: Arc<Event>) -> i32 {
         self.handle_alloc(HandleObject::Event(ev), false)
+    }
+    pub fn handle_alloc_semaphore(&self, s: Arc<Semaphore>) -> i32 {
+        self.handle_alloc(HandleObject::Semaphore(s), false)
+    }
+    pub fn handle_alloc_mutant(&self, m: Arc<Mutant>) -> i32 {
+        self.handle_alloc(HandleObject::Mutant(m), false)
+    }
+    pub fn handle_alloc_section(&self, s: Arc<Section>) -> i32 {
+        self.handle_alloc(HandleObject::Section(s), false)
+    }
+    pub fn handle_section(&self, h: i32) -> Option<Arc<Section>> {
+        match &self.fds.lock().get(h as usize)?.as_ref()?.obj {
+            HandleObject::Section(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// The dispatcher object a HANDLE names, as a [`Waitable`], if it is one.
+    pub fn handle_waitable(&self, h: i32) -> Option<Waitable> {
+        match &self.fds.lock().get(h as usize)?.as_ref()?.obj {
+            HandleObject::Event(e) => Some(Waitable::Event(e.clone())),
+            HandleObject::Semaphore(s) => Some(Waitable::Semaphore(s.clone())),
+            HandleObject::Mutant(m) => Some(Waitable::Mutant(m.clone())),
+            _ => None,
+        }
     }
 
     /// The registry-key path a HANDLE names, if it is one.
@@ -605,6 +684,24 @@ pub fn current_event(h: i32) -> Option<Arc<Event>> {
 pub fn current_alloc_event(ev: Arc<Event>) -> i32 {
     sched::current().task().map_or(-1, |t| t.handle_alloc_event(ev))
 }
+pub fn current_alloc_semaphore(s: Arc<Semaphore>) -> i32 {
+    sched::current().task().map_or(-1, |t| t.handle_alloc_semaphore(s))
+}
+pub fn current_alloc_mutant(m: Arc<Mutant>) -> i32 {
+    sched::current().task().map_or(-1, |t| t.handle_alloc_mutant(m))
+}
+pub fn current_alloc_section(s: Arc<Section>) -> i32 {
+    sched::current().task().map_or(-1, |t| t.handle_alloc_section(s))
+}
+pub fn current_section(h: i32) -> Option<Arc<Section>> {
+    sched::current().task().and_then(|t| t.handle_section(h))
+}
+
+/// The current task's [`Waitable`] for HANDLE `h`, if it names a dispatcher
+/// object (event / semaphore / mutant).
+pub fn current_waitable(h: i32) -> Option<Waitable> {
+    sched::current().task().and_then(|t| t.handle_waitable(h))
+}
 
 /// The current task's registry-key path for HANDLE `h`, if it names one.
 pub fn current_regkey(h: i32) -> Option<String> {
@@ -637,6 +734,53 @@ pub fn current_take_apc() -> Option<ApcEntry> {
 #[allow(dead_code)]
 pub fn current_apc_pending() -> bool {
     sched::current().task().map(|t| t.apc_pending()).unwrap_or(false)
+}
+
+/// This thread's id (distinct per thread within a process — unlike
+/// [`current_pid`], which is the shared `Task` id).
+pub fn current_tid() -> u64 {
+    sched::current().id
+}
+
+/// Per-worker-thread exit events, keyed by thread id. A thread's
+/// `NtCreateThreadEx` registers one; `NtTerminateThread` signals + removes it,
+/// so a `NtWaitForSingleObject` on the returned handle completes on exit.
+static THREAD_EXITS: Mutex<BTreeMap<u64, Arc<Event>>> = Mutex::new(BTreeMap::new());
+
+pub fn register_thread_exit(tid: u64, ev: Arc<Event>) {
+    THREAD_EXITS.lock().insert(tid, ev);
+}
+
+/// Signal + forget `tid`'s exit event. `false` if none was registered (i.e. the
+/// caller is the process's original thread).
+pub fn signal_thread_exit(tid: u64) -> bool {
+    match THREAD_EXITS.lock().remove(&tid) {
+        Some(ev) => {
+            ev.signal();
+            true
+        }
+        None => false,
+    }
+}
+
+/// A `ps`-style dump of every spawned task (ELF and PE alike), for the
+/// Milestone 3 check that both personalities show up in one listing.
+#[allow(dead_code)] // only the `petest` milestone calls this
+pub fn ps_dump() {
+    let (mut elf, mut pe) = (0u32, 0u32);
+    crate::kprintln!("THOS: ps    PID PPID KIND STATE");
+    for (pid, t) in TASKS.lock().iter() {
+        let is_pe = t.is_pe.load(Ordering::Relaxed);
+        if is_pe {
+            pe += 1;
+        } else {
+            elf += 1;
+        }
+        let kind = if is_pe { "PE " } else { "ELF" };
+        let state = if t.exited.load(Ordering::Relaxed) { "exited" } else { "run" };
+        crate::kprintln!("THOS: ps    {:>3} {:>4} {}  {}", pid, t.ppid, kind, state);
+    }
+    crate::kprintln!("THOS: ps ok  {} ELF + {} PE processes in one listing", elf, pe);
 }
 
 pub fn current_pid() -> u64 {
@@ -719,6 +863,7 @@ pub fn spawn_pe(bytes: &[u8]) -> Result<u64, &'static str> {
     // MS x64 ABI: at the entry instruction RSP+8 must be 16-aligned.
     let rsp = (stack_top & !0xF) - 8;
     let task = Task::new(0, space);
+    task.mark_pe();
     sched::spawn_user_pe("pe", task.clone(), img.entry, rsp, img.teb);
     Ok(task.pid)
 }

@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# The "how far can this box actually go" run — ~1B params, deliberately run
+# with most of its training state living in swap (a 2G cgroup memory cap +
+# a 64G swapfile on the Samsung SSD; see ml/train/config/README notes in
+# docs/thos/ai.md). Extremely slow per step and badly overparameterised for
+# the ~11.7M-token corpus (data/train.bin, BPE vocab 16384) — expect
+# memorisation, not generalisation. This run exists to find the real,
+# empirical ceiling of "big model, CPU + swap", not to produce a good model.
+#
+#   echo $$ | sudo tee /sys/fs/cgroup/training/cgroup.procs
+#   CONFIG=ml/train/config/big-1b.toml TLM=big-1b.tlm ml/train/run.sh train-bg
+
+[model]
+n_layer    = 20
+n_head     = 16
+n_embd     = 2048
+block_size = 256
+vocab_size = 16384    # matches data/tokenizer.json (P1b BPE run)
+dropout    = 0.1
+norm_eps   = 1e-5
+
+[train]
+seed          = 20260904
+batch_size    = 4
+grad_accum    = 1        # keep accum minimal: every microbatch touches the
+                         # WHOLE swapped-out parameter set, so grad_accum
+                         # multiplies the brutal swap cost almost linearly
+max_steps     = 20000
+warmup_steps  = 200
+lr            = 2e-4
+min_lr        = 2e-5
+weight_decay  = 0.1
+grad_clip     = 1.0
+eval_interval = 50
+eval_batches  = 5        # each eval batch is roughly as expensive as a
+                         # train step here — keep this small
+ckpt_interval = 25       # checkpoint often; a single step can take minutes
+num_threads   = 0
+
+[data]
+train_bin = "data/train.bin"
+val_bin   = "data/val.bin"

@@ -338,6 +338,12 @@ static SCHED: Mutex<Inner> = Mutex::new(Inner {
 
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// `true` once [`start`] has run and per-CPU state (`gs`, idle threads) is live
+/// on every CPU — i.e. it is safe to touch `smp::this_cpu()` from an IRQ.
+pub fn is_started() -> bool {
+    STARTED.load(Ordering::Acquire)
+}
 static CTX_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
 pub fn ctx_switches() -> u64 {

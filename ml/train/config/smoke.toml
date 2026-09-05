@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Tiny run to prove the training loop works and to time steps/sec on this box:
+#   CONFIG=ml/train/config/smoke.toml ml/train/run.sh train
+
+[model]
+n_layer    = 4
+n_head     = 4
+n_embd     = 128
+block_size = 128
+vocab_size = 256
+dropout    = 0.0
+norm_eps   = 1e-5
+
+[train]
+seed          = 20260904
+batch_size    = 32
+grad_accum    = 4
+max_steps     = 60
+warmup_steps  = 10
+lr            = 3e-4
+min_lr        = 3e-5
+weight_decay  = 0.1
+grad_clip     = 1.0
+eval_interval = 20
+eval_batches  = 10
+ckpt_interval = 60
+num_threads   = 0
+
+[data]
+train_bin = "data/train.bin"
+val_bin   = "data/val.bin"

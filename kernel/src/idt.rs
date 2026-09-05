@@ -66,6 +66,7 @@ extern "x86-interrupt" fn apic_timer(_frame: InterruptStackFrame) {
     apic::on_timer_tick();
     apic::eoi();
     crate::ahci::poll_wake(); // safety net for a dropped AHCI completion IRQ
+    crate::timer::tick(); // advance the monotonic clock + wake timed sleepers
     crate::sched::on_tick();
 }
 

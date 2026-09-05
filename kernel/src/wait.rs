@@ -8,7 +8,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use spin::Mutex;
 use x86_64::instructions::interrupts;
@@ -147,9 +147,13 @@ impl Event {
 
     pub fn wait(&self) {
         match self.mode {
+            // `wait_if` holds the queue lock across the check + enqueue, and
+            // `signal`'s `wake_all` takes the same lock — closing the
+            // check-then-sleep window for a manual event signalled by another
+            // thread (e.g. a worker signalling its exit event).
             EventMode::Manual => {
                 while !self.signaled.load(Ordering::Acquire) {
-                    self.queue.wait();
+                    self.queue.wait_if(|| !self.signaled.load(Ordering::Acquire));
                 }
             }
             // `wait_if` holds the queue lock across the check + enqueue, and
@@ -160,5 +164,133 @@ impl Event {
                 self.queue.wait_if(|| !self.signaled.swap(false, Ordering::AcqRel));
             }
         }
+    }
+}
+
+/// A counting semaphore (NT `KSEMAPHORE`). Signalled while `count > 0`; each
+/// successful `wait` / `try_take` consumes one unit, `release(n)` adds `n`
+/// (never past `limit`) and wakes up to `n` waiters.
+pub struct Semaphore {
+    count: AtomicI32,
+    limit: i32,
+    queue: WaitQueue,
+}
+
+#[allow(dead_code)]
+impl Semaphore {
+    pub fn new(initial: i32, limit: i32) -> Self {
+        Self { count: AtomicI32::new(initial), limit, queue: WaitQueue::new() }
+    }
+
+    /// Take one unit without blocking.
+    pub fn try_take(&self) -> bool {
+        let mut c = self.count.load(Ordering::Acquire);
+        loop {
+            if c <= 0 {
+                return false;
+            }
+            match self.count.compare_exchange_weak(c, c - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(n) => c = n,
+            }
+        }
+    }
+
+    pub fn wait(&self) {
+        loop {
+            if self.try_take() {
+                return;
+            }
+            self.queue.wait_if(|| self.count.load(Ordering::Acquire) <= 0);
+        }
+    }
+
+    /// Add `n` units and wake up to `n` waiters. `None` if it would exceed
+    /// `limit`; otherwise the previous count.
+    pub fn release(&self, n: i32) -> Option<i32> {
+        let mut c = self.count.load(Ordering::Acquire);
+        loop {
+            if n <= 0 || c.checked_add(n).map_or(true, |v| v > self.limit) {
+                return None;
+            }
+            match self.count.compare_exchange_weak(c, c + n, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(prev) => {
+                    for _ in 0..n {
+                        if !self.queue.wake_one() {
+                            break;
+                        }
+                    }
+                    return Some(prev);
+                }
+                Err(x) => c = x,
+            }
+        }
+    }
+
+    pub fn is_signaled(&self) -> bool {
+        self.count.load(Ordering::Acquire) > 0
+    }
+}
+
+/// A mutant (NT mutex): recursive, thread-owned. `owner == 0` ⇒ free. Signalled
+/// to a thread iff free or already owned by it.
+pub struct Mutant {
+    owner: AtomicU64,
+    recursion: AtomicU32,
+    queue: WaitQueue,
+}
+
+#[allow(dead_code)]
+impl Mutant {
+    /// `initial_owner == 0` ⇒ created free; otherwise held by that thread id
+    /// with recursion 1.
+    pub fn new(initial_owner: u64) -> Self {
+        Self {
+            owner: AtomicU64::new(initial_owner),
+            recursion: AtomicU32::new(if initial_owner != 0 { 1 } else { 0 }),
+            queue: WaitQueue::new(),
+        }
+    }
+
+    pub fn try_acquire(&self, tid: u64) -> bool {
+        if self.owner.load(Ordering::Acquire) == tid {
+            self.recursion.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if self.owner.compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            self.recursion.store(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    pub fn acquire(&self, tid: u64) {
+        loop {
+            if self.try_acquire(tid) {
+                return;
+            }
+            self.queue.wait_if(|| self.owner.load(Ordering::Acquire) != 0);
+        }
+    }
+
+    /// Give up one recursion level. `Err` if `tid` is not the owner; otherwise
+    /// the recursion count *before* this release (1 ⇒ the mutant is now free).
+    pub fn release(&self, tid: u64) -> Result<u32, ()> {
+        if self.owner.load(Ordering::Acquire) != tid {
+            return Err(());
+        }
+        let prev = self.recursion.load(Ordering::Acquire);
+        if prev <= 1 {
+            self.recursion.store(0, Ordering::Release);
+            self.owner.store(0, Ordering::Release);
+            self.queue.wake_one();
+        } else {
+            self.recursion.store(prev - 1, Ordering::Release);
+        }
+        Ok(prev)
+    }
+
+    pub fn is_signaled(&self, tid: u64) -> bool {
+        matches!(self.owner.load(Ordering::Acquire), 0) || self.owner.load(Ordering::Acquire) == tid
     }
 }

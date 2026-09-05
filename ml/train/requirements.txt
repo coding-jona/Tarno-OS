@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# CPU-only training stack. Install the CPU wheel of torch explicitly:
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   pip install -r ml/train/requirements.txt
+#
+# numpy alone is enough for: fetch.py, prepare.py, sample.py, ref_forward.py,
+# make_fixture.py. Only model.py / train.py / export.py need torch.
+numpy>=1.26,<3
+tqdm>=4.66
+torch>=2.2 ; platform_machine == "x86_64"
+
+# Optional, only for thos-shell's '/lang' translation layer (not the model
+# itself — see translate.py). Apache-2.0, fully offline at translate time.
+# Install manually if you want it: pip install argostranslate
+#   argostranslate>=1.9
+

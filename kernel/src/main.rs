@@ -54,6 +54,7 @@ mod seh;
 mod serial;
 mod smp;
 mod syscall;
+mod timer;
 mod vfs;
 mod vmm;
 mod xhci;
@@ -643,6 +644,29 @@ fn storage_milestone() {
         assert!(process::spawn_pe(&junk).is_err(), "malformed PE was not rejected");
         assert!(process::spawn_pe(b"MZ\x90\x00not really a pe").is_err());
         kprintln!("THOS: pe reject ok     malformed PEs rejected, kernel alive");
+
+        // Milestone 3: a real mingw-w64 compiler-produced Win32 console `.exe`
+        // (own entry, only KERNEL32 imports) runs through the NT path.
+        let wc = fs.read_path("/wincon.exe").expect("read /wincon.exe from ext2");
+        kprintln!("THOS: wincon ok        /wincon.exe = {} bytes (mingw-w64)", wc.len());
+        let wpid = process::spawn_pe(&wc).expect("spawn_pe: /wincon.exe rejected");
+        while !process::pid_exited(wpid) {
+            sched::yield_now();
+        }
+        kprintln!("THOS: wincon exited    real toolchain PE ran to exit");
+
+        // Milestone 3+: a full mingw CRT `int main` .exe — imports msvcrt.dll,
+        // runs against THOS's synthetic C runtime (printf / __getmainargs / ...).
+        let ce = fs.read_path("/crt.exe").expect("read /crt.exe from ext2");
+        kprintln!("THOS: crt ok           /crt.exe = {} bytes (mingw CRT)", ce.len());
+        let cpid = process::spawn_pe(&ce).expect("spawn_pe: /crt.exe rejected");
+        while !process::pid_exited(cpid) {
+            sched::yield_now();
+        }
+        kprintln!("THOS: crt exited       mingw C runtime ran to exit");
+
+        // ELF and PE processes in one `ps` view.
+        process::ps_dump();
     }
 
     // AHCI write: round-trip a known pattern through a scratch sector past the

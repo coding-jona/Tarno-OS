@@ -41,7 +41,20 @@ pub const NT_HEAPALLOC: u16 = 14;
 pub const NT_HEAPFREE: u16 = 15;
 pub const NT_GETPROCADDRESS: u16 = 16;
 pub const NT_LOADLIBRARYA: u16 = 17;
-pub const NT_STUB_COUNT: u16 = 18;
+pub const NT_CREATEEVENTA: u16 = 18;
+pub const NT_WAITFORSINGLEOBJECT_K: u16 = 19;
+pub const NT_INITIALIZECRITICALSECTION: u16 = 20;
+pub const NT_DELETECRITICALSECTION: u16 = 21;
+pub const NT_ENTERCRITICALSECTION: u16 = 22;
+pub const NT_LEAVECRITICALSECTION: u16 = 23;
+pub const NT_TLSGETVALUE: u16 = 24;
+pub const NT_ISDBCSLEADBYTEEX: u16 = 25;
+pub const NT_MULTIBYTETOWIDECHAR: u16 = 26;
+pub const NT_WIDECHARTOMULTIBYTE: u16 = 27;
+pub const NT_SETUNHANDLEDEXCEPTIONFILTER: u16 = 28;
+pub const NT_VIRTUALQUERY: u16 = 29;
+pub const NT_SLEEP: u16 = 30;
+pub const NT_STUB_COUNT: u16 = 31;
 
 /// The `kernel32` export table, in stub-index order. Drives both
 /// [`crate::pe::resolve_import`] (import → stub index) and the synthetic
@@ -67,6 +80,19 @@ pub const NT_EXPORTS: [&str; NT_STUB_COUNT as usize] = [
     "HeapFree",
     "GetProcAddress",
     "LoadLibraryA",
+    "CreateEventA",
+    "WaitForSingleObject",
+    "InitializeCriticalSection",
+    "DeleteCriticalSection",
+    "EnterCriticalSection",
+    "LeaveCriticalSection",
+    "TlsGetValue",
+    "IsDBCSLeadByteEx",
+    "MultiByteToWideChar",
+    "WideCharToMultiByte",
+    "SetUnhandledExceptionFilter",
+    "VirtualQuery",
+    "Sleep",
 ];
 
 /// Selector bit OR-ed into a stub's index when it belongs to the **native NT**
@@ -104,7 +130,17 @@ pub const NT_NTOPENKEY: u16 = 23;
 pub const NT_NTSETVALUEKEY: u16 = 24;
 pub const NT_NTQUERYVALUEKEY: u16 = 25;
 pub const NT_NTDELETEKEY: u16 = 26;
-pub const NTDLL_STUB_COUNT: u16 = 27;
+pub const NT_NTCREATEMUTANT: u16 = 27;
+pub const NT_NTRELEASEMUTANT: u16 = 28;
+pub const NT_NTCREATESEMAPHORE: u16 = 29;
+pub const NT_NTRELEASESEMAPHORE: u16 = 30;
+pub const NT_NTWAITFORMULTIPLEOBJECTS: u16 = 31;
+pub const NT_NTDELAYEXECUTION: u16 = 32;
+pub const NT_NTCREATETHREADEX: u16 = 33;
+pub const NT_NTTERMINATETHREAD: u16 = 34;
+pub const NT_NTCREATESECTION: u16 = 35;
+pub const NT_NTMAPVIEWOFSECTION: u16 = 36;
+pub const NTDLL_STUB_COUNT: u16 = 37;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -139,6 +175,16 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtSetValueKey",
     "NtQueryValueKey",
     "NtDeleteKey",
+    "NtCreateMutant",
+    "NtReleaseMutant",
+    "NtCreateSemaphore",
+    "NtReleaseSemaphore",
+    "NtWaitForMultipleObjects",
+    "NtDelayExecution",
+    "NtCreateThreadEx",
+    "NtTerminateThread",
+    "NtCreateSection",
+    "NtMapViewOfSection",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -167,6 +213,8 @@ const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_MUTANT_NOT_OWNED: u32 = 0xC000_0046;
+const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = 0xC000_005F;
 
 /// `TEB.LastErrorValue` lives at `gs:[0x68]`. The kernel runs with `gs` swapped
 /// to the per-CPU block, so reach the TEB through the thread's saved `%gs` base.
@@ -189,10 +237,96 @@ fn get_last_error() -> u32 {
 pub fn dispatch(sel: u16, frame: &mut UserFrame) -> i64 {
     if sel & NT_NTDLL_FLAG != 0 {
         dispatch_ntdll(sel & !NT_NTDLL_FLAG, frame)
+    } else if sel & NT_MSVCRT_FLAG != 0 {
+        dispatch_msvcrt(sel & !NT_MSVCRT_FLAG, frame)
     } else {
         dispatch_kernel32(sel, frame)
     }
 }
+
+/// Selector bit for the synthetic `msvcrt.dll` C-runtime layer (`0x4000`), the
+/// third personality alongside `kernel32` and `ntdll`. A mingw-w64 `int main`
+/// `.exe` imports `msvcrt.dll` for its CRT startup + stdio; these are just
+/// enough of it to run.
+pub const NT_MSVCRT_FLAG: u16 = 0x4000;
+
+/// The synthetic `msvcrt.dll` export table — index **is** the service number.
+/// `_commode` / `_fmode` / `__initenv` are *data* exports (an `int` / `char***`
+/// the CRT reads and writes); their trampoline slot is left as writable zero
+/// bytes (both default to 0), see `pe::map_synth_dll`.
+pub const MSVCRT_EXPORTS: [&str; MSVCRT_STUB_COUNT as usize] = [
+    "memcpy",               // 0
+    "memset",               // 1
+    "strlen",               // 2
+    "strncmp",              // 3
+    "wcslen",               // 4
+    "malloc",               // 5
+    "calloc",               // 6
+    "free",                 // 7
+    "exit",                 // 8
+    "abort",                // 9
+    "_amsg_exit",           // 10
+    "_cexit",               // 11
+    "_initterm",            // 12
+    "_onexit",              // 13
+    "_lock",                // 14
+    "_unlock",              // 15
+    "__iob_func",           // 16
+    "_errno",               // 17
+    "__getmainargs",        // 18
+    "__set_app_type",       // 19
+    "__setusermatherr",     // 20
+    "___lc_codepage_func",  // 21
+    "___mb_cur_max_func",   // 22
+    "localeconv",           // 23
+    "signal",               // 24
+    "strerror",             // 25
+    "fwrite",               // 26
+    "fputc",                // 27
+    "fflush",               // 28
+    "fprintf",              // 29
+    "vfprintf",             // 30
+    "__C_specific_handler", // 31
+    "_commode",             // 32  (data)
+    "_fmode",               // 33  (data)
+    "__initenv",            // 34  (data)
+];
+pub const MSVCRT_STUB_COUNT: u16 = 35;
+/// Indices whose EAT slot is a writable data cell, not a call trampoline.
+pub const MSVCRT_DATA_EXPORTS: [u16; 3] = [32, 33, 34];
+
+const MSV_MEMCPY: u16 = 0;
+const MSV_MEMSET: u16 = 1;
+const MSV_STRLEN: u16 = 2;
+const MSV_STRNCMP: u16 = 3;
+const MSV_WCSLEN: u16 = 4;
+const MSV_MALLOC: u16 = 5;
+const MSV_CALLOC: u16 = 6;
+const MSV_FREE: u16 = 7;
+const MSV_EXIT: u16 = 8;
+const MSV_ABORT: u16 = 9;
+const MSV_AMSG_EXIT: u16 = 10;
+const MSV_CEXIT: u16 = 11;
+const MSV_INITTERM: u16 = 12;
+const MSV_ONEXIT: u16 = 13;
+const MSV_LOCK: u16 = 14;
+const MSV_UNLOCK: u16 = 15;
+const MSV_IOB_FUNC: u16 = 16;
+const MSV_ERRNO: u16 = 17;
+const MSV_GETMAINARGS: u16 = 18;
+const MSV_SET_APP_TYPE: u16 = 19;
+const MSV_SETUSERMATHERR: u16 = 20;
+const MSV_LC_CODEPAGE: u16 = 21;
+const MSV_MB_CUR_MAX: u16 = 22;
+const MSV_LOCALECONV: u16 = 23;
+const MSV_SIGNAL: u16 = 24;
+const MSV_STRERROR: u16 = 25;
+const MSV_FWRITE: u16 = 26;
+const MSV_FPUTC: u16 = 27;
+const MSV_FFLUSH: u16 = 28;
+const MSV_FPRINTF: u16 = 29;
+const MSV_VFPRINTF: u16 = 30;
+const MSV_C_SPECIFIC_HANDLER: u16 = 31;
 
 // --- shared cores: one implementation, reached from either personality ---
 
@@ -372,42 +506,267 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             STATUS_SUCCESS as i64
         }
 
-        // NtWaitForSingleObject(Handle, Alertable, *Timeout). NULL = block
-        // forever; `*Timeout == 0` = poll; a negative `*Timeout` is a relative
-        // wait in 100 ns units — spun against the 100 Hz APIC tick until the
-        // event fires or the deadline passes (a real timed block on the
-        // executive timer wheel comes later). Positive (absolute) = poll.
+        // NtWaitForSingleObject(Handle, Alertable, *Timeout) on any dispatcher
+        // object (event / semaphore / mutant). NULL = block forever;
+        // `*Timeout == 0` = poll; a negative `*Timeout` is a relative wait in
+        // 100 ns units — a bounded cooperative-yield spin (a real timed block on
+        // the executive timer wheel comes later). Positive (absolute) = poll.
         NT_NTWAITFORSINGLEOBJECT => {
-            let Some(ev) = process::current_event(a0 as i32) else {
+            let Some(w) = process::current_waitable(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
             };
+            let tid = process::current_tid();
             if a2 == 0 {
-                ev.wait();
+                w.wait(tid);
                 return STATUS_SUCCESS as i64;
             }
             let timeout = unsafe { *(a2 as *const i64) };
             if timeout >= 0 {
-                // 0 = poll; positive (absolute deadline) is not tracked, so
-                // also just check the current state.
-                return if ev.try_take() {
-                    STATUS_SUCCESS as i64
-                } else {
-                    STATUS_TIMEOUT as i64
-                };
+                return if w.try_take(tid) { STATUS_SUCCESS as i64 } else { STATUS_TIMEOUT as i64 };
             }
-            // Relative timeout. A PE thread's syscall runs with IF=0 (they are
-            // cooperatively scheduled), so we can't rely on the timer tick or
-            // block — spin a bounded number of cooperative yields scaled to the
-            // requested interval and return `STATUS_TIMEOUT`. A true timed
-            // block lands with the executive timer wheel.
-            let spins = (((-timeout) as u64) / 50).clamp(20_000, 4_000_000);
-            for _ in 0..spins {
-                if ev.try_take() {
+            // Relative timeout: real wall-clock deadline off the timer wheel.
+            // The wait itself still yield-polls the object between ticks (a
+            // fully-blocking timed object wait — dual-enqueue on the object's
+            // queue *and* the wheel — is the remaining refinement); the
+            // *duration* is now accurate.
+            let deadline = crate::timer::deadline_from_relative_100ns(timeout);
+            while crate::timer::now() < deadline {
+                if w.try_take(tid) {
                     return STATUS_SUCCESS as i64;
                 }
                 sched::yield_now();
             }
-            STATUS_TIMEOUT as i64
+            if w.try_take(tid) { STATUS_SUCCESS as i64 } else { STATUS_TIMEOUT as i64 }
+        }
+
+        // NtCreateMutant(*Handle, DesiredAccess, *ObjectAttributes, InitialOwner)
+        NT_NTCREATEMUTANT => {
+            let owner = if a3 & 0xFF != 0 { process::current_tid() } else { 0 };
+            let h = process::current_alloc_mutant(Arc::new(crate::wait::Mutant::new(owner)));
+            if h < 0 {
+                return STATUS_NO_MEMORY as i64;
+            }
+            unsafe { *(a0 as *mut u64) = h as u64 };
+            STATUS_SUCCESS as i64
+        }
+
+        // NtReleaseMutant(Handle, *PreviousCount) — one recursion level.
+        NT_NTRELEASEMUTANT => {
+            let Some(process::Waitable::Mutant(m)) = process::current_waitable(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            match m.release(process::current_tid()) {
+                Ok(prev) => {
+                    if a1 != 0 {
+                        unsafe { *(a1 as *mut u32) = prev };
+                    }
+                    STATUS_SUCCESS as i64
+                }
+                Err(()) => STATUS_MUTANT_NOT_OWNED as i64,
+            }
+        }
+
+        // NtCreateSemaphore(*Handle, DesiredAccess, *ObjectAttributes,
+        //                   InitialCount, MaximumCount)
+        NT_NTCREATESEMAPHORE => {
+            let (initial, max) = (a3 as i32, stack(0) as i32);
+            if max < 1 || initial < 0 || initial > max {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let h = process::current_alloc_semaphore(Arc::new(crate::wait::Semaphore::new(initial, max)));
+            if h < 0 {
+                return STATUS_NO_MEMORY as i64;
+            }
+            unsafe { *(a0 as *mut u64) = h as u64 };
+            STATUS_SUCCESS as i64
+        }
+
+        // NtReleaseSemaphore(Handle, ReleaseCount, *PreviousCount)
+        NT_NTRELEASESEMAPHORE => {
+            let Some(process::Waitable::Semaphore(s)) = process::current_waitable(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            match s.release(a1 as i32) {
+                Some(prev) => {
+                    if a2 != 0 {
+                        unsafe { *(a2 as *mut u32) = prev as u32 };
+                    }
+                    STATUS_SUCCESS as i64
+                }
+                None => STATUS_SEMAPHORE_LIMIT_EXCEEDED as i64,
+            }
+        }
+
+        // NtWaitForMultipleObjects(Count, Handles[], WaitType, Alertable,
+        //                          *Timeout). WaitType 0 = WaitAll, 1 = WaitAny.
+        // WaitAny returns STATUS_WAIT_0 + index. Cooperative-yield spin, same
+        // timeout rules as NtWaitForSingleObject; NULL timeout spins until ready.
+        NT_NTWAITFORMULTIPLEOBJECTS => {
+            let count = a0 as usize;
+            if count == 0 || count > 64 {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let wait_all = a2 == 0;
+            let tid = process::current_tid();
+            let mut objs: alloc::vec::Vec<process::Waitable> = alloc::vec::Vec::with_capacity(count);
+            for i in 0..count {
+                let h = unsafe { *((a1 + (i * 8) as u64) as *const u64) } as i32;
+                match process::current_waitable(h) {
+                    Some(w) => objs.push(w),
+                    None => return STATUS_INVALID_HANDLE as i64,
+                }
+            }
+            let tptr = stack(0);
+            // NULL timeout = wait forever; `*t == 0` = poll once; `*t < 0` =
+            // relative wall-clock deadline off the timer wheel.
+            let timeout = if tptr == 0 { -1 } else { unsafe { *(tptr as *const i64) } };
+            let deadline = if tptr != 0 && timeout < 0 {
+                Some(crate::timer::deadline_from_relative_100ns(timeout))
+            } else {
+                None
+            };
+            let poll_once = tptr != 0 && timeout >= 0;
+
+            loop {
+                if wait_all {
+                    if objs.iter().all(|w| w.is_signaled(tid)) {
+                        for w in &objs {
+                            w.try_take(tid);
+                        }
+                        return STATUS_SUCCESS as i64;
+                    }
+                } else {
+                    for (i, w) in objs.iter().enumerate() {
+                        if w.try_take(tid) {
+                            return (STATUS_SUCCESS as i64) + i as i64; // STATUS_WAIT_0 + i
+                        }
+                    }
+                }
+                if poll_once || deadline.is_some_and(|d| crate::timer::now() >= d) {
+                    return STATUS_TIMEOUT as i64;
+                }
+                sched::yield_now();
+            }
+        }
+
+        // NtDelayExecution(Alertable, *Interval). Negative interval = relative
+        // 100 ns units — a real executive block on the timer wheel. 0 or
+        // positive (absolute) = just yield.
+        NT_NTDELAYEXECUTION => {
+            let interval = if a1 == 0 { 0 } else { unsafe { *(a1 as *const i64) } };
+            if interval < 0 {
+                crate::timer::sleep_until(crate::timer::deadline_from_relative_100ns(interval));
+            } else {
+                sched::yield_now();
+            }
+            STATUS_SUCCESS as i64
+        }
+
+        // NtCreateThreadEx(*Handle, DesiredAccess, *ObjAttr, ProcessHandle,
+        //                  StartRoutine, Argument, CreateFlags, ZeroBits,
+        //                  StackSize, MaxStackSize, *AttrList). One worker per
+        // process for now; CREATE_SUSPENDED is ignored (starts immediately).
+        // The returned handle is a manual-reset event signalled on thread exit.
+        NT_NTCREATETHREADEX => {
+            let (start, arg) = (stack(0), stack(1));
+            if start == 0 {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            match crate::pe::spawn_thread(start, arg) {
+                Ok((_tid, ev)) => {
+                    let h = process::current_alloc_event(ev);
+                    if h < 0 {
+                        return STATUS_NO_MEMORY as i64;
+                    }
+                    unsafe { *(a0 as *mut u64) = h as u64 };
+                    STATUS_SUCCESS as i64
+                }
+                Err(_) => STATUS_NO_MEMORY as i64,
+            }
+        }
+
+        // NtTerminateThread(ThreadHandle, ExitStatus). A worker thread signals
+        // its exit event and dies; the process's original thread takes the whole
+        // process down (matching `ExitProcess` on the last thread).
+        NT_NTTERMINATETHREAD => {
+            if process::signal_thread_exit(process::current_tid()) {
+                sched::exit();
+            }
+            proc_terminate(a1 as i32)
+        }
+
+        // NtCreateSection(*Handle, DesiredAccess, *ObjectAttributes,
+        //                 *MaximumSize, PageProtection, AllocationAttributes,
+        //                 FileHandle). FileHandle 0 = anonymous zeroed section;
+        // otherwise a copy of the file's bytes at create time. No shared
+        // writeback / COW; protection is not enforced yet.
+        NT_NTCREATESECTION => {
+            const CAP: usize = 16 * 1024 * 1024;
+            let file_h = stack(2) as i32;
+            let data: alloc::vec::Vec<u8> = if file_h != 0 {
+                let Some(f) = process::current_fd(file_h) else {
+                    return STATUS_INVALID_HANDLE as i64;
+                };
+                let mut buf = alloc::vec::Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = f.read(&mut chunk);
+                    if n <= 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n as usize]);
+                    if buf.len() > CAP {
+                        return STATUS_INVALID_PARAMETER as i64;
+                    }
+                }
+                buf
+            } else {
+                let max = if a3 != 0 { (unsafe { *(a3 as *const i64) }) as usize } else { 0 };
+                if max == 0 || max > CAP {
+                    return STATUS_INVALID_PARAMETER as i64;
+                }
+                alloc::vec![0u8; max]
+            };
+            let sec = Arc::new(process::Section { size: data.len(), data });
+            let h = process::current_alloc_section(sec);
+            if h < 0 {
+                return STATUS_NO_MEMORY as i64;
+            }
+            unsafe { *(a0 as *mut u64) = h as u64 };
+            STATUS_SUCCESS as i64
+        }
+
+        // NtMapViewOfSection(SectionHandle, ProcessHandle, *BaseAddress,
+        //                    ZeroBits, CommitSize, *SectionOffset, *ViewSize,
+        //                    InheritDisposition, AllocationType, Win32Protect).
+        // Copies the requested range into fresh private RW pages (CR3 is this
+        // process's here, so the copy writes straight into the user VA).
+        NT_NTMAPVIEWOFSECTION => {
+            let Some(sec) = process::current_section(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            if a2 == 0 {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let (off_pp, vsize_pp) = (stack(1), stack(2));
+            let offset = if off_pp != 0 { (unsafe { *(off_pp as *const i64) }) as usize } else { 0 };
+            if offset >= sec.size {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let want = if vsize_pp != 0 { (unsafe { *(vsize_pp as *const u64) }) as usize } else { 0 };
+            let view = if want != 0 { want.min(sec.size - offset) } else { sec.size - offset };
+            let base = mem_alloc_core(view as u64);
+            if base == 0 {
+                return STATUS_NO_MEMORY as i64;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(sec.data.as_ptr().add(offset), base as *mut u8, view);
+                *(a2 as *mut u64) = base;
+                if vsize_pp != 0 {
+                    *(vsize_pp as *mut u64) = view as u64;
+                }
+            }
+            STATUS_SUCCESS as i64
         }
 
         // NtContinue(*Context, TestAlert) — resume ring 3 from the CONTEXT the
@@ -743,6 +1102,7 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
     let a1 = frame.rdx;
     let a2 = frame.r8;
     let a3 = frame.r9;
+    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
 
     match idx {
         // ExitProcess(UINT uExitCode)
@@ -886,8 +1246,478 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
         NT_HEAPALLOC => mem_alloc_core(a2.max(1)) as i64,
         NT_HEAPFREE => 1,
 
+        // CreateEventA(lpEventAttributes, bManualReset, bInitialState, lpName).
+        // Unnamed only. The HANDLE is just the fd.
+        NT_CREATEEVENTA => {
+            let mode = if a1 & 0xFF != 0 { EventMode::Manual } else { EventMode::Auto };
+            let ev = Arc::new(Event::with_mode(mode));
+            if a2 & 0xFF != 0 {
+                ev.signal();
+            }
+            match process::current_alloc_event(ev) {
+                h if h >= 0 => h as i64,
+                _ => 0,
+            }
+        }
+
+        // WaitForSingleObject(hHandle, dwMilliseconds) on any dispatcher object.
+        // INFINITE (0xFFFFFFFF) blocks; 0 polls; else a real wall-clock wait.
+        // Returns WAIT_OBJECT_0 (0), WAIT_TIMEOUT (0x102), or WAIT_FAILED.
+        NT_WAITFORSINGLEOBJECT_K => {
+            const WAIT_TIMEOUT: i64 = 0x102;
+            const WAIT_FAILED: i64 = 0xFFFF_FFFF;
+            let Some(w) = process::current_waitable(a0 as i32) else {
+                return WAIT_FAILED;
+            };
+            let tid = process::current_tid();
+            let ms = a1 as u32;
+            if ms == 0xFFFF_FFFF {
+                w.wait(tid);
+                return 0;
+            }
+            if ms == 0 {
+                return if w.try_take(tid) { 0 } else { WAIT_TIMEOUT };
+            }
+            let deadline =
+                crate::timer::now().saturating_add(((ms as u64) * crate::timer::TICK_HZ / 1000).max(1));
+            while crate::timer::now() < deadline {
+                if w.try_take(tid) {
+                    return 0;
+                }
+                sched::yield_now();
+            }
+            if w.try_take(tid) { 0 } else { WAIT_TIMEOUT }
+        }
+
+        // CRT-startup helpers. CriticalSection is a no-op (the CRT locks it
+        // around single-threaded init); TlsGetValue → NULL; the code-page
+        // converters do a plain ASCII widen/narrow.
+        NT_INITIALIZECRITICALSECTION
+        | NT_DELETECRITICALSECTION
+        | NT_ENTERCRITICALSECTION
+        | NT_LEAVECRITICALSECTION
+        | NT_SETUNHANDLEDEXCEPTIONFILTER => 0,
+        NT_TLSGETVALUE => 0,
+        NT_ISDBCSLEADBYTEEX => 0, // no lead bytes in our single-byte code page
+        NT_SLEEP => {
+            if a0 != 0 {
+                crate::timer::sleep_until(
+                    crate::timer::now().saturating_add((a0 * crate::timer::TICK_HZ / 1000).max(1)),
+                );
+            } else {
+                sched::yield_now();
+            }
+            0
+        }
+        // MultiByteToWideChar(cp, flags, src, srclen, dst, dstlen)
+        NT_MULTIBYTETOWIDECHAR => {
+            let (src, srclen) = (a2, a3 as i32);
+            let (dst, dstlen) = (stack(0), stack(1) as usize);
+            let n = if srclen < 0 { user_cstr_len(src) + 1 } else { srclen as usize };
+            if dst == 0 || dstlen == 0 {
+                return n as i64;
+            }
+            let m = n.min(dstlen);
+            for k in 0..m {
+                unsafe { *((dst + (k * 2) as u64) as *mut u16) = *((src + k as u64) as *const u8) as u16 };
+            }
+            m as i64
+        }
+        // WideCharToMultiByte(cp, flags, src, srclen, dst, dstlen, defchar, used)
+        NT_WIDECHARTOMULTIBYTE => {
+            let (src, srclen) = (a2, a3 as i32);
+            let (dst, dstlen) = (stack(0), stack(1) as usize);
+            let mut n = 0usize;
+            if srclen < 0 {
+                while unsafe { *((src + (n * 2) as u64) as *const u16) } != 0 {
+                    n += 1;
+                }
+                n += 1;
+            } else {
+                n = srclen as usize;
+            }
+            if dst == 0 || dstlen == 0 {
+                return n as i64;
+            }
+            let m = n.min(dstlen);
+            for k in 0..m {
+                let wc = unsafe { *((src + (k * 2) as u64) as *const u16) };
+                unsafe { *((dst + k as u64) as *mut u8) = if wc < 0x100 { wc as u8 } else { b'?' } };
+            }
+            m as i64
+        }
+        // VirtualQuery(addr, *MEMORY_BASIC_INFORMATION, len) — one committed RWX
+        // private region per page, like NtQueryVirtualMemory.
+        NT_VIRTUALQUERY => {
+            let (addr, buf, len) = (a0, a1, a2 as usize);
+            if buf == 0 || len < 0x30 {
+                return 0;
+            }
+            let page = addr & !0xFFF;
+            unsafe {
+                let b = buf as *mut u64;
+                *b.add(0) = page;
+                *b.add(1) = page;
+                *(b.add(2) as *mut u32) = 0x40;
+                *b.add(3) = 0x1000;
+                *(b.add(4) as *mut u32) = 0x1000;
+                *(b.add(4) as *mut u32).add(1) = 0x40;
+                *(b.add(5) as *mut u32) = 0x2_0000;
+            }
+            0x30
+        }
+
         _ => {
             crate::kprintln!("THOS: nt unhandled call {}", idx);
+            0
+        }
+    }
+}
+
+// --- synthetic msvcrt.dll: just enough C runtime for a mingw `int main` ---
+
+/// `PE_CRT_ADDR` layout (one rw page mapped by `pe::map_crt_page`).
+const CRT_IOB_OFF: u64 = 0x000; // FILE[3], 48 bytes each; `_file` fd at +28
+const CRT_ERRNO_OFF: u64 = 0x100;
+const CRT_LCONV_OFF: u64 = 0x108; // struct lconv (zeroed; char* fields -> CRT_DOT)
+const CRT_DOT_OFF: u64 = 0x180; // "." then "" for the empty lconv strings
+const CRT_ARGV_OFF: u64 = 0x200; // argv pointer array then the arg strings
+
+fn crt(off: u64) -> u64 {
+    crate::pe::PE_CRT_ADDR + off
+}
+
+/// Length of a NUL-terminated user string, capped.
+fn user_cstr_len(p: u64) -> usize {
+    let mut n = 0usize;
+    while n < 1 << 20 && unsafe { *((p + n as u64) as *const u8) } != 0 {
+        n += 1;
+    }
+    n
+}
+
+/// Minimal `printf`-family formatter. Writes into `out`, returns the byte count.
+/// `ap` points at the first vararg (Win64: consecutive 8-byte slots). No
+/// closures — plain procedural code to keep the borrow checker happy.
+fn cfmt(fmt: u64, ap: *const u64, out: &mut [u8]) -> usize {
+    let rb = |p: u64| unsafe { *(p as *const u8) };
+    let mut o = 0usize;
+    let mut w = |b: u8, o: &mut usize| {
+        if *o < out.len() {
+            out[*o] = b;
+        }
+        *o += 1;
+    };
+    let mut arg = 0isize;
+    let nextarg = |arg: &mut isize| -> u64 {
+        let v = unsafe { *ap.offset(*arg) };
+        *arg += 1;
+        v
+    };
+
+    let mut i = 0u64;
+    loop {
+        let c = rb(fmt + i);
+        i += 1;
+        if c == 0 {
+            break;
+        }
+        if c != b'%' {
+            w(c, &mut o);
+            continue;
+        }
+        let (mut left, mut zero) = (false, false);
+        loop {
+            match rb(fmt + i) {
+                b'-' => left = true,
+                b'0' => zero = true,
+                b'+' | b' ' | b'#' => {}
+                _ => break,
+            }
+            i += 1;
+        }
+        let mut width = 0usize;
+        while rb(fmt + i).is_ascii_digit() {
+            width = width * 10 + (rb(fmt + i) - b'0') as usize;
+            i += 1;
+        }
+        let mut prec: Option<usize> = None;
+        if rb(fmt + i) == b'.' {
+            i += 1;
+            let mut p = 0usize;
+            while rb(fmt + i).is_ascii_digit() {
+                p = p * 10 + (rb(fmt + i) - b'0') as usize;
+                i += 1;
+            }
+            prec = Some(p);
+        }
+        while matches!(rb(fmt + i), b'h' | b'l' | b'L' | b'z' | b'j' | b't') {
+            i += 1;
+        }
+        let conv = rb(fmt + i);
+        i += 1;
+
+        // Render the body into `tmp`, then pad to `width`.
+        let mut tmp = [0u8; 40];
+        let mut tn = 0usize;
+        let digits = |u: u64, radix: u64, upper: bool, tmp: &mut [u8], tn: &mut usize| {
+            let hx: &[u8] = if upper { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
+            let mut u = u;
+            if u == 0 {
+                tmp[*tn] = b'0';
+                *tn += 1;
+            }
+            while u > 0 {
+                tmp[*tn] = hx[(u % radix) as usize];
+                *tn += 1;
+                u /= radix;
+            }
+            tmp[..*tn].reverse();
+        };
+
+        match conv {
+            b'%' => {
+                w(b'%', &mut o);
+                continue;
+            }
+            b'c' => {
+                tmp[0] = nextarg(&mut arg) as u8;
+                tn = 1;
+            }
+            b's' => {
+                let p = nextarg(&mut arg);
+                let mut len = user_cstr_len(p);
+                if let Some(pr) = prec {
+                    len = len.min(pr);
+                }
+                if !left {
+                    for _ in len..width {
+                        w(b' ', &mut o);
+                    }
+                }
+                for k in 0..len {
+                    w(rb(p + k as u64), &mut o);
+                }
+                if left {
+                    for _ in len..width {
+                        w(b' ', &mut o);
+                    }
+                }
+                continue;
+            }
+            b'd' | b'i' => {
+                let v = nextarg(&mut arg) as i64;
+                if v < 0 {
+                    tmp[tn] = b'-';
+                    tn += 1;
+                }
+                let mut body = [0u8; 24];
+                let mut bn = 0usize;
+                digits(v.unsigned_abs(), 10, false, &mut body, &mut bn);
+                tmp[tn..tn + bn].copy_from_slice(&body[..bn]);
+                tn += bn;
+            }
+            b'u' => digits(nextarg(&mut arg), 10, false, &mut tmp, &mut tn),
+            b'x' => digits(nextarg(&mut arg), 16, false, &mut tmp, &mut tn),
+            b'X' => digits(nextarg(&mut arg), 16, true, &mut tmp, &mut tn),
+            b'p' => {
+                tmp[0] = b'0';
+                tmp[1] = b'x';
+                tn = 2;
+                let mut body = [0u8; 24];
+                let mut bn = 0usize;
+                digits(nextarg(&mut arg), 16, false, &mut body, &mut bn);
+                tmp[tn..tn + bn].copy_from_slice(&body[..bn]);
+                tn += bn;
+            }
+            b'f' | b'F' | b'g' | b'G' | b'e' | b'E' => {
+                let _ = nextarg(&mut arg); // consume the f64 slot
+                tmp[..7].copy_from_slice(b"<float>");
+                tn = 7;
+            }
+            _ => {
+                w(b'%', &mut o);
+                w(conv, &mut o);
+                continue;
+            }
+        }
+
+        let pad = if zero { b'0' } else { b' ' };
+        if !left {
+            for _ in tn..width {
+                w(pad, &mut o);
+            }
+        }
+        for k in 0..tn {
+            w(tmp[k], &mut o);
+        }
+        if left {
+            for _ in tn..width {
+                w(b' ', &mut o);
+            }
+        }
+    }
+    o.min(out.len())
+}
+
+/// `FILE*` -> the fd stored at `_iobuf._file` (offset 28). Falls back to stdout.
+fn file_fd(file_ptr: u64) -> i32 {
+    if file_ptr == 0 {
+        return 1;
+    }
+    unsafe { *((file_ptr + 28) as *const i32) }
+}
+
+fn dispatch_msvcrt(idx: u16, frame: &mut UserFrame) -> i64 {
+    let a0 = frame.r10;
+    let a1 = frame.rdx;
+    let a2 = frame.r8;
+    let a3 = frame.r9;
+    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
+
+    match idx {
+        MSV_MEMCPY => {
+            unsafe { core::ptr::copy(a1 as *const u8, a0 as *mut u8, a2 as usize) };
+            a0 as i64
+        }
+        MSV_MEMSET => {
+            unsafe { core::ptr::write_bytes(a0 as *mut u8, a1 as u8, a2 as usize) };
+            a0 as i64
+        }
+        MSV_STRLEN => user_cstr_len(a0) as i64,
+        MSV_WCSLEN => {
+            let mut n = 0u64;
+            while unsafe { *((a0 + n * 2) as *const u16) } != 0 {
+                n += 1;
+            }
+            n as i64
+        }
+        MSV_STRNCMP => {
+            for k in 0..a2 {
+                let (x, y) = unsafe {
+                    (*((a0 + k) as *const u8) as i32, *((a1 + k) as *const u8) as i32)
+                };
+                if x != y {
+                    return (x - y) as i64;
+                }
+                if x == 0 {
+                    break;
+                }
+            }
+            0
+        }
+        MSV_MALLOC => mem_alloc_core(a0.max(1)) as i64,
+        MSV_CALLOC => mem_alloc_core(a0.saturating_mul(a1).max(1)) as i64, // mmap_anon zeroes
+        MSV_FREE => 0,
+        MSV_EXIT => proc_terminate(a0 as i32),
+        MSV_ABORT => proc_terminate(134),
+        MSV_AMSG_EXIT => {
+            crate::kprintln!("THOS: msvcrt _amsg_exit({})", a0 as i32);
+            proc_terminate(255)
+        }
+        MSV_CEXIT => 0,
+        // _initterm(fp, end): call each non-null fn ptr. A plain C program has an
+        // empty range; C++ static ctors / __attribute__((constructor)) would
+        // need a ring-3 loop stub (not built yet).
+        MSV_INITTERM => {
+            if a1.saturating_sub(a0) >= 8 {
+                crate::kprintln!("THOS: msvcrt _initterm — non-empty init range ignored");
+            }
+            0
+        }
+        MSV_ONEXIT => a0 as i64, // pretend the atexit registration succeeded
+        MSV_LOCK | MSV_UNLOCK => 0,
+        MSV_IOB_FUNC => crt(CRT_IOB_OFF) as i64,
+        MSV_ERRNO => crt(CRT_ERRNO_OFF) as i64,
+        MSV_SET_APP_TYPE | MSV_SETUSERMATHERR | MSV_SIGNAL => 0,
+        MSV_LC_CODEPAGE => 1252,
+        MSV_MB_CUR_MAX => 1,
+        MSV_LOCALECONV => crt(CRT_LCONV_OFF) as i64,
+        MSV_STRERROR => {
+            // point at "." (a non-empty NUL-terminated string) — good enough.
+            crt(CRT_DOT_OFF) as i64
+        }
+        MSV_C_SPECIFIC_HANDLER => 1, // ExceptionContinueSearch
+
+        // __getmainargs(*argc, *argv, *env, expandWildcards, *startupinfo)
+        MSV_GETMAINARGS => {
+            let cmdline = crate::pe::PE_ANSI_CMDLINE_ADDR;
+            let argv_base = crt(CRT_ARGV_OFF);
+            let strs = argv_base + 32 * 8; // room for 32 argv pointers
+            let mut argc = 0u64;
+            let mut sp = strs;
+            let mut p = cmdline;
+            unsafe {
+                loop {
+                    while *(p as *const u8) == b' ' {
+                        p += 1;
+                    }
+                    if *(p as *const u8) == 0 || argc >= 32 {
+                        break;
+                    }
+                    *((argv_base + argc * 8) as *mut u64) = sp;
+                    argc += 1;
+                    while *(p as *const u8) != 0 && *(p as *const u8) != b' ' {
+                        *(sp as *mut u8) = *(p as *const u8);
+                        sp += 1;
+                        p += 1;
+                    }
+                    *(sp as *mut u8) = 0;
+                    sp += 1;
+                }
+                *((argv_base + argc * 8) as *mut u64) = 0; // argv[argc] = NULL
+                *(a0 as *mut i32) = argc as i32;
+                *(a1 as *mut u64) = argv_base;
+                if a2 != 0 {
+                    *(a2 as *mut u64) = argv_base + argc * 8; // env -> the NULL slot
+                }
+            }
+            0
+        }
+
+        MSV_FWRITE => {
+            // fwrite(ptr, size, nmemb, FILE*)
+            let (ptr, size, nmemb) = (a0, a1, a2);
+            let fd = file_fd(a3);
+            if size == 0 {
+                return 0;
+            }
+            let n = file_write_core(fd, ptr, (size * nmemb) as usize);
+            if n <= 0 {
+                0
+            } else {
+                (n as u64 / size) as i64
+            }
+        }
+        MSV_FPUTC => {
+            let ch = a0 as u8;
+            let fd = file_fd(a1);
+            let _ = file_write_core(fd, &ch as *const u8 as u64, 1);
+            a0 as i64
+        }
+        MSV_FFLUSH => 0,
+        MSV_FPRINTF => {
+            // fprintf(FILE*, fmt, ...) — varargs are r8/r9 then the stack;
+            // gather them into one contiguous array for the formatter.
+            let fd = file_fd(a0);
+            let args: [u64; 8] =
+                [a2, a3, stack(0), stack(1), stack(2), stack(3), stack(4), stack(5)];
+            let mut buf = [0u8; 1024];
+            let n = cfmt(a1, args.as_ptr(), &mut buf);
+            file_write_core(fd, buf.as_ptr() as u64, n);
+            n as i64
+        }
+        MSV_VFPRINTF => {
+            // vfprintf(FILE*, fmt, va_list) — a2 is the va_list pointer.
+            let fd = file_fd(a0);
+            let mut buf = [0u8; 1024];
+            let n = cfmt(a1, a2 as *const u64, &mut buf);
+            file_write_core(fd, buf.as_ptr() as u64, n);
+            n as i64
+        }
+
+        _ => {
+            crate::kprintln!("THOS: msvcrt unhandled call {}", idx);
             0
         }
     }

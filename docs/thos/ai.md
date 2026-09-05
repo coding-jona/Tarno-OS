@@ -1,81 +1,210 @@
-# THOS — in-system AI (plan, not yet built)
+# THOS – In-system AI
 
-Status: **planning only.** No code. This is a near-separate subproject; it gets a
-plan before a line is written so scope doesn't leak into the kernel work.
+**Status:** P0 "Proof of Life" done (`ml/` — pipeline trained + cross-checked).
+A near-separate subproject. *(direction set by user, 2026-09-04)*
 
-## Hard constraints (set by the project owner)
+## The three tracks
 
-- **No external dependency at runtime.** No API keys, no network calls, no
-  "talk to a server". THOS must do this offline, forever.
-- **No running third-party model.** Not llama.cpp, not an ONNX runtime, not a
-  bundled GGUF. The inference code is *ours*, written from scratch.
-- **Own logic, from zero.** Hand-rolled math, weights we can read and explain.
-- **Deterministic and verifiable** wherever it touches a security decision.
+This doc is the entry point. The AI effort has three tracks that share the `ml/`
+stack and the `.tlm` format:
 
-These rule out an LLM-in-the-kernel. What's left is small classical ML, which is
-a good fit for the jobs THOS actually has.
-
-## Two tiers
-
-| Tier | Where | What | Size |
+| Track | What | Doc | State |
 |---|---|---|---|
-| **1 — in-kernel** | `#![no_std]` crate `thos-ml`, pure `fn infer(&Features) -> Scores` | tiny deterministic model (MLP / decision tree / logistic regression / naïve Bayes / n-gram). Frozen weights baked in via `include_bytes!`. **Inference only.** | KiB–low-MiB of weights, microseconds per call |
-| **2 — post-boot userspace** | a normal THOS process started by init after the system is up | the heavier analysis that can't or shouldn't run in ring 0. Talks to the kernel over a syscall / device interface. Can be larger, can use `alloc`, can be restarted, can be updated independently. | bounded by policy, not by the kernel |
+| **A — small LM from scratch** | Own architecture + weights + `#![no_std]` Rust inference. Byte→BPE, ~1M→tens of M params, CPU-trained on open data. The interactive surface + the exec-gate/AV head. | *this doc* | P0 done |
+| **B — rethink context** | A learned active-memory mechanism (window + gated memory + retrieval over cold KV) so a small resident footprint behaves like a huge context. Trained into Track A's model. | [`ai-context.md`](ai-context.md) | research, not scheduled |
+| **C — big open model, resident** | A ~20–30 B *open* model quantised to ~2-bit so it fits in the 16 GB RAM (~3–5 tok/s on CPU). The "think harder" step. Relaxes "own weights" — for this track only. | [`ai-large.md`](ai-large.md) | research, R0–R2 |
 
-Tier 1 is the gate that must never block boot and must always answer fast. Tier 2
-is where anything ambitious lives, sandboxed like any other process.
+**Product shape = a cascade.** Track A's always-resident small LM answers the
+interactive 90 %; when it punts, Track C's resident 2-bit ~24 B open model does
+the deliberate deep-think. Track B's memory work applies to A first and can later
+inform how C's KV is managed. There is **no fourth "stream a 70 B from disk"
+tier** — the target's Kingston A400 SATA SSD makes it hours-per-answer
+([`ai-large.md`](ai-large.md)).
 
-## First use case (decides the feature pipeline)
+## Decision
 
-Leading candidate: the **exec-gate / AV scorer** from
-`memory: thos-security-architecture` — score a PE/ELF as benign / suspicious from
-*static* features (import set, section layout, entropy, header anomalies,
-overlay, TLS-callback abuse, entry-point section) before it runs. It's already on
-the roadmap, it's a classification problem (small models do this well), and a
-wrong answer degrades to "ask the admin", not "crash".
+Build a **real small language model from scratch**, and grow it step by step —
+not a one-off classifier. Concretely:
 
-Alternatives considered: syscall-sequence anomaly detection (Tier 2, n-gram /
-Markov), compat-layer heuristics for the zero-config goal, scheduler/IO
-prediction (low payoff). Not decided yet.
+- **Own architecture, own weights, own inference.** PyTorch is only the training
+  compute frame; the model design, the trained weights, and the shipped
+  inference engine are all first-party.
+- **Train off-device**, CPU-only, on the dev box (i7-13700KF, 24 threads, AVX2).
+  No usable GPU, no cloud.
+- **Ship a hand-written `#![no_std]` Rust engine** (`ml/thos-lm`): parses the
+  `.tlm` weight format, runs the forward pass and sampling with `core` + `alloc`
+  + `libm` — no `std`, no external tensor library, no SIMD intrinsics.
+- **Only open / permissively-licensed / public-domain training data.** Every
+  source recorded in [`../../ml/DATASETS.md`](../../ml/DATASETS.md). No
+  proprietary lab mixes, no pirated book corpora, no scraped commercial verdicts.
+- **`ml/` subtree**; weight blobs are **not** committed (code + resumable
+  downloader + configs reproduce them).
 
-## Training (off-device)
+This rules out an LLM *inside the kernel* and rules out a chatbot-class model in
+the near term — see Non-goals.
 
-- Training harness is a **separate `std` Rust (or Python) tool** in the repo,
-  run on the dev box. Never in the kernel.
-- Output is a frozen weight blob + a versioned feature-schema. Committed as data.
-- Kernel does the forward pass only. Optional bounded on-device adaptation is a
-  later, explicit decision — not the default.
-- **Dataset provenance is a clean-room concern.** Malware corpora, EMBER-style
-  feature sets, labels — each source's licence and redistribution terms get
-  recorded next to the blob, same discipline as `THIRD_PARTY/`. No scraping of
-  proprietary AV verdicts as ground truth.
+## Constraints
 
-## Open decisions
+| Area | Reality |
+|---|---|
+| Compute | CPU only (i7-13700KF, AVX2, no AVX-512). RX 6600 / ROCm not worth it. → small models, byte-level tokens, long CPU runs. |
+| Internet | Drops daily at 00:00 (02:00 Fri→Sat, Sat→Sun). `ml/train/fetch.py` is fully resumable; the v0 corpus fits one window. Training needs no internet. |
+| Kernel | Zero `f32`/`f64` today; SSE enabled but **no FPU/SIMD-state save across a preemption or the syscall boundary** (`sched.rs` saves 6 regs). 32 MiB heap. → LM inference cannot run in the kernel; one `forward` call must run to completion. |
+| THOS userland | Linux x86-64 subset. **No** sockets / named pipes / shared memory / device nodes / custom syscall; **userland can't create or write files** (`open` has no `O_CREAT`). 512 MiB RAM, 64 KiB stacks, `mmap` anon-only, no address-space teardown. → a THOS-hosted model needs new kernel surface first (phase P3). |
 
-1. First use case (exec-gate scorer vs. something else).
-2. Model class (MLP vs. tree vs. linear vs. sequence model).
-3. Feature schema for the chosen job.
-4. Fixed-point vs. `f32` in the kernel (f32 is simpler; SSE is available; no
-   kernel FPU-save story yet for ring-0 SIMD — check).
-5. Where Tier 2 gets its inputs (a `\Device\ThosML` interface? a syscall?).
-6. Whether Tier 1 ever adapts on-device.
+## Architecture
+
+**Train / infer split.** `ml/train/` (Python) owns data, tokenizer, model
+definition, the CPU training loop, and the exporter. `ml/thos-lm/` (Rust,
+`no_std`) owns *only* loading `.tlm` + forward + sampling. A numpy reference
+(`ml/train/tlm.py:numpy_forward`) is the oracle the Rust engine is checked
+against; the golden test (`ml/thos-lm/tests/golden.rs`) enforces agreement to
+< 1e-4 (currently ~4e-8).
+
+**`.tlm` weight format** — little-endian: a 44-byte header (magic `TLM1`,
+version, `n_layer/n_head/n_embd/block_size/vocab_size`, flags, `norm_eps`) then
+raw `f32` tensors in a fixed declared order. Documented in
+`ml/thos-lm/src/tlm.rs`; produced by `ml/train/export.py`. Loadable from a file
+(host / eventual THOS userland) or `include_bytes!` (eventual kernel use for
+Application B).
+
+**Model (v0).** Decoder-only "GPT-style": byte tokenizer (vocab 256), learned
+positional embeddings, pre-norm LayerNorm, fused QKV, causal MHA, tanh-approx
+GELU MLP, tied output projection. Deliberately plain so the three
+implementations stay in lockstep.
+
+**"Own logic from zero" boundary.** PyTorch trains; it is not the model. The
+architecture, the weights, and every line of the shipped forward pass are ours.
+`libm` (soft-float `expf`/`tanhf`/`sqrtf`) is the one dependency — the same
+"soft, no CPU-feature dispatch" stance as the kernel's `sha2 force-soft`.
+
+## Applications
+
+- **A — text generation / completion.** The LM itself. P0–P2, P6.
+- **B — exec-gate / AV scorer.** *(was the standalone `ai.md` plan; now folded
+  in as an application of this stack.)* A small classifier head reusing
+  `thos-lm`'s tensor + loader code, scoring a PE/ELF as benign/suspicious from
+  **static** features (import set, section layout, entropy, header anomalies,
+  overlay, TLS-callback abuse, entry-point section) *before* it runs. Ties into
+  the [`roadmap.md`](roadmap.md) security-architecture section and
+  `memory: thos-security-architecture`. Default-deny high scores with admin
+  override, matching the age-gate model. Phase P5.
+- **C — syscall / behaviour anomaly detection.** Later; likely a sequence model
+  in a Tier-2 userspace service.
+
+## Data & provenance
+
+See [`../../ml/DATASETS.md`](../../ml/DATASETS.md). Hard lines: no proprietary
+mixes, no pirated corpora, no scraped commercial verdicts. Licence obligations
+(e.g. CC BY-SA share-alike on derived text) are tracked per source. The open web
+corpora the big labs also use (FineWeb, The Stack v2 with opt-out, Wikipedia,
+Gutenberg, arXiv/PMC-OA, StackExchange) are the legitimate growth path.
 
 ## Phased plan
 
-- **P0 — spike (1–2 wk).** `thos-ml` crate skeleton; a linear model with
-  hand-picked weights; wire one call into the exec-gate behind a feature flag;
-  prove the no_std forward pass + `include_bytes!` weight load works and is fast.
-- **P1 — real features.** Static PE/ELF feature extractor in the kernel (reuses
-  the loader's parsing). Feature-schema v1. Off-device training harness lands.
-- **P2 — trained Tier 1.** Train the chosen small model off-device, freeze,
-  ship. Exec-gate consults it; verdicts logged, not yet enforced.
-- **P3 — enforcement + Tier 2.** Turn on default-deny for high scores with
-  admin override (matches the age-gate / security-architecture model). Stand up
-  the post-boot userspace service for the heavier pass.
-- **P4+ — more jobs.** Syscall-anomaly (Tier 2), compat heuristics, etc., each
-  with its own schema + model.
+- **P0 — Proof of Life** *(done: pipeline wired + cross-checked)*: `ml/` skeleton;
+  resumable fetch of a tiny open corpus; byte tokenizer; ~1M-param GPT trainable
+  on CPU (`config/spike-1m.toml`); `.tlm` export; `thos-lm` loads + samples;
+  committed golden test (Rust `forward` ≈ numpy ref on fixed weights, Rust
+  sampler deterministic).
+- **P1 — usable tiny LM** *(in progress — pipeline done, long CPU run pending)*:
+  from-scratch byte-level **BPE** tokenizer (`ml/train/bpe.py`, merges embedded in
+  `.tlm` v2, mirrored in `thos-lm`'s `tokenizer.rs`); `config/small-30m.toml`
+  (~30M: L8 H8 C512 T256 V16384); `fetch.py` grown to ~35 Gutenberg titles;
+  `eval.py` (perplexity / bits-per-byte + teacher-forced next-token accuracy +
+  a sample). `q8` weights still to come.
+- **P2 — host-side THOS integration**: `thos-lm` kept `#![no_std]`-clean for
+  `x86_64-unknown-none`; a host `cargo xtask lm-demo` that runs generation;
+  decide `include_bytes!` vs ext2-file weight delivery.
+- **P3 — THOS runtime prerequisites** *(separate roadmap items, not ML work)*:
+  userland `O_CREAT`+write; a kernel↔userspace query channel (`\Device\ThosLM` or
+  a syscall); a RAM / `mmap` budget for a ~10–50 MB model.
+- **P4 — THOS userspace AI service**: ship `thos-lm` as a host-cross-compiled
+  static-musl process, started by init, weights from ext2, queried over the P3
+  channel. `cargo xtask lm-test` boots THOS and asserts a serial marker from a
+  canned generation.
+- **P5 — Application B (exec-gate)**: static PE/ELF feature extractor (reuses the
+  loader parsing in `pe.rs` / `elf.rs`); labelled *open* dataset (EMBER-style,
+  licensed); classifier head; wire into `elf::load` / `pe::load` behind an
+  `execgate` feature; log verdicts, then enforce.
+- **P6+ — grow** as compute / RAM allow.
+
+## Consolidated build order — what we actually build
+
+Best pieces from all three tracks, in dependency order. Only the first three are
+shovel-ready; the rest are gated on THOS kernel work or research outcomes.
+
+1. **Track A P1 — a real small LM.** *(next)* Byte-level BPE (~8–16 k), ~20–40 M
+   params, a larger open corpus (`ml/train/fetch.py` windowed), longer CPU runs,
+   a proper eval (perplexity + a needle probe). Ship as `.tlm`. This is the
+   spine everything else hangs off.
+2. **Track C R0 — measure the box.** *(parallel, cheap)* A benchmark script:
+   DDR4-3600 sustained bandwidth, AVX2 int2/int4/int8 matmul throughput on 24
+   threads, A400 read profile. No commitment — it makes every later number real.
+3. **Track B v1 experiment.** *(after 1)* `ml/train/model_mem.py`: sliding-window
+   attention + a learned gated memory (Titans/RMT-style) + kNN retrieval over an
+   on-disk KV store. Train vs. the vanilla baseline on the same corpus/CPU-time;
+   score on a synthetic needle-in-a-haystack at 1 K–512 K logical context with a
+   ≤ 32 K resident footprint. Winner's forward path goes into `thos-lm` as an
+   alternate model kind.
+4. **Track C R1–R2 — the big-model engine.** A sub-2-bit PTQ (AQLM / QuIP# /
+   ParetoQ) on a chosen ~24–30 B open base, plus a `no_std`-friendly CPU
+   inference engine (int2/int4 kernels, GQA, RoPE, RMSNorm, MoE routing if
+   applicable) + KV-cache quantisation. Target: ~3–5 tok/s, ≤ ~8 GB resident.
+5. **Track A P2 — host integration.** `thos-lm` verified `#![no_std]`-clean for
+   `x86_64-unknown-none`; `cargo xtask lm-demo` host command.
+6. **THOS runtime prerequisites (P3).** Userland `O_CREAT` + write; a
+   kernel↔userspace query channel; a RAM budget for a resident model. Each is its
+   own roadmap item.
+7. **THOS AI service (P4)** and **exec-gate head (P5)** — as below.
+
+**Deferred / dropped:** streaming a 70 B+ model from the A400 (hours/answer —
+needs NVMe); training anything ≥ 1 B from scratch (no GPU).
+
+**Large open models — the wider picture** — see [`ai-large.md`](ai-large.md) for
+the full analysis (why MoE-in-swap fails, the resident-vs-streaming split, the
+KV-budget / long-context stack).
+
+**Milestone AI-0:** `cargo test -p thos-lm --target x86_64-unknown-linux-gnu`
+passes (Rust forward matches the numpy reference; sampler deterministic) **and**
+`cargo build -p thos-lm --target x86_64-unknown-none` compiles. *(met)*
+
+**Milestone AI-1:** a byte-level ~1M model trained on the CPU spike corpus
+reaches val loss well below the uniform-byte baseline (ln 256 ≈ 5.55) and
+`ml/thos-lm --example generate` emits recognisable English fragments. *(met —
+0.84 M params, 20 k steps in ~2¼ h on 16 threads at ~42 k tok/s, final val loss
+**1.197 nats/byte ≈ 1.73 bits/byte**; the `thos-lm` Rust engine generates
+grammatical clauses, dialogue with attribution, and training-corpus vocabulary
+("Rostóv", "the whale", "Chapter").)*
+
+## Open decisions
+
+1. `.tlm` layout details + quantisation (`q8` / `q4`); tensor layout for a KV
+   cache.
+2. P1 tokenizer algorithm (byte-level BPE vs. unigram).
+3. `thos-lm` `f32` vs. fixed-point for the eventual in-kernel Application B.
+4. Weight delivery into THOS: `include_bytes!` (kernel `.rodata`) vs. a file on
+   the ext2 image.
+5. Shape of the kernel↔userspace query channel (its own design doc before P3/P4).
+6. `ml/` licence — default `GPL-2.0-or-later` to match the kernel tree (since
+   `thos-lm` may be vendored into it); revisit if a permissive licence is wanted.
+7. Whether CC BY-SA source text imposes share-alike on distributed *weights*
+   (see `ml/DATASETS.md`).
+8. Track B: whether the v1 learned-memory architecture beats the eviction
+   baseline at small scale, and whether it transfers ([`ai-context.md`](ai-context.md)).
+9. Track C: which open base model, and target bit-width ([`ai-large.md`](ai-large.md)).
 
 ## Non-goals
 
-Chatbot, natural-language shell, code generation, anything that wants billions of
-parameters or a GPU. If it needs that, it's not this subproject.
+- No runtime dependency on external services or third-party model runtimes
+  (llama.cpp / ONNX / a bundled GGUF).
+- No training in the kernel; no GPU assumption for training.
+- Not a chatbot product in the near term.
+- A billions-of-params LLM trained from scratch is out of scope until the GPU
+  driver ([`feasibility.md`](feasibility.md) Phase 4) and the compute exist.
+  *Running* a large open model on little RAM is a separate research track
+  ([`ai-large.md`](ai-large.md)), also unscheduled.
+
+See [`roadmap.md`](roadmap.md) · [`architecture.md`](architecture.md) ·
+[`feasibility.md`](feasibility.md) · [`ai-large.md`](ai-large.md) ·
+[`ai-context.md`](ai-context.md) · [`../../ml/README.md`](../../ml/README.md).
