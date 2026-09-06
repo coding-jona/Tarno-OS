@@ -140,14 +140,18 @@ pub struct Thread {
     /// into `IA32_KERNEL_GS_BASE` on every switch in, so the exit `swapgs`
     /// brings it live for ring 3.
     gsbase: AtomicU64,
-    /// Single-wake guard. Cleared (`arm_wake`) under the wait-queue lock right
-    /// before this thread enqueues to block; every `unblock` does a
-    /// `swap(true)` and only the first caller actually requeues it. This is
-    /// what makes a *dual-enqueued* timed wait safe — parked on an object's
-    /// `WaitQueue` **and** the timer wheel, the object signal and the wheel
-    /// deadline can both fire, but the thread is readied exactly once. `true`
-    /// at rest, so a stray `unblock` on a running thread is a no-op.
-    wake_claimed: AtomicBool,
+    /// Set by [`unblock`], cleared by [`mark_blocking`]. Read by `reschedule`
+    /// (only while blocking, under the `SCHED` lock) to catch a waker that
+    /// raced the prepare-to-wait window: the thread enqueued itself on a
+    /// `WaitQueue` / the timer wheel and a `wake_*` (or `timer::tick`) on
+    /// another CPU tried to `unblock` it before it reached `reschedule(true)`.
+    /// If a wake is pending the thread stays runnable and re-checks its
+    /// condition instead of blocking — which would otherwise strand it (blocked
+    /// state, no queue entry, or a phantom entry that double-schedules it off a
+    /// stale `ctx`). Also serialises the two `unblock`s of a dual-enqueued
+    /// timed wait: `false` at rest, so the requeue is deduped by the ready-queue
+    /// scan in `unblock` rather than a claim flag.
+    wake_pending: AtomicBool,
 }
 
 unsafe impl Send for Thread {}
@@ -181,7 +185,7 @@ impl Thread {
             running: AtomicBool::new(true), // it is running right now
             fsbase: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
-            wake_claimed: AtomicBool::new(true),
+            wake_pending: AtomicBool::new(false),
         })
     }
 
@@ -206,7 +210,13 @@ impl Thread {
         (stack, sp as u64, top as u64)
     }
 
-    fn spawned(id: u64, name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -> Arc<Self> {
+    fn spawned(
+        id: u64,
+        name: &'static str,
+        entry: extern "C" fn(usize) -> !,
+        arg: usize,
+        is_idle: bool,
+    ) -> Arc<Self> {
         let (stack, sp, top) = Self::build_stack(
             thos_thread_trampoline as *const () as u64,
             entry as u64,
@@ -220,7 +230,7 @@ impl Thread {
             state: Mutex::new(State::Ready),
             ctx: UnsafeCell::new(sp),
             _stack: Some(stack),
-            is_idle: false,
+            is_idle,
             cr3: AtomicU64::new(vmm::kernel_pml4_phys()),
             kstack_top: Some(top),
             task: None,
@@ -228,7 +238,7 @@ impl Thread {
             running: AtomicBool::new(false),
             fsbase: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
-            wake_claimed: AtomicBool::new(true),
+            wake_pending: AtomicBool::new(false),
         })
     }
 
@@ -263,7 +273,7 @@ impl Thread {
             running: AtomicBool::new(false),
             fsbase: AtomicU64::new(0),
             gsbase: AtomicU64::new(gsbase),
-            wake_claimed: AtomicBool::new(true),
+            wake_pending: AtomicBool::new(false),
         })
     }
 
@@ -298,7 +308,7 @@ impl Thread {
             running: AtomicBool::new(false),
             fsbase: AtomicU64::new(fsbase),
             gsbase: AtomicU64::new(0),
-            wake_claimed: AtomicBool::new(true),
+            wake_pending: AtomicBool::new(false),
         })
     }
 
@@ -391,7 +401,7 @@ pub fn current_proc() -> Option<Arc<crate::process::Process>> {
 /// thread. Scheduling becomes active on return.
 pub fn init_bsp() {
     let boot = Thread::adopting(0, "cpu0/boot", false);
-    let idle = Thread::spawned(idle_tid(0), "cpu0/idle", idle_entry, 0);
+    let idle = Thread::spawned(idle_tid(0), "cpu0/idle", idle_entry, 0, true);
     {
         let mut s = SCHED.lock();
         s.cpus[0].current = Some(boot);
@@ -431,7 +441,7 @@ extern "C" fn idle_entry(_arg: usize) -> ! {
 /// Create a runnable kernel thread.
 pub fn spawn(name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
-    let t = Thread::spawned(id, name, entry, arg);
+    let t = Thread::spawned(id, name, entry, arg, false);
     SCHED.lock().ready.push_back(t);
     id
 }
@@ -516,22 +526,37 @@ pub fn block_current() {
     interrupts::without_interrupts(|| reschedule(true));
 }
 
-/// Arm `t`'s single-wake guard: the next `unblock` will actually requeue it.
-/// Call this under the wait-queue lock, immediately before enqueuing `t` to
-/// block, so it is serialised against the primary waker.
-pub fn arm_wake(t: &Arc<Thread>) {
-    t.wake_claimed.store(false, Ordering::Release);
+/// Arm a thread for a blocking wait. `wait.rs` / `timer.rs` call this *before*
+/// they enqueue the thread on the wait object (and, for a dual-enqueued timed
+/// wait, on the timer wheel) and drop that object's lock — so a waker racing in
+/// on another CPU sees a cleared `wake_pending` and, if it fires, sets it,
+/// telling this thread's imminent `reschedule(true)` to abort the block.
+/// Mirrors Linux's `set_current_state()` before `schedule()`.
+pub fn mark_blocking(t: &Arc<Thread>) {
+    t.wake_pending.store(false, Ordering::Release);
 }
 
-/// Make a previously-blocked thread runnable again. Requeues at most once per
-/// [`arm_wake`]: whichever waker calls first wins the `swap`, any later
-/// caller (the other half of a dual-enqueued timed wait) is a no-op.
+/// Make a previously-blocked thread runnable again.
+///
+/// Safe on a thread that has *armed* a wait ([`mark_blocking`]) but not yet
+/// reached `reschedule(true)`, or is mid-unwind right after committing to the
+/// block: it records `wake_pending` and, seeing `running` still set, leaves the
+/// requeue to that thread's own CPU (`reschedule` aborts the block, or
+/// `finish_switch` requeues it). A genuinely blocked thread (`running` clear)
+/// is set `Ready` and pushed. The push is deduped against the ready queue, so
+/// the two `unblock`s of a dual-enqueued timed wait (object signal + wheel
+/// deadline) ready it exactly once and a raced `unblock` can't strand a phantom
+/// entry that double-schedules it off a stale `ctx`.
 pub fn unblock(t: Arc<Thread>) {
-    if t.wake_claimed.swap(true, Ordering::AcqRel) {
-        return; // already woken by someone else (or never armed)
+    t.wake_pending.store(true, Ordering::Release);
+    let mut s = SCHED.lock();
+    if t.running.load(Ordering::Acquire) {
+        return;
     }
     t.set_state(State::Ready);
-    SCHED.lock().ready.push_back(t);
+    if !s.ready.iter().any(|x| Arc::ptr_eq(x, &t)) {
+        s.ready.push_back(t);
+    }
 }
 
 /// Terminate the current thread. Never returns.
@@ -584,6 +609,15 @@ fn reschedule(block: bool) {
         let cpu = smp::this_cpu() as usize;
 
         let prev = s.cpus[cpu].current.clone().expect("reschedule: no current thread");
+
+        // A waker on another CPU raced our prepare-to-wait window (it drained us
+        // off a `WaitQueue` / the timer wheel and called `unblock` while we were
+        // still `running`). Abort the block, stay runnable, and let the caller
+        // re-check its condition. Nothing has been mutated yet — nothing to undo.
+        if block && prev.wake_pending.load(Ordering::Acquire) {
+            return;
+        }
+
         let next = pick_next(&mut s, cpu);
 
         if Arc::ptr_eq(&prev, &next) {
@@ -595,7 +629,7 @@ fn reschedule(block: bool) {
         // Commit only now that we know a real switch is happening.
         if block {
             prev.set_state(State::Blocked);
-        } else if prev.state() == State::Running && !prev.is_idle {
+        } else if !prev.is_idle {
             prev.set_state(State::Ready);
         }
         next.set_state(State::Running);
@@ -649,7 +683,19 @@ fn finish_switch() {
     let Some((prev, was_blocking)) = s.cpus[cpu].handoff.take() else {
         return;
     };
-    if !was_blocking && prev.state() == State::Ready && !prev.is_idle {
+    let requeue = if prev.state() == State::Exited || prev.is_idle {
+        false
+    } else if !was_blocking {
+        // A plain yield / preemption: `prev` is still runnable.
+        true
+    } else {
+        // `prev` blocked — but if a waker raced in after it committed (so
+        // `unblock` saw `running` still set and skipped the queue), it is our
+        // job to make it runnable now that this CPU is off its stack.
+        prev.wake_pending.load(Ordering::Acquire)
+    };
+    if requeue && !s.ready.iter().any(|t| Arc::ptr_eq(t, &prev)) {
+        prev.set_state(State::Ready);
         s.ready.push_back(prev.clone());
     }
     prev.running.store(false, Ordering::Release);

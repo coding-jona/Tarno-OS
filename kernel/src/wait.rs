@@ -30,7 +30,7 @@ impl WaitQueue {
         interrupts::without_interrupts(|| {
             let me = sched::current();
             let mut w = self.waiters.lock();
-            sched::arm_wake(&me); // under the lock: serialised vs. the waker
+            sched::mark_blocking(&me); // under the lock: serialised vs. the waker
             w.push_back(me);
             drop(w);
             sched::block_current();
@@ -50,7 +50,7 @@ impl WaitQueue {
                 return;
             }
             let me = sched::current();
-            sched::arm_wake(&me);
+            sched::mark_blocking(&me);
             w.push_back(me);
             drop(w);
             sched::block_current();
@@ -67,9 +67,9 @@ impl WaitQueue {
     /// `NtWaitForSingleObject` — no yield-poll spin.
     ///
     /// Both the object-signal path (`wake_one` under this queue's lock) and the
-    /// wheel path (`timer::tick`) call `sched::unblock`; the single-wake guard
-    /// (`sched::arm_wake`, set here under the queue lock) means only the first
-    /// of the two actually requeues the thread. On wake we still scrub the
+    /// wheel path (`timer::tick`) call `sched::unblock`; `unblock` dedupes
+    /// against the ready queue (and no-ops on a still-`running` thread), so the
+    /// two together ready the thread exactly once. On wake we still scrub the
     /// stale entry from whichever side didn't fire.
     ///
     /// Returns `true` **only** when the thread actually blocked and woke with
@@ -84,7 +84,7 @@ impl WaitQueue {
                 return false;
             }
             let me = sched::current();
-            sched::arm_wake(&me);
+            sched::mark_blocking(&me);
             w.push_back(me.clone());
             drop(w);
             crate::timer::arm(deadline, me.clone());

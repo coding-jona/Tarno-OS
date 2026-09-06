@@ -84,7 +84,7 @@ pub fn sleep_until(deadline: u64) {
         return;
     }
     let me = sched::current();
-    sched::arm_wake(&me);
+    sched::mark_blocking(&me);
     arm(deadline, me.clone());
     sched::block_current();
     disarm(&me); // woken (deadline or an unrelated wake) — drop any stale entry
