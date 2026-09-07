@@ -503,8 +503,9 @@ fn smp_stress_milestone(init_bytes: &[u8]) {
     );
 
     kprintln!(
-        "THOS: smp stress ok    {spawned} churn + {PARKERS} parker threads clean; {runs}+{park_runs} runs, {} ctx switches",
-        sched::ctx_switches()
+        "THOS: smp stress ok    {spawned} churn + {PARKERS} parker threads clean; {runs}+{park_runs} runs, {} ctx switches, {} phantoms dropped",
+        sched::ctx_switches(),
+        sched::phantoms_dropped(),
     );
 }
 

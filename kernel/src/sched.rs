@@ -538,19 +538,22 @@ pub fn mark_blocking(t: &Arc<Thread>) {
 
 /// Make a previously-blocked thread runnable again.
 ///
-/// Safe on a thread that has *armed* a wait ([`mark_blocking`]) but not yet
-/// reached `reschedule(true)`, or is mid-unwind right after committing to the
-/// block: it records `wake_pending` and, seeing `running` still set, leaves the
-/// requeue to that thread's own CPU (`reschedule` aborts the block, or
-/// `finish_switch` requeues it). A genuinely blocked thread (`running` clear)
-/// is set `Ready` and pushed. The push is deduped against the ready queue, so
-/// the two `unblock`s of a dual-enqueued timed wait (object signal + wheel
-/// deadline) ready it exactly once and a raced `unblock` can't strand a phantom
-/// entry that double-schedules it off a stale `ctx`.
+/// Only a genuinely blocked-and-parked thread (`Blocked`, `running` clear) is
+/// made `Ready` and pushed here. Every other state means another CPU owns the
+/// wake and this call must not queue it:
+///  - `Running`: the thread armed a wait ([`mark_blocking`]) and enqueued
+///    itself but has not yet reached `reschedule(true)` (or is mid-unwind right
+///    after committing) — recording `wake_pending` makes `reschedule` abort the
+///    block / `finish_switch` requeue it, on its own CPU.
+///  - `Ready`: already queued or being scheduled — don't double it.
+///  - `Exited`: a wait queue is holding a stale corpse reference — never
+///    resurrect it, or `pick_next` would resume it off a dead `ctx`.
+/// The push is also deduped against the ready queue, so the two `unblock`s of a
+/// dual-enqueued timed wait (object signal + wheel deadline) ready it once.
 pub fn unblock(t: Arc<Thread>) {
     t.wake_pending.store(true, Ordering::Release);
     let mut s = SCHED.lock();
-    if t.running.load(Ordering::Acquire) {
+    if t.state() != State::Blocked || t.running.load(Ordering::Acquire) {
         return;
     }
     t.set_state(State::Ready);
@@ -595,10 +598,35 @@ pub fn exit() -> ! {
     unreachable!("switched back into an exited thread")
 }
 
+/// Pop the next runnable thread, **discarding stale phantom entries**. An Arc in
+/// the ready queue that is already `Running`/`Exited`, has `running` set, or is
+/// `current` on some CPU has no business there — a wake or requeue that raced
+/// the owning CPU double-enqueued it. Scheduling such an entry would resume the
+/// thread off a `ctx` its live copy has moved past (or `exit()` never saved) →
+/// `#PF` with a junk `rip`. A genuinely runnable thread is none of those, so it
+/// is never skipped. Falls back to this CPU's idle thread when nothing real is
+/// queued.
 fn pick_next(s: &mut Inner, cpu: usize) -> Arc<Thread> {
-    s.ready
-        .pop_front()
-        .unwrap_or_else(|| s.cpus[cpu].idle.clone().expect("cpu has no idle thread"))
+    while let Some(t) = s.ready.pop_front() {
+        let stale = matches!(t.state(), State::Running | State::Exited)
+            || t.running.load(Ordering::Acquire)
+            || s.cpus.iter().any(|c| {
+                c.current.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &t))
+            });
+        if !stale {
+            return t;
+        }
+        PHANTOMS_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    s.cpus[cpu].idle.clone().expect("cpu has no idle thread")
+}
+
+/// Count of phantom ready-queue entries [`pick_next`] has discarded — 0 in
+/// normal operation; the `smp` stress milestone prints it.
+static PHANTOMS_DROPPED: AtomicU64 = AtomicU64::new(0);
+#[allow(dead_code)] // read by the `stress` milestone only
+pub fn phantoms_dropped() -> u64 {
+    PHANTOMS_DROPPED.load(Ordering::Relaxed)
 }
 
 /// The core switch. `block` = don't return the current thread to the ready
