@@ -28,7 +28,7 @@ grad_accum    = 2        # effective batch 48; 12288 tokens/step at ctx 256
 # 40k steps ~ 0.49B token-passes (~0.26 epoch of the 1.86B corpus, but still 2x
 # the entire P0 run). ~3-4 days full-throttle CPU, ~1-2 weeks capped to 6 cores.
 # Bump later if the val loss is still dropping.
-max_steps     = 40000
+max_steps     = 30000    # ~1.8 epoch of the 208M-token subsample
 warmup_steps  = 1000
 lr            = 6e-4
 min_lr        = 6e-5
@@ -37,7 +37,7 @@ grad_clip     = 1.0
 eval_interval = 100
 eval_batches  = 20
 ckpt_interval = 100
-num_threads   = 8        # match the game-mode cap so torch doesn't spawn 24 threads that thrash
+num_threads   = 6        # 6/24 threads (game gets 18)
 
 [data]
 train_bin = "data_stage2/train.bin"

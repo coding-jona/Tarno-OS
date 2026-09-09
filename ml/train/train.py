@@ -78,14 +78,27 @@ def main() -> None:
 
     if tc.get("num_threads", 0):
         torch.set_num_threads(int(tc["num_threads"]))
+        try:
+            torch.set_num_interop_threads(1)  # no extra pool fighting the game
+        except RuntimeError:
+            pass  # already set once this process
     torch.manual_seed(tc["seed"])
     rng = np.random.default_rng(tc["seed"])
 
     # memmap, not fromfile: the Stage-2 train.bin is multi-GB and get_batch only
     # ever touches random windows — loading it all into RAM (P0 did, its bin was
     # tiny) forces the box into swap and makes the whole desktop thrash.
+    # MADV_RANDOM: kill the kernel readahead — on random-index access it just
+    # pulls in pages we never read, stealing memory bandwidth from whatever
+    # else is running (e.g. a game).
     def _map(p, dt):
-        return np.memmap(os.path.join(HERE, p), dtype=dt, mode="r")
+        m = np.memmap(os.path.join(HERE, p), dtype=dt, mode="r")
+        try:
+            import mmap as _mm
+            m._mmap.madvise(_mm.MADV_RANDOM)
+        except (AttributeError, OSError, ValueError):
+            pass
+        return m
 
     train_data = _map(dc["train_bin"], np.uint16)
     val_data = _map(dc["val_bin"], np.uint16)
