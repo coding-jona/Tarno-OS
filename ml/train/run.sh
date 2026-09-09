@@ -9,6 +9,9 @@
 #   ml/train/run.sh all            setup -> data -> train -> export -> sample
 #   ml/train/run.sh setup          create .venv, install torch(CPU)/numpy/tqdm
 #   ml/train/run.sh data           fetch the open corpus + build train/val bins
+#   ml/train/run.sh stage2         Stage-2: stream the open web/edu corpus + BPE + tokenize + pack (data_stage2/)
+#   ml/train/run.sh stage2-fetch [--list|--only NAME]      just the download step (resumable)
+#   ml/train/run.sh stage2-prep  [--phase bpe|tok|pack] [--workers N]   just the tokenize/pack step
 #   ml/train/run.sh train          train (auto-resumes from out/<config>/latest.pt)
 #   ml/train/run.sh train-bg       same, in the background -> out/<config>/train.log
 #   ml/train/run.sh status         show background training progress
@@ -97,6 +100,18 @@ cmd_data() {
   "$PY" "$HERE/fetch.py"
   say "prepare (tokenize + pack)  BPE=${BPE:-0}"
   "$PY" "$HERE/prepare.py" --bpe "${BPE:-0}"
+}
+
+# Stage 2 — the real pretraining corpus: stream open web/edu datasets, re-learn
+# a byte-BPE, tokenize + pack into data_stage2/{train,val}.bin. All steps are
+# resumable. Pair with `run.sh game on` to keep the machine usable.
+cmd_stage2_fetch() { need_venv; _game_adopt_self; "$PY" "$HERE/fetch_web.py" "$@"; }
+cmd_stage2_prep()  { need_venv; _game_adopt_self; "$PY" "$HERE/prepare_web.py" "$@"; }
+cmd_stage2() {
+  cmd_stage2_fetch
+  cmd_stage2_prep
+  say "stage-2 corpus ready — data_stage2/{train,val}.bin + tokenizer.json"
+  echo "start it:  CONFIG=config/small-30m-stage2.toml TLM=small-30m-stage2.tlm $0 train-bg"
 }
 
 cmd_eval() {
@@ -265,7 +280,18 @@ cmd_ctl() {
   echo "wrote $OUT/control.json: $(cat "$OUT/control.json")"
 }
 
-_game_pids() { pgrep -f "[t]rain\.py --config|[p]repare\.py --bpe|[f]etch\.py" || true; }
+_game_pids() {
+  pgrep -f "[t]rain\.py --config|[p]repare\.py --bpe|[f]etch\.py|[f]etch_web\.py|[p]repare_web\.py" || true
+}
+
+# Move the current shell (and its children) into the game cgroup if game mode
+# is armed — so a long stage-2 step started *after* `game on` is capped too.
+_game_adopt_self() {
+  [ -d "$GAME_CG" ] && [ -w /dev/null ] || return 0
+  [ -n "$(cat "$GAME_CG/cgroup.procs" 2>/dev/null)" ] || return 0
+  echo "$$" | sudo -n tee "$GAME_CG/cgroup.procs" >/dev/null 2>&1 \
+    && echo "[game] this step capped to ${GAME_CORES}/24 threads" || true
+}
 
 # Training keeps running while you game — it just gets capped to a slice of
 # the CPU (cpu.max quota in a cgroup) instead of being paused, so progress
@@ -363,6 +389,9 @@ cmd_clean() {
 case "${1:-help}" in
   setup)     cmd_setup ;;
   data)      cmd_data ;;
+  stage2)       cmd_stage2 ;;
+  stage2-fetch) shift || true; cmd_stage2_fetch "$@" ;;
+  stage2-prep)  shift || true; cmd_stage2_prep "$@" ;;
   train)
     [ -n "${2:-}" ] && die "run.sh train takes no extra args (did you mean 'run.sh status', or 'ctl'/'game' for a running job? got: train $*)"
     cmd_train
