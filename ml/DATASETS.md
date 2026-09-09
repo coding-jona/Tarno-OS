@@ -39,14 +39,31 @@ UTF-8 bytes and will pick up German-specific merges (e.g. `ü`, `sch`, `-ung`) o
 its own from whatever fraction of the corpus is German. Growing that fraction is
 future work if German output quality matters more than a first proof of it.
 
-## Planned additions (P1+, not yet wired)
+## Stage-2 corpus (active — `fetch_web.py` + `prepare_web.py`, `data_stage2/`)
+
+The real P1 pretraining mix for the ~34M model: ~1.2B tokens, streamed from
+Hugging Face (`streaming=True`, capped per source, never fully downloaded).
+All open-licensed. `data_stage2/` is git-ignored. Token counts are the
+`fetch_web.py` budgets (bytes/4 estimate).
+
+| Source | HF path | Budget | Licence | Obligations |
+|---|---|---|---|---|
+| TinyStories | `roneneldan/TinyStories` | 350M | CDLA-Sharing-1.0 (synthetic) | none beyond attribution; front-loaded to teach fluency |
+| FineWeb-Edu (sample-10BT) | `HuggingFaceFW/fineweb-edu` | 600M | **ODC-By-1.0** | attribute the dataset; respect Common Crawl terms |
+| Wikipedia (en, 2023-11-01) | `wikimedia/wikipedia` | 150M | **CC-BY-SA-4.0** | attribution + **share-alike** on distributed derived text (weights TBD — see below) |
+| Cosmopedia v2 | `HuggingFaceTB/smollm-corpus` | 120M | Apache-2.0 (synthetic) | attribution |
+
+`prepare_web.py` re-learns a byte-BPE (vocab 16384) on a sample across all four,
+so the Stage-2 model has its **own** `data_stage2/tokenizer.json` and is not
+`--resume`-able from the P0 `small-30m` checkpoint. Config:
+`config/small-30m-stage2.toml` (ctx 512, 120k steps).
+
+## Planned additions (later, not yet wired)
 
 | Source | Licence | Notes / obligations |
 |---|---|---|
-| Simple English Wikipedia (`simplewiki` dump) | CC BY-SA 4.0 | Attribution + **share-alike**: any distributed *text derived from it* must stay CC BY-SA. Weights are a separate legal question, tracked when we get there. Needs a markup stripper (`wikiextractor`-class). |
 | Project Gutenberg — full mirror subset | Public domain | Larger book set; same header-stripping rule. |
-| FineWeb / FineWeb-Edu (HF) | ODC-BY | Documented-filtered Common Crawl. Attribution to the dataset; respect Common Crawl's terms. This is the kind of open web corpus the big labs also use. |
-| The Stack v2 (HF, `bigcode`) | per-file OSS licences + opt-out list | Code. Must honour the maintainer **opt-out** list and keep per-file licence metadata. |
+| The Stack v2 (HF, `bigcode`) — permissive-licensed Python only | per-file OSS licences + opt-out list | Code. Must honour the maintainer **opt-out** list and keep per-file licence metadata. Was in the Stage-2 plan but deferred to keep the first real run simple. |
 | arXiv bulk (S3 requester-pays) / PubMed Central OA | mixed CC / arXiv licence | Per-paper licence varies; filter to CC-BY / CC0 / arXiv-perpetual before use. |
 | StackExchange data dump | CC BY-SA 4.0 | Same share-alike as Wikipedia; attribution to contributors + SE. |
 
