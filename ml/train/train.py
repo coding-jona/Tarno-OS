@@ -81,12 +81,18 @@ def main() -> None:
     torch.manual_seed(tc["seed"])
     rng = np.random.default_rng(tc["seed"])
 
-    train_data = np.fromfile(os.path.join(HERE, dc["train_bin"]), dtype=np.uint16)
-    val_data = np.fromfile(os.path.join(HERE, dc["val_bin"]), dtype=np.uint16)
+    # memmap, not fromfile: the Stage-2 train.bin is multi-GB and get_batch only
+    # ever touches random windows — loading it all into RAM (P0 did, its bin was
+    # tiny) forces the box into swap and makes the whole desktop thrash.
+    def _map(p, dt):
+        return np.memmap(os.path.join(HERE, p), dtype=dt, mode="r")
+
+    train_data = _map(dc["train_bin"], np.uint16)
+    val_data = _map(dc["val_bin"], np.uint16)
     train_mask = val_mask = None
     if dc.get("train_mask"):
-        train_mask = np.fromfile(os.path.join(HERE, dc["train_mask"]), dtype=np.uint8)
-        val_mask = np.fromfile(os.path.join(HERE, dc["val_mask"]), dtype=np.uint8)
+        train_mask = _map(dc["train_mask"], np.uint8)
+        val_mask = _map(dc["val_mask"], np.uint8)
         assert len(train_mask) == len(train_data) and len(val_mask) == len(val_data), \
             "mask/token length mismatch — regenerate with prepare_sft.py"
         print(f"SFT mode: loss masked to assistant turns only ({train_mask.mean():.1%} of tokens)")
