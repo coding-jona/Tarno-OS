@@ -361,7 +361,11 @@ class ChatPane:
             else:
                 self.push(run_sh(self.config_path, arg, *rest), width, curses.A_DIM)
         else:
-            self.push(f"  unknown /{name} — /help for the list", width, curses.A_DIM)
+            # Anything else: treat it as a run.sh subcommand. So a new
+            # subcommand (e.g. /full) works without restarting the dashboard.
+            self.push(f"  /{name} -> run.sh {name} {' '.join([arg, *rest])}".rstrip(), width, curses.A_DIM)
+            self.push(run_sh(self.config_path, name, *([arg] if arg else []), *rest, timeout=90),
+                      width, curses.A_DIM)
 
     def submit(self, width: int, generating_attr: int) -> None:
         msg = self.input.strip()
