@@ -14,7 +14,7 @@ Right pane sends each message through the built `thos-lm` `generate` example
 (the same engine `run.sh shell` uses) against `--tlm`, so it always reflects
 whatever's on disk — pair it with 'run.sh watch-export' to chat with a model
 that's still training. It also understands the same control commands as
-`thos-shell` (/game, /train, /temp, /topk, /tokens, /reset, /params, /help) —
+`thos-shell` (/game, /full, /train, /temp, /topk, /tokens, /reset, /params, /help) —
 type /help in the chat box. Missing vs. the dedicated shell: /lang
 translation and live token-by-token streaming (the whole reply prints at
 once here).
@@ -223,6 +223,7 @@ HELP_ROWS = [
     ("/params", "show current temp/top-k/tokens"),
     ("/reset", "forget the chat context"),
     ("/game on|off|toggle|status", "cap training's CPU share for a game — training keeps running"),
+    ("/full", "opposite of /game on: uncap, all cores, boosted priority (restarts the bg run)"),
     ("/train start|stop|pause|resume|status", "control the run this dashboard is watching"),
     ("/run <cmd> [args]", "any other run.sh subcommand, passed straight through"),
     ("/model <stem|path>", "switch which weights the chat talks to, e.g. /model spike-1m"),
@@ -309,6 +310,8 @@ class ChatPane:
         elif name == "game":
             sub = arg or "status"
             self.push(run_sh(self.config_path, "game", sub), width, curses.A_DIM)
+        elif name == "full":
+            self.push(run_sh(self.config_path, "full", timeout=90), width, curses.A_DIM)
         elif name == "train":
             sub = arg or "status"
             if sub == "start":
