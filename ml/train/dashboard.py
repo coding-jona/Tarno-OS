@@ -20,7 +20,7 @@ translation and live token-by-token streaming (the whole reply prints at
 once here).
 
 Keys:  F2 pause   F3 resume   F4 request a graceful stop+checkpoint
-       F1 quit the dashboard (training keeps running)
+       F1 quit the dashboard (training keeps running); F3 also restarts a training that F4 stopped
        type + Enter to chat; Backspace to edit; Esc clears the input line
 Pause/resume/stop write out/<config>/control.json, which train.py polls once
 per step — same file 'run.sh ctl' writes, so both are interchangeable.
@@ -556,7 +556,21 @@ def run(stdscr, args) -> None:
             msg = "pause requested"
         elif ch == curses.KEY_F3:
             write_control(ctl_path, {})
-            msg = "resume requested"
+            pid_path = os.path.join(out_dir, "train.pid")
+            alive = False
+            try:
+                with open(pid_path) as fh:
+                    os.kill(int(fh.read().strip()), 0)
+                alive = True
+            except (OSError, ValueError, FileNotFoundError):
+                pass
+            if alive:
+                msg = "resume requested"
+            else:
+                # F4 (or a crash) actually exited train.py — clearing the flag
+                # can't revive it; relaunch (train-bg auto-resumes latest.pt).
+                msg = "no training process — restarting (resumes from latest.pt)"
+                run_sh(args.config, "train-bg", timeout=30)
         elif ch == curses.KEY_F4:
             write_control(ctl_path, {"stop": True})
             msg = "stop requested — checkpointing at end of step"
