@@ -26,6 +26,7 @@
 #   ml/train/run.sh dashboard      live curses status view of a training run
 #   ml/train/run.sh ctl CMD        control a running job: stop|pause|resume|"lr <x>"
 #   ml/train/run.sh game {on|off|toggle|status}   cap training's CPU share for a game (keeps training running, just slower); GAME_CORES=N to tune
+#   ml/train/run.sh full          the opposite: uncap, all cores, boosted priority, restart bg train with num_threads=0 (desktop will crawl)
 #   ml/train/run.sh test           no_std build + golden cross-check + fixture
 #   ml/train/run.sh clean          remove .venv, data/, out/, *.tlm
 #
@@ -53,6 +54,13 @@ case "$CONFIG" in
 esac
 # checkpoints/logs are per-config so a new model never resumes another's latest.pt
 OUT="$HERE/out/$(basename "${CONFIG%.toml}")"
+# The tokenizer that belongs with this config: sibling of its [data] train_bin
+# (so a Stage-2 config -> data_stage2/tokenizer.json), else the default P0 one.
+# Overridable with TOKENIZER=. export.py still vocab-checks before attaching.
+_cfg_data_dir="$(sed -n 's/^[[:space:]]*train_bin[[:space:]]*=[[:space:]]*"\?\([^"]*\)"\?.*/\1/p' "$CONFIG" 2>/dev/null | head -1)"
+_cfg_data_dir="$HERE/$(dirname "${_cfg_data_dir:-data/train.bin}")"
+TOKENIZER="${TOKENIZER:-$_cfg_data_dir/tokenizer.json}"
+[ -f "$TOKENIZER" ] || TOKENIZER="$HERE/data/tokenizer.json"
 TLM="${TLM:-$ROOT/spike-1m.tlm}"
 # Same class of bug as CONFIG above: a bare relative TLM (as every doc
 # example writes it, e.g. TLM=small-30m.tlm) resolved against whatever a
@@ -121,7 +129,8 @@ cmd_eval() {
   "$PY" "$HERE/eval.py" --weights "$TLM"
 }
 
-_train_ready() { [ -f "$HERE/data/train.bin" ] && [ -f "$HERE/data/val.bin" ]; }
+# the bins this config actually points at (P0 -> data/, Stage-2 -> data_stage2/)
+_train_ready() { [ -f "$_cfg_data_dir/train.bin" ] && [ -f "$_cfg_data_dir/val.bin" ]; }
 
 cmd_train() {
   need_venv
@@ -192,7 +201,7 @@ cmd_export() {
   need_venv
   [ -f "$OUT/latest.pt" ] || die "no checkpoint at $OUT/latest.pt — train first"
   say "export -> $TLM"
-  "$PY" "$HERE/export.py" --ckpt "$OUT/latest.pt" --out "$TLM"
+  "$PY" "$HERE/export.py" --ckpt "$OUT/latest.pt" --out "$TLM" --tokenizer "$TOKENIZER"
 }
 
 cmd_sample() {
@@ -232,7 +241,7 @@ cmd_watch_export() {
     if [ -f "$OUT/latest.pt" ]; then
       local mtime; mtime="$(stat -c %Y "$OUT/latest.pt" 2>/dev/null || echo "")"
       if [ -n "$mtime" ] && [ "$mtime" != "$last" ]; then
-        if "$PY" "$HERE/export.py" --ckpt "$OUT/latest.pt" --out "$TLM"; then
+        if "$PY" "$HERE/export.py" --ckpt "$OUT/latest.pt" --out "$TLM" --tokenizer "$TOKENIZER"; then
           last="$mtime"
           echo "[watch-export] $(date '+%T') refreshed $TLM"
           local step=""; [ -f "$OUT/log.csv" ] && step="$(tail -n1 "$OUT/log.csv" | cut -d, -f1)"
@@ -358,6 +367,34 @@ cmd_game() {
   esac
 }
 
+# Full throttle: the hard opposite of `game on`. Removes the cgroup cap, boosts
+# priority, and — since torch's thread count is fixed at process start — sets
+# `num_threads = 0` (all cores) in the config and restarts a running bg train
+# (resumes from latest.pt). Your desktop WILL crawl while this is on.
+cmd_full() {
+  local pids; pids="$(_game_pids)"
+  for p in $pids; do
+    echo "$p" | sudo -n tee /sys/fs/cgroup/cgroup.procs >/dev/null 2>&1 || true
+    sudo -n renice -n -5 -p "$p" >/dev/null 2>&1 || renice -n 0 -p "$p" >/dev/null 2>&1 || true
+    ionice -c 2 -n 0 -p "$p" >/dev/null 2>&1 || true
+  done
+  [ -d "$GAME_CG" ] && sudo -n rmdir "$GAME_CG" 2>/dev/null || true
+
+  if grep -q '^num_threads' "$CONFIG" && ! grep -qE '^num_threads *= *0( |$)' "$CONFIG"; then
+    sed -i 's/^num_threads .*/num_threads   = 0        # full throttle — all cores/' "$CONFIG"
+    echo "[full] $CONFIG: num_threads -> 0 (all $(nproc) cores)"
+    if [ -f "$OUT/train.pid" ] && kill -0 "$(cat "$OUT/train.pid")" 2>/dev/null; then
+      local tp; tp="$(cat "$OUT/train.pid")"
+      echo "[full] restarting bg training (pid $tp) to pick up the thread count — resumes from latest.pt"
+      kill "$tp" 2>/dev/null; for _ in 1 2 3 4 5; do kill -0 "$tp" 2>/dev/null || break; sleep 1; done
+      kill -9 "$tp" 2>/dev/null || true
+      rm -f "$OUT/train.pid"
+      cmd_train_bg
+    fi
+  fi
+  echo "[full] uncapped, priority boosted. 'ml/train/run.sh game on' to throttle again."
+}
+
 cmd_shell() {
   local w="$TLM"
   [ -f "$w" ] || w="$ROOT/spike-1m.tlm"
@@ -408,6 +445,7 @@ case "${1:-help}" in
   watch-export-stop) cmd_watch_export_stop ;;
   ctl)       shift || true; cmd_ctl "$@" ;;
   game)      shift || true; cmd_game "$@" ;;
+  full)      cmd_full ;;
   dashboard) shift || true; need_venv; ( cd "$HERE" && "$PY" dashboard.py --config "$CONFIG" --tlm "$TLM" "$@" ) ;;
   test)      cmd_test ;;
   all)       cmd_all ;;
