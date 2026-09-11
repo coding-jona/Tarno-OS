@@ -144,6 +144,24 @@ pub fn map_mmio(phys: u64, len: u64) -> u64 {
     hhdm + phys
 }
 
+/// Unmap a 4 KiB page from an *arbitrary* PML4 (given by physical base) —
+/// `NtUnmapViewOfSection` tearing down a section view. Unlike `map_page_in`,
+/// this `invlpg`s immediately: the caller may keep running on this same CR3
+/// right after and must not still be able to see the old mapping. Does not
+/// free the underlying frame — a section's frames are owned by the `Section`
+/// object, not by any one mapping of them.
+pub fn unmap_page_in(pml4_phys: u64, virt: u64) {
+    let hhdm = crate::mm::hhdm_offset();
+    let pml4: &mut PageTable = unsafe {
+        &mut *crate::mm::phys_to_virt(x86_64::PhysAddr::new(pml4_phys)).as_mut_ptr::<PageTable>()
+    };
+    let mut m = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(hhdm)) };
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    if let Ok((_, flush)) = m.unmap(page) {
+        flush.flush();
+    }
+}
+
 /// Map a 4 KiB page into an *arbitrary* PML4 (given by physical base). Used for
 /// per-process address spaces. Does not flush the TLB — the caller loads CR3.
 pub fn map_page_in(pml4_phys: u64, virt: u64, phys: u64, writable: bool, user: bool, exec: bool) {

@@ -339,7 +339,7 @@ pub fn open_resolved(path: &str) -> i64 {
             fs.read_dir(ino).into_iter().map(|(i, t, n)| (i as u64, t, n)).collect();
         task.fd_alloc(crate::file::DirFile::new(&entries)) as i64
     } else {
-        task.fd_alloc(crate::file::MemFile::new(fs.read_file(&node))) as i64
+        task.fd_alloc(crate::file::Ext2File::new(path.into(), fs.read_file(&node))) as i64
     }
 }
 

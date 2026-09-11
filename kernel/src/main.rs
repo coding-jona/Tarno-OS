@@ -592,6 +592,59 @@ fn registry_enum_check() {
     kprintln!("THOS: registry enum ok NtEnumerateKey/Value order + STATUS_NO_MORE_ENTRIES");
 }
 
+/// `NtCreateSection`/`NtMapViewOfSection`/`NtUnmapViewOfSection`/
+/// `NtFlushVirtualMemory`'s backing logic (`process::Section` /
+/// `Process::map_section_view` etc.), exercised directly against real page
+/// tables — no PE process needed. Proves the actual new capability over the
+/// old copy-based section: two views share the *same* physical frames (a
+/// write through one view's VA is visible reading through the other's,
+/// checked via `Process::translate`, not just "the `Vec<PhysFrame>` lists
+/// match"), `unmap_view` tears down and is not idempotent, and a file-backed
+/// section's `flush()` genuinely rewrites the underlying ext2 file's bytes
+/// on disk.
+fn section_sharing_check(fs: &ext2::Ext2) {
+    let proc = process::Process::new();
+    let hhdm = mm::hhdm_offset();
+
+    // --- anonymous section: two views, one process, shared frames ---
+    let sec = Arc::new(process::Section::new(b"AAAA", None));
+    let v1 = proc.map_section_view(&sec, 0, 4096);
+    let v2 = proc.map_section_view(&sec, 0, 4096);
+    assert_ne!(v1, v2, "section_sharing_check: two views got the same VA");
+
+    proc.write_user(v1, b"HELLO");
+    let p2 = proc.translate(v2).expect("view2 mapped");
+    let seen = unsafe { core::slice::from_raw_parts((p2 + hhdm) as *const u8, 5) };
+    assert_eq!(seen, b"HELLO", "write through view1 not visible through view2 — sections aren't sharing frames");
+
+    proc.write_user(v2, b"WORLD");
+    let p1 = proc.translate(v1).expect("view1 mapped");
+    let seen_back = unsafe { core::slice::from_raw_parts((p1 + hhdm) as *const u8, 5) };
+    assert_eq!(seen_back, b"WORLD", "write through view2 not visible through view1");
+
+    assert!(proc.unmap_view(v2), "unmap_view(v2) should succeed the first time");
+    assert!(!proc.unmap_view(v2), "unmap_view(v2) should fail the second time (already gone)");
+    assert!(proc.translate(v2).is_none(), "view2's PTEs should be torn down after unmap");
+    assert!(proc.translate(v1).is_some(), "view1 must survive v2's unmap — frames are shared, not owned by one view");
+    assert!(proc.unmap_view(v1), "unmap_view(v1) should still succeed");
+
+    // --- file-backed section: flush() writes real bytes back to ext2 ---
+    let path = "/section_check.tmp";
+    fs.write_path(path, b"before").expect("seed /section_check.tmp");
+    let file: Arc<dyn file::FileOps> =
+        file::Ext2File::new(path.into(), fs.read_path(path).expect("read seeded file"));
+    let sec2 = Arc::new(process::Section::new(b"before", Some(file)));
+    let v3 = proc.map_section_view(&sec2, 0, sec2.size);
+    proc.write_user(v3, b"after!");
+    assert!(proc.flush_view(v3), "flush_view should succeed");
+    let on_disk = fs.read_path(path).expect("re-read /section_check.tmp");
+    assert_eq!(&on_disk[..6], b"after!", "Section::flush didn't actually rewrite the ext2 file");
+    assert!(proc.unmap_view(v3));
+    fs.unlink_path(path).ok();
+
+    kprintln!("THOS: sections ok      shared frames across views; file-backed flush writes through to ext2");
+}
+
 /// Phase 2 milestone: a VFS with an in-memory file opened through the handle
 /// table, and the AHCI driver reading real sectors off the SATA disk.
 fn storage_milestone() {
@@ -647,6 +700,7 @@ fn storage_milestone() {
         if loaded_hives == 0 { " (first boot — defaults seeded)" } else { "" }
     );
     registry_enum_check();
+    section_sharing_check(&fs);
     let init = fs.read_path("/init").expect("read /init from ext2");
     kprintln!("THOS: ext2 ok          /init = {} bytes", init.len());
 

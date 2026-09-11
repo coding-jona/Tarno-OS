@@ -142,7 +142,9 @@ pub const NT_NTCREATESECTION: u16 = 35;
 pub const NT_NTMAPVIEWOFSECTION: u16 = 36;
 pub const NT_NTENUMERATEKEY: u16 = 37;
 pub const NT_NTENUMERATEVALUEKEY: u16 = 38;
-pub const NTDLL_STUB_COUNT: u16 = 37;
+pub const NT_NTUNMAPVIEWOFSECTION: u16 = 39;
+pub const NT_NTFLUSHVIRTUALMEMORY: u16 = 40;
+pub const NTDLL_STUB_COUNT: u16 = 41;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -187,6 +189,10 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtTerminateThread",
     "NtCreateSection",
     "NtMapViewOfSection",
+    "NtEnumerateKey",
+    "NtEnumerateValueKey",
+    "NtUnmapViewOfSection",
+    "NtFlushVirtualMemory",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -217,6 +223,7 @@ const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_NOT_MAPPED_VIEW: u32 = 0xC000_0019;
 const STATUS_MUTANT_NOT_OWNED: u32 = 0xC000_0046;
 const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = 0xC000_005F;
 
@@ -711,15 +718,14 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // NtCreateSection(*Handle, DesiredAccess, *ObjectAttributes,
         //                 *MaximumSize, PageProtection, AllocationAttributes,
         //                 FileHandle). FileHandle 0 = anonymous zeroed section;
-        // otherwise a copy of the file's bytes at create time. No shared
-        // writeback / COW; protection is not enforced yet.
+        // otherwise seeded from the file's bytes at create time, and the file
+        // kept for `NtFlushVirtualMemory` / unmap-time writeback. Protection is
+        // not enforced yet.
         NT_NTCREATESECTION => {
             const CAP: usize = 16 * 1024 * 1024;
             let file_h = stack(2) as i32;
-            let data: alloc::vec::Vec<u8> = if file_h != 0 {
-                let Some(f) = process::current_fd(file_h) else {
-                    return STATUS_INVALID_HANDLE as i64;
-                };
+            let file = if file_h != 0 { process::current_fd(file_h) } else { None };
+            let data: alloc::vec::Vec<u8> = if let Some(f) = &file {
                 let mut buf = alloc::vec::Vec::new();
                 let mut chunk = [0u8; 4096];
                 loop {
@@ -733,6 +739,8 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                     }
                 }
                 buf
+            } else if file_h != 0 {
+                return STATUS_INVALID_HANDLE as i64; // a handle was given but didn't resolve
             } else {
                 let max = if a3 != 0 { (unsafe { *(a3 as *const i64) }) as usize } else { 0 };
                 if max == 0 || max > CAP {
@@ -740,7 +748,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 }
                 alloc::vec![0u8; max]
             };
-            let sec = Arc::new(process::Section { size: data.len(), data });
+            let sec = Arc::new(process::Section::new(&data, file));
             let h = process::current_alloc_section(sec);
             if h < 0 {
                 return STATUS_NO_MEMORY as i64;
@@ -752,8 +760,9 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // NtMapViewOfSection(SectionHandle, ProcessHandle, *BaseAddress,
         //                    ZeroBits, CommitSize, *SectionOffset, *ViewSize,
         //                    InheritDisposition, AllocationType, Win32Protect).
-        // Copies the requested range into fresh private RW pages (CR3 is this
-        // process's here, so the copy writes straight into the user VA).
+        // Maps the section's own frames — this view and every other view of
+        // the same section (this process or any other) share the physical
+        // pages, so a write through one is visible through all of them.
         NT_NTMAPVIEWOFSECTION => {
             let Some(sec) = process::current_section(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
@@ -768,18 +777,42 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             }
             let want = if vsize_pp != 0 { (unsafe { *(vsize_pp as *const u64) }) as usize } else { 0 };
             let view = if want != 0 { want.min(sec.size - offset) } else { sec.size - offset };
-            let base = mem_alloc_core(view as u64);
-            if base == 0 {
-                return STATUS_NO_MEMORY as i64;
-            }
+            let Some(proc) = sched::current_proc() else {
+                return STATUS_INVALID_PARAMETER as i64; // not a user task
+            };
+            let base = proc.map_section_view(&sec, offset, view);
             unsafe {
-                core::ptr::copy_nonoverlapping(sec.data.as_ptr().add(offset), base as *mut u8, view);
                 *(a2 as *mut u64) = base;
                 if vsize_pp != 0 {
                     *(vsize_pp as *mut u64) = view as u64;
                 }
             }
             STATUS_SUCCESS as i64
+        }
+
+        // NtUnmapViewOfSection(ProcessHandle, BaseAddress). Writes the section
+        // back to its file (best-effort — the unmap proceeds either way),
+        // then tears down the mapping. STATUS_NOT_MAPPED_VIEW if `BaseAddress`
+        // doesn't name a view this process has mapped.
+        NT_NTUNMAPVIEWOFSECTION => {
+            let Some(proc) = sched::current_proc() else {
+                return STATUS_INVALID_PARAMETER as i64;
+            };
+            status(proc.unmap_view(a1), STATUS_NOT_MAPPED_VIEW)
+        }
+
+        // NtFlushVirtualMemory(ProcessHandle, **BaseAddress, *RegionSize,
+        //                      *IoStatusBlock). Writes the view's section back
+        // to its file; the mapping stays. `**BaseAddress` because real NT
+        // takes the address by reference and can round it down to the view's
+        // actual base — THOS requires the exact base `NtMapViewOfSection`
+        // returned (no partial-range flush).
+        NT_NTFLUSHVIRTUALMEMORY => {
+            let Some(proc) = sched::current_proc() else {
+                return STATUS_INVALID_PARAMETER as i64;
+            };
+            let base = unsafe { *(a1 as *const u64) };
+            status(proc.flush_view(base), STATUS_NOT_MAPPED_VIEW)
         }
 
         // NtContinue(*Context, TestAlert) — resume ring 3 from the CONTEXT the

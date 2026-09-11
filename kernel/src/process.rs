@@ -35,6 +35,16 @@ pub struct Process {
     next_user_va: AtomicU64,
     /// Program break for `brk`.
     brk: AtomicU64,
+    /// Active `NtMapViewOfSection` views in this address space, so
+    /// `NtUnmapViewOfSection` / `NtFlushVirtualMemory` can find which
+    /// `Section` (and how many pages) a base VA names.
+    views: Mutex<Vec<SectionView>>,
+}
+
+struct SectionView {
+    base: u64,
+    pages: usize,
+    section: Arc<Section>,
 }
 
 /// User virtual space for `mmap` / stacks, clear of typical ELF load addresses.
@@ -67,6 +77,7 @@ impl Process {
             pml4_phys,
             next_user_va: AtomicU64::new(USER_ALLOC_BASE),
             brk: AtomicU64::new(BRK_BASE),
+            views: Mutex::new(Vec::new()),
         })
     }
 
@@ -166,6 +177,50 @@ impl Process {
             v += 4096;
         }
         base
+    }
+
+    /// `NtMapViewOfSection`: map `sec`'s frames covering `[offset, offset+len)`
+    /// into a freshly reserved VA range in *this* address space. Unlike
+    /// `mmap_anon`, no new physical memory is allocated — the same frames get
+    /// mapped, so a write here is a write into `sec` itself, visible to every
+    /// other view of it (this process or any other) with no copy. Returns the
+    /// view's base VA; the view is remembered so `unmap_view`/`flush_view` can
+    /// find `sec` again from that VA.
+    pub fn map_section_view(&self, sec: &Arc<Section>, offset: usize, len: usize) -> u64 {
+        let frames = sec.frames_for(offset, len);
+        let base = self.next_user_va.fetch_add(frames.len() as u64 * 4096 + 0x1000, Ordering::Relaxed);
+        for (i, f) in frames.iter().enumerate() {
+            self.map(base + i as u64 * 4096, f.start_address().as_u64(), true, false);
+        }
+        self.views.lock().push(SectionView { base, pages: frames.len(), section: sec.clone() });
+        base
+    }
+
+    fn view_at(&self, base: u64) -> Option<Arc<Section>> {
+        self.views.lock().iter().find(|v| v.base == base).map(|v| v.section.clone())
+    }
+
+    /// `NtFlushVirtualMemory`: write the view at `base`'s section back to its
+    /// file (a no-op success for an anonymous section). Keeps the mapping.
+    pub fn flush_view(&self, base: u64) -> bool {
+        self.view_at(base).is_some_and(|s| s.flush())
+    }
+
+    /// `NtUnmapViewOfSection`: flush (best-effort — the unmap proceeds either
+    /// way, matching real NT), then tear down the PTEs and forget the view.
+    /// `false` if `base` doesn't name an active view in this process.
+    pub fn unmap_view(&self, base: u64) -> bool {
+        let removed = {
+            let mut views = self.views.lock();
+            let pos = views.iter().position(|v| v.base == base);
+            pos.map(|i| views.swap_remove(i))
+        };
+        let Some(v) = removed else { return false };
+        v.section.flush();
+        for i in 0..v.pages {
+            vmm::unmap_page_in(self.pml4_phys, v.base + i as u64 * 4096);
+        }
+        true
     }
 
     /// Allocate + map a fresh user stack; returns the (page-aligned) stack top.
@@ -314,12 +369,73 @@ pub fn current_uid() -> u32 {
 /// What a HANDLE / file descriptor points at. Both personalities share one
 /// per-process table: a POSIX fd and a Win32 `HANDLE` are the same integer
 /// into the same `Vec` — a file, or an executive object.
-/// A section object's backing store. Anonymous ⇒ zeroed; file-backed ⇒ a copy
-/// of the file's bytes at create time. No shared writeback / copy-on-write yet —
-/// `NtMapViewOfSection` copies the range into fresh private pages.
+/// A section object's backing store: physical frames, not a plain buffer.
+/// Every view any process maps of this section (`Process::map_section_view`)
+/// maps these *same* frames — a write through one view is visible through
+/// every other view immediately, in any process, with no copy. That's what
+/// makes it "shared": the sharing happens at the MMU, not in this struct.
+///
+/// Anonymous (`file: None`) ⇒ frames start zeroed, no writeback target.
+/// File-backed ⇒ frames start as a copy of the file's bytes, and the file is
+/// kept open so [`Section::flush`] (`NtFlushVirtualMemory`, or an implicit
+/// flush on `NtUnmapViewOfSection`) can write the current bytes back to it —
+/// the "writeback" half.
 pub struct Section {
     pub size: usize,
-    pub data: Vec<u8>,
+    frames: Vec<PhysFrame>,
+    file: Option<Arc<dyn FileOps>>,
+}
+
+impl Section {
+    /// Distribute `init` across freshly allocated physical frames (the tail
+    /// of the last page, past `init.len()`, is zeroed). `file`, if given, is
+    /// the source this section can write its current contents back to.
+    pub fn new(init: &[u8], file: Option<Arc<dyn FileOps>>) -> Self {
+        let pages = init.len().div_ceil(4096).max(1);
+        let mut frames = Vec::with_capacity(pages);
+        for i in 0..pages {
+            let f = FRAME_ALLOC.lock().alloc().expect("no frame for section");
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(phys_to_virt(f.start_address()).as_mut_ptr::<u8>(), 4096)
+            };
+            let start = i * 4096;
+            let end = (start + 4096).min(init.len());
+            dst[..end - start].copy_from_slice(&init[start..end]);
+            dst[end - start..].fill(0);
+            frames.push(f);
+        }
+        Self { size: init.len(), frames, file }
+    }
+
+    /// The frames covering `[offset, offset+len)`, page-rounded outward.
+    fn frames_for(&self, offset: usize, len: usize) -> &[PhysFrame] {
+        let first = offset / 4096;
+        let last = (offset + len).div_ceil(4096).min(self.frames.len());
+        &self.frames[first..last]
+    }
+
+    /// Write every backing frame's bytes back to the file this section was
+    /// created from. `true` (no-op) for an anonymous section — there is
+    /// nothing to write back to. THOS writes the *whole* section back rather
+    /// than tracking dirty pages — simpler, correct, just not incremental.
+    pub fn flush(&self) -> bool {
+        let Some(f) = &self.file else { return true };
+        if f.seek(0, crate::file::SEEK_SET) < 0 {
+            return false;
+        }
+        let mut remaining = self.size;
+        for frame in &self.frames {
+            let n = remaining.min(4096);
+            let src = unsafe {
+                core::slice::from_raw_parts(phys_to_virt(frame.start_address()).as_ptr::<u8>(), n)
+            };
+            if f.write(src) != n as i64 {
+                return false;
+            }
+            remaining -= n;
+        }
+        true
+    }
 }
 
 #[derive(Clone)]
