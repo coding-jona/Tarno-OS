@@ -511,10 +511,28 @@ late.
     transition test, not something a kernel-internal Rust check can stand
     in for, so (unlike sections/registry/multi-wait) it's a hand-assembled
     `pe-test` scenario, printing `PE callback OK`.
-  - **Then (the phase):** real windows on top of the mechanism above —
-    `CreateWindowExA`, window/DC objects proper, a message queue,
-    `GetMessageA`/`DispatchMessageA` driving `WndProc` for real. Then process
-    isolation / integrity for the security phase.
+  - **Real windows** (`window.rs`, new): `RegisterClassA` (class name →
+    `WndProc`), `CreateWindowExA` (→ `HWND`, queues its own `WM_CREATE`),
+    `PostMessageA`/`PostQuitMessage` and a genuine per-thread message queue
+    (`GetMessageA` really blocks on it — `WaitQueue`, same pattern as the
+    console's input queue), `DispatchMessageA`/`UpdateWindow` driving the
+    target `WndProc` for real, in ring 3, through the callback mechanism
+    above (`UpdateWindow` *sends* — a direct call, bypassing the queue,
+    matching real Win32). `ShowWindow`/`DefWindowProcA`/`TranslateMessage`
+    are still close to no-ops (no compositor, no default painting, no
+    keyboard→message pipeline yet) — deliberately: this increment is the
+    message-loop plumbing, not window rendering. A window's rect is recorded
+    but nothing clips or offsets `gdi.rs`'s (still whole-screen) drawing into
+    it yet — the natural next step once real rendering matters.
+    Verified with a real message-loop round trip in `pe-test`
+    (`RegisterClassA` → `CreateWindowExA` → `PostMessageA` a custom message
+    → a real `GetMessageA`/`DispatchMessageA` loop drives the test's own
+    `WndProc`, which calls `PostQuitMessage` with the message's `wParam` →
+    the loop exits on `WM_QUIT` → the `MSG`'s `wParam` is checked to have
+    survived the whole round trip) — prints `PE window OK`.
+  - **Then (the phase):** window-relative GDI (client-area clipping/offset,
+    replacing the still-whole-screen drawing above); process isolation /
+    integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
