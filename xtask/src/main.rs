@@ -490,9 +490,10 @@ fn write_pe_hello(path: &Path) {
         b"LoadLibraryA",     // 17
     ];
     // A func spelled `#N` is imported by ordinal N instead of by name.
-    let imports: [(&[u8], &[&[u8]]); 2] = [
+    let imports: [(&[u8], &[&[u8]]); 3] = [
         (b"KERNEL32.dll", k32_funcs),
         (b"thoscrt.dll", &[b"thos_add", b"#2", b"thos_fwd"]),
+        (b"USER32.dll", &[b"CallWindowProcA"]),
     ];
     let n_imp = imports.len();
     let import_dir_size = ((n_imp + 1) * 20) as u32;
@@ -575,6 +576,7 @@ fn write_pe_hello(path: &Path) {
     let iat_add = idata_rva + iat_at[1]; // thoscrt!thos_add  (by name)
     let iat_mul = idata_rva + iat_at[1] + 8; // thoscrt!thos_mul (by ordinal 2)
     let iat_fwd = idata_rva + iat_at[1] + 16; // thoscrt!thos_fwd (forwarded to KERNEL32.GetProcessHeap)
+    let iat_cwp = idata_rva + iat_at[2]; // USER32!CallWindowProcA
 
     // --- entry machine code (x86-64) ---
     // Deferred RIP-relative fixups: (disp32 position in `code`, target RVA).
@@ -694,6 +696,8 @@ fn write_pe_hello(path: &Path) {
     let vbase_tag = u32::MAX - 104;
     let vsize_tag = u32::MAX - 105;
     let msg_sec_tag = u32::MAX - 106;
+    let cbfn_tag = u32::MAX - 107;
+    let msg_cb_tag = u32::MAX - 108;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -1522,6 +1526,33 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2n0) CallWindowProcA(&cb_fn, 0x1111, 100, 50, 7) — the ring-3 callback
+    //      mechanism: cb_fn is *our own inline code*, called back by the
+    //      kernel (NtContinue-style resume, not a real x86 CALL) with the
+    //      Win64 WNDPROC args (hWnd/Msg/wParam/lParam) in rcx/rdx/r8/r9,
+    //      computing msg+wParam-lParam = 143 and returning it as this
+    //      syscall's own LRESULT (via NtCallbackReturn resuming *this*
+    //      frame). Trap unless the round-trip landed exactly right.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], cbfn_tag); // lea rcx, [rip+cb_fn]
+    code.extend_from_slice(&[0xBA, 0x11, 0x11, 0, 0]); // mov edx, 0x1111 (hWnd)
+    code.extend_from_slice(&[0x41, 0xB8, 100, 0, 0, 0]); // mov r8d, 100 (Msg)
+    code.extend_from_slice(&[0x41, 0xB9, 50, 0, 0, 0]); // mov r9d, 50 (wParam)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 7, 0, 0, 0]); // [rsp+0x20]=7 (lParam)
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_cwp); // call [rip+iat_CallWindowProcA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x3D, 143, 0, 0, 0]); // cmp eax, 143
+    code.extend_from_slice(&[0x74, 0x01]); // je +1
+    code.extend_from_slice(&[0xCC]); // int3 (wrong LRESULT — callback mechanism broken)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_cb_tag); // lea rdx, [rip+msg_cb]
+    let cb_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -1666,6 +1697,16 @@ fn write_pe_hello(path: &Path) {
     // ULONG_PTR arg in rcx): store the argument to apc_flag, return.
     let apc_handler_off = code.len();
     rel!([0x48, 0x89, 0x0D, 0, 0, 0, 0], apc_flag_tag); // mov [rip+apc_flag], rcx
+    code.extend_from_slice(&[0xC3]); // ret
+
+    // cb_fn — a WNDPROC-shaped callback: LRESULT cb_fn(HWND hwnd /*rcx,
+    // unused*/, UINT msg /*rdx*/, WPARAM wparam /*r8*/, LPARAM lparam /*r9*/)
+    // { return msg + wparam - lparam; } — proves the args the ring-3 callback
+    // mechanism delivers are the real ones, not garbage.
+    let cbfn_off = code.len();
+    code.extend_from_slice(&[0x48, 0x89, 0xD0]); // mov rax, rdx
+    code.extend_from_slice(&[0x4C, 0x01, 0xC0]); // add rax, r8
+    code.extend_from_slice(&[0x4C, 0x29, 0xC8]); // sub rax, r9
     code.extend_from_slice(&[0xC3]); // ret
 
     // thread_fn — a worker thread's StartRoutine (arg in rcx, ignored):
@@ -1955,7 +1996,11 @@ fn write_pe_hello(path: &Path) {
     let msg_sec: &[u8] = b"PE section OK\n";
     let msg_sec_off = code.len();
     code.extend_from_slice(msg_sec);
+    let msg_cb: &[u8] = b"PE callback OK\n";
+    let msg_cb_off = code.len();
+    code.extend_from_slice(msg_cb);
 
+    code[cb_r8..cb_r8 + 4].copy_from_slice(&(msg_cb.len() as u32).to_le_bytes());
     code[sec_r8..sec_r8 + 4].copy_from_slice(&(msg_sec.len() as u32).to_le_bytes());
     code[thread_fn_r8..thread_fn_r8 + 4].copy_from_slice(&(msg_thread.len() as u32).to_le_bytes());
     code[thr_r8..thr_r8 + 4].copy_from_slice(&(msg_thr.len() as u32).to_le_bytes());
@@ -2108,6 +2153,8 @@ fn write_pe_hello(path: &Path) {
             t if t == vbase_tag => text_rva + vbase_off as u32,
             t if t == vsize_tag => text_rva + vsize_off as u32,
             t if t == msg_sec_tag => text_rva + msg_sec_off as u32,
+            t if t == cbfn_tag => text_rva + cbfn_off as u32,
+            t if t == msg_cb_tag => text_rva + msg_cb_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -3419,6 +3466,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE thread ran") // NtCreateThreadEx worker ran its StartRoutine
         && serial.contains("PE thread OK") // main thread waited on the thread handle + resumed
         && serial.contains("PE section OK") // NtCreateSection + NtMapViewOfSection, sentinel round-trip
+        && serial.contains("PE callback OK") // CallWindowProcA: ring-3 callback mechanism, args + LRESULT round-trip
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL

@@ -144,7 +144,14 @@ pub const NT_NTENUMERATEKEY: u16 = 37;
 pub const NT_NTENUMERATEVALUEKEY: u16 = 38;
 pub const NT_NTUNMAPVIEWOFSECTION: u16 = 39;
 pub const NT_NTFLUSHVIRTUALMEMORY: u16 = 40;
-pub const NTDLL_STUB_COUNT: u16 = 41;
+/// The ring-3 callback mechanism's other half — see `dispatch_user32`'s
+/// `CallWindowProcA` and `pe::PE_CALLBACK_RETURN_ADDR`. Not a real `Nt*`
+/// (real NT's equivalent, `NtCallbackReturn`, is `win32k`-only and userland
+/// never imports it directly — `user32.dll`'s callback dispatcher calls it).
+/// THOS's version lives on `ntdll`'s table anyway since it's the same
+/// syscall-number space and nothing else needs the name.
+pub const NT_NTCALLBACKRETURN: u16 = 41;
+pub const NTDLL_STUB_COUNT: u16 = 42;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -193,6 +200,7 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtEnumerateValueKey",
     "NtUnmapViewOfSection",
     "NtFlushVirtualMemory",
+    "NtCallbackReturn",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -329,9 +337,10 @@ pub const NT_USER32_FLAG: u16 = 0x2000;
 const USER_GETSYSTEMMETRICS: u16 = 0;
 const USER_GETDC: u16 = 1;
 const USER_RELEASEDC: u16 = 2;
-pub const USER32_STUB_COUNT: u16 = 3;
+const USER_CALLWINDOWPROCA: u16 = 3;
+pub const USER32_STUB_COUNT: u16 = 4;
 pub const USER32_EXPORTS: [&str; USER32_STUB_COUNT as usize] =
-    ["GetSystemMetrics", "GetDC", "ReleaseDC"];
+    ["GetSystemMetrics", "GetDC", "ReleaseDC", "CallWindowProcA"];
 
 /// `GetStockObject`/`CreateSolidBrush`/`SelectObject`/`SetPixel`/`GetPixel`/
 /// `Rectangle` — thin syscall skin over `crate::gdi`. The `HDC` argument every
@@ -373,8 +382,55 @@ fn dispatch_user32(idx: u16, frame: &mut UserFrame) -> i64 {
             }
         }
         USER_GETDC | USER_RELEASEDC => 1,
+        // CallWindowProcA(lpPrevWndFunc, hWnd, Msg, wParam, lParam) — the
+        // ring-3 callback mechanism's first real user: call a WNDPROC-shaped
+        // function (a0) with the next four Win64 args shifted left by one
+        // (hWnd/Msg/wParam here, lParam on the stack) and hand its LRESULT
+        // back as this syscall's own return value.
+        USER_CALLWINDOWPROCA => {
+            let lparam = unsafe { *((frame.rsp + 0x28) as *const u64) };
+            invoke_ring3_callback(a0, [frame.rdx, frame.r8, frame.r9, lparam], frame)
+        }
         _ => -1,
     }
+}
+
+/// The ring-3 callback mechanism itself: call `target` (a WNDPROC-shaped
+/// `LRESULT CALLBACK(HWND, UINT, WPARAM, LPARAM)`) in ring 3, on the calling
+/// thread's own stack — below its current `rsp`, exactly as a real nested
+/// call would, since that stack is otherwise idle while this syscall runs —
+/// and eventually, via `NtCallbackReturn`, hand its return value back as if
+/// *this* syscall itself had returned it.
+///
+/// Diverges, like `NtContinue`: this never falls through to the normal
+/// syscall-return epilogue. `frame` (the syscall that asked for the
+/// callback — `CallWindowProcA` today) is stashed via
+/// `process::push_callback_frame` first; `NtCallbackReturn` resumes *that*
+/// saved frame later; instead of `NtContinue`'s ExcFrame the normal frame
+/// covers the callback's own ring-3 register loop.
+fn invoke_ring3_callback(target: u64, args: [u64; 4], frame: &UserFrame) -> i64 {
+    process::push_callback_frame(process::current_tid(), *frame);
+
+    // A fresh call frame below the caller's own stack: a return address
+    // (the trampoline) plus the Win64 shadow space the callback may
+    // scribble into, 16-aligned as if a real `call` had just landed here.
+    let ret_rsp = ((frame.rsp - 0x100) & !0xF) - 8;
+    unsafe { *(ret_rsp as *mut u64) = crate::pe::PE_CALLBACK_RETURN_ADDR };
+
+    let (cs, ss) = process::user_selectors();
+    let f = crate::seh::ExcFrame {
+        rip: target,
+        rsp: ret_rsp,
+        rcx: args[0],
+        rdx: args[1],
+        r8: args[2],
+        r9: args[3],
+        rflags: 0x202, // reserved bit + IF (ring 3 stays preemptible)
+        cs,
+        ss,
+        ..Default::default()
+    };
+    unsafe { crate::seh::thos_exc_resume(&f) }
 }
 
 const MSV_MEMCPY: u16 = 0;
@@ -885,6 +941,30 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let base = unsafe { *(a1 as *const u64) };
             status(proc.flush_view(base), STATUS_NOT_MAPPED_VIEW)
         }
+
+        // NtCallbackReturn(Result) — the ring-3 callback mechanism's other
+        // half (see `dispatch_user32`'s `CallWindowProcA`): resume whichever
+        // syscall frame is stashed for this thread, with `Result` as that
+        // syscall's own return value, instead of returning to the trampoline
+        // that made this call. A stray call (nothing stashed) has nothing
+        // sane to resume into — end the thread rather than fall into the
+        // trampoline's `jmp $` safety net.
+        NT_NTCALLBACKRETURN => match process::pop_callback_frame(process::current_tid()) {
+            Some(mut saved) => {
+                saved.rax = a0;
+                // `saved` was captured on the normal syscall fast path, where
+                // `UserFrame.cs`/`.ss` are dead slots (`sysretq` needs neither
+                // — see the entry stub's `sub rsp, 16`) and so hold whatever
+                // garbage was on the kernel stack, not real selectors.
+                // `thos_user_resume` (unlike `sysretq`) does IRETQ and reads
+                // both — fill them in for real or the IRETQ #GPs.
+                let (cs, ss) = process::user_selectors();
+                saved.cs = cs;
+                saved.ss = ss;
+                unsafe { crate::syscall::thos_user_resume(&saved) }
+            }
+            None => sched::exit(),
+        },
 
         // NtContinue(*Context, TestAlert) — resume ring 3 from the CONTEXT the
         // exception / APC dispatcher (maybe) fixed up. When `TestAlert` is set

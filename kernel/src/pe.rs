@@ -142,6 +142,16 @@ pub const PE_INITTERM_ADDR: u64 = NT_STUB_BASE + 0x10000;
 const PE_USER32_ADDR: u64 = NT_STUB_BASE + 0x11000;
 const PE_GDI32_ADDR: u64 = NT_STUB_BASE + 0x12000;
 
+/// The ring-3 callback mechanism's return trampoline (`CallWindowProcA` /
+/// `NtCallbackReturn` — see `nt::dispatch_user32`): the address
+/// `CallWindowProcA` sets as the callback's return address. Runs *after* the
+/// callback returns, on the caller's own stack — `mov r10, rax` moves its
+/// `LRESULT` into the arg0 slot every trampoline uses, then a normal syscall
+/// into `NtCallbackReturn`. Never falls through in practice (that syscall
+/// resumes a *different* saved context instead of returning); the trailing
+/// `jmp $` is just a safety net against ever running off the page.
+pub const PE_CALLBACK_RETURN_ADDR: u64 = NT_STUB_BASE + 0x13000;
+
 /// A single worker thread's TEB + entry stub + stack. One extra thread per PE
 /// process for now (fixed regions); a real per-thread allocator comes later.
 const PE_TEB2_ADDR: u64 = NT_STUB_BASE + 0xC000;
@@ -789,6 +799,7 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     map_msvcrt_page(proc)?;
     map_user32_page(proc)?;
     map_gdi32_page(proc)?;
+    map_callback_return_page(proc)?;
     map_crt_page(proc)?;
     map_initterm_page(proc)?;
     map_seh_pages(proc)?;
@@ -1395,6 +1406,30 @@ fn map_user32_page(proc: &Process) -> Result<(), &'static str> {
 }
 fn map_gdi32_page(proc: &Process) -> Result<(), &'static str> {
     map_synth_dll(proc, PE_GDI32_ADDR, "GDI32.DLL", &crate::nt::GDI32_EXPORTS, crate::nt::NT_GDI32_FLAG, &[])
+}
+
+/// Build the r-x callback-return trampoline page (see
+/// [`PE_CALLBACK_RETURN_ADDR`]).
+fn map_callback_return_page(proc: &Process) -> Result<(), &'static str> {
+    let f = FRAME_ALLOC.lock().alloc().ok_or("PE: out of frames (callback return)")?;
+    let page = unsafe {
+        let p = phys_to_virt(f.start_address()).as_mut_ptr::<u8>();
+        core::ptr::write_bytes(p, 0, 4096);
+        core::slice::from_raw_parts_mut(p, 4096)
+    };
+    let sel = (crate::nt::NT_BASE | crate::nt::NT_NTDLL_FLAG as u64 | crate::nt::NT_NTCALLBACKRETURN as u64) as u32;
+    #[rustfmt::skip]
+    let mut code: [u8; 10] = [
+        0x49, 0x89, 0xC2,       // mov r10, rax        ; LRESULT -> arg0
+        0xB8, 0, 0, 0, 0,       // mov eax, sel         ; NtCallbackReturn (patched below)
+        0x0F, 0x05,             // syscall
+    ];
+    code[4..8].copy_from_slice(&sel.to_le_bytes());
+    page[..code.len()].copy_from_slice(&code);
+    page[code.len()] = 0xEB; // jmp $ (safety net, never reached in practice)
+    page[code.len() + 1] = 0xFE;
+    proc.map(PE_CALLBACK_RETURN_ADDR, f.start_address().as_u64(), false, true);
+    Ok(())
 }
 
 /// Build the r-x `_initterm` stub page (see [`PE_INITTERM_ADDR`]).

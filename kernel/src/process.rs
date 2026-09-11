@@ -888,6 +888,34 @@ pub fn register_thread_exit(tid: u64, ev: Arc<Event>) {
     THREAD_EXITS.lock().insert(tid, ev);
 }
 
+/// The ring-3 callback mechanism's save stack (`CallWindowProcA` /
+/// `NtCallbackReturn` — see `nt::dispatch_user32`): the syscall frame a
+/// thread was in when it asked the kernel to call back into ring-3 code, so
+/// `NtCallbackReturn` can resume *that* context (with the callback's result
+/// in `rax`) instead of the trampoline that invoked it. A `Vec` per thread,
+/// not just one slot, so a callback that itself triggers another callback
+/// nests correctly (LIFO, matching real call/return order).
+static CALLBACK_FRAMES: Mutex<BTreeMap<u64, Vec<crate::syscall::UserFrame>>> =
+    Mutex::new(BTreeMap::new());
+
+/// Stash `frame` before diverging into a ring-3 callback.
+pub fn push_callback_frame(tid: u64, frame: crate::syscall::UserFrame) {
+    CALLBACK_FRAMES.lock().entry(tid).or_default().push(frame);
+}
+
+/// Pop the most recently stashed frame for `tid` (`NtCallbackReturn`'s doing
+/// the popping) — `None` if the thread has no callback in flight (a stray or
+/// duplicate `NtCallbackReturn`).
+pub fn pop_callback_frame(tid: u64) -> Option<crate::syscall::UserFrame> {
+    let mut frames = CALLBACK_FRAMES.lock();
+    let stack = frames.get_mut(&tid)?;
+    let f = stack.pop();
+    if stack.is_empty() {
+        frames.remove(&tid);
+    }
+    f
+}
+
 /// Signal + forget `tid`'s exit event. `false` if none was registered (i.e. the
 /// caller is the process's original thread).
 pub fn signal_thread_exit(tid: u64) -> bool {
