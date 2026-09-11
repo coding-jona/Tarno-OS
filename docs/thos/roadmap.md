@@ -429,11 +429,27 @@ late.
     (`sched::current().id`) distinguishes threads within a process; a `THREAD_EXITS`
     map gives each worker a manual exit event, so `NtWaitForSingleObject` on the
     returned handle completes on exit. `PE thread ran` / `PE thread OK`.
-  - **Section objects.** `HandleObject::Section` — anonymous (zeroed) or a copy
-    of a file's bytes at create time. `NtCreateSection` / `NtMapViewOfSection`
-    (copies the range into fresh private RW pages; CR3 is the process's so the
-    copy writes straight to the user VA). No shared writeback / COW yet.
-    `PE section OK`.
+  - **Section objects.** `HandleObject::Section` — backed by real physical
+    frames (`process::Section`), not a copy: `NtMapViewOfSection` maps a
+    section's own frames into the caller's page tables, so every view of one
+    section (same process or a different one) shares the same memory — a
+    write through one view is visible through all the others immediately, at
+    the MMU, with no copy. Anonymous sections start zeroed; file-backed ones
+    seed from the file's bytes at create time and keep the file open so
+    `NtFlushVirtualMemory` (or an implicit flush on `NtUnmapViewOfSection`)
+    can write the current bytes back to it. `Process::unmap_view` tears the
+    PTEs down (`vmm::unmap_page_in`, `invlpg`'d) without freeing the shared
+    frames — a section's frames outlive any one view. `PE section OK`;
+    `section_sharing_check` proves cross-view write visibility and genuine
+    ext2 writeback on real boot (`ext2-test`).
+  - **`Ext2File`** (`file.rs`): the missing piece that makes file-backed
+    writeback real — a `FileOps` impl for actual ext2 regular files
+    (read/write, whole-file-rewrite-on-write via `Ext2::write_path`, same
+    "rewrite it all, synchronously" pattern as the registry hives). Replaces
+    the old read-only `MemFile` at the one call site (`syscall::open_resolved`,
+    shared by POSIX `open`/`openat` and `CreateFileA`) — every open handle,
+    including the ones `NtCreateSection` seeds a section from, is now
+    genuinely writable.
   - **Done since:** the ring-3 IRQ `swapgs` shim (PE threads run `IF=1`,
     preemptible — `3aabdbd`); a fully-blocking timed object wait (dual-enqueue:
     object queue + timer wheel — `33a5c79`); a real **multi-object wait-block**
@@ -443,12 +459,15 @@ late.
     loop — `b42e8eb`; `multi_wait_milestone` proves WaitAny/WaitAll both block
     and wake correctly with two threads on an overlapping set concurrently);
     a scheduler stale-`ctx`/phantom-ready-queue race found and fixed
-    (`db9e59f`, `1c2358a` — smp-test 46/46 incl. under host load).
+    (`db9e59f`, `1c2358a` — smp-test 46/46 incl. under host load); the
+    **registry** grown to persisted hives (three `.hiv` files under
+    `/etc/thos/registry`, loaded once at boot, rewritten synchronously on
+    every mutation — verified with a genuine two-boot load-from-disk
+    round-trip — `6cb2c10`); **shared-writeback sections** (above).
   - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
     unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
-    unmodified), or a from-scratch `ntdll` — shared-writeback sections, the
-    registry grown to hives; then process isolation / integrity for the
-    security phase.
+    unmodified), or a from-scratch `ntdll`; then process isolation / integrity
+    for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
