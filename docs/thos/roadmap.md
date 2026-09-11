@@ -464,10 +464,35 @@ late.
     `/etc/thos/registry`, loaded once at boot, rewritten synchronously on
     every mutation — verified with a genuine two-boot load-from-disk
     round-trip — `6cb2c10`); **shared-writeback sections** (above).
-  - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
-    unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
-    unmodified), or a from-scratch `ntdll`; then process isolation / integrity
-    for the security phase.
+  - **Decided: the Wine/`ntdll` boundary.** Staying on the from-scratch
+    `ntdll` — not Wine's `__wine_unix_call` unixlib + a wineserver-equivalent.
+    Wine isn't a component that bolts on: it brings its own object model, its
+    own wineserver IPC protocol, its own view of processes/handles/sync
+    objects, all of which would need reimplementing on THOS's executive
+    anyway — no less work than the from-scratch path, just against someone
+    else's moving target instead of THOS's own design, and it would mean
+    discarding a `ntdll` that already works (SSDT dispatch, PE loader,
+    sections, hive registry, multi-object wait, real mingw-CRT programs
+    running to exit).
+  - **GDI32/User32 skeleton** (new synthetic `gdi32.dll`/`user32.dll`,
+    alongside `kernel32`/`ntdll`/`msvcrt`, same trampoline-page mechanism):
+    `GetDC`/`ReleaseDC`/`GetSystemMetrics`, `GetStockObject`/
+    `CreateSolidBrush`/`SelectObject`, `SetPixel`/`GetPixel`/`Rectangle` —
+    real pixel writes into the boot framebuffer (mapped into THOS's own
+    tables via `vmm::map_mmio`, same VA Limine used), not a stub. One DC (the
+    whole screen), a brush is just a colour — no window objects, no
+    compositor, no WndProc callback yet. `gdi_paint_check` (kernel-internal,
+    same rationale as `registry_enum_check`/`section_sharing_check`) verifies
+    fill bounds, the SetPixel/GetPixel round-trip, and brush/select-object
+    semantics against the real framebuffer on boot.
+  - **Then (the phase):** real windows — `CreateWindowExA` + a message loop
+    that can call back into ring-3 `WndProc` code. That needs a mechanism
+    THOS doesn't have yet: calling from a kernel syscall handler into
+    arbitrary ring-3 code and getting a return value back *within* that same
+    syscall (real Windows' `DispatchMessageA` is ordinary user32 code making
+    a direct call; ours is a kernel trampoline, so it has to build that call
+    frame itself — akin to the exception/APC dispatch machinery, but
+    synchronous). Then process isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
