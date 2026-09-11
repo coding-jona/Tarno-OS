@@ -485,14 +485,36 @@ late.
     same rationale as `registry_enum_check`/`section_sharing_check`) verifies
     fill bounds, the SetPixel/GetPixel round-trip, and brush/select-object
     semantics against the real framebuffer on boot.
-  - **Then (the phase):** real windows — `CreateWindowExA` + a message loop
-    that can call back into ring-3 `WndProc` code. That needs a mechanism
-    THOS doesn't have yet: calling from a kernel syscall handler into
-    arbitrary ring-3 code and getting a return value back *within* that same
-    syscall (real Windows' `DispatchMessageA` is ordinary user32 code making
-    a direct call; ours is a kernel trampoline, so it has to build that call
-    frame itself — akin to the exception/APC dispatch machinery, but
-    synchronous). Then process isolation / integrity for the security phase.
+  - **The ring-3 callback mechanism.** The piece real windows need —
+    calling from a kernel syscall handler into arbitrary ring-3 code and
+    getting a return value back *within that same syscall* — is built and
+    proven: `CallWindowProcA` (`dispatch_user32`) stashes the calling
+    syscall's own `UserFrame` per-thread (`process::push/pop_callback_frame`,
+    LIFO — a callback that triggers another nests correctly), builds a fresh
+    ring-3 call frame on the caller's own (otherwise idle) stack — real
+    args in `rcx`/`rdx`/`r8`/`r9`, return address pointing at a small new
+    trampoline page (`pe::PE_CALLBACK_RETURN_ADDR`) — and resumes into it
+    via `seh::thos_exc_resume` (the same IRETQ-based primitive `NtContinue`
+    already uses to resume an arbitrary saved context). The trampoline runs
+    *after* the ring-3 function returns, on the caller's stack, and calls a
+    new `NtCallbackReturn` (`ntdll`, index 41), which pops the stashed frame,
+    writes the callback's result into its `rax`, and resumes *that* via
+    `syscall::thos_user_resume` — so the original syscall (`CallWindowProcA`)
+    ends up returning the callback's value, exactly as if it had done the
+    call itself. One real bug found and fixed en route: a stashed
+    `syscall::UserFrame` carries garbage in `.cs`/`.ss` (dead slots on the
+    normal `sysretq` fast path — `thos_user_resume`'s IRETQ needs both, and
+    without filling them in first, resuming faulted with `#GP`). Verified
+    with a genuine ring-3 round-trip (`CallWindowProcA` calling an inline
+    callback in the test PE's own code, computing `msg+wParam-lParam` and
+    handing the result back) — this is inherently a real-CPU-privilege-
+    transition test, not something a kernel-internal Rust check can stand
+    in for, so (unlike sections/registry/multi-wait) it's a hand-assembled
+    `pe-test` scenario, printing `PE callback OK`.
+  - **Then (the phase):** real windows on top of the mechanism above —
+    `CreateWindowExA`, window/DC objects proper, a message queue,
+    `GetMessageA`/`DispatchMessageA` driving `WndProc` for real. Then process
+    isolation / integrity for the security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
