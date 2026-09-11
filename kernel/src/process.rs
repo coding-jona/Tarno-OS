@@ -379,6 +379,16 @@ impl Waitable {
             Waitable::Mutant(m) => m.is_signaled(tid),
         }
     }
+
+    /// The underlying wait queue — for `wait::wait_any_until`
+    /// (`NtWaitForMultipleObjects`'s real multi-object block).
+    pub fn queue(&self) -> &crate::wait::WaitQueue {
+        match self {
+            Waitable::Event(e) => e.queue(),
+            Waitable::Semaphore(s) => s.queue(),
+            Waitable::Mutant(m) => m.queue(),
+        }
+    }
 }
 
 /// One table slot: the object plus its close-on-exec flag (per-descriptor, not

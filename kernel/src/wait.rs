@@ -102,6 +102,10 @@ impl WaitQueue {
         self.waiters.lock().retain(|x| !Arc::ptr_eq(x, t));
     }
 
+    fn queue_ptr(&self) -> *const WaitQueue {
+        self as *const WaitQueue
+    }
+
     /// Wake one blocked thread, if any. Returns whether one was woken.
     pub fn wake_one(&self) -> bool {
         match self.waiters.lock().pop_front() {
@@ -141,6 +145,64 @@ impl WaitQueue {
         }
         n
     }
+}
+
+/// The `NtWaitForMultipleObjects` primitive: block the current thread on every
+/// queue in `queues` **simultaneously** (and, if `deadline` is given, the
+/// timer wheel too) — whichever fires first, any queue's `wake_*` or the
+/// deadline, wakes the thread. Condvar contract, same as [`WaitQueue::wait_if`]
+/// / [`WaitQueue::wait_if_until`]: the caller re-checks the real state of every
+/// object itself; the `bool` says only whether the deadline had passed.
+///
+/// `should_block` is evaluated with **every** queue's lock held at once (in
+/// ascending address order, and each distinct address only once, so two
+/// concurrent multi-waits over an overlapping object set — or a caller
+/// passing the same object's handle twice — can never deadlock against each
+/// other or against themselves). That closes the check-then-sleep window
+/// across the whole object set: a `signal()` / `release()` on any one of them
+/// blocks on that queue's lock until we have either bailed out or finished
+/// enqueuing on all of them, so it can never land in the gap.
+pub fn wait_any_until<F: FnOnce() -> bool>(
+    queues: &[&WaitQueue],
+    deadline: Option<u64>,
+    should_block: F,
+) -> bool {
+    interrupts::without_interrupts(|| {
+        let mut qs: alloc::vec::Vec<&WaitQueue> = queues.to_vec();
+        qs.sort_by_key(|q| q.queue_ptr() as usize);
+        qs.dedup_by_key(|q| q.queue_ptr() as usize);
+
+        let mut guards: alloc::vec::Vec<_> = alloc::vec::Vec::with_capacity(qs.len());
+        for q in &qs {
+            guards.push(q.waiters.lock());
+        }
+
+        if !should_block() {
+            return false;
+        }
+
+        let me = sched::current();
+        sched::mark_blocking(&me);
+        for g in guards.iter_mut() {
+            g.push_back(me.clone());
+        }
+        drop(guards);
+
+        if let Some(d) = deadline {
+            crate::timer::arm(d, me.clone());
+        }
+        sched::block_current();
+
+        // Woken by one of the objects, the deadline, or spuriously — scrub
+        // this thread out of every queue and the wheel.
+        for q in queues {
+            q.remove(&me);
+        }
+        if deadline.is_some() {
+            crate::timer::disarm(&me);
+        }
+        deadline.is_some_and(|d| crate::timer::now() >= d)
+    })
 }
 
 /// Manual-reset (`Notification`) stays signalled until `reset`; auto-reset
@@ -186,6 +248,11 @@ impl Event {
 
     pub fn is_signaled(&self) -> bool {
         self.signaled.load(Ordering::Acquire)
+    }
+
+    /// The underlying wait queue — for [`wait_any_until`] (`NtWaitForMultipleObjects`).
+    pub fn queue(&self) -> &WaitQueue {
+        &self.queue
     }
 
     /// Non-blocking check that consumes the signal for an auto-reset event.
@@ -314,6 +381,11 @@ impl Semaphore {
     pub fn is_signaled(&self) -> bool {
         self.count.load(Ordering::Acquire) > 0
     }
+
+    /// The underlying wait queue — for [`wait_any_until`] (`NtWaitForMultipleObjects`).
+    pub fn queue(&self) -> &WaitQueue {
+        &self.queue
+    }
 }
 
 /// A mutant (NT mutex): recursive, thread-owned. `owner == 0` ⇒ free. Signalled
@@ -388,5 +460,10 @@ impl Mutant {
 
     pub fn is_signaled(&self, tid: u64) -> bool {
         matches!(self.owner.load(Ordering::Acquire), 0) || self.owner.load(Ordering::Acquire) == tid
+    }
+
+    /// The underlying wait queue — for [`wait_any_until`] (`NtWaitForMultipleObjects`).
+    pub fn queue(&self) -> &WaitQueue {
+        &self.queue
     }
 }

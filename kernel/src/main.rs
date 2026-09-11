@@ -147,6 +147,7 @@ extern "C" fn kmain() -> ! {
     syscall::init_cpu(0);
 
     scheduler_milestone();
+    multi_wait_milestone();
     storage_milestone();
 
     #[cfg(feature = "interactive")]
@@ -360,6 +361,60 @@ fn scheduler_milestone() {
         "THOS: wait primitive   waiter woke via Event; handles open {}",
         object::open_count()
     );
+}
+
+// --- Milestone 1 addition: the real multi-object wait-block
+// (`wait::wait_any_until`, what `NtWaitForMultipleObjects` uses) — two
+// threads each parked on the *same pair* of events at once, one WaitAny-style
+// (wakes on the first) and one WaitAll-style (wakes only once both are set),
+// proving the multi-queue block actually blocks and wakes correctly, and that
+// two independent multi-waits over an overlapping object set don't deadlock
+// each other via the fixed-lock-order dedup in `wait_any_until`.
+static MULTI_EV_A: wait::Event = wait::Event::new();
+static MULTI_EV_B: wait::Event = wait::Event::new();
+static MULTI_WOKE_ANY: AtomicBool = AtomicBool::new(false);
+static MULTI_WOKE_ALL: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn multi_any_waiter(_: usize) -> ! {
+    while !MULTI_EV_A.is_signaled() && !MULTI_EV_B.is_signaled() {
+        wait::wait_any_until(&[MULTI_EV_A.queue(), MULTI_EV_B.queue()], None, || {
+            !MULTI_EV_A.is_signaled() && !MULTI_EV_B.is_signaled()
+        });
+    }
+    MULTI_WOKE_ANY.store(true, Ordering::Release);
+    sched::exit()
+}
+
+extern "C" fn multi_all_waiter(_: usize) -> ! {
+    while !(MULTI_EV_A.is_signaled() && MULTI_EV_B.is_signaled()) {
+        wait::wait_any_until(&[MULTI_EV_A.queue(), MULTI_EV_B.queue()], None, || {
+            !(MULTI_EV_A.is_signaled() && MULTI_EV_B.is_signaled())
+        });
+    }
+    MULTI_WOKE_ALL.store(true, Ordering::Release);
+    sched::exit()
+}
+
+extern "C" fn multi_setter(_: usize) -> ! {
+    for _ in 0..20 {
+        sched::yield_now();
+    }
+    MULTI_EV_A.signal(); // the WaitAny waiter must wake now — WaitAll must not yet
+    for _ in 0..20 {
+        sched::yield_now();
+    }
+    MULTI_EV_B.signal(); // now the WaitAll waiter must wake too
+    sched::exit()
+}
+
+fn multi_wait_milestone() {
+    sched::spawn("multi-any", multi_any_waiter, 0);
+    sched::spawn("multi-all", multi_all_waiter, 0);
+    sched::spawn("multi-set", multi_setter, 0);
+    while !MULTI_WOKE_ANY.load(Ordering::Acquire) || !MULTI_WOKE_ALL.load(Ordering::Acquire) {
+        sched::yield_now();
+    }
+    kprintln!("THOS: multi wait ok    WaitAny + WaitAll both blocked and woke correctly");
 }
 
 // --- SMP scheduler stress (feature = "stress", driven by `cargo xtask smp-test`) ---

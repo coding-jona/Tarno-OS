@@ -16,7 +16,7 @@
 use alloc::sync::Arc;
 
 use crate::syscall::UserFrame;
-use crate::wait::{Event, EventMode};
+use crate::wait::{self, Event, EventMode};
 use crate::{process, sched};
 
 /// `rax` values `NT_BASE ..= NT_BASE|0xFFFF` are NT-personality calls.
@@ -594,11 +594,12 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
 
         // NtWaitForMultipleObjects(Count, Handles[], WaitType, Alertable,
         //                          *Timeout). WaitType 0 = WaitAll, 1 = WaitAny.
-        // WaitAny returns STATUS_WAIT_0 + index. Re-polls each object, sleeping
-        // one tick between passes on the timer wheel (so it yields the CPU
-        // properly, not a scheduler spin); same timeout rules as
-        // NtWaitForSingleObject. A true multi-object block (a wait-block
-        // enqueued on every object's queue at once) is the remaining refinement.
+        // WaitAny returns STATUS_WAIT_0 + index. Fully blocking: the thread is
+        // parked on every object's WaitQueue at once (`wait::wait_any_until`,
+        // dedupes a repeated handle so it can't self-deadlock) and, for a
+        // relative timeout, the timer wheel too — no poll loop. Whichever
+        // object is signalled, or the deadline, wakes it; the loop then
+        // re-checks the real WaitAll/WaitAny condition itself.
         NT_NTWAITFORMULTIPLEOBJECTS => {
             let count = a0 as usize;
             if count == 0 || count > 64 {
@@ -643,10 +644,17 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 if poll_once || deadline.is_some_and(|d| crate::timer::now() >= d) {
                     return STATUS_TIMEOUT as i64;
                 }
-                // Sleep to the deadline, but wake each tick to re-poll every
-                // object (no per-object enqueue yet).
-                let next = crate::timer::now() + 1;
-                crate::timer::sleep_until(deadline.map_or(next, |d| d.min(next)));
+                let queues: alloc::vec::Vec<&wait::WaitQueue> = objs.iter().map(|w| w.queue()).collect();
+                let timed_out = wait::wait_any_until(&queues, deadline, || {
+                    if wait_all {
+                        !objs.iter().all(|w| w.is_signaled(tid))
+                    } else {
+                        !objs.iter().any(|w| w.is_signaled(tid))
+                    }
+                });
+                if timed_out {
+                    return STATUS_TIMEOUT as i64;
+                }
             }
         }
 
