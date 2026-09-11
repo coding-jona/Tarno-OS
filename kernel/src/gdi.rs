@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Phase 3 — GDI32/User32 skeleton: one real framebuffer, no windows yet.
+//! Phase 3 — GDI32/User32: the real framebuffer, now window-relative.
 //!
-//! There is no window manager, no compositor, no WndProc callback mechanism
-//! (that needs a way to call back into ring-3 code mid-syscall — a real chunk
-//! of work, the next increment). What this gives instead is the actual pixel
-//! plumbing: the boot framebuffer Limine handed us, mapped into THOS's own
-//! page tables and reachable from the NT personality, plus just enough of a
-//! "device context" model (one DC, the whole screen; a brush is just a
-//! colour) for `GetDC`/`SetPixel`/`GetPixel`/`Rectangle`/`GetSystemMetrics`
-//! to do the real thing. Everything here is plain Rust, not syscall-shaped —
-//! `nt::dispatch_gdi32`/`dispatch_user32` are the thin syscall skin on top.
+//! `GetDC(0)` still hands back the fixed screen DC (`1`) — draw in screen
+//! coordinates, clipped only to the screen. `GetDC(hwnd)` for a real window
+//! (`crate::window`) hands back a DC tagged with that `hwnd`
+//! ([`WINDOW_DC_TAG`]); every draw through it is in *client* coordinates —
+//! offset by the window's `(x, y)` and clipped to its rect intersected with
+//! the screen — exactly like real Win32. Still no compositor (windows don't
+//! occlude each other, there's no z-order) and every DC still just carries
+//! one current brush colour, no real GDI object table.
+
+use alloc::collections::BTreeMap;
 
 use spin::{Mutex, Once};
 
@@ -25,10 +26,17 @@ struct FbInfo {
 
 static FB: Once<FbInfo> = Once::new();
 
-/// The one and only DC's current fill colour (`COLORREF`, `0x00BBGGRR`).
-/// `GetDC` always returns the fixed handle `1` — there is nothing to look up
-/// yet, since there is only one DC.
-static CURRENT_BRUSH: Mutex<u32> = Mutex::new(0x00FF_FFFF); // white
+/// Tag bit OR-ed into a window's `hwnd` to make a `GetDC(hwnd)` handle —
+/// distinguishes a window DC from the fixed screen DC (`1`) in every
+/// drawing call. `hwnd`s are small (`window::NEXT_HWND` starts at 1), so
+/// this bit is always free.
+pub const WINDOW_DC_TAG: u64 = 0x8000_0000;
+
+/// Each DC's current brush colour (`COLORREF`), keyed by the DC handle
+/// itself; defaults to white the first time a DC is drawn through or
+/// selected into. No real GDI object table — a brush "handle" is just a
+/// colour (see [`create_solid_brush`]), so there is nothing else to store.
+static BRUSHES: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
 
 pub const SM_CXSCREEN: i64 = 0;
 pub const SM_CYSCREEN: i64 = 1;
@@ -97,12 +105,44 @@ fn ptr_at(x: u32, y: u32) -> Option<*mut u32> {
     Some((f.virt + y as u64 * f.pitch as u64 + x as u64 * 4) as *mut u32)
 }
 
-/// `SetPixel(hdc, x, y, colorref)`. `0xFFFF_FFFF` (`CLR_INVALID`) off-screen.
-pub fn set_pixel(x: i64, y: i64, colorref: u32) -> u32 {
-    if x < 0 || y < 0 {
+/// A DC's resolved drawing bounds: where its own `(0, 0)` lands on screen,
+/// and the screen rectangle drawing through it must stay inside (already
+/// intersected with the screen, so callers never need to check separately).
+struct DcBounds {
+    origin: (i32, i32),
+    clip: (i32, i32, i32, i32), // left, top, right, bottom — screen coords, exclusive
+}
+
+fn resolve_dc(dc: u64) -> DcBounds {
+    let (w, h) = screen_size();
+    let screen = || DcBounds { origin: (0, 0), clip: (0, 0, w as i32, h as i32) };
+    if dc & WINDOW_DC_TAG == 0 {
+        return screen();
+    }
+    let hwnd = (dc & !WINDOW_DC_TAG) as u32;
+    match crate::window::rect_of(hwnd) {
+        // A window's own client rect, clamped to the screen — a window
+        // partially (or fully) off-screen just clips there, like real GDI.
+        Some((x, y, cw, ch)) => DcBounds {
+            origin: (x, y),
+            clip: (x.max(0), y.max(0), (x + cw).min(w as i32), (y + ch).min(h as i32)),
+        },
+        // A destroyed/unknown hwnd: fall back to the screen rather than a
+        // DC that can never draw anything.
+        None => screen(),
+    }
+}
+
+/// `SetPixel(hdc, x, y, colorref)` — `x`/`y` are client-relative for a
+/// window DC. `0xFFFF_FFFF` (`CLR_INVALID`) outside the DC's clip rect.
+pub fn set_pixel(dc: u64, x: i64, y: i64, colorref: u32) -> u32 {
+    let b = resolve_dc(dc);
+    let (sx, sy) = (b.origin.0 as i64 + x, b.origin.1 as i64 + y);
+    let (l, t, r, bot) = b.clip;
+    if sx < l as i64 || sy < t as i64 || sx >= r as i64 || sy >= bot as i64 {
         return u32::MAX;
     }
-    match ptr_at(x as u32, y as u32) {
+    match ptr_at(sx as u32, sy as u32) {
         Some(p) => {
             unsafe { p.write_volatile(pack(colorref)) };
             colorref
@@ -111,31 +151,41 @@ pub fn set_pixel(x: i64, y: i64, colorref: u32) -> u32 {
     }
 }
 
-/// `GetPixel(hdc, x, y)`. `0xFFFF_FFFF` (`CLR_INVALID`) off-screen.
-pub fn get_pixel(x: i64, y: i64) -> u32 {
-    if x < 0 || y < 0 {
+/// `GetPixel(hdc, x, y)` — the inverse of [`set_pixel`]'s coordinate mapping.
+pub fn get_pixel(dc: u64, x: i64, y: i64) -> u32 {
+    let b = resolve_dc(dc);
+    let (sx, sy) = (b.origin.0 as i64 + x, b.origin.1 as i64 + y);
+    let (l, t, r, bot) = b.clip;
+    if sx < l as i64 || sy < t as i64 || sx >= r as i64 || sy >= bot as i64 {
         return u32::MAX;
     }
-    match ptr_at(x as u32, y as u32) {
+    match ptr_at(sx as u32, sy as u32) {
         Some(p) => unpack(unsafe { p.read_volatile() }),
         None => u32::MAX,
     }
 }
 
-/// `Rectangle(hdc, left, top, right, bottom)`: fill `[left,right) x [top,bottom)`
-/// with the DC's current brush colour, clamped to the screen. `false` if the
-/// (clamped) rectangle is empty — otherwise `true`, matching real GDI's BOOL.
-pub fn fill_rect(left: i64, top: i64, right: i64, bottom: i64) -> bool {
-    let Some(f) = fb() else { return false };
-    let color = pack(*CURRENT_BRUSH.lock());
-    let l = left.max(0) as u32;
-    let t = top.max(0) as u32;
-    let r = (right.max(0) as u32).min(f.width);
-    let b = (bottom.max(0) as u32).min(f.height);
-    if l >= r || t >= b {
+/// `Rectangle(hdc, left, top, right, bottom)`: fill `[left,right) x
+/// [top,bottom)`, client-relative for a window DC, with the DC's current
+/// brush colour, clamped to its clip rect. `false` if the clamped rectangle
+/// is empty — otherwise `true`, matching real GDI's BOOL.
+pub fn fill_rect(dc: u64, left: i64, top: i64, right: i64, bottom: i64) -> bool {
+    if fb().is_none() {
         return false;
     }
-    for y in t..b {
+    let b = resolve_dc(dc);
+    let color = pack(brush_of(dc));
+    let (ox, oy) = (b.origin.0 as i64, b.origin.1 as i64);
+    let (cl, ct, cr, cb) = b.clip;
+    let l = (ox + left).max(cl as i64).max(0) as u32;
+    let t = (oy + top).max(ct as i64).max(0) as u32;
+    let r = ((ox + right).min(cr as i64).max(0)) as u32;
+    let bot = ((oy + bottom).min(cb as i64).max(0)) as u32;
+    if l >= r || t >= bot {
+        return false;
+    }
+    let f = fb().unwrap();
+    for y in t..bot {
         let row = (f.virt + y as u64 * f.pitch as u64) as *mut u32;
         for x in l..r {
             unsafe { row.add(x as usize).write_volatile(color) };
@@ -144,8 +194,12 @@ pub fn fill_rect(left: i64, top: i64, right: i64, bottom: i64) -> bool {
     true
 }
 
+fn brush_of(dc: u64) -> u32 {
+    *BRUSHES.lock().entry(dc).or_insert(0x00FF_FFFF) // default: white
+}
+
 /// A brush "handle" is just its colour with a tag bit — there is no real GDI
-/// object table yet (nothing to look up: one DC, one current brush).
+/// object table yet (nothing to look up beyond a DC's current colour).
 const BRUSH_TAG: u64 = 0x9000_0000;
 
 /// `CreateSolidBrush(colorref)`.
@@ -159,12 +213,10 @@ pub fn get_stock_object(i: i64) -> u64 {
     create_solid_brush(if i == 4 { 0x0000_0000 } else { 0x00FF_FFFF })
 }
 
-/// `SelectObject(hdc, hbrush)`: set the DC's brush, return the previous one
+/// `SelectObject(hdc, hbrush)`: set `hdc`'s brush, return the previous one
 /// (also brush-tagged, like real GDI returning the previous object).
-pub fn select_object(hobj: u64) -> u64 {
+pub fn select_object(dc: u64, hobj: u64) -> u64 {
     let color = (hobj & 0x00FF_FFFF) as u32;
-    let mut b = CURRENT_BRUSH.lock();
-    let old = *b;
-    *b = color;
+    let old = BRUSHES.lock().insert(dc, color).unwrap_or(0x00FF_FFFF);
     BRUSH_TAG | old as u64
 }

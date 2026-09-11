@@ -30,10 +30,9 @@ static CLASSES: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 pub struct Window {
     pub wndproc: u64,
     pub owner_tid: u64,
-    /// (x, y, width, height) — recorded for the next increment (offsetting
-    /// `gdi.rs`'s drawing into the window's client area); nothing reads it
-    /// yet.
-    #[allow(dead_code)]
+    /// (x, y, width, height), screen coordinates — `rect_of` is how
+    /// `gdi.rs`'s `GetDC(hwnd)` turns client-relative drawing into real
+    /// screen pixels.
     pub rect: (i32, i32, i32, i32),
 }
 
@@ -75,6 +74,12 @@ pub fn create_window(class: &str, x: i32, y: i32, w: i32, h: i32, owner_tid: u64
 
 pub fn wndproc_of(hwnd: u32) -> Option<u64> {
     WINDOWS.lock().get(&hwnd).map(|w| w.wndproc)
+}
+
+/// `(x, y, width, height)` in screen coordinates — `gdi.rs`'s `GetDC(hwnd)`
+/// uses this to turn client-relative drawing into real screen pixels.
+pub fn rect_of(hwnd: u32) -> Option<(i32, i32, i32, i32)> {
+    WINDOWS.lock().get(&hwnd).map(|w| w.rect)
 }
 
 fn owner_of(hwnd: u32) -> Option<u64> {

@@ -379,12 +379,12 @@ fn dispatch_gdi32(idx: u16, frame: &mut UserFrame) -> i64 {
     match idx {
         GDI_GETSTOCKOBJECT => crate::gdi::get_stock_object(a0 as i64) as i64,
         GDI_CREATESOLIDBRUSH => crate::gdi::create_solid_brush(a0 as u32) as i64,
-        GDI_SELECTOBJECT => crate::gdi::select_object(a1) as i64,
-        GDI_SETPIXEL => crate::gdi::set_pixel(a1 as i64, a2 as i64, a3 as u32) as i64,
-        GDI_GETPIXEL => crate::gdi::get_pixel(a1 as i64, a2 as i64) as i64,
+        GDI_SELECTOBJECT => crate::gdi::select_object(a0, a1) as i64,
+        GDI_SETPIXEL => crate::gdi::set_pixel(a0, a1 as i64, a2 as i64, a3 as u32) as i64,
+        GDI_GETPIXEL => crate::gdi::get_pixel(a0, a1 as i64, a2 as i64) as i64,
         GDI_RECTANGLE => {
             let bottom = stack(0) as i64;
-            crate::gdi::fill_rect(a1 as i64, a2 as i64, a3 as i64, bottom) as i64
+            crate::gdi::fill_rect(a0, a1 as i64, a2 as i64, a3 as i64, bottom) as i64
         }
         _ => -1,
     }
@@ -409,7 +409,20 @@ fn dispatch_user32(idx: u16, frame: &mut UserFrame) -> i64 {
                 _ => 0,
             }
         }
-        USER_GETDC | USER_RELEASEDC => 1,
+        // GetDC(hWnd) -> HDC. `0` (the desktop/whole screen) is the fixed
+        // screen DC (`1`); a real window's HDC is tagged with its hwnd so
+        // gdi.rs's drawing calls know to offset/clip into that window's
+        // client rect instead of drawing in raw screen coordinates.
+        USER_GETDC => {
+            if a0 == 0 {
+                1
+            } else {
+                (crate::gdi::WINDOW_DC_TAG | a0) as i64
+            }
+        }
+        // ReleaseDC(hWnd, hDC) -> BOOL. DCs aren't allocated objects here
+        // (just a tagged integer), so there's nothing to release.
+        USER_RELEASEDC => 1,
         // CallWindowProcA(lpPrevWndFunc, hWnd, Msg, wParam, lParam) — the
         // ring-3 callback mechanism's first real user: call a WNDPROC-shaped
         // function (a0) with the next four Win64 args shifted left by one

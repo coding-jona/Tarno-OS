@@ -325,31 +325,53 @@ fn gdi_paint_check() {
         kprintln!("THOS: gdi skip check   no framebuffer, nothing to verify");
         return;
     }
-    assert_eq!(gdi::set_pixel(0, 0, 0x00AB_CDEF), 0x00AB_CDEF, "SetPixel: bad return");
-    assert_eq!(gdi::get_pixel(0, 0), 0x00AB_CDEF, "SetPixel/GetPixel round-trip lost the colour");
-    assert_eq!(gdi::get_pixel(-1, 0), u32::MAX, "GetPixel(-1, _) should be CLR_INVALID");
-    assert_eq!(gdi::get_pixel(w as i64, 0), u32::MAX, "GetPixel(width, _) should be CLR_INVALID (off-screen)");
+    const SCREEN: u64 = 1; // GetDC(0)
+    assert_eq!(gdi::set_pixel(SCREEN, 0, 0, 0x00AB_CDEF), 0x00AB_CDEF, "SetPixel: bad return");
+    assert_eq!(gdi::get_pixel(SCREEN, 0, 0), 0x00AB_CDEF, "SetPixel/GetPixel round-trip lost the colour");
+    assert_eq!(gdi::get_pixel(SCREEN, -1, 0), u32::MAX, "GetPixel(-1, _) should be CLR_INVALID");
+    assert_eq!(gdi::get_pixel(SCREEN, w as i64, 0), u32::MAX, "GetPixel(width, _) should be CLR_INVALID (off-screen)");
 
     let white = gdi::get_stock_object(0); // WHITE_BRUSH
     let black = gdi::get_stock_object(4); // BLACK_BRUSH
-    let prev = gdi::select_object(white);
+    let prev = gdi::select_object(SCREEN, white);
     assert_eq!(prev, white, "SelectObject should hand back the DC's previous brush (default: white)");
     // A known white background around the black rect, so the edge checks
     // below aren't at the mercy of whatever the boot gradient left there.
-    assert!(gdi::fill_rect(5, 5, 25, 25), "fill_rect should report success for an on-screen rect");
-    gdi::select_object(black);
-    assert!(gdi::fill_rect(10, 10, 20, 20), "fill_rect should report success for an on-screen rect");
-    assert_eq!(gdi::get_pixel(15, 15), 0x0000_0000, "Rectangle didn't actually paint black inside the rect");
-    assert_eq!(gdi::get_pixel(9, 15), 0x00FF_FFFF, "Rectangle painted outside its left edge");
-    assert_eq!(gdi::get_pixel(20, 15), 0x00FF_FFFF, "Rectangle painted outside its right edge (exclusive bound)");
+    assert!(gdi::fill_rect(SCREEN, 5, 5, 25, 25), "fill_rect should report success for an on-screen rect");
+    gdi::select_object(SCREEN, black);
+    assert!(gdi::fill_rect(SCREEN, 10, 10, 20, 20), "fill_rect should report success for an on-screen rect");
+    assert_eq!(gdi::get_pixel(SCREEN, 15, 15), 0x0000_0000, "Rectangle didn't actually paint black inside the rect");
+    assert_eq!(gdi::get_pixel(SCREEN, 9, 15), 0x00FF_FFFF, "Rectangle painted outside its left edge");
+    assert_eq!(gdi::get_pixel(SCREEN, 20, 15), 0x00FF_FFFF, "Rectangle painted outside its right edge (exclusive bound)");
 
     // A rectangle that only partially overlaps the screen still fills the
     // part that's on it, and doesn't walk off the mapped framebuffer.
-    assert!(gdi::fill_rect(-5, -5, 5, 5), "a partially off-screen rect should still fill its on-screen part");
-    assert_eq!(gdi::get_pixel(0, 0), 0x0000_0000, "partially off-screen fill didn't reach the on-screen corner");
-    assert!(!gdi::fill_rect(-10, -10, -1, -1), "a fully off-screen rect should report no fill");
+    assert!(gdi::fill_rect(SCREEN, -5, -5, 5, 5), "a partially off-screen rect should still fill its on-screen part");
+    assert_eq!(gdi::get_pixel(SCREEN, 0, 0), 0x0000_0000, "partially off-screen fill didn't reach the on-screen corner");
+    assert!(!gdi::fill_rect(SCREEN, -10, -10, -1, -1), "a fully off-screen rect should report no fill");
 
-    kprintln!("THOS: gdi paint ok     {}x{}; SetPixel/GetPixel + brush + Rectangle verified", w, h);
+    // --- window-relative DC: the actual point of this check ---
+    window::register_class(alloc::string::String::from("GdiCheckClass"), 0);
+    let hwnd = window::create_window("GdiCheckClass", 50, 50, 20, 20, 0);
+    assert_ne!(hwnd, 0, "create_window should succeed against a registered class");
+    let wdc = gdi::WINDOW_DC_TAG | hwnd as u64;
+
+    // (0,0) in the window's own DC is screen (50,50) — separate from the
+    // screen DC's own (0,0), which the checks above already painted black.
+    gdi::select_object(wdc, gdi::create_solid_brush(0x0000_FF00)); // green
+    assert_eq!(gdi::set_pixel(wdc, 0, 0, 0x0000_00FF), 0x0000_00FF, "SetPixel on a window DC: bad return");
+    assert_eq!(gdi::get_pixel(SCREEN, 50, 50), 0x0000_00FF, "window DC (0,0) didn't land at the window's screen origin");
+    assert_eq!(gdi::get_pixel(SCREEN, 15, 15), 0x0000_0000, "drawing through the window DC leaked into the screen DC's rect");
+
+    // A rectangle drawn through the window DC clips to the window's own
+    // 20x20 rect, not the whole screen: [10,10)..[30,30) client-relative
+    // clips to [0,0)..[20,20) client == [50,50)..[70,70) screen.
+    assert!(gdi::fill_rect(wdc, -10, -10, 30, 30), "fill_rect on a window DC should still report success");
+    assert_eq!(gdi::get_pixel(SCREEN, 50, 50), 0x0000_FF00, "window-DC fill_rect didn't reach its own client origin");
+    assert_eq!(gdi::get_pixel(SCREEN, 69, 69), 0x0000_FF00, "window-DC fill_rect didn't reach its own client corner");
+    assert_ne!(gdi::get_pixel(SCREEN, 70, 70), 0x0000_FF00, "window-DC fill_rect wasn't clipped to the window's own rect");
+
+    kprintln!("THOS: gdi paint ok     {}x{}; SetPixel/GetPixel + brush + Rectangle + window DC verified", w, h);
 }
 
 // --- Milestone 1: scheduler + wait primitive + handle table ---
