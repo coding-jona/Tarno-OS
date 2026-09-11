@@ -140,6 +140,8 @@ pub const NT_NTCREATETHREADEX: u16 = 33;
 pub const NT_NTTERMINATETHREAD: u16 = 34;
 pub const NT_NTCREATESECTION: u16 = 35;
 pub const NT_NTMAPVIEWOFSECTION: u16 = 36;
+pub const NT_NTENUMERATEKEY: u16 = 37;
+pub const NT_NTENUMERATEVALUEKEY: u16 = 38;
 pub const NTDLL_STUB_COUNT: u16 = 37;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
@@ -208,6 +210,8 @@ const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+const STATUS_NO_MORE_ENTRIES: u32 = 0x8000_001A;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_TIMEOUT: u32 = 0x0000_0102;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
@@ -990,6 +994,82 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 return STATUS_INVALID_HANDLE as i64;
             };
             status(crate::registry::delete_key(&path), STATUS_OBJECT_NAME_NOT_FOUND)
+        }
+
+        // NtEnumerateKey(KeyHandle, Index, KeyInformationClass,
+        //                *KeyInformation, Length, *ResultLength). Only
+        //                KeyBasicInformation (class 0): { i64 LastWriteTime
+        //                (zero — not tracked); u32 TitleIndex; u32 NameLength;
+        //                WCHAR Name[] }. Enumeration order is the tree's
+        //                natural (sorted) order; STATUS_NO_MORE_ENTRIES once
+        //                `Index` runs past the last subkey.
+        NT_NTENUMERATEKEY => {
+            let Some(path) = process::current_regkey(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            if a2 != 0 {
+                return STATUS_INVALID_INFO_CLASS as i64;
+            }
+            let Some(name) = crate::registry::enumerate_key(&path, a1 as usize) else {
+                return STATUS_NO_MORE_ENTRIES as i64;
+            };
+            let name_len = name.len() * 2; // UTF-16LE; registry names are ASCII here
+            let need = 16 + name_len;
+            let ret_len = stack(1);
+            if ret_len != 0 {
+                unsafe { *(ret_len as *mut u32) = need as u32 };
+            }
+            if (stack(0) as usize) < need {
+                return STATUS_BUFFER_TOO_SMALL as i64;
+            }
+            unsafe {
+                let b = a3 as *mut u8;
+                *(b as *mut i64) = 0; // LastWriteTime
+                *(b.add(8) as *mut u32) = 0; // TitleIndex
+                *(b.add(12) as *mut u32) = name_len as u32;
+                for (i, c) in name.encode_utf16().enumerate() {
+                    *(b.add(16 + i * 2) as *mut u16) = c;
+                }
+            }
+            STATUS_SUCCESS as i64
+        }
+
+        // NtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass,
+        //                     *KeyValueInformation, Length, *ResultLength).
+        //                     Only KeyValueBasicInformation (class 0):
+        //                     { u32 TitleIndex; u32 Type; u32 NameLength;
+        //                     WCHAR Name[] } — data itself comes from a
+        //                     follow-up NtQueryValueKey by name, same as real
+        //                     NT's typical RegEnumValue two-call pattern.
+        NT_NTENUMERATEVALUEKEY => {
+            let Some(path) = process::current_regkey(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            if a2 != 0 {
+                return STATUS_INVALID_INFO_CLASS as i64;
+            }
+            let Some((name, ty, _len)) = crate::registry::enumerate_value(&path, a1 as usize) else {
+                return STATUS_NO_MORE_ENTRIES as i64;
+            };
+            let name_len = name.len() * 2;
+            let need = 12 + name_len;
+            let ret_len = stack(1);
+            if ret_len != 0 {
+                unsafe { *(ret_len as *mut u32) = need as u32 };
+            }
+            if (stack(0) as usize) < need {
+                return STATUS_BUFFER_TOO_SMALL as i64;
+            }
+            unsafe {
+                let b = a3 as *mut u8;
+                *(b as *mut u32) = 0; // TitleIndex
+                *(b.add(4) as *mut u32) = ty;
+                *(b.add(8) as *mut u32) = name_len as u32;
+                for (i, c) in name.encode_utf16().enumerate() {
+                    *(b.add(12 + i * 2) as *mut u16) = c;
+                }
+            }
+            STATUS_SUCCESS as i64
         }
 
         // LdrGetProcedureAddress(DllHandle, *AnsiName(STRING), Ordinal, *Address)

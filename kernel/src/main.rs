@@ -564,6 +564,34 @@ fn smp_stress_milestone(init_bytes: &[u8]) {
     );
 }
 
+/// `NtEnumerateKey` / `NtEnumerateValueKey`'s backing logic
+/// (`registry::enumerate_key`/`enumerate_value`), exercised directly — no PE
+/// process needed, unlike the hand-assembled `pe-test` round-trip. Uses a
+/// throwaway key so it can't collide with — or leak into — a real hive.
+fn registry_enum_check() {
+    let base = r"\Registry\Machine\Software\ThosEnumCheck";
+    assert!(registry::create(base), "registry_enum_check: create base");
+    for (sub, val, data) in [("Alpha", "A", b"1".as_slice()), ("Beta", "B", b"22".as_slice())] {
+        assert!(registry::create(&alloc::format!("{base}\\{sub}")), "create subkey");
+        assert!(registry::set_value(base, val, 4, data), "set value");
+    }
+    // Subkeys and values enumerate in (sorted) order, and stop past the end.
+    assert_eq!(registry::enumerate_key(base, 0).as_deref(), Some("alpha"));
+    assert_eq!(registry::enumerate_key(base, 1).as_deref(), Some("beta"));
+    assert_eq!(registry::enumerate_key(base, 2), None);
+    let (name0, ty0, len0) = registry::enumerate_value(base, 0).expect("value 0");
+    assert_eq!((name0.as_str(), ty0, len0), ("a", 4, 1));
+    let (name1, ty1, len1) = registry::enumerate_value(base, 1).expect("value 1");
+    assert_eq!((name1.as_str(), ty1, len1), ("b", 4, 2));
+    assert!(registry::enumerate_value(base, 2).is_none());
+    // Clean up: don't leave a stray key sitting in a real hive on disk.
+    for sub in ["alpha", "beta"] {
+        registry::delete_key(&alloc::format!("{base}\\{sub}"));
+    }
+    assert!(registry::delete_key(base), "registry_enum_check: cleanup");
+    kprintln!("THOS: registry enum ok NtEnumerateKey/Value order + STATUS_NO_MORE_ENTRIES");
+}
+
 /// Phase 2 milestone: a VFS with an in-memory file opened through the handle
 /// table, and the AHCI driver reading real sectors off the SATA disk.
 fn storage_milestone() {
@@ -611,6 +639,14 @@ fn storage_milestone() {
     }
 
     let fs = ext2::open().expect("mount ext2");
+    // Before anything can touch the registry (PE syscalls included).
+    let loaded_hives = registry::load_hives(&fs);
+    kprintln!(
+        "THOS: registry ok      {}/3 hives loaded from disk{}",
+        loaded_hives,
+        if loaded_hives == 0 { " (first boot — defaults seeded)" } else { "" }
+    );
+    registry_enum_check();
     let init = fs.read_path("/init").expect("read /init from ext2");
     kprintln!("THOS: ext2 ok          /init = {} bytes", init.len());
 
