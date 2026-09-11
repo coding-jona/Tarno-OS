@@ -387,17 +387,28 @@ late.
     `pe-test` queues an APC to itself, `NtTestAlert`s, checks the handler ran
     (`PE APC OK`). Kernel-mode APCs / alertable `NtWaitForSingleObject` land
     with the timer wheel. `QueueUserAPC` (Win32) layers straight on top.
-  - **Minimal configuration registry.** `crate::registry`: one global key tree
-    of typed values addressed by `\`-separated path, seeded with
-    `\Registry\Machine` + `\Registry\User` on first use. Backs `NtCreateKey`,
-    `NtOpenKey`, `NtSetValueKey`, `NtQueryValueKey`
-    (`KeyValuePartialInformation`) and `NtDeleteKey` on the SSDT;
+  - **Configuration registry, grown to persisted hives.** `crate::registry`:
+    one global key tree of typed values addressed by `\`-separated path,
+    seeded with `\Registry\Machine` + `\Registry\User` on first use. Backs
+    `NtCreateKey`, `NtOpenKey`, `NtSetValueKey`, `NtQueryValueKey`
+    (`KeyValuePartialInformation`), `NtDeleteKey`, and **`NtEnumerateKey` /
+    `NtEnumerateValueKey`** (`KeyBasicInformation` / `KeyValueBasicInformation`,
+    index-based, `STATUS_NO_MORE_ENTRIES` past the end — the real
+    `RegEnumKey`/`RegEnumValue` two-call pattern) on the SSDT;
     `OBJECT_ATTRIBUTES.ObjectName` (+ `RootDirectory`) resolves to a path. A key
-    HANDLE is a `HandleObject::RegKey(path)` in the unified table. `pe-test`
+    HANDLE is a `HandleObject::RegKey(path)` in the unified table.
+    **Each top-level root (`machine\software`, `machine\system`, `user`) is a
+    hive** — its own backing file under `/etc/thos/registry/*.hiv` on ext2,
+    loaded once at boot before anything can touch the registry, rewritten on
+    every mutation under it (a from-scratch text format, not
+    regf-binary-compatible — THOS only reads its own hives). `pe-test`
     round-trips create → set → close → reopen → query → delete → reopen-fails
-    (`PE registry OK`). Not transactional / persisted / enumerable yet —
-    hive files, `NtEnumerateKey`/`Value`, change-notify and per-key security
-    come with the registry phase.
+    (`PE registry OK`); `registry_enum_check()` (every boot) exercises
+    enumeration order + `STATUS_NO_MORE_ENTRIES` directly. Verified with a
+    real two-boot round trip on one disk image (boot 1 writes the hive, boot 2
+    loads it back). Still not transactional (a crash mid-write can lose that
+    one write) and no change-notify / per-key security — those come with the
+    security phase.
   - **Mutant + semaphore + `NtWaitForMultipleObjects`.** `wait.rs` gains a
     counting `Semaphore` and a recursive thread-owned `Mutant`; `process.rs` a
     polymorphic `Waitable` (event / semaphore / mutant) with
