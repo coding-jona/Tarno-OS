@@ -520,19 +520,34 @@ late.
     above (`UpdateWindow` *sends* — a direct call, bypassing the queue,
     matching real Win32). `ShowWindow`/`DefWindowProcA`/`TranslateMessage`
     are still close to no-ops (no compositor, no default painting, no
-    keyboard→message pipeline yet) — deliberately: this increment is the
-    message-loop plumbing, not window rendering. A window's rect is recorded
-    but nothing clips or offsets `gdi.rs`'s (still whole-screen) drawing into
-    it yet — the natural next step once real rendering matters.
+    keyboard→message pipeline yet) — deliberately: this increment was the
+    message-loop plumbing, not window rendering.
     Verified with a real message-loop round trip in `pe-test`
     (`RegisterClassA` → `CreateWindowExA` → `PostMessageA` a custom message
     → a real `GetMessageA`/`DispatchMessageA` loop drives the test's own
     `WndProc`, which calls `PostQuitMessage` with the message's `wParam` →
     the loop exits on `WM_QUIT` → the `MSG`'s `wParam` is checked to have
     survived the whole round trip) — prints `PE window OK`.
-  - **Then (the phase):** window-relative GDI (client-area clipping/offset,
-    replacing the still-whole-screen drawing above); process isolation /
-    integrity for the security phase.
+  - **Window-relative GDI.** `GetDC(hwnd)` for a real window now returns a
+    DC tagged with that `hwnd` (`gdi::WINDOW_DC_TAG`, distinct from the
+    fixed screen DC `1` `GetDC(0)` still returns) instead of always meaning
+    "the whole screen". `gdi::resolve_dc` turns a tagged DC into an origin
+    (the window's `(x, y)`, from `window::rect_of`) and a clip rectangle
+    (the window's rect intersected with the screen) that `SetPixel`/
+    `GetPixel`/`Rectangle` all go through — client-relative coordinates in,
+    real (offset, clipped) screen pixels out, same as real Win32. Each DC
+    also got its own current-brush colour (`gdi::BRUSHES`, keyed by DC
+    handle) instead of the one global the whole-screen-only version had —
+    needed the moment more than one DC (screen + any window) can exist at
+    once. Verified by extending `gdi_paint_check` (kernel-internal, same
+    rationale as the earlier GDI/registry/section checks) with a real
+    window: drawing through its DC lands at the window's screen origin, not
+    the screen DC's own origin or the window's own drawing leaking outside
+    its rect — passes on real boot.
+  - **Then (the phase):** process isolation / integrity for the security
+    phase — the NT personality's remaining phase-3 items (below) are mostly
+    done; a compositor / real window rendering is a plausible detour but not
+    required to get there.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
