@@ -423,13 +423,21 @@ late.
     (copies the range into fresh private RW pages; CR3 is the process's so the
     copy writes straight to the user VA). No shared writeback / COW yet.
     `PE section OK`.
+  - **Done since:** the ring-3 IRQ `swapgs` shim (PE threads run `IF=1`,
+    preemptible — `3aabdbd`); a fully-blocking timed object wait (dual-enqueue:
+    object queue + timer wheel — `33a5c79`); a real **multi-object wait-block**
+    for `NtWaitForMultipleObjects` (`wait::wait_any_until` parks the thread on
+    every involved object's queue at once, locked in fixed address order so an
+    overlapping wait set can't deadlock, instead of the old re-poll-every-tick
+    loop — `b42e8eb`; `multi_wait_milestone` proves WaitAny/WaitAll both block
+    and wake correctly with two threads on an overlapping set concurrently);
+    a scheduler stale-`ctx`/phantom-ready-queue race found and fixed
+    (`db9e59f`, `1c2358a` — smp-test 46/46 incl. under host load).
   - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
     unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
-    unmodified), or a from-scratch `ntdll` — a preemption-safe path out of a PE
-    syscall (ring-3 IRQ `swapgs` shim so PE threads can run `IF=1`), a
-    fully-blocking timed object wait (dual-enqueue: object queue + wheel),
-    multiple threads per process, shared-writeback sections, the registry grown
-    to hives; then process isolation / integrity for the security phase.
+    unmodified), or a from-scratch `ntdll` — shared-writeback sections, the
+    registry grown to hives; then process isolation / integrity for the
+    security phase.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
