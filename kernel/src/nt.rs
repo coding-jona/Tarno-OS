@@ -250,6 +250,10 @@ pub fn dispatch(sel: u16, frame: &mut UserFrame) -> i64 {
         dispatch_ntdll(sel & !NT_NTDLL_FLAG, frame)
     } else if sel & NT_MSVCRT_FLAG != 0 {
         dispatch_msvcrt(sel & !NT_MSVCRT_FLAG, frame)
+    } else if sel & NT_USER32_FLAG != 0 {
+        dispatch_user32(sel & !NT_USER32_FLAG, frame)
+    } else if sel & NT_GDI32_FLAG != 0 {
+        dispatch_gdi32(sel & !NT_GDI32_FLAG, frame)
     } else {
         dispatch_kernel32(sel, frame)
     }
@@ -305,6 +309,73 @@ pub const MSVCRT_EXPORTS: [&str; MSVCRT_STUB_COUNT as usize] = [
 pub const MSVCRT_STUB_COUNT: u16 = 35;
 /// Indices whose EAT slot is a writable data cell, not a call trampoline.
 pub const MSVCRT_DATA_EXPORTS: [u16; 3] = [32, 33, 34];
+
+/// Selector bit for the synthetic `gdi32.dll` layer (`0x1000`) — the
+/// GDI32/User32 skeleton: `crate::gdi`'s pixel-level primitives against the
+/// boot framebuffer, no window manager yet.
+pub const NT_GDI32_FLAG: u16 = 0x1000;
+const GDI_GETSTOCKOBJECT: u16 = 0;
+const GDI_CREATESOLIDBRUSH: u16 = 1;
+const GDI_SELECTOBJECT: u16 = 2;
+const GDI_SETPIXEL: u16 = 3;
+const GDI_GETPIXEL: u16 = 4;
+const GDI_RECTANGLE: u16 = 5;
+pub const GDI32_STUB_COUNT: u16 = 6;
+pub const GDI32_EXPORTS: [&str; GDI32_STUB_COUNT as usize] =
+    ["GetStockObject", "CreateSolidBrush", "SelectObject", "SetPixel", "GetPixel", "Rectangle"];
+
+/// Selector bit for the synthetic `user32.dll` layer (`0x2000`).
+pub const NT_USER32_FLAG: u16 = 0x2000;
+const USER_GETSYSTEMMETRICS: u16 = 0;
+const USER_GETDC: u16 = 1;
+const USER_RELEASEDC: u16 = 2;
+pub const USER32_STUB_COUNT: u16 = 3;
+pub const USER32_EXPORTS: [&str; USER32_STUB_COUNT as usize] =
+    ["GetSystemMetrics", "GetDC", "ReleaseDC"];
+
+/// `GetStockObject`/`CreateSolidBrush`/`SelectObject`/`SetPixel`/`GetPixel`/
+/// `Rectangle` — thin syscall skin over `crate::gdi`. The `HDC` argument every
+/// one of these takes is ignored: there is exactly one DC (the whole screen)
+/// so far, `GetDC` always hands back the same fixed handle.
+fn dispatch_gdi32(idx: u16, frame: &mut UserFrame) -> i64 {
+    let a0 = frame.r10;
+    let a1 = frame.rdx;
+    let a2 = frame.r8;
+    let a3 = frame.r9;
+    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
+    match idx {
+        GDI_GETSTOCKOBJECT => crate::gdi::get_stock_object(a0 as i64) as i64,
+        GDI_CREATESOLIDBRUSH => crate::gdi::create_solid_brush(a0 as u32) as i64,
+        GDI_SELECTOBJECT => crate::gdi::select_object(a1) as i64,
+        GDI_SETPIXEL => crate::gdi::set_pixel(a1 as i64, a2 as i64, a3 as u32) as i64,
+        GDI_GETPIXEL => crate::gdi::get_pixel(a1 as i64, a2 as i64) as i64,
+        GDI_RECTANGLE => {
+            let bottom = stack(0) as i64;
+            crate::gdi::fill_rect(a1 as i64, a2 as i64, a3 as i64, bottom) as i64
+        }
+        _ => -1,
+    }
+}
+
+/// `GetSystemMetrics`/`GetDC`/`ReleaseDC` — no window objects yet, so this is
+/// deliberately tiny: `GetDC`/`ReleaseDC` don't need to track anything (one
+/// DC, never freed), `GetSystemMetrics` only knows the two screen-size
+/// indices `crate::gdi` can actually answer.
+fn dispatch_user32(idx: u16, frame: &mut UserFrame) -> i64 {
+    let a0 = frame.r10;
+    match idx {
+        USER_GETSYSTEMMETRICS => {
+            let (w, h) = crate::gdi::screen_size();
+            match a0 as i64 {
+                crate::gdi::SM_CXSCREEN => w as i64,
+                crate::gdi::SM_CYSCREEN => h as i64,
+                _ => 0,
+            }
+        }
+        USER_GETDC | USER_RELEASEDC => 1,
+        _ => -1,
+    }
+}
 
 const MSV_MEMCPY: u16 = 0;
 const MSV_MEMSET: u16 = 1;

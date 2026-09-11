@@ -135,6 +135,13 @@ pub const PE_CRT_ADDR: u64 = NT_STUB_BASE + 0xF000;
 /// trampoline by [`Loader::new`].
 pub const PE_INITTERM_ADDR: u64 = NT_STUB_BASE + 0x10000;
 
+/// Synthetic `user32.dll` / `gdi32.dll` trampoline pages — the GDI32/User32
+/// skeleton (`crate::gdi`). Registered the same way `msvcrt.dll` is: seeded
+/// into `Loader::new` for import binding, no PEB `Ldr` entry yet (nothing so
+/// far calls `GetModuleHandleA("user32.dll")`/`LoadLibraryA` on them).
+const PE_USER32_ADDR: u64 = NT_STUB_BASE + 0x11000;
+const PE_GDI32_ADDR: u64 = NT_STUB_BASE + 0x12000;
+
 /// A single worker thread's TEB + entry stub + stack. One extra thread per PE
 /// process for now (fixed regions); a real per-thread allocator comes later.
 const PE_TEB2_ADDR: u64 = NT_STUB_BASE + 0xC000;
@@ -225,6 +232,8 @@ impl<'a> Loader<'a> {
             ("kernel32.dll", PE_KERNEL32_ADDR, &crate::nt::NT_EXPORTS[..]),
             ("ntdll.dll", PE_NTDLL_ADDR, &crate::nt::NTDLL_EXPORTS[..]),
             ("msvcrt.dll", PE_MSVCRT_ADDR, &crate::nt::MSVCRT_EXPORTS[..]),
+            ("user32.dll", PE_USER32_ADDR, &crate::nt::USER32_EXPORTS[..]),
+            ("gdi32.dll", PE_GDI32_ADDR, &crate::nt::GDI32_EXPORTS[..]),
         ] {
             // Matches `map_synth_dll`'s export directory: Base 1, EAT[i] = stub i.
             let mut eat = Vec::with_capacity(table.len());
@@ -778,6 +787,8 @@ pub fn load(proc: &Process, file: &[u8], stack_top: u64) -> Result<PeImage, &'st
     map_kernel32_page(proc)?;
     map_ntdll_page(proc)?;
     map_msvcrt_page(proc)?;
+    map_user32_page(proc)?;
+    map_gdi32_page(proc)?;
     map_crt_page(proc)?;
     map_initterm_page(proc)?;
     map_seh_pages(proc)?;
@@ -1377,6 +1388,13 @@ fn map_msvcrt_page(proc: &Process) -> Result<(), &'static str> {
         crate::nt::NT_MSVCRT_FLAG,
         &crate::nt::MSVCRT_DATA_EXPORTS,
     )
+}
+
+fn map_user32_page(proc: &Process) -> Result<(), &'static str> {
+    map_synth_dll(proc, PE_USER32_ADDR, "USER32.DLL", &crate::nt::USER32_EXPORTS, crate::nt::NT_USER32_FLAG, &[])
+}
+fn map_gdi32_page(proc: &Process) -> Result<(), &'static str> {
+    map_synth_dll(proc, PE_GDI32_ADDR, "GDI32.DLL", &crate::nt::GDI32_EXPORTS, crate::nt::NT_GDI32_FLAG, &[])
 }
 
 /// Build the r-x `_initterm` stub page (see [`PE_INITTERM_ADDR`]).

@@ -37,6 +37,7 @@ mod elf;
 mod ext2;
 mod fat;
 mod file;
+mod gdi;
 mod gdt;
 mod gpt;
 mod idt;
@@ -140,6 +141,8 @@ extern "C" fn kmain() -> ! {
     memory_bringup();
     acpi_apic_bringup();
     vmm_bringup();
+    gdi_bringup();
+    gdi_paint_check();
 
     let mp = MP_REQUEST.response().expect("Limine MP request unanswered");
     smp::init(mp);
@@ -295,6 +298,57 @@ fn vmm_bringup() {
         "THOS: own page tables  PML4 switched; {} GiB HHDM + 4 GiB identity + W^X kernel",
         vmm::hhdm_gib(memmap.entries())
     );
+}
+
+/// Map the boot framebuffer into THOS's own tables — the GDI32/User32
+/// skeleton's one and only "device context". Must run after `vmm_bringup`
+/// (needs `vmm::map_mmio`, which needs the kernel PML4).
+fn gdi_bringup() {
+    let hhdm = HHDM_REQUEST.response().expect("HHDM request unanswered").offset;
+    match FRAMEBUFFER_REQUEST.response().and_then(|r| r.framebuffers().first()) {
+        Some(fb) => gdi::init(fb, hhdm),
+        None => kprintln!("THOS: gdi FAIL         no framebuffer in response"),
+    }
+}
+
+/// `gdi::` functions exercised directly — no PE process, no hand-assembled
+/// syscall trampolines needed, same rationale as `registry_enum_check` /
+/// `section_sharing_check`. Proves the pixel plumbing actually reaches the
+/// real framebuffer: a fill lands at the right offsets and nowhere else, a
+/// set/get round-trips exactly, an off-screen access is rejected rather than
+/// walking off the mapped region, and the brush/select-object colour model
+/// behaves like real GDI (old colour handed back, stock objects are right).
+fn gdi_paint_check() {
+    let (w, h) = gdi::screen_size();
+    if w == 0 {
+        kprintln!("THOS: gdi skip check   no framebuffer, nothing to verify");
+        return;
+    }
+    assert_eq!(gdi::set_pixel(0, 0, 0x00AB_CDEF), 0x00AB_CDEF, "SetPixel: bad return");
+    assert_eq!(gdi::get_pixel(0, 0), 0x00AB_CDEF, "SetPixel/GetPixel round-trip lost the colour");
+    assert_eq!(gdi::get_pixel(-1, 0), u32::MAX, "GetPixel(-1, _) should be CLR_INVALID");
+    assert_eq!(gdi::get_pixel(w as i64, 0), u32::MAX, "GetPixel(width, _) should be CLR_INVALID (off-screen)");
+
+    let white = gdi::get_stock_object(0); // WHITE_BRUSH
+    let black = gdi::get_stock_object(4); // BLACK_BRUSH
+    let prev = gdi::select_object(white);
+    assert_eq!(prev, white, "SelectObject should hand back the DC's previous brush (default: white)");
+    // A known white background around the black rect, so the edge checks
+    // below aren't at the mercy of whatever the boot gradient left there.
+    assert!(gdi::fill_rect(5, 5, 25, 25), "fill_rect should report success for an on-screen rect");
+    gdi::select_object(black);
+    assert!(gdi::fill_rect(10, 10, 20, 20), "fill_rect should report success for an on-screen rect");
+    assert_eq!(gdi::get_pixel(15, 15), 0x0000_0000, "Rectangle didn't actually paint black inside the rect");
+    assert_eq!(gdi::get_pixel(9, 15), 0x00FF_FFFF, "Rectangle painted outside its left edge");
+    assert_eq!(gdi::get_pixel(20, 15), 0x00FF_FFFF, "Rectangle painted outside its right edge (exclusive bound)");
+
+    // A rectangle that only partially overlaps the screen still fills the
+    // part that's on it, and doesn't walk off the mapped framebuffer.
+    assert!(gdi::fill_rect(-5, -5, 5, 5), "a partially off-screen rect should still fill its on-screen part");
+    assert_eq!(gdi::get_pixel(0, 0), 0x0000_0000, "partially off-screen fill didn't reach the on-screen corner");
+    assert!(!gdi::fill_rect(-10, -10, -1, -1), "a fully off-screen rect should report no fill");
+
+    kprintln!("THOS: gdi paint ok     {}x{}; SetPixel/GetPixel + brush + Rectangle verified", w, h);
 }
 
 // --- Milestone 1: scheduler + wait primitive + handle table ---
