@@ -338,9 +338,33 @@ const USER_GETSYSTEMMETRICS: u16 = 0;
 const USER_GETDC: u16 = 1;
 const USER_RELEASEDC: u16 = 2;
 const USER_CALLWINDOWPROCA: u16 = 3;
-pub const USER32_STUB_COUNT: u16 = 4;
-pub const USER32_EXPORTS: [&str; USER32_STUB_COUNT as usize] =
-    ["GetSystemMetrics", "GetDC", "ReleaseDC", "CallWindowProcA"];
+const USER_REGISTERCLASSA: u16 = 4;
+const USER_CREATEWINDOWEXA: u16 = 5;
+const USER_SHOWWINDOW: u16 = 6;
+const USER_UPDATEWINDOW: u16 = 7;
+const USER_DEFWINDOWPROCA: u16 = 8;
+const USER_GETMESSAGEA: u16 = 9;
+const USER_DISPATCHMESSAGEA: u16 = 10;
+const USER_POSTQUITMESSAGE: u16 = 11;
+const USER_TRANSLATEMESSAGE: u16 = 12;
+const USER_POSTMESSAGEA: u16 = 13;
+pub const USER32_STUB_COUNT: u16 = 14;
+pub const USER32_EXPORTS: [&str; USER32_STUB_COUNT as usize] = [
+    "GetSystemMetrics",
+    "GetDC",
+    "ReleaseDC",
+    "CallWindowProcA",
+    "RegisterClassA",
+    "CreateWindowExA",
+    "ShowWindow",
+    "UpdateWindow",
+    "DefWindowProcA",
+    "GetMessageA",
+    "DispatchMessageA",
+    "PostQuitMessage",
+    "TranslateMessage",
+    "PostMessageA",
+];
 
 /// `GetStockObject`/`CreateSolidBrush`/`SelectObject`/`SetPixel`/`GetPixel`/
 /// `Rectangle` — thin syscall skin over `crate::gdi`. The `HDC` argument every
@@ -372,6 +396,10 @@ fn dispatch_gdi32(idx: u16, frame: &mut UserFrame) -> i64 {
 /// indices `crate::gdi` can actually answer.
 fn dispatch_user32(idx: u16, frame: &mut UserFrame) -> i64 {
     let a0 = frame.r10;
+    let a1 = frame.rdx;
+    let a2 = frame.r8;
+    let a3 = frame.r9;
+    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
     match idx {
         USER_GETSYSTEMMETRICS => {
             let (w, h) = crate::gdi::screen_size();
@@ -391,6 +419,105 @@ fn dispatch_user32(idx: u16, frame: &mut UserFrame) -> i64 {
             let lparam = unsafe { *((frame.rsp + 0x28) as *const u64) };
             invoke_ring3_callback(a0, [frame.rdx, frame.r8, frame.r9, lparam], frame)
         }
+
+        // RegisterClassA(const WNDCLASSA *lpWndClass). Only the two fields
+        // CreateWindowExA actually needs: lpfnWndProc @0x08, lpszClassName
+        // @0x40 (real WNDCLASSA layout — natural alignment puts the pointer
+        // fields there after the leading `UINT style`). `0` (real
+        // `ATOM` failure value) if the class name is empty.
+        USER_REGISTERCLASSA => {
+            let wndproc = unsafe { *((a0 + 0x08) as *const u64) };
+            let name_ptr = unsafe { *((a0 + 0x40) as *const u64) };
+            let name = user_cstr(name_ptr);
+            if name.is_empty() {
+                0
+            } else {
+                crate::window::register_class(name, wndproc);
+                1 // a nonzero ATOM — THOS looks classes up by name again, never by it
+            }
+        }
+
+        // CreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle, x,
+        //                  y, nWidth, nHeight, hWndParent, hMenu, hInstance,
+        //                  lpParam) -> HWND (`0` on failure — unregistered
+        // class). hWndParent/hMenu/hInstance/lpParam aren't used yet (no
+        // parent/child windows, no menus).
+        USER_CREATEWINDOWEXA => {
+            let class = user_cstr(a1);
+            let (x, y, w, h) = (stack(0) as i32, stack(1) as i32, stack(2) as i32, stack(3) as i32);
+            crate::window::create_window(&class, x, y, w, h, process::current_tid()) as i64
+        }
+
+        // ShowWindow(hWnd, nCmdShow) -> BOOL. No compositor yet, so there is
+        // nothing to actually show — beyond queuing the WM_PAINT a real
+        // newly-shown window gets from its invalidated region.
+        USER_SHOWWINDOW => {
+            if a1 != 0 {
+                crate::window::post_message(a0 as u32, crate::window::WM_PAINT, 0, 0);
+            }
+            1
+        }
+
+        // UpdateWindow(hWnd) -> BOOL. Real UpdateWindow *sends* WM_PAINT
+        // directly (bypassing the queue) when the window has an invalid
+        // region — exactly a `CallWindowProcA`-shaped ring-3 call, so this
+        // reuses the same mechanism. `0` (failure) for an unknown HWND.
+        USER_UPDATEWINDOW => match crate::window::wndproc_of(a0 as u32) {
+            Some(wndproc) => invoke_ring3_callback(wndproc, [a0, crate::window::WM_PAINT as u64, 0, 0], frame),
+            None => 0,
+        },
+
+        // DefWindowProcA(hWnd, Msg, wParam, lParam) -> LRESULT. No default
+        // message handling implemented yet (no painting, no hit-testing) —
+        // `0`, same as real DefWindowProc's default case for anything it
+        // doesn't specifically handle.
+        USER_DEFWINDOWPROCA => 0,
+
+        // GetMessageA(&msg, hWnd, wMsgFilterMin, wMsgFilterMax) -> BOOL. The
+        // hWnd/filter args aren't applied yet (one queue per thread, no
+        // per-window or per-message filtering). `0` only for WM_QUIT, `1`
+        // otherwise — real GetMessageA's BOOL-shaped tri-state return.
+        USER_GETMESSAGEA => {
+            let m = crate::window::get_message(process::current_tid());
+            unsafe {
+                *(a0 as *mut u64) = m.hwnd as u64; // MSG.hwnd
+                *((a0 + 0x08) as *mut u32) = m.message; // MSG.message
+                *((a0 + 0x10) as *mut u64) = m.wparam; // MSG.wParam
+                *((a0 + 0x18) as *mut u64) = m.lparam; // MSG.lParam
+            }
+            (m.message != crate::window::WM_QUIT) as i64
+        }
+
+        // DispatchMessageA(const MSG *lpMsg) -> LRESULT. Calls the target
+        // window's WndProc in ring 3 (`invoke_ring3_callback`, the same
+        // mechanism `CallWindowProcA` uses) and hands its result back.
+        USER_DISPATCHMESSAGEA => {
+            let hwnd = unsafe { *(a0 as *const u64) } as u32;
+            let message = unsafe { *((a0 + 0x08) as *const u32) };
+            let wparam = unsafe { *((a0 + 0x10) as *const u64) };
+            let lparam = unsafe { *((a0 + 0x18) as *const u64) };
+            match crate::window::wndproc_of(hwnd) {
+                Some(wndproc) => invoke_ring3_callback(wndproc, [hwnd as u64, message as u64, wparam, lparam], frame),
+                None => 0,
+            }
+        }
+
+        // PostQuitMessage(nExitCode) — always targets the calling thread's
+        // own queue (real WM_QUIT isn't associated with any window).
+        USER_POSTQUITMESSAGE => {
+            crate::window::post_quit(process::current_tid(), a0);
+            0
+        }
+
+        // TranslateMessage(&msg) -> BOOL. No keyboard input feeds the
+        // message queue yet, so there is nothing to translate — `1` (TRUE),
+        // matching real TranslateMessage's success return for anything it
+        // doesn't act on.
+        USER_TRANSLATEMESSAGE => 1,
+
+        // PostMessageA(hWnd, Msg, wParam, lParam) -> BOOL.
+        USER_POSTMESSAGEA => crate::window::post_message(a0 as u32, a1 as u32, a2, a3) as i64,
+
         _ => -1,
     }
 }

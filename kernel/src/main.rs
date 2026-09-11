@@ -58,6 +58,7 @@ mod syscall;
 mod timer;
 mod vfs;
 mod vmm;
+mod window;
 mod xhci;
 mod wait;
 

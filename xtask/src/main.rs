@@ -493,7 +493,18 @@ fn write_pe_hello(path: &Path) {
     let imports: [(&[u8], &[&[u8]]); 3] = [
         (b"KERNEL32.dll", k32_funcs),
         (b"thoscrt.dll", &[b"thos_add", b"#2", b"thos_fwd"]),
-        (b"USER32.dll", &[b"CallWindowProcA"]),
+        (
+            b"USER32.dll",
+            &[
+                b"CallWindowProcA",
+                b"RegisterClassA",
+                b"CreateWindowExA",
+                b"PostMessageA",
+                b"GetMessageA",
+                b"DispatchMessageA",
+                b"PostQuitMessage",
+            ],
+        ),
     ];
     let n_imp = imports.len();
     let import_dir_size = ((n_imp + 1) * 20) as u32;
@@ -577,6 +588,12 @@ fn write_pe_hello(path: &Path) {
     let iat_mul = idata_rva + iat_at[1] + 8; // thoscrt!thos_mul (by ordinal 2)
     let iat_fwd = idata_rva + iat_at[1] + 16; // thoscrt!thos_fwd (forwarded to KERNEL32.GetProcessHeap)
     let iat_cwp = idata_rva + iat_at[2]; // USER32!CallWindowProcA
+    let iat_rca = idata_rva + iat_at[2] + 8; // USER32!RegisterClassA
+    let iat_cwx = idata_rva + iat_at[2] + 16; // USER32!CreateWindowExA
+    let iat_pma = idata_rva + iat_at[2] + 24; // USER32!PostMessageA
+    let iat_gma = idata_rva + iat_at[2] + 32; // USER32!GetMessageA
+    let iat_dma = idata_rva + iat_at[2] + 40; // USER32!DispatchMessageA
+    let iat_pqm = idata_rva + iat_at[2] + 48; // USER32!PostQuitMessage
 
     // --- entry machine code (x86-64) ---
     // Deferred RIP-relative fixups: (disp32 position in `code`, target RVA).
@@ -698,6 +715,10 @@ fn write_pe_hello(path: &Path) {
     let msg_sec_tag = u32::MAX - 106;
     let cbfn_tag = u32::MAX - 107;
     let msg_cb_tag = u32::MAX - 108;
+    let wndclass_tag = u32::MAX - 109;
+    let classname_tag = u32::MAX - 110;
+    let msgbuf_tag = u32::MAX - 111;
+    let msg_win_tag = u32::MAX - 113;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -1553,6 +1574,90 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2n0.5) real windows: RegisterClassA -> CreateWindowExA -> PostMessageA
+    //        a custom message carrying wParam=77 -> a real GetMessageA /
+    //        DispatchMessageA loop drives our WndProc (ring-3, via the same
+    //        callback mechanism CallWindowProcA uses); the WndProc ignores
+    //        WM_CREATE and calls PostQuitMessage(wParam) on anything else.
+    //        GetMessageA sees WM_QUIT, the loop exits; check that the
+    //        MSG's wParam is still 77 — the whole round trip through real
+    //        window/message-queue state, not just the callback mechanism.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], wndclass_tag); // lea rcx, [rip+wndclass]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_rca); // call [rip+iat_RegisterClassA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x75, 0x01, 0xCC]); // test eax,eax; jne+1; int3
+
+    // CreateWindowExA(0, classname, 0, 0, 0, 0, 100, 100, 0, 0, 0, 0)
+    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], classname_tag); // lea rdx, [rip+classname]
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x68]);
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // x=0
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0]); // y=0
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x30, 100, 0, 0, 0]); // nWidth
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x38, 100, 0, 0, 0]); // nHeight
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x40, 0, 0, 0, 0]); // hWndParent
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x48, 0, 0, 0, 0]); // hMenu
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x50, 0, 0, 0, 0]); // hInstance
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x58, 0, 0, 0, 0]); // lpParam
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_cwx); // call [rip+iat_CreateWindowExA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x68]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (hwnd)
+    code.extend_from_slice(&[0x85, 0xC0, 0x75, 0x01, 0xCC]); // test eax,eax; jne+1; int3
+
+    // PostMessageA(hwnd, 0x0400 /*WM_USER*/, 77, 0)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    code.extend_from_slice(&[0xBA, 0, 4, 0, 0]); // mov edx, 0x400
+    code.extend_from_slice(&[0x41, 0xB8, 77, 0, 0, 0]); // mov r8d, 77
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_pma); // call [rip+iat_PostMessageA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x75, 0x01, 0xCC]); // test eax,eax; jne+1; int3
+
+    // message loop
+    let loop_start = code.len();
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], msgbuf_tag); // lea rcx, [rip+msgbuf]
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gma); // call [rip+iat_GetMessageA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+    code.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]); // je .done (patched below)
+    let je_done_pos = code.len() - 4;
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], msgbuf_tag); // lea rcx, [rip+msgbuf]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_dma); // call [rip+iat_DispatchMessageA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.push(0xE9); // jmp loop_start (rel32, patched below)
+    let jmp_loop_pos = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    let disp = loop_start as i64 - (jmp_loop_pos as i64 + 4);
+    code[jmp_loop_pos..jmp_loop_pos + 4].copy_from_slice(&(disp as i32).to_le_bytes());
+    let done_off = code.len();
+    let disp = done_off as i64 - (je_done_pos as i64 + 4);
+    code[je_done_pos..je_done_pos + 4].copy_from_slice(&(disp as i32).to_le_bytes());
+
+    // WM_QUIT's wParam must still be 77 — the value our WndProc passed to
+    // PostQuitMessage, round-tripped through the real message queue.
+    rel!([0x48, 0x8D, 0x05, 0, 0, 0, 0], msgbuf_tag); // lea rax, [rip+msgbuf]
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x10]); // mov rax, [rax+0x10]  ; MSG.wParam
+    code.extend_from_slice(&[0x48, 0x83, 0xF8, 77]); // cmp rax, 77
+    code.extend_from_slice(&[0x74, 0x01]); // je +1
+    code.extend_from_slice(&[0xCC]); // int3
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_win_tag); // lea rdx, [rip+msg_win]
+    let win_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -1709,6 +1814,23 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0x4C, 0x29, 0xC8]); // sub rax, r9
     code.extend_from_slice(&[0xC3]); // ret
 
+    // wndproc — the test window's real WndProc, called by DispatchMessageA
+    // through the ring-3 callback mechanism: LRESULT wndproc(HWND hwnd
+    // /*rcx, unused*/, UINT msg /*rdx*/, WPARAM wparam /*r8*/, LPARAM lparam
+    // /*r9, unused*/). Ignores WM_CREATE(1) (the message CreateWindowExA
+    // itself queues); anything else (our PostMessageA'd custom message) is
+    // treated as "the test is done" — PostQuitMessage(wparam) then return 0.
+    let wndproc_off = code.len();
+    code.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1
+    code.extend_from_slice(&[0x74, 0x11]); // je .ret0 (+0x11, patched by hand below)
+    code.extend_from_slice(&[0x4C, 0x89, 0xC1]); // mov rcx, r8       ; nExitCode = wParam
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_pqm); // call [rip+iat_PostQuitMessage]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    // .ret0:
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    code.extend_from_slice(&[0xC3]); // ret
+
     // thread_fn — a worker thread's StartRoutine (arg in rcx, ignored):
     // WriteFile(1, msg_thread, len, &written, 0); return 0.
     let thread_fn_off = code.len();
@@ -1728,6 +1850,12 @@ fn write_pe_hello(path: &Path) {
     }
     let ptr_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // absolute ptr to msg1 (DIR64-relocated)
+    let wndclass_off = code.len();
+    code.extend_from_slice(&[0u8; 0x48]); // WNDCLASSA (lpfnWndProc @8, lpszClassName @0x40 patched below)
+    let classname_off = code.len();
+    code.extend_from_slice(b"THOSTestClass\0");
+    let msgbuf_off = code.len();
+    code.extend_from_slice(&[0u8; 0x30]); // MSG
     let wr_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // DWORD `written` (+ pad)
     let stdout_off = code.len();
@@ -1999,7 +2127,11 @@ fn write_pe_hello(path: &Path) {
     let msg_cb: &[u8] = b"PE callback OK\n";
     let msg_cb_off = code.len();
     code.extend_from_slice(msg_cb);
+    let msg_win: &[u8] = b"PE window OK\n";
+    let msg_win_off = code.len();
+    code.extend_from_slice(msg_win);
 
+    code[win_r8..win_r8 + 4].copy_from_slice(&(msg_win.len() as u32).to_le_bytes());
     code[cb_r8..cb_r8 + 4].copy_from_slice(&(msg_cb.len() as u32).to_le_bytes());
     code[sec_r8..sec_r8 + 4].copy_from_slice(&(msg_sec.len() as u32).to_le_bytes());
     code[thread_fn_r8..thread_fn_r8 + 4].copy_from_slice(&(msg_thread.len() as u32).to_le_bytes());
@@ -2043,6 +2175,10 @@ fn write_pe_hello(path: &Path) {
         .copy_from_slice(&(ib + keyname_u16_off as u64).to_le_bytes());
     code[rvalname_us_off + 8..rvalname_us_off + 16]
         .copy_from_slice(&(ib + valname_u16_off as u64).to_le_bytes());
+    // WNDCLASSA.lpfnWndProc / .lpszClassName: absolute preferred-base VAs,
+    // DIR64-relocated at load like the fields above.
+    code[wndclass_off + 0x08..wndclass_off + 0x10].copy_from_slice(&(ib + wndproc_off as u64).to_le_bytes());
+    code[wndclass_off + 0x40..wndclass_off + 0x48].copy_from_slice(&(ib + classname_off as u64).to_le_bytes());
 
     for (pos, target) in fixups {
         let target_rva = match target {
@@ -2155,6 +2291,10 @@ fn write_pe_hello(path: &Path) {
             t if t == msg_sec_tag => text_rva + msg_sec_off as u32,
             t if t == cbfn_tag => text_rva + cbfn_off as u32,
             t if t == msg_cb_tag => text_rva + msg_cb_off as u32,
+            t if t == wndclass_tag => text_rva + wndclass_off as u32,
+            t if t == classname_tag => text_rva + classname_off as u32,
+            t if t == msgbuf_tag => text_rva + msgbuf_off as u32,
+            t if t == msg_win_tag => text_rva + msg_win_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -2172,6 +2312,8 @@ fn write_pe_hello(path: &Path) {
         text_rva + roa_off as u32 + 0x10,   // OBJECT_ATTRIBUTES.ObjectName
         text_rva + keyname_us_off as u32 + 8, // key UNICODE_STRING.Buffer
         text_rva + rvalname_us_off as u32 + 8, // value UNICODE_STRING.Buffer
+        text_rva + wndclass_off as u32 + 0x08, // WNDCLASSA.lpfnWndProc
+        text_rva + wndclass_off as u32 + 0x40, // WNDCLASSA.lpszClassName
     ];
     dir64.sort_unstable();
     let mut reloc: Vec<u8> = Vec::new();
@@ -3467,6 +3609,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE thread OK") // main thread waited on the thread handle + resumed
         && serial.contains("PE section OK") // NtCreateSection + NtMapViewOfSection, sentinel round-trip
         && serial.contains("PE callback OK") // CallWindowProcA: ring-3 callback mechanism, args + LRESULT round-trip
+        && serial.contains("PE window OK") // RegisterClassA/CreateWindowExA/PostMessageA/GetMessageA/DispatchMessageA
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
