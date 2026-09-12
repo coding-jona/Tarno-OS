@@ -401,8 +401,21 @@ late.
     the routine then `NtContinue(&ctx, TestAlert=TRUE)`, so a run of queued APCs
     unwinds one dispatcher call at a time before the interrupted code resumes.
     `pe-test` queues an APC to itself, `NtTestAlert`s, checks the handler ran
-    (`PE APC OK`). Kernel-mode APCs / alertable `NtWaitForSingleObject` land
-    with the timer wheel. `QueueUserAPC` (Win32) layers straight on top.
+    (`PE APC OK`).
+    **Alertable `NtWaitForSingleObject` — done.** `Alertable` (its 2nd
+    argument) used to be read by nobody at all. Now: an already-pending
+    APC is delivered instead of the wait ever touching the object — same
+    `apc::take_and_stage` mechanism `NtTestAlert` uses, `STATUS_USER_APC`
+    staged as `Rax` instead of `STATUS_SUCCESS`. Real, stated scope limit:
+    a *cross-thread* APC arriving while already blocked isn't reachable
+    yet — `NtQueueApcThread` only ever targets the calling thread itself
+    today (any other handle is `STATUS_INVALID_HANDLE`), so that half of
+    the real feature has no way to fire regardless. Verified in `pe-test`
+    with a call built to hang forever if the short-circuit doesn't fire
+    (`Alertable=TRUE`, `Timeout=NULL`, on an event nothing will ever
+    signal) — passed first try, `PE APC alertable-wait OK`.
+    `QueueUserAPC` (Win32) layers straight on top; kernel-mode APCs are
+    unrelated future work.
   - **Configuration registry, grown to persisted hives.** `crate::registry`:
     one global key tree of typed values addressed by `\`-separated path,
     seeded with `\Registry\Machine` + `\Registry\User` on first use. Backs
