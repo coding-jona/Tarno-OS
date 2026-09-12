@@ -544,10 +544,67 @@ late.
     window: drawing through its DC lands at the window's screen origin, not
     the screen DC's own origin or the window's own drawing leaking outside
     its rect — passes on real boot.
-  - **Then (the phase):** process isolation / integrity for the security
-    phase — the NT personality's remaining phase-3 items (below) are mostly
-    done; a compositor / real window rendering is a plausible detour but not
-    required to get there.
+  - **Process address-space teardown**, closing a gap `process.rs`'s own
+    module doc used to flag ("no address-space teardown (a reaper frees the
+    frames later)"): every process's PML4/page-table frames and image/stack/
+    heap pages now genuinely go back to `FRAME_ALLOC` when it exits or
+    `execve`s away, instead of leaking for the rest of the boot. A dead
+    process's memory not lingering (rather than sitting there, freeable by
+    accident, potential fodder for a use-after-free elsewhere) is itself
+    part of what "process isolation" means, alongside the per-process page
+    tables THOS already had.
+    - `Process::teardown`: unmaps every section view first (giving back the
+      PTEs, never the frames — those belong to the `Section`, still possibly
+      live elsewhere), then walks PML4[0..256] (the user half only) freeing
+      every present leaf frame plus the PT/PD/PDPT frames that mapped them,
+      then the PML4 itself.
+      **Caller's responsibility, not the function's**: the process's
+      `pml4_phys` must not be the live CR3 on *any* CPU, now or ever again.
+      Two call sites establish that: `execve`, right after its own explicit
+      `Cr3::write` off the old space (`Task::swap_space`, not `set_space` —
+      keeps the old `Process` alive until *this* code chooses to drop it,
+      not whenever the assignment happens to run); `sched::reap`, once
+      `Task::thread_exited` reports a task's last thread gone (not the
+      `Task`'s own `Arc` strong count — always >= 2 for its whole life,
+      since `TASKS` holds a permanent reference until some parent `wait4`s
+      it, which plenty of THOS's test-spawned processes never get; a new
+      `active_threads` counter, incremented by every `sched::spawn_user*`,
+      is the real signal for "no thread of this process can still be
+      running anywhere").
+    - **A real, pre-existing scheduler bug found and fixed along the way**:
+      `sched::exit()` held the thread it was switching *into* (`next`) in a
+      local variable across `thos_ctx_switch`, which never returns for that
+      call (the stack is dead the instant it jumps away) — so `next`'s Drop
+      glue never ran, permanently leaking one `Arc<Thread>` reference onto
+      whichever thread `next` happened to be. Invisible before (nothing
+      depended on an exact refcount), but it silently defeated `reap()`'s
+      own `Arc::strong_count == 1` liveness check for roughly half of every
+      batch of exited threads — always dropping to the exact same frame
+      count with 8 test processes and never budging across 40 retries. Found
+      by bisecting with a debug trace of `reap()`'s graveyard, `finish_switch`,
+      and `SCHED`'s per-CPU state until the missing drop was visible
+      directly. Fixed with one explicit `drop(next)` before the point of no
+      return.
+    - Also fixed along the way: an earlier attempt drove `reap()` from every
+      idle CPU's hot loop for automatic background reclaim — reverted after
+      it produced a real, timing-dependent hang (registry load one run,
+      mid-fork/exec the next) under concurrent idle-loop lock traffic on
+      `SCHED`. `reap()` stays explicitly-driven for now (a real reaper
+      thread, paced sanely rather than spinning every idle iteration, is
+      future work); the discipline that caught this — real boot tests, not
+      "it compiles" — held again.
+    - Verified with a genuine before/after frame-count check
+      (`process_teardown_check`, kernel-internal): spawn and exit a batch of
+      real user processes, force `reap()` (interleaved with `yield_now` so
+      an exiting thread's own CPU gets to run `finish_switch` first — same
+      pattern the stress milestone's reap-loop already used), and assert
+      `FRAME_ALLOC`'s free count is back exactly where it started. Passes on
+      real boot; full regression sweep green (ext2-test, pe-test, smp-test —
+      the concurrency-heaviest one, unaffected — login-test, kbd-test).
+  - **Then (the phase):** the rest of process isolation / integrity for the
+    security phase — the NT personality's remaining phase-3 items (below)
+    are mostly done; a compositor / real window rendering is a plausible
+    detour but not required to get there.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
