@@ -33,11 +33,42 @@ pub struct Ext2 {
     sparse_super: bool,
 }
 
-#[allow(dead_code)] // mode used once we honour permissions / file types
 pub struct Inode {
     pub mode: u16,
     pub size: u64,
     pub block: [u32; 15],
+    /// `i_uid`/`i_gid` — the classic 16-bit ext2 fields (not the Linux
+    /// high-16-bits-in-`i_osd2` extension; THOS's own uid space is small
+    /// enough that this doesn't matter yet). Every file THOS itself creates
+    /// today (registry hives, the credential store, the integrity baseline,
+    /// the write-path test fixtures) goes through `write_path`/`mkdir_path`
+    /// without an explicit owner, so it's `0` — conceptually the system
+    /// account, matching real Unix's read of an unset owner, and consistent
+    /// with THOS having no interactive root login to actually confuse this
+    /// with (see `cred.rs`).
+    pub uid: u32,
+    #[allow(dead_code)] // parsed and available; `access_ok` has no group tier yet
+    pub gid: u32,
+}
+
+impl Inode {
+    /// The DAC permission check every file open goes through: standard Unix
+    /// owner/other bits. No group tier yet — THOS's identity model doesn't
+    /// have real group membership beyond the single `gid` stamped on a
+    /// file, so a non-owner is checked against "other" directly; that's the
+    /// gap the wider capability-policy work this is a foundation for is
+    /// meant to fill in. uid `0` (the system account) always passes,
+    /// matching real Unix root semantics — consistent with THOS having no
+    /// interactive root login to actually confuse this with (`cred.rs`).
+    pub fn access_ok(&self, uid: u32, want_write: bool) -> bool {
+        if uid == 0 {
+            return true;
+        }
+        let perm = self.mode & 0o777;
+        let bits = if uid == self.uid { (perm >> 6) & 0o7 } else { perm & 0o7 };
+        let need = if want_write { 0o2 } else { 0o4 };
+        bits & need == need
+    }
 }
 
 /// Read an arbitrary byte range off the disk (sector-granular under the hood).
@@ -165,6 +196,8 @@ impl Ext2 {
             mode: le16(&raw[0..]),
             size: le32(&raw[4..]) as u64,
             block,
+            uid: le16(&raw[2..]) as u32,
+            gid: le16(&raw[24..]) as u32,
         }
     }
 

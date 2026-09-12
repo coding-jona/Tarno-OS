@@ -214,6 +214,7 @@ const INVALID_HANDLE_VALUE: i64 = -1;
 
 // A few Win32 error codes.
 const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INVALID_ADDRESS: u32 = 487;
@@ -1643,8 +1644,16 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
                 return INVALID_HANDLE_VALUE;
             }
             let path = win_path_to_thos(&name);
-            let fd = crate::syscall::open_resolved(&path);
-            if fd < 0 {
+            // `access` (a1): GENERIC_READ=0x8000_0000, GENERIC_WRITE=0x4000_0000
+            // — the same DAC check `open`/`openat` go through now, just fed
+            // from `DesiredAccess` instead of `O_ACCMODE`.
+            let want_read = a1 & 0x8000_0000 != 0;
+            let want_write = a1 & 0x4000_0000 != 0;
+            let fd = crate::syscall::open_resolved_access(&path, want_read, want_write);
+            if fd == crate::syscall::EACCES {
+                set_last_error(ERROR_ACCESS_DENIED);
+                INVALID_HANDLE_VALUE
+            } else if fd < 0 {
                 set_last_error(ERROR_FILE_NOT_FOUND);
                 INVALID_HANDLE_VALUE
             } else {

@@ -119,6 +119,7 @@ const EINVAL: i64 = -22;
 const ENOTTY: i64 = -25;
 const ENOENT: i64 = -2;
 const EIO: i64 = -5;
+pub(crate) const EACCES: i64 = -13;
 const EISDIR: i64 = -21;
 const ENOTDIR: i64 = -20;
 const ENOTEMPTY: i64 = -39;
@@ -320,19 +321,35 @@ fn sys_unlink(path_ptr: u64, dir: bool) -> i64 {
     }
 }
 
-fn sys_open(path_ptr: u64) -> i64 {
-    open_resolved(&process::resolve_path(&user_cstr(path_ptr)))
+fn sys_open(path_ptr: u64, flags: u64) -> i64 {
+    open_resolved(&process::resolve_path(&user_cstr(path_ptr)), flags)
 }
 
 /// Open an already-resolved absolute path, returning a new fd (or `-errno`).
-/// Shared by `open`/`openat` and the NT personality's `CreateFileA`.
-pub fn open_resolved(path: &str) -> i64 {
+/// `flags`' `O_ACCMODE` bits (`O_RDONLY`=0, `O_WRONLY`=1, `O_RDWR`=2) decide
+/// which permission(s) to actually check — shared by `open`/`openat`.
+pub fn open_resolved(path: &str, flags: u64) -> i64 {
+    let accmode = flags & 0x3;
+    open_resolved_access(path, accmode != 1, accmode != 0)
+}
+
+/// The permission-checked open underneath [`open_resolved`] — also the NT
+/// personality's `CreateFileA`, which decides `want_read`/`want_write` from
+/// `DesiredAccess` instead of `O_ACCMODE`. `EACCES` if the calling task's
+/// uid doesn't have whichever of `want_read`/`want_write` it asked for
+/// against the target inode's owner/mode bits (`Inode::access_ok`) — the
+/// DAC check every file open goes through now, not just a mode-bits-ignored
+/// lookup.
+pub fn open_resolved_access(path: &str, want_read: bool, want_write: bool) -> i64 {
     let Some(task) = sched::current().task() else {
         return EBADF;
     };
     let Some(fs) = ext2::open().ok() else { return EIO };
-    let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
+    let Some(ino) = fs.path_lookup(path) else { return ENOENT };
     let node = fs.read_inode(ino);
+    if (want_read && !node.access_ok(task.uid, false)) || (want_write && !node.access_ok(task.uid, true)) {
+        return EACCES;
+    }
     if node.mode & 0xF000 == 0x4000 {
         // A directory: hand back a `getdents64`-able stream.
         let entries: alloc::vec::Vec<(u64, u8, alloc::string::String)> =
@@ -530,8 +547,8 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             total
         }
 
-        SYS_OPEN => sys_open(a1),
-        SYS_OPENAT => sys_open(a2), // dirfd ignored; paths are absolute
+        SYS_OPEN => sys_open(a1, a2),
+        SYS_OPENAT => sys_open(a2, a3), // dirfd ignored; paths are absolute
 
         SYS_UNLINK => sys_unlink(a1, false),
         SYS_RMDIR => sys_unlink(a1, true),

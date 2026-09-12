@@ -3026,6 +3026,7 @@ fn type_line(sock: &Path, text: &str) {
             '.' => "dot",
             ',' => "comma",
             '|' => "altgr-less", // DE: AltGr + the key left of Y
+            '>' => "shift-less", // DE: Shift + the key left of Y (plain = `<`)
             '$' => "shift-4",
             '(' => "shift-8",
             ')' => "shift-9",
@@ -3094,6 +3095,15 @@ fn kbd_test(iso: &Path) {
     // running CI can be slow enough that a 2 MiB BusyBox applet takes seconds.
     let _ = wait_for(&log, "hello a file read via open+lseek+read", 30);
 
+    // Capability policy: the logged-in session is uid 1000 (`thos`, per
+    // `drive_login`); `/etc/thos/admin.cred` is owned by uid 0 (the system
+    // account — every file `write_path` creates is, today) at mode 644 —
+    // world-readable, owner-only-writable. A real DAC denial, not a mocked
+    // one: `>` opens for write, the kernel's `Inode::access_ok` check
+    // rejects it, and BusyBox's own shell reports the failure.
+    type_line(&sock, "echo x > /etc/thos/admin.cred");
+    let _ = wait_for(&log, "Permission denied", 15);
+
     let out = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = child.kill();
     let _ = child.wait();
@@ -3105,11 +3115,12 @@ fn kbd_test(iso: &Path) {
     // `pwd` prints the cwd we chdir'd into.
     let cwd_ok = after.contains("\n/bin\n");
     let cat_ok = after.contains("hello a file read via open+lseek+read");
-    if shell_ok && ls_ok && cwd_ok && cat_ok {
-        println!("kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls)");
+    let perm_ok = after.contains("Permission denied");
+    if shell_ok && ls_ok && cwd_ok && cat_ok && perm_ok {
+        println!("kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), DAC write denial");
     } else {
         eprintln!(
-            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok})\n---\n{after}\n---"
+            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} perm_ok={perm_ok})\n---\n{after}\n---"
         );
         exit(1);
     }
