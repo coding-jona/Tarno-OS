@@ -223,6 +223,34 @@ impl Process {
         true
     }
 
+    /// `NtProtectVirtualMemory`/`VirtualProtect`: change `writable`/`exec` on
+    /// every page in `[virt, virt+len)` (rounded outward to page
+    /// boundaries). Real `VirtualProtect` validates the *whole* region is
+    /// committed before changing anything and fails the call entirely
+    /// otherwise (`ERROR_INVALID_ADDRESS`) — so this checks every page is
+    /// present first, then applies. `None` if any page in the range isn't
+    /// mapped; otherwise `Some((old_writable, old_exec))` from the first
+    /// page (real NT reports one previous-protection value for the region
+    /// too, so this matches even though THOS doesn't track per-page history
+    /// beyond what the PTE itself already encodes).
+    pub fn protect(&self, virt: u64, len: u64, writable: bool, exec: bool) -> Option<(bool, bool)> {
+        let start = virt & !0xFFF;
+        let end = (virt + len + 0xFFF) & !0xFFF;
+        let mut v = start;
+        while v < end {
+            vmm::page_present_in(self.pml4_phys, v).then_some(())?;
+            v += 4096;
+        }
+        let mut old = None;
+        let mut v = start;
+        while v < end {
+            let this_old = vmm::protect_page_in(self.pml4_phys, v, writable, exec)?;
+            old.get_or_insert(this_old);
+            v += 4096;
+        }
+        old
+    }
+
     /// Reclaim this address space's frames back to `FRAME_ALLOC`: every
     /// section view's PTEs (never the frames — those belong to the
     /// `Section`, which may still be live elsewhere), then every remaining

@@ -488,6 +488,7 @@ fn write_pe_hello(path: &Path) {
         b"HeapAlloc",        // 14
         b"GetProcAddress",   // 16
         b"LoadLibraryA",     // 17
+        b"VirtualProtect",   // 12
     ];
     // A func spelled `#N` is imported by ordinal N instead of by name.
     let imports: [(&[u8], &[&[u8]]); 3] = [
@@ -584,6 +585,7 @@ fn write_pe_hello(path: &Path) {
     let iat_ha = iat0 + 80; // HeapAlloc
     let iat_gpa = iat0 + 88; // GetProcAddress
     let iat_ll = iat0 + 96; // LoadLibraryA
+    let iat_vp = iat0 + 104; // VirtualProtect
     let iat_add = idata_rva + iat_at[1]; // thoscrt!thos_add  (by name)
     let iat_mul = idata_rva + iat_at[1] + 8; // thoscrt!thos_mul (by ordinal 2)
     let iat_fwd = idata_rva + iat_at[1] + 16; // thoscrt!thos_fwd (forwarded to KERNEL32.GetProcessHeap)
@@ -719,6 +721,8 @@ fn write_pe_hello(path: &Path) {
     let classname_tag = u32::MAX - 110;
     let msgbuf_tag = u32::MAX - 111;
     let msg_win_tag = u32::MAX - 113;
+    let old_protect_tag = u32::MAX - 114;
+    let msg_prot_tag = u32::MAX - 115;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -1658,6 +1662,68 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2n0.7) VirtualProtect: real per-page W^X. VirtualAlloc a fresh page
+    //        (RW, NX by default), write a tiny function into it by hand,
+    //        VirtualProtect it to PAGE_EXECUTE_READ (checking the reported
+    //        previous protection is PAGE_READWRITE), then actually CALL
+    //        into it — only possible if the NX bit genuinely got cleared,
+    //        not just bookkeeping — then flip it to PAGE_READONLY and
+    //        check that reported previous protection too.
+    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx (lpAddress = NULL)
+    code.extend_from_slice(&[0xBA, 0x00, 0x10, 0, 0]); // mov edx, 0x1000
+    code.extend_from_slice(&[0x41, 0xB8, 0x00, 0x30, 0, 0]); // mov r8d, MEM_COMMIT|MEM_RESERVE
+    code.extend_from_slice(&[0x41, 0xB9, 0x04, 0, 0, 0]); // mov r9d, PAGE_READWRITE
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_va); // call [rip+iat_VirtualAlloc]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (page base)
+
+    // Hand-write "mov eax, 42 ; ret" (B8 2A 00 00 00 C3) at [rbx].
+    code.extend_from_slice(&[0xC7, 0x03, 0xB8, 0x2A, 0x00, 0x00]); // mov dword [rbx], 0x00002AB8
+    code.extend_from_slice(&[0x66, 0xC7, 0x43, 0x04, 0x00, 0xC3]); // mov word [rbx+4], 0xC300
+
+    // VirtualProtect(rbx, 0x1000, PAGE_EXECUTE_READ, &old_protect)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    code.extend_from_slice(&[0xBA, 0x00, 0x10, 0, 0]); // mov edx, 0x1000
+    code.extend_from_slice(&[0x41, 0xB8, 0x20, 0, 0, 0]); // mov r8d, PAGE_EXECUTE_READ
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], old_protect_tag); // lea r9, [rip+old_protect]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_vp); // call [rip+iat_VirtualProtect]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x75, 0x01, 0xCC]); // test eax,eax; jne+1; int3
+    rel!([0x8B, 0x05, 0, 0, 0, 0], old_protect_tag); // mov eax, [rip+old_protect]
+    code.extend_from_slice(&[0x83, 0xF8, 0x04]); // cmp eax, PAGE_READWRITE
+    code.extend_from_slice(&[0x74, 0x01, 0xCC]); // je +1; int3
+
+    // Call into the now-executable page — only reachable if EXEC really works.
+    code.extend_from_slice(&[0xFF, 0xD3]); // call rbx
+    code.extend_from_slice(&[0x83, 0xF8, 0x2A]); // cmp eax, 42
+    code.extend_from_slice(&[0x74, 0x01, 0xCC]); // je +1; int3
+
+    // VirtualProtect(rbx, 0x1000, PAGE_READONLY, &old_protect) — chain-check
+    // the previous-protection readback a second time.
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    code.extend_from_slice(&[0xBA, 0x00, 0x10, 0, 0]); // mov edx, 0x1000
+    code.extend_from_slice(&[0x41, 0xB8, 0x02, 0, 0, 0]); // mov r8d, PAGE_READONLY
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], old_protect_tag); // lea r9, [rip+old_protect]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_vp);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x75, 0x01, 0xCC]); // test eax,eax; jne+1; int3
+    rel!([0x8B, 0x05, 0, 0, 0, 0], old_protect_tag); // mov eax, [rip+old_protect]
+    code.extend_from_slice(&[0x83, 0xF8, 0x20]); // cmp eax, PAGE_EXECUTE_READ
+    code.extend_from_slice(&[0x74, 0x01, 0xCC]); // je +1; int3
+
+    // WriteFile(1, msg_prot, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_prot_tag);
+    let prot_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -1856,6 +1922,8 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(b"THOSTestClass\0");
     let msgbuf_off = code.len();
     code.extend_from_slice(&[0u8; 0x30]); // MSG
+    let old_protect_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // DWORD old_protect (+ pad)
     let wr_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // DWORD `written` (+ pad)
     let stdout_off = code.len();
@@ -2130,7 +2198,11 @@ fn write_pe_hello(path: &Path) {
     let msg_win: &[u8] = b"PE window OK\n";
     let msg_win_off = code.len();
     code.extend_from_slice(msg_win);
+    let msg_prot: &[u8] = b"PE protect OK\n";
+    let msg_prot_off = code.len();
+    code.extend_from_slice(msg_prot);
 
+    code[prot_r8..prot_r8 + 4].copy_from_slice(&(msg_prot.len() as u32).to_le_bytes());
     code[win_r8..win_r8 + 4].copy_from_slice(&(msg_win.len() as u32).to_le_bytes());
     code[cb_r8..cb_r8 + 4].copy_from_slice(&(msg_cb.len() as u32).to_le_bytes());
     code[sec_r8..sec_r8 + 4].copy_from_slice(&(msg_sec.len() as u32).to_le_bytes());
@@ -2295,6 +2367,8 @@ fn write_pe_hello(path: &Path) {
             t if t == classname_tag => text_rva + classname_off as u32,
             t if t == msgbuf_tag => text_rva + msgbuf_off as u32,
             t if t == msg_win_tag => text_rva + msg_win_off as u32,
+            t if t == old_protect_tag => text_rva + old_protect_off as u32,
+            t if t == msg_prot_tag => text_rva + msg_prot_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -3610,6 +3684,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE section OK") // NtCreateSection + NtMapViewOfSection, sentinel round-trip
         && serial.contains("PE callback OK") // CallWindowProcA: ring-3 callback mechanism, args + LRESULT round-trip
         && serial.contains("PE window OK") // RegisterClassA/CreateWindowExA/PostMessageA/GetMessageA/DispatchMessageA
+        && serial.contains("PE protect OK") // VirtualProtect: real W^X — EXEC granted then called, old-protect readback
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL

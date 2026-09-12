@@ -215,6 +215,48 @@ const INVALID_HANDLE_VALUE: i64 = -1;
 // A few Win32 error codes.
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_INVALID_HANDLE: u32 = 6;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_INVALID_ADDRESS: u32 = 487;
+
+// Win32 `PAGE_*` protection constants (`VirtualProtect`'s `flNewProtect` /
+// `NtProtectVirtualMemory`'s `NewProtect`).
+const PAGE_READONLY: u32 = 0x02;
+const PAGE_READWRITE: u32 = 0x04;
+const PAGE_WRITECOPY: u32 = 0x08;
+const PAGE_EXECUTE: u32 = 0x10;
+const PAGE_EXECUTE_READ: u32 = 0x20;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+
+/// Win32 `PAGE_*` → `(writable, exec)`. `None` for `PAGE_NOACCESS` or
+/// anything unrecognized — THOS doesn't have a true "mapped but
+/// inaccessible" page state yet, so there's nothing honest to enforce for
+/// it; treated as unsupported rather than silently granting access anyway.
+/// `PAGE_WRITECOPY`/`PAGE_EXECUTE_WRITECOPY` collapse to the plain
+/// read-write forms — no real copy-on-write yet (see `process.rs`'s own
+/// module doc), so a private mapping is the closest honest behavior.
+fn win32_protect_to_wx(flags: u32) -> Option<(bool, bool)> {
+    match flags & 0xFF {
+        PAGE_READONLY => Some((false, false)),
+        PAGE_READWRITE | PAGE_WRITECOPY => Some((true, false)),
+        PAGE_EXECUTE | PAGE_EXECUTE_READ => Some((false, true)),
+        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY => Some((true, true)),
+        _ => None,
+    }
+}
+
+/// The inverse of [`win32_protect_to_wx`] — for reporting `lpflOldProtect`/
+/// `OldProtect`. Picks the plain (non-writecopy) `PAGE_*` constant; THOS
+/// never distinguishes the writecopy variants once mapped (see above), so
+/// there is no way to report one back either.
+fn wx_to_win32_protect(writable: bool, exec: bool) -> u32 {
+    match (writable, exec) {
+        (false, false) => PAGE_READONLY,
+        (true, false) => PAGE_READWRITE,
+        (false, true) => PAGE_EXECUTE_READ,
+        (true, true) => PAGE_EXECUTE_READWRITE,
+    }
+}
 
 // NTSTATUS values the `Nt*` layer returns (low 32 bits; the high bit marks an
 // error, which a caller tests with `NT_SUCCESS`).
@@ -698,7 +740,41 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             STATUS_SUCCESS as i64
         }
         // No teardown / per-page protection yet.
-        NT_NTFREEVIRTUALMEMORY | NT_NTPROTECTVIRTUALMEMORY => STATUS_SUCCESS as i64,
+        // No teardown yet for a live decommit/release of a sub-range (see
+        // process.rs's Process::teardown for whole-process reclaim).
+        NT_NTFREEVIRTUALMEMORY => STATUS_SUCCESS as i64,
+
+        // NtProtectVirtualMemory(ProcessHandle, *BaseAddress, *RegionSize,
+        //                        NewProtect, *OldProtect). Real per-page W^X
+        // now (Process::protect), not a no-op stub. `*BaseAddress`/
+        // `*RegionSize` are read only, not rounded-and-written-back like
+        // `NtAllocateVirtualMemory` does — a caller that wants the rounded
+        // range has to ask for it another way; good enough for the callers
+        // THOS actually has today.
+        NT_NTPROTECTVIRTUALMEMORY => {
+            let (base_pp, size_pp) = (a1, a2);
+            if base_pp == 0 || size_pp == 0 {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let base = unsafe { *(base_pp as *const u64) };
+            let size = unsafe { *(size_pp as *const u64) };
+            let Some((w, x)) = win32_protect_to_wx(a3 as u32) else {
+                return STATUS_INVALID_PARAMETER as i64;
+            };
+            let Some(proc) = sched::current_proc() else {
+                return STATUS_INVALID_PARAMETER as i64;
+            };
+            match proc.protect(base, size.max(1), w, x) {
+                Some((old_w, old_x)) => {
+                    let old_pp = stack(0);
+                    if old_pp != 0 {
+                        unsafe { *(old_pp as *mut u32) = wx_to_win32_protect(old_w, old_x) };
+                    }
+                    STATUS_SUCCESS as i64
+                }
+                None => STATUS_INVALID_PARAMETER as i64,
+            }
+        }
 
         // NtQueryInformationProcess(ProcessHandle, InfoClass, Buffer, Length,
         //                           *ReturnLength). Only ProcessBasicInformation
@@ -1649,8 +1725,36 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
             }
             base => base as i64,
         },
-        // VirtualFree / VirtualProtect: no teardown / per-page protection yet.
-        NT_VIRTUALFREE | NT_VIRTUALPROTECT => 1,
+        // VirtualFree: no teardown yet (see process.rs's Process::teardown
+        // for whole-process reclaim; a live VirtualFree/decommit of a
+        // sub-range is still a stub).
+        NT_VIRTUALFREE => 1,
+
+        // VirtualProtect(lpAddress, dwSize, flNewProtect, lpflOldProtect).
+        // Real per-page W^X now (Process::protect / vmm::protect_page_in),
+        // not a no-op stub.
+        NT_VIRTUALPROTECT => {
+            let Some((w, x)) = win32_protect_to_wx(a2 as u32) else {
+                set_last_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            };
+            let Some(proc) = sched::current_proc() else {
+                set_last_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            };
+            match proc.protect(a0, a1.max(1), w, x) {
+                Some((old_w, old_x)) => {
+                    if a3 != 0 {
+                        unsafe { *(a3 as *mut u32) = wx_to_win32_protect(old_w, old_x) };
+                    }
+                    1
+                }
+                None => {
+                    set_last_error(ERROR_INVALID_ADDRESS);
+                    0
+                }
+            }
+        }
 
         NT_GETPROCESSHEAP => PE_PROCESS_HEAP as i64,
 
