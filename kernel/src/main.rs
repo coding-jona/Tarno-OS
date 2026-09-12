@@ -724,6 +724,55 @@ fn section_sharing_check(fs: &ext2::Ext2) {
 
 /// Phase 2 milestone: a VFS with an in-memory file opened through the handle
 /// table, and the AHCI driver reading real sectors off the SATA disk.
+/// Process isolation's other half, closing a gap `process.rs`'s own module
+/// doc used to flag ("no address-space teardown (a reaper frees the frames
+/// later)"): spawn and exit a batch of real user processes, force the
+/// reaper (`sched::reap` — normally driven by an idle CPU's loop, called
+/// here directly for a deterministic check) to run, and confirm the frame
+/// count actually comes back down — not "compiles", a genuine check that a
+/// terminated process's page tables and image/stack/heap frames are
+/// reclaimed rather than left dangling (a resource leak, and a lingering
+/// trace of a dead process's memory the isolation boundary is supposed to
+/// have closed) and, in the shared-section case, that only the process's
+/// *own* frames go back — a section still held elsewhere must survive.
+fn process_teardown_check(bin: &[u8]) {
+    // Warm up once first — the loader's own one-time lazy setup shouldn't be
+    // mistaken for a per-process leak.
+    let before_warmup = syscall::user_exits();
+    process::spawn_init(bin, &["/rusthello"], &["THOS=1"]);
+    while syscall::user_exits() < before_warmup + 1 {
+        sched::yield_now();
+    }
+    for _ in 0..40 {
+        sched::yield_now(); // let a still-switching-away thread finish (`finish_switch`
+        sched::reap(); // clears `running`) before reap() re-checks it — same pattern
+    } // the stress milestone's own reap-loop already uses.
+    let baseline = mm::FRAME_ALLOC.lock().free_frames();
+
+    const ROUNDS: u64 = 8;
+    let start_exits = syscall::user_exits();
+    for _ in 0..ROUNDS {
+        process::spawn_init(bin, &["/rusthello"], &["THOS=1"]);
+    }
+    while syscall::user_exits() < start_exits + ROUNDS {
+        sched::yield_now();
+    }
+    // `reap()` isn't driven automatically anywhere yet (a real reaper thread
+    // is future work — see `sched::reap`'s doc comment); call it directly,
+    // interleaved with `yield_now` so an exited thread's own CPU gets to run
+    // `finish_switch` (clearing `running`) before reap() re-checks it.
+    for _ in 0..40 {
+        sched::yield_now();
+        sched::reap();
+    }
+    let after = mm::FRAME_ALLOC.lock().free_frames();
+    assert_eq!(
+        after, baseline,
+        "process teardown leaked frames: {ROUNDS} processes spawned+exited, {baseline} -> {after} free frames"
+    );
+    kprintln!("THOS: proc teardown ok {ROUNDS} processes spawned+exited, {baseline} free frames unchanged");
+}
+
 fn storage_milestone() {
     vfs::init();
     let f = vfs::create("/hello");
@@ -798,6 +847,7 @@ fn storage_milestone() {
         sched::yield_now();
     }
     kprintln!("THOS: musl binary ok   (static Rust/musl ran to exit)");
+    process_teardown_check(&rs);
 
     // Milestone 2: an unmodified stock static BusyBox. Feature-gated — reading
     // the 2 MiB binary a block at a time makes every boot noticeably slower.

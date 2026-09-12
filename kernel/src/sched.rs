@@ -450,6 +450,7 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -
 /// the first time it is scheduled, in `proc`'s address space.
 pub fn spawn_user(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    task.thread_spawned();
     let t = Thread::spawned_user(id, name, task, entry, user_rsp, 0);
     SCHED.lock().ready.push_back(t);
     id
@@ -460,6 +461,7 @@ pub fn spawn_user(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64
 /// and carrying `teb` as its `%gs` base.
 pub fn spawn_user_pe(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64, teb: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    task.thread_spawned();
     let t = Thread::spawned_user(id, name, task, entry, user_rsp, teb);
     SCHED.lock().ready.push_back(t);
     id
@@ -469,6 +471,7 @@ pub fn spawn_user_pe(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: 
 /// fork child).
 pub fn spawn_user_frame(name: &'static str, task: Arc<Task>, frame: UserFrame, fsbase: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    task.thread_spawned();
     let t = Thread::spawned_user_frame(id, name, task, frame, fsbase);
     SCHED.lock().ready.push_back(t);
     id
@@ -593,6 +596,13 @@ pub fn exit() -> ! {
     while next.running.swap(true, Ordering::Acquire) {
         core::hint::spin_loop();
     }
+    // `thos_ctx_switch` does not return for this call — this stack is dead
+    // the instant it jumps away, so `next`'s Drop glue would otherwise never
+    // run (the enclosing frame is never unwound to reach it). Drop it
+    // explicitly, now that its last use (`running`, above) is behind us, or
+    // this reference leaks onto `next` forever — whichever thread that
+    // happens to be, not necessarily this one.
+    drop(next);
     let mut scratch = 0u64;
     unsafe { thos_ctx_switch(&mut scratch, load) };
     unreachable!("switched back into an exited thread")
@@ -732,7 +742,16 @@ fn finish_switch() {
 /// Free the kernel stacks of exited threads. Safe to call from anywhere: a
 /// corpse is only dropped once no CPU is on its stack (`running` cleared by
 /// `finish_switch`) and nothing else still holds a reference.
-#[allow(dead_code)] // driven by the `stress` milestone today; a reaper thread later
+///
+/// Also the safe point for reclaiming a *process's* address space: right
+/// before a dead thread's stack is freed (i.e. once nothing is running on
+/// it anywhere — the exact same proof that makes freeing the stack safe),
+/// `Task::thread_exited` records it gone; once it reports this was the
+/// task's *last* thread, no thread of that process can possibly still be
+/// executing anywhere, and `Task::teardown_space_if_unreferenced` may run.
+/// (Not `Arc<Task>`'s own strong count — that stays >= 2 for the task's
+/// whole life, since `TASKS` holds a permanent reference until some parent
+/// `wait4`s it, which plenty of THOS's test-spawned processes never get.)
 pub fn reap() {
     let mut s = SCHED.lock();
     let mut i = 0;
@@ -740,7 +759,13 @@ pub fn reap() {
         let dead =
             !s.graveyard[i].running.load(Ordering::Acquire) && Arc::strong_count(&s.graveyard[i]) == 1;
         if dead {
-            s.graveyard.swap_remove(i); // Arc drops -> the Box<[u8]> stack is freed
+            let corpse = s.graveyard.swap_remove(i); // about to be the last reference
+            if let Some(task) = &corpse.task {
+                if task.thread_exited() {
+                    task.teardown_space_if_unreferenced();
+                }
+            }
+            drop(corpse); // Arc drops -> the Box<[u8]> stack (and now-unreferenced Task) freed
         } else {
             i += 1;
         }

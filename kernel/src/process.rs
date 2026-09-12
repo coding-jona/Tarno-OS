@@ -223,6 +223,74 @@ impl Process {
         true
     }
 
+    /// Reclaim this address space's frames back to `FRAME_ALLOC`: every
+    /// section view's PTEs (never the frames — those belong to the
+    /// `Section`, which may still be live elsewhere), then every remaining
+    /// present user-half page (now provably this process's *own* — ELF/PE
+    /// image, stacks, heap, TLS, TEB/PEB/stub pages) plus the PT/PD/PDPT
+    /// frames that mapped them, and finally the PML4 frame itself.
+    ///
+    /// **Caller's responsibility, not this function's**: this process's
+    /// `pml4_phys` must not be the live CR3 on *any* CPU, now or later — the
+    /// two call sites (`execve`, right after its own `Cr3::write` off this
+    /// space; `sched::reap`, once the last `Thread` referencing this
+    /// `Process`'s `Task` is confirmed not running anywhere) each establish
+    /// that before calling this.
+    fn teardown(&self) {
+        let bases: alloc::vec::Vec<u64> = self.views.lock().iter().map(|v| v.base).collect();
+        for base in bases {
+            self.unmap_view(base);
+        }
+        self.free_user_address_space();
+    }
+
+    /// The raw page-table walk `teardown` uses: PML4[0..256] only (the
+    /// user half — PML4[256..512] plus the low identity map that PML4[0]'s
+    /// *kernel* half briefly overlapped are the kernel's own frames, shared
+    /// by pointer, never this process's to free). A 1 GiB/2 MiB entry is
+    /// skipped rather than freed as if it were a 4 KiB frame — THOS never
+    /// creates a user huge-page mapping, but this is not the place to first
+    /// notice one exists.
+    fn free_user_address_space(&self) {
+        let hhdm = hhdm_offset();
+        let tbl = |phys: u64| unsafe { &*((phys + hhdm) as *const PageTable) };
+        let mut fa = FRAME_ALLOC.lock();
+
+        for i4 in 0..256usize {
+            let e4 = &tbl(self.pml4_phys)[i4];
+            if !e4.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            let pdpt_phys = e4.addr().as_u64();
+            for i3 in 0..512usize {
+                let e3 = &tbl(pdpt_phys)[i3];
+                let f3 = e3.flags();
+                if !f3.contains(PageTableFlags::PRESENT) || f3.contains(PageTableFlags::HUGE_PAGE) {
+                    continue;
+                }
+                let pd_phys = e3.addr().as_u64();
+                for i2 in 0..512usize {
+                    let e2 = &tbl(pd_phys)[i2];
+                    let f2 = e2.flags();
+                    if !f2.contains(PageTableFlags::PRESENT) || f2.contains(PageTableFlags::HUGE_PAGE) {
+                        continue;
+                    }
+                    let pt_phys = e2.addr().as_u64();
+                    for i1 in 0..512usize {
+                        let e1 = &tbl(pt_phys)[i1];
+                        if e1.flags().contains(PageTableFlags::PRESENT) {
+                            fa.dealloc(PhysFrame::containing_address(e1.addr()));
+                        }
+                    }
+                    fa.dealloc(PhysFrame::containing_address(PhysAddr::new(pt_phys)));
+                }
+                fa.dealloc(PhysFrame::containing_address(PhysAddr::new(pd_phys)));
+            }
+            fa.dealloc(PhysFrame::containing_address(PhysAddr::new(pdpt_phys)));
+        }
+        fa.dealloc(PhysFrame::containing_address(PhysAddr::new(self.pml4_phys)));
+    }
+
     /// Allocate + map a fresh user stack; returns the (page-aligned) stack top.
     pub fn new_user_stack(&self) -> u64 {
         let base = self.next_user_va.fetch_add(USER_STACK_SIZE + 0x1000, Ordering::Relaxed);
@@ -542,6 +610,16 @@ pub struct Task {
     apcs: Mutex<VecDeque<ApcEntry>>,
     /// `true` for a native PE image, `false` for an ELF — for a `ps` view.
     is_pe: AtomicBool,
+    /// How many of this task's threads are still alive — *not* the same
+    /// thing as this `Arc<Task>`'s own strong count, which stays >= 2 for
+    /// the task's entire lifetime (one held by `TASKS`, permanently, until
+    /// some parent `wait4`s it — many of THOS's test-spawned processes never
+    /// get one). Threads are what actually run on a CR3, so this is the
+    /// right signal for "is it safe to reclaim the address space now" —
+    /// `sched::spawn_user`/`spawn_user_pe`/`spawn_user_frame` increment it,
+    /// `sched::reap` decrements it once a thread's stack is confirmed safe
+    /// to free, and reclaims the address space right when it hits zero.
+    active_threads: AtomicU64,
 }
 
 fn seed_fds() -> Vec<Fd> {
@@ -564,6 +642,7 @@ impl Task {
             cwd: Mutex::new(String::from("/")),
             apcs: Mutex::new(VecDeque::new()),
             is_pe: AtomicBool::new(false),
+            active_threads: AtomicU64::new(0),
         });
         TASKS.lock().insert(t.pid, t.clone());
         t
@@ -577,8 +656,44 @@ impl Task {
         self.space.lock().clone()
     }
 
-    fn set_space(&self, s: Arc<Process>) {
-        *self.space.lock() = s;
+    /// Install `new`, returning the *old* space still alive (not dropped
+    /// here) — unlike `set_space`, so a caller that is still running on the
+    /// old space's CR3 (`execve`, until its own `Cr3::write` a few
+    /// instructions later) controls exactly when it becomes safe to free.
+    fn swap_space(&self, new: Arc<Process>) -> Arc<Process> {
+        core::mem::replace(&mut *self.space.lock(), new)
+    }
+
+    /// Record that a new thread of this task just started (`sched::spawn_user`
+    /// / `spawn_user_pe` / `spawn_user_frame` — every path that creates a
+    /// `Thread` bound to this `Task`, the initial one included).
+    pub(crate) fn thread_spawned(&self) {
+        self.active_threads.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Record that one of this task's threads is confirmed gone (`sched::reap`,
+    /// right as it is about to free that thread's kernel stack — i.e. once
+    /// nothing is running on it anywhere). `true` if that was the *last* one —
+    /// the task's address space is then provably safe to reclaim: whatever CR3
+    /// its threads used cannot be loaded on any CPU with none of them left.
+    pub(crate) fn thread_exited(&self) -> bool {
+        self.active_threads.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+
+    /// Reclaim this task's address-space frames — called once `thread_exited`
+    /// reports the last thread gone. The `Arc<Process>` strong-count check is
+    /// still a belt-and-suspenders guard, not the trigger: a `Task`'s own
+    /// strong count stays >= 2 for its whole life (one held by `TASKS`
+    /// permanently — many of THOS's test-spawned processes are never
+    /// `wait4`'d — one by this thread), so it was never a usable signal for
+    /// "safe to free"; this only skips the rare case something else (a
+    /// concurrent `execve` mid-swap, a `ps` snapshot) holds a temporary extra
+    /// clone of the `Process` itself at this exact moment.
+    pub(crate) fn teardown_space_if_unreferenced(&self) {
+        let space = self.space.lock();
+        if Arc::strong_count(&space) == 1 {
+            space.teardown();
+        }
     }
 
     pub fn fd_get(&self, fd: i32) -> Option<Arc<dyn FileOps>> {
@@ -1083,7 +1198,12 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
     task.close_on_exec(); // drop O_CLOEXEC fds before the new image sees them
 
     let new_cr3 = space.pml4_phys();
-    task.set_space(space);
+    // `swap_space`, not `set_space`: this thread is still running on the
+    // *old* space's CR3 for a few more instructions (the actual register
+    // switch is the explicit `Cr3::write` below) — dropping the old
+    // `Process` here, before that, would free its page tables out from
+    // under the very code currently executing off them.
+    let old_space = task.swap_space(space);
     cur.set_cr3(new_cr3);
     cur.set_fsbase(0); // fresh image: TLS is re-established by its own arch_prctl
 
@@ -1103,6 +1223,13 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
             PhysFrame::from_start_address(PhysAddr::new(new_cr3)).unwrap(),
             Cr3Flags::empty(),
         );
+        // This CPU is off the old space now — safe to reclaim it, provided
+        // nothing else still references it (a concurrent `wait4`/`ps`
+        // snapshot could in principle hold a clone; if so, just leave it —
+        // whoever does hold the last reference will drop it in turn).
+        if Arc::strong_count(&old_space) == 1 {
+            old_space.teardown();
+        }
         syscall::thos_user_resume(&f)
     }
 }
