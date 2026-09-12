@@ -943,6 +943,30 @@ into ring 0."
     Skips (not fails) if `swtpm` isn't on `PATH`, since it's optional test
     tooling. `bootpick-test` itself (no TPM attached) still passes unchanged,
     confirming the TPM path is genuinely optional. Both pass on real boot.
+  - **File-integrity baselines — done, `kernel/src/integrity.rs`.** SHA-256
+    (already vendored for `cred.rs`'s PBKDF2 — no new crypto dependency)
+    hashes of `integrity::BASELINE_FILES` (`/init`, `/rusthello` today — the
+    files every boot configuration is guaranteed to have; grows as more of
+    the system becomes something every boot can rely on being there),
+    recorded once to `/etc/thos/integrity.baseline` (the registry hives' /
+    credential store's own "own text format, hex-encoded fields"
+    convention) on the first boot that finds none stored, and recomputed +
+    compared against on every boot after. **Detection, not prevention** —
+    nothing here stops a write to a baselined file, it only notices
+    afterward that one happened; the building block a later on-access
+    scanner or boot-attestation flow reads, not a scanner itself.
+    Verified with a genuine three-boot round trip (`cargo xtask
+    integrity-test`), including real tamper detection, not a mocked one:
+    boot 1 (fresh disk) records the baseline; boot 2 (same disk, untouched)
+    verifies clean; `/init` is then overwritten *directly on the disk image
+    from the host* (`debugfs`, simulating an external tamper THOS itself
+    never did); boot 3 must report the mismatch — and does
+    (`THOS: integrity FAIL   /init does not match its baseline hash`),
+    genuinely before the kernel goes on to legitimately panic trying to
+    load the now-corrupt `/init` as an ELF (a real consequence of the
+    tamper, not a test bug — further proof the check ran, not skipped).
+    Full regression sweep otherwise unaffected: ext2-test, pe-test,
+    smp-test, login-test all still pass.
 - **Security Service (isolated userspace) — the full AV:** real-time (on-access
   + on-exec) and on-demand scanning; file scanner (YARA + open-source signature
   sets, e.g. ClamAV-style DBs); exec scanner (PE/ELF static analysis, reusing
