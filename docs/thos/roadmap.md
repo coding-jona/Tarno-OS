@@ -636,6 +636,10 @@ late.
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
   transactional key-value store; **SEH** ↔ trap dispatch; **APC** delivery.
+  - Registry status: hives (load/persist to ext2) and **per-key security**
+    done — see "Capability policy" under Security Core below. Still open:
+    real transactions (a crash mid-write can still lose that one write) and
+    change-notify.
 - Write the `ntdll` lower boundary; layer **Wine PE-built DLLs** (`kernel32` /
   `kernelbase` / `user32` core) on top.
 - **Milestone 3:** a statically linked Win32 **console** `.exe` (`CreateFile`,
@@ -1070,6 +1074,37 @@ into ring 0."
     calls `getuid()` and prints the result — proof the *spawned* process
     really has uid 0. `cargo xtask kbd-test`: `elevate returned 22` (a real
     pid) followed by `elevated-check uid=0`. Full regression sweep green.
+  - **Per-key registry security — done.** Closes one of `registry.rs`'s own
+    three stated gaps (transactions and change-notify are still open). Same
+    DAC shape as the filesystem: every `Key` gains an `owner_uid`
+    (default `0`, system — `ext2::Inode`'s own convention for an unset
+    owner); uid `0` or the key's own owner may write, anyone may still
+    read. `create`/`make` split the same way `write_path`/`mkdir_path`
+    were — `create_owned(path, uid)` stamps the real owner on every newly
+    auto-vivified ancestor (real `RegCreateKeyEx` behavior), an
+    already-existing key's owner is untouched by re-creating it. Because
+    the registry auto-creates missing ancestors (unlike the filesystem,
+    there's no single guaranteed-existing parent), `create_write_ok` walks
+    up to the nearest ancestor that *does* exist and checks that one — the
+    filesystem's "creating an entry is a write to the parent" rule,
+    generalized. The owner now persists too: the hive format gained an
+    `O <relpath> <uid>` record, omitted when `0` so an old hive with none
+    loads exactly as it always did — no format-version bump needed.
+    `nt.rs` is where this is actually enforced: `NtCreateKey` distinguishes
+    opening (read, unchecked) from creating (checked against the nearest
+    ancestor), `NtSetValueKey`/`NtDeleteKey` check the key itself —
+    `STATUS_ACCESS_DENIED` on a hit. Every process before a login session
+    exists runs as uid `0` — always permitted against any owner — so
+    `pe-test`'s existing NT registry round trip needed no changes at all.
+    Verified two ways: `registry_security_check` (main.rs, kernel-internal)
+    — a uid-1000-owned key accepts its own owner and root, rejects a
+    stranger; a system-owned key (every pre-existing hive key) is now
+    genuinely denied to a normal uid, the actual gap closed; persistence
+    checked for real by reading `/etc/thos/registry/software.hiv` straight
+    off ext2 afterward and asserting the raw hive text carries the `O`
+    record. Full regression sweep green: ext2-test, pe-test (the live NT
+    registry round trip, unaffected), smp-test, login-test,
+    integrity-test, kbd-test.
 - **Security Service (isolated userspace) — the full AV:** real-time (on-access
   + on-exec) and on-demand scanning; file scanner (YARA + open-source signature
   sets, e.g. ClamAV-style DBs); exec scanner (PE/ELF static analysis, reusing
