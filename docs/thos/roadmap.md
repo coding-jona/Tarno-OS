@@ -1022,6 +1022,24 @@ into ring 0."
     scoping as `execve`'s exec-gate wiring below. Full regression sweep
     green: ext2-test, pe-test, smp-test, login-test, integrity-test,
     kbd-test.
+  - **Capability policy — third slice done: real group-tier DAC.** The
+    first slice's own stated gap — `gid` parsed and stamped on every file
+    but never actually checked, so a non-owner always landed in "other"
+    regardless of group. `Task` now carries a `gid` (== its `uid` — no
+    supplementary groups yet, the "user private group" scheme `cred::save`
+    already assumed naming a new account's home directory) and
+    `Inode::access_ok(uid, gid, want_write)` is a real three-tier check:
+    owner, then group (caller's gid matches the file's gid), then other.
+    `SYS_GETGID`/`SYS_GETEGID` return the real gid instead of quietly
+    aliasing `SYS_GETUID`.
+    Verified kernel-internal (`group_tier_check`, main.rs — THOS is still a
+    single-admin-account system, so there's no second uid/gid to drive this
+    live through a real shell, same scoping as chmod/chown's own
+    verification): a real file owned `(1000, 1000)`, chmod'd to `0640` via
+    the real `chmod_path`; the owner gets read+write, a *different* uid
+    sharing the file's gid gets read only, a uid matching neither gets
+    nothing, uid 0 always passes. Full regression sweep green: ext2-test,
+    pe-test, smp-test, login-test, integrity-test, kbd-test.
 - **Security Service (isolated userspace) — the full AV:** real-time (on-access
   + on-exec) and on-demand scanning; file scanner (YARA + open-source signature
   sets, e.g. ClamAV-style DBs); exec scanner (PE/ELF static analysis, reusing
