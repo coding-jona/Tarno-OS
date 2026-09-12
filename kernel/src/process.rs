@@ -462,6 +462,15 @@ pub fn current_uid() -> u32 {
     sched::current().task().map(|t| t.uid).unwrap_or(0)
 }
 
+/// Is the calling task a native PE image? `false` (never PE) if there is no
+/// current task at all. The one place this matters: whether it's safe to
+/// even *look* at the PE-only vectored-exception-handler slot (`seh.rs`) —
+/// that page is only ever mapped for a PE process; reading it for a plain
+/// ELF one faults.
+pub fn current_is_pe() -> bool {
+    sched::current().task().is_some_and(|t| t.is_pe.load(Ordering::Relaxed))
+}
+
 /// What a HANDLE / file descriptor points at. Both personalities share one
 /// per-process table: a POSIX fd and a Win32 `HANDLE` are the same integer
 /// into the same `Vec` — a file, or an executive object.
@@ -1165,6 +1174,13 @@ pub fn spawn_init(bytes: &[u8], argv: &[&str], envp: &[&str]) -> u64 {
 /// syscalls runs on this alone.
 #[allow(dead_code)] // only the `petest` milestone calls this so far
 pub fn spawn_pe(bytes: &[u8]) -> Result<u64, &'static str> {
+    // The native-exec gate: every program entering the system passes the
+    // hash/signature check + policy engine before `pe::load` ever parses a
+    // header. Same rejection shape as a malformed PE — `Err`, kernel alive.
+    if let crate::execgate::Verdict::Quarantine(reason) = crate::execgate::check(bytes) {
+        crate::kprintln!("THOS: exec gate        quarantined a PE — {reason}");
+        return Err("quarantined by the native-exec gate");
+    }
     let space = Process::new();
     let stack_top = space.new_user_stack();
     let img = crate::pe::load(&space, bytes, stack_top)?; // malformed .exe -> Err, never panic
@@ -1213,6 +1229,20 @@ pub fn fork(frame: &UserFrame) -> i64 {
 
 /// `execve`: replace the current task's image. Does not return on success.
 pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
+    // The native-exec gate: same check `spawn_pe` runs, here for the path a
+    // *running* process takes to become a different program. A malformed
+    // image already can't panic the kernel past this point (`elf::load`
+    // below), but there's no `Result` to hand back through `execve`'s own
+    // ABI (the calling thread's image is what's being replaced) — quarantine
+    // ends the calling thread cleanly instead, exit code 126 (the shell
+    // convention for "found but not executable"), kernel alive either way.
+    if let crate::execgate::Verdict::Quarantine(reason) = crate::execgate::check(bytes) {
+        crate::kprintln!("THOS: exec gate        quarantined an ELF — {reason}");
+        set_exit_status(126);
+        crate::syscall::note_user_exit();
+        sched::exit();
+    }
+
     let cur = sched::current();
     let task = cur.task().expect("execve: not a user task");
 

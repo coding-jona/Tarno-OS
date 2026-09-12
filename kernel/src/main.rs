@@ -34,6 +34,7 @@ mod cpu;
 #[cfg(feature = "interactive")]
 mod cred;
 mod elf;
+mod execgate;
 mod ext2;
 mod fat;
 mod file;
@@ -670,6 +671,26 @@ fn registry_enum_check() {
     kprintln!("THOS: registry enum ok NtEnumerateKey/Value order + STATUS_NO_MORE_ENTRIES");
 }
 
+/// `execgate::check`'s detection logic, exercised directly — the algorithm
+/// shared by both `spawn_pe` (`PE reject`/exec-gate check below, a real
+/// `pe::load` round trip) and `execve` (wired the same way, not yet
+/// exercised by a dedicated live test — no test binary execve's malicious
+/// content today; this at least proves the shared detection logic itself is
+/// right). Ordinary bytes with no signature must pass; the EICAR string
+/// anywhere in an otherwise arbitrary buffer must not.
+fn execgate_check() {
+    assert_eq!(execgate::check(b"just an ordinary file, nothing to see here"), execgate::Verdict::Allow);
+    assert_eq!(execgate::check(&[]), execgate::Verdict::Allow);
+    let mut buf = alloc::vec![0xAAu8; 64];
+    buf.extend_from_slice(b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*");
+    buf.extend_from_slice(&[0xBBu8; 64]);
+    assert!(
+        matches!(execgate::check(&buf), execgate::Verdict::Quarantine(_)),
+        "EICAR string buried in the middle of a buffer wasn't caught"
+    );
+    kprintln!("THOS: exec gate check ok EICAR signature detected, clean content passes");
+}
+
 /// `NtCreateSection`/`NtMapViewOfSection`/`NtUnmapViewOfSection`/
 /// `NtFlushVirtualMemory`'s backing logic (`process::Section` /
 /// `Process::map_section_view` etc.), exercised directly against real page
@@ -855,6 +876,7 @@ fn storage_milestone() {
         if loaded_hives == 0 { " (first boot — defaults seeded)" } else { "" }
     );
     registry_enum_check();
+    execgate_check();
     section_sharing_check(&fs);
     integrity_check(&fs);
     let init = fs.read_path("/init").expect("read /init from ext2");
@@ -947,6 +969,18 @@ fn storage_milestone() {
         assert!(process::spawn_pe(&junk).is_err(), "malformed PE was not rejected");
         assert!(process::spawn_pe(b"MZ\x90\x00not really a pe").is_err());
         kprintln!("THOS: pe reject ok     malformed PEs rejected, kernel alive");
+
+        // The native-exec gate: an otherwise perfectly valid, already-tested
+        // PE (this same /pe-hello.exe) carrying the EICAR test string
+        // anywhere in it must be quarantined before `pe::load` even parses
+        // a header — the well-formedness of the container is irrelevant to
+        // the gate, only its content. `exe` on its own already proved this
+        // exact byte sequence runs fine (`THOS: pe exited` above), so a
+        // rejection here can only be the gate, not a malformed-file fluke.
+        let mut eicar_pe = exe.clone();
+        eicar_pe.extend_from_slice(b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*");
+        assert!(process::spawn_pe(&eicar_pe).is_err(), "EICAR-laced PE was not quarantined");
+        kprintln!("THOS: exec gate ok     EICAR-signature PE quarantined, kernel alive");
 
         // Milestone 3: a real mingw-w64 compiler-produced Win32 console `.exe`
         // (own entry, only KERNEL32 imports) runs through the NT path.
