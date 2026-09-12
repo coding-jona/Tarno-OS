@@ -728,6 +728,58 @@ fn registry_security_check(fs: &ext2::Ext2) {
     kprintln!("THOS: registry sec ok  per-key owner, write DAC, ancestor-create check, persisted to hive");
 }
 
+/// Change-notify (`registry::watch`/`nt.rs`'s `NtNotifyChangeKey`) — the
+/// registry side directly (no PE process needed: `watch` takes a plain
+/// `Arc<wait::Event>`, the same object `NtNotifyChangeKey` resolves from a
+/// handle). `nt.rs`'s own dispatch glue (`current_regkey`/`current_event`/
+/// the `WatchTree` stack arg) isn't exercised by a dedicated live PE test
+/// yet — no hand-assembled PE test scenario calls it today, the same
+/// honest scoping already used for `chmod`/`chown` (no BusyBox applet) and
+/// `execve`'s exec-gate wiring.
+fn registry_notify_check() {
+    let base = r"\Registry\Machine\Software\ThosNotifyCheck";
+    assert!(registry::create(base), "create base");
+
+    // A watch on `base` itself fires on a value change on `base`.
+    let ev = alloc::sync::Arc::new(wait::Event::new());
+    assert!(registry::watch(base, false, ev.clone()), "watch an existing key");
+    assert!(!ev.is_signaled(), "must not be signalled before any change");
+    assert!(registry::set_value(base, "Foo", 4, b"1"), "set a value on base");
+    assert!(ev.is_signaled(), "watch didn't fire on a value change");
+
+    // One-shot: the same change again must NOT re-fire a watch that has
+    // already fired and wasn't re-armed — prove it with a *fresh* event
+    // that was never (re-)registered after the first fire.
+    let ev2 = alloc::sync::Arc::new(wait::Event::new());
+    assert!(registry::set_value(base, "Foo", 4, b"2"), "set base's value again");
+    assert!(!ev2.is_signaled(), "an unrelated, never-registered event must never be signalled");
+
+    // Without WatchTree, a direct child firing base is expected (depth 1);
+    // a grandchild must NOT fire it.
+    let child = alloc::format!("{base}\\Child");
+    let grandchild = alloc::format!("{child}\\Grandchild");
+    assert!(registry::create(&child), "create child");
+    let ev3 = alloc::sync::Arc::new(wait::Event::new());
+    assert!(registry::watch(base, false, ev3.clone()), "re-arm the watch on base");
+    assert!(registry::create(&grandchild), "create grandchild");
+    assert!(!ev3.is_signaled(), "a non-WatchTree watch must not fire on a grandchild-depth change");
+    assert!(registry::set_value(&child, "Bar", 4, b"1"), "set a value on the direct child");
+    assert!(ev3.is_signaled(), "a non-WatchTree watch must still fire on a direct child's own change");
+
+    // WatchTree DOES cover the grandchild.
+    let ev4 = alloc::sync::Arc::new(wait::Event::new());
+    assert!(registry::watch(base, true, ev4.clone()), "watch base with WatchTree");
+    assert!(registry::set_value(&grandchild, "Baz", 4, b"1"), "set a value deep in the subtree");
+    assert!(ev4.is_signaled(), "a WatchTree watch must fire on a grandchild-depth change");
+
+    assert!(!registry::watch(r"\Registry\Machine\Software\ThosNoSuchKey", false, ev.clone()), "watching a missing key must fail");
+
+    registry::delete_key(&grandchild);
+    registry::delete_key(&child);
+    registry::delete_key(base);
+    kprintln!("THOS: registry notify ok one-shot fire, WatchTree depth, no-fire-before-change");
+}
+
 /// `execgate::check`'s detection logic, exercised directly — the algorithm
 /// shared by both `spawn_pe` (`PE reject`/exec-gate check below, a real
 /// `pe::load` round trip) and `execve` (wired the same way, not yet
@@ -1042,6 +1094,7 @@ fn storage_milestone() {
     );
     registry_enum_check();
     registry_security_check(&fs);
+    registry_notify_check();
     execgate_check();
     section_sharing_check(&fs);
     integrity_check(&fs);

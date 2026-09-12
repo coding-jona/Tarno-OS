@@ -151,7 +151,16 @@ pub const NT_NTFLUSHVIRTUALMEMORY: u16 = 40;
 /// THOS's version lives on `ntdll`'s table anyway since it's the same
 /// syscall-number space and nothing else needs the name.
 pub const NT_NTCALLBACKRETURN: u16 = 41;
-pub const NTDLL_STUB_COUNT: u16 = 42;
+/// Registers `Event` (an already-created event object) to be signalled the
+/// *next* time the watched key (or, with `WatchTree`, anything under it)
+/// changes — one-shot, same as real NT: a fired watch needs a fresh
+/// `NtNotifyChangeKey` call to re-arm. This is the asynchronous shape (a
+/// caller-supplied `Event`, checked with a normal `NtWaitForSingleObject`)
+/// — the synchronous one (`Event` omitted, the call itself blocks) isn't
+/// built; THOS already has real event/wait primitives, so this slice is
+/// "wire the registry into them", not new blocking machinery.
+pub const NT_NTNOTIFYCHANGEKEY: u16 = 42;
+pub const NTDLL_STUB_COUNT: u16 = 43;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -201,6 +210,7 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtUnmapViewOfSection",
     "NtFlushVirtualMemory",
     "NtCallbackReturn",
+    "NtNotifyChangeKey",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -1409,6 +1419,29 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 return STATUS_ACCESS_DENIED as i64;
             }
             status(crate::registry::delete_key(&path), STATUS_OBJECT_NAME_NOT_FOUND)
+        }
+
+        // NtNotifyChangeKey(KeyHandle, Event, ApcRoutine, ApcContext,
+        //                   *IoStatusBlock, CompletionFilter, WatchTree,
+        //                   *Buffer, BufferSize, Asynchronous). Only the
+        // asynchronous, Event-driven shape: ApcRoutine/ApcContext/
+        // IoStatusBlock/CompletionFilter/Buffer/BufferSize/Asynchronous are
+        // all ignored — a caller waits on `Event` the normal way
+        // (`NtWaitForSingleObject`) instead of THOS delivering an APC or
+        // blocking this call itself. Registers a one-shot watch: `Event` is
+        // signalled the *next* time this key (or, with WatchTree != 0,
+        // anything under it) changes; a fired watch needs a fresh call to
+        // re-arm, same as real NT.
+        NT_NTNOTIFYCHANGEKEY => {
+            let Some(path) = process::current_regkey(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            let Some(ev) = process::current_event(a1 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            let watch_tree = stack(2) != 0;
+            crate::registry::watch(&path, watch_tree, ev);
+            STATUS_SUCCESS as i64
         }
 
         // NtEnumerateKey(KeyHandle, Index, KeyInformationClass,

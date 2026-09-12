@@ -11,8 +11,16 @@
 //! on every mutation under it ([`create`] / [`set_value`] / [`delete_key`]) —
 //! durable by default, no explicit flush needed (the tradeoff: every write is
 //! an ext2 write; fine for a registry, which isn't a hot path). Not yet
-//! transactional (a crash mid-write can still lose that one write), no
-//! change-notify.
+//! transactional (a crash mid-write can still lose that one write).
+//!
+//! **Change-notify** (real, not a stub): [`watch`] registers a one-shot
+//! signal on an already-created `Event` object, fired the next time a given
+//! key (or, with `watch_tree`, anything under it) actually changes —
+//! `nt.rs`'s `NtNotifyChangeKey` is the asynchronous, Event-driven shape of
+//! the real NT call; THOS already has real event/wait primitives
+//! (`wait.rs`), so this is "wire the registry into them", not new blocking
+//! machinery. One-shot, same as real NT: a fired watch needs a fresh
+//! `NtNotifyChangeKey` to re-arm.
 //!
 //! **Per-key security** (real, not a stub): every key carries an
 //! `owner_uid`, persisted in the hive right alongside its subkeys/values.
@@ -29,12 +37,14 @@
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::ext2::Ext2;
+use crate::wait::Event;
 
 /// One stored value: an `REG_*` type tag plus its raw bytes.
 pub struct Value {
@@ -69,6 +79,56 @@ fn write_ok(owner_uid: u32, uid: u32) -> bool {
 
 static ROOT: Mutex<Key> = Mutex::new(Key::new());
 static SEEDED: AtomicBool = AtomicBool::new(false);
+
+/// A registered [`watch`]: `event` is signalled the next time `path`
+/// changes (or, with `watch_tree`, anything under it) — removed from
+/// [`WATCHES`] the moment it fires (one-shot).
+struct WatchEntry {
+    path: Vec<String>,
+    watch_tree: bool,
+    event: Arc<Event>,
+}
+static WATCHES: Mutex<Vec<WatchEntry>> = Mutex::new(Vec::new());
+
+/// `NtNotifyChangeKey`'s backing call: signal `event` the next time `path`
+/// changes. `false` if `path` doesn't currently exist (nothing to watch —
+/// real NT requires an open handle to the key, which already implies it
+/// exists).
+pub fn watch(path: &str, watch_tree: bool, event: Arc<Event>) -> bool {
+    let comps = components(path);
+    if !run(|root| find(root, &comps).is_some()) {
+        return false;
+    }
+    WATCHES.lock().push(WatchEntry { path: comps, watch_tree, event });
+    true
+}
+
+/// Does a watch on `watch_path` (optionally covering its whole subtree)
+/// cover a change that happened at `changed`? A change *on* the watched key
+/// itself always counts (a value changed on it, or a direct subkey
+/// appeared/disappeared under it); anything deeper needs `watch_tree`.
+fn watch_matches(watch_path: &[String], watch_tree: bool, changed: &[String]) -> bool {
+    if changed.len() < watch_path.len() || changed[..watch_path.len()] != *watch_path {
+        return false;
+    }
+    let depth = changed.len() - watch_path.len();
+    depth == 0 || depth == 1 || watch_tree
+}
+
+/// Fire (and drop — one-shot) every watch that covers a real change at
+/// `changed`.
+fn fire(changed: &[String]) {
+    let mut list = WATCHES.lock();
+    let mut i = 0;
+    while i < list.len() {
+        if watch_matches(&list[i].path, list[i].watch_tree, changed) {
+            let w = list.remove(i);
+            w.event.signal();
+        } else {
+            i += 1;
+        }
+    }
+}
 
 /// Split a path into normalised components (lowercased, non-empty). A leading
 /// `registry` element is dropped, so `\Registry\Machine` and `Machine` name the
@@ -142,10 +202,16 @@ pub fn create_owned(path: &str, uid: u32) -> bool {
     if comps.is_empty() {
         return false;
     }
+    // Only a genuine new key is a change — re-"creating" an existing one
+    // (`NtCreateKey`'s open-if-present behavior) must not fire a watch.
+    let existed = run(|root| find(root, &comps).is_some());
     run(|root| {
         make(root, &comps, uid);
     });
     persist(&comps);
+    if !existed {
+        fire(&comps);
+    }
     true
 }
 
@@ -219,6 +285,7 @@ pub fn set_value(path: &str, name: &str, ty: u32, data: &[u8]) -> bool {
     });
     if ok {
         persist(&comps);
+        fire(&comps);
     }
     ok
 }
@@ -248,6 +315,12 @@ pub fn delete_key(path: &str) -> bool {
     });
     if ok {
         persist(&comps);
+        // The change is on the *parent* — a subkey disappeared from its
+        // list, same as `create_owned`'s "a subkey appeared" fires the
+        // parent, not (today) a dedicated "the watched key itself was
+        // deleted" notification on `comps` — a real, scoped-out gap
+        // relative to full NT semantics.
+        fire(parent);
     }
     ok
 }
