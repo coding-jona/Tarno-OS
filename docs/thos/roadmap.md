@@ -652,6 +652,30 @@ late.
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
   transactional key-value store; **SEH** ↔ trap dispatch; **APC** delivery.
+  - **`\Device\` namespace + drive letters — done, `kernel/src/device.rs`.**
+    Real name resolution, the way NT actually does it, replacing what used
+    to be a crude "strip any `X:\` prefix" (every drive letter silently
+    aliased the same ext2 root — `D:\foo` and `C:\foo` were
+    indistinguishable, a typo'd drive letter just worked). A small, fixed
+    table (no dynamic mount/unmount yet): `\Device\HarddiskVolume1` (`C:`)
+    is the ext2 filesystem, read/write; `\Device\CdRom0` (`D:`) is the boot
+    ISO's FAT32 ESP, read-only — real, already-mounted content
+    (`/EFI/THOS/HELLO.TXT`, the same file the GPT/FAT boot milestone reads),
+    not a synthetic second volume invented just to exercise this. A path
+    can also name the device directly (`\Device\CdRom0\...`), bypassing the
+    drive letter. An unmapped drive letter or unrecognised `\Device\...`
+    name is now a real failure (`ERROR_PATH_NOT_FOUND`), not a silent alias.
+    `NtCreateFile`/`CreateFileA` resolves through this before any path
+    lookup; the `Cdrom` branch rejects `GENERIC_WRITE` up front (a real
+    CD-ROM wouldn't accept one either) and hands back a new `FatFile`
+    (`file.rs`) — same shape as `Ext2File` but genuinely read-only.
+    Verified with a real ring-3 round trip: `wincon.c` (already a real
+    mingw-w64-compiled PE) now also opens `D:\EFI\THOS\HELLO.TXT` and reads
+    the real FAT content back, confirms a `GENERIC_WRITE` open on that same
+    path is denied, and confirms `Z:\nope.txt` (unmapped) now genuinely
+    fails — three new `pe-test` markers, the existing `C:\pe-read.txt`
+    round trip unaffected (same device, same posix path). Full regression
+    sweep green.
   - Registry status: hives (load/persist to ext2), **per-key security**,
     **change-notify** (`NtNotifyChangeKey`), and **crash-safe overwrite
     ordering** all done — see "Capability policy" under Security Core
