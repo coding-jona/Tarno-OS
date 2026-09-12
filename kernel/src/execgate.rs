@@ -27,11 +27,29 @@ use sha2::{Digest, Sha256};
 /// database (the Security Service's job later).
 const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
 
-/// SHA-256 hashes of known-bad content. Empty today — a stand-in for the
-/// real signature database a userspace scanner would maintain and push
-/// down; this exists so the hash/signature pipeline stage is something
-/// real, not a TODO, even with nothing in it yet.
-const BLOCKED_HASHES: &[[u8; 32]] = &[];
+/// A THOS-authored test marker — **not malware, not derived from any real
+/// sample**. THOS ships no malware corpus and never will (fetching /
+/// possessing real malicious samples for a hash list is a different, much
+/// bigger undertaking than this kernel-side skeleton — that data belongs to
+/// the userspace Security Service's real signature database later, sourced
+/// from actual threat-intel feeds, not hand-picked into kernel source).
+/// This exists purely so `BLOCKED_HASHES` has a genuine, non-empty entry to
+/// check against — on content the EICAR *substring* check has no way to
+/// catch at all, since matching is a whole-file hash, not a scan — so the
+/// hash/signature pipeline stage is provably doing something, not a TODO
+/// with nothing in it. `execgate_check` (main.rs) verifies the hash below
+/// really is this string's SHA-256, by computing it fresh and comparing,
+/// rather than trusting a hand-transcribed hex constant blindly.
+pub const MARKER_STRING: &[u8] = b"THOS-EXECGATE-TEST-KNOWN-BAD-MARKER-v1";
+
+/// SHA-256 hashes of known-bad content. A stand-in for the real signature
+/// database a userspace scanner would maintain and push down — one entry
+/// (`MARKER_STRING`'s hash) today, so the pipeline stage is real, not a
+/// TODO, even though this is nowhere close to an actual malware database.
+const BLOCKED_HASHES: &[[u8; 32]] = &[[
+    0x80, 0x2c, 0x34, 0x94, 0xf7, 0x96, 0xf1, 0x3b, 0xf2, 0x1d, 0x55, 0x90, 0x92, 0x28, 0x1b, 0x26,
+    0x52, 0x58, 0x68, 0xec, 0x99, 0x2c, 0xcf, 0xc7, 0x6f, 0xa8, 0xd2, 0x0b, 0x1c, 0xf5, 0x92, 0xe2,
+]];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {

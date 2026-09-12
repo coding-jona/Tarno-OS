@@ -73,6 +73,7 @@ use limine::request::{
     ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest, RsdpRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
+use sha2::{Digest, Sha256};
 
 /// Limine base-revision marker. Kept in the `.requests` section.
 ///
@@ -688,7 +689,33 @@ fn execgate_check() {
         matches!(execgate::check(&buf), execgate::Verdict::Quarantine(_)),
         "EICAR string buried in the middle of a buffer wasn't caught"
     );
-    kprintln!("THOS: exec gate check ok EICAR signature detected, clean content passes");
+
+    // The hash/signature side of the pipeline (`BLOCKED_HASHES`), on content
+    // the EICAR substring check has no way to catch at all — proves the hash
+    // path is actually wired, not just non-empty. First, the hash itself:
+    // computed fresh here rather than trusted from execgate.rs's own
+    // hand-transcribed hex constant blindly — a real check, not an assumption.
+    let mut h = Sha256::new();
+    h.update(execgate::MARKER_STRING);
+    let digest: [u8; 32] = h.finalize().into();
+    assert_eq!(
+        execgate::check(execgate::MARKER_STRING),
+        execgate::Verdict::Quarantine("known-bad hash"),
+        "MARKER_STRING's real SHA-256 ({digest:02x?}) doesn't match execgate.rs's BLOCKED_HASHES entry"
+    );
+    // A byte-for-byte-different buffer that merely *contains* the marker as
+    // a substring must NOT be caught — this is a whole-file hash match, not
+    // another substring scan; different coverage than the EICAR check above.
+    let mut wrapped = alloc::vec![0xCCu8; 8];
+    wrapped.extend_from_slice(execgate::MARKER_STRING);
+    wrapped.extend_from_slice(&[0xDDu8; 8]);
+    assert_eq!(
+        execgate::check(&wrapped),
+        execgate::Verdict::Allow,
+        "the hash check must require an exact whole-file match, not fire on a substring"
+    );
+
+    kprintln!("THOS: exec gate check ok EICAR signature + known-bad hash detected, clean content passes");
 }
 
 /// `NtCreateSection`/`NtMapViewOfSection`/`NtUnmapViewOfSection`/
