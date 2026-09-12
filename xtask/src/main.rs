@@ -285,6 +285,27 @@ fn disk_image() -> PathBuf {
         img.to_str().unwrap(),
     ]));
 
+    // elevate() round trip: /do-elevate calls the real THOS-native syscall
+    // (re-authenticating with the admin password), which — if it accepts —
+    // spawns /elevated-check as uid 0. Same static-musl recipe as rusthello.
+    for (src, name) in [("do-elevate.rs", "do-elevate"), ("elevated-check.rs", "elevated-check")] {
+        let rs = root.join("xtask/testdata").join(src);
+        let bin = root.join("target").join(name);
+        run(Command::new("rustc").args([
+            "--target", "x86_64-unknown-linux-musl",
+            "-C", "relocation-model=static",
+            "-C", "link-args=-no-pie",
+            "-C", "strip=symbols",
+            "-O",
+            "-o", bin.to_str().unwrap(),
+            rs.to_str().unwrap(),
+        ]));
+        run(Command::new("debugfs").args([
+            "-w", "-R", &format!("write {} {name}", bin.to_str().unwrap()),
+            img.to_str().unwrap(),
+        ]));
+    }
+
     // A real, unmodified statically-linked BusyBox -> /busybox (Milestone 2:
     // stock Linux x86-64 ELF binaries run as-is). From the `busybox-static`
     // package.
@@ -3121,6 +3142,14 @@ fn kbd_test(iso: &Path) {
     type_line(&sock, "ls");
     std::thread::sleep(std::time::Duration::from_millis(1000));
 
+    // elevate(): the uid-1000 session calls the real THOS-native syscall,
+    // re-authenticating with its own password, to spawn /elevated-check as
+    // uid 0 — /elevated-check then genuinely reads back `getuid() == 0`
+    // itself, so this is proof the spawned process actually got the
+    // privileged identity, not just that the syscall returned success.
+    type_line(&sock, "/do-elevate");
+    let _ = wait_for(&log, "elevated-check uid=0", 20);
+
     let out = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = child.kill();
     let _ = child.wait();
@@ -3139,13 +3168,14 @@ fn kbd_test(iso: &Path) {
         let tail = after.rsplit("thos$ ls\n").next().unwrap_or("");
         tail.contains("newfile") && tail.contains("newdir")
     };
-    if shell_ok && ls_ok && cwd_ok && cat_ok && perm_ok && create_ok {
+    let elevate_ok = after.contains("elevated-check uid=0");
+    if shell_ok && ls_ok && cwd_ok && cat_ok && perm_ok && create_ok && elevate_ok {
         println!(
-            "kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), DAC write denial, O_CREAT/mkdir"
+            "kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), DAC write denial, O_CREAT/mkdir, elevate()"
         );
     } else {
         eprintln!(
-            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} perm_ok={perm_ok} create_ok={create_ok})\n---\n{after}\n---"
+            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} perm_ok={perm_ok} create_ok={create_ok} elevate_ok={elevate_ok})\n---\n{after}\n---"
         );
         exit(1);
     }

@@ -677,11 +677,22 @@ fn seed_fds() -> Vec<Fd> {
 
 impl Task {
     fn new(ppid: u64, space: Arc<Process>) -> Arc<Self> {
+        let uid = SESSION_UID.load(Ordering::Relaxed) as u32;
+        Self::new_with_ids(ppid, space, uid, uid)
+    }
+
+    /// Like `new`, but with an explicit uid/gid instead of inheriting the
+    /// session's — the primitive behind `elevate()`: a process that is
+    /// privileged from the moment it starts, not one that started
+    /// unprivileged and had its token upgraded in place (THOS has no
+    /// in-place token upgrade — a fresh process is the only way a task ever
+    /// becomes uid 0).
+    fn new_with_ids(ppid: u64, space: Arc<Process>, uid: u32, gid: u32) -> Arc<Self> {
         let t = Arc::new(Self {
             pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
             ppid,
-            uid: SESSION_UID.load(Ordering::Relaxed) as u32,
-            gid: SESSION_UID.load(Ordering::Relaxed) as u32,
+            uid,
+            gid,
             space: Mutex::new(space),
             exit_status: Mutex::new(None),
             exited: AtomicBool::new(false),
@@ -1163,6 +1174,29 @@ fn should_block_in_wait4(me: u64, pid: i64) -> bool {
         }
     }
     has_child
+}
+
+/// The primitive behind `elevate()` (`syscall::sys_elevate` does the
+/// re-authentication and admin-only policy check *before* calling this):
+/// spawn `bytes` as a brand-new process with an explicit uid/gid instead of
+/// the caller's session identity. Scoped to exactly that one process —
+/// there is no elevated token or elevated shell that outlives it or that a
+/// later, unrelated action could reuse; the next privileged action needs
+/// its own `elevate` call. Goes through the same native-exec gate every
+/// other entry point into the system does.
+#[cfg_attr(not(feature = "interactive"), allow(dead_code))] // only sys_elevate (interactive-only: needs cred.rs) calls this
+pub fn spawn_elevated(ppid: u64, bytes: &[u8], argv: &[&str], envp: &[&str], uid: u32, gid: u32) -> Result<u64, &'static str> {
+    if let crate::execgate::Verdict::Quarantine(reason) = crate::execgate::check(bytes) {
+        crate::kprintln!("THOS: exec gate        quarantined an elevated exec — {reason}");
+        return Err("quarantined by the native-exec gate");
+    }
+    let space = Process::new();
+    let img = elf::load(&space, bytes)?;
+    let stack_top = space.new_user_stack();
+    let rsp = space.init_stack(stack_top, argv, envp, &img);
+    let task = Task::new_with_ids(ppid, space, uid, gid);
+    sched::spawn_user("elevated", task.clone(), img.entry, rsp);
+    Ok(task.pid)
 }
 
 /// `spawn` the initial user program: build its address space + entry stack and

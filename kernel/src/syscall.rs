@@ -19,6 +19,8 @@ use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, 
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
 
+#[cfg(feature = "interactive")]
+use crate::cred;
 use crate::{ext2, gdt, kprintln, process, sched, smp};
 
 static USER_EXITS: AtomicU64 = AtomicU64::new(0);
@@ -75,6 +77,13 @@ const SYS_CHOWN: u64 = 92;
 const SYS_LCHOWN: u64 = 94;
 const SYS_FCHOWNAT: u64 = 260;
 const SYS_UTIMENSAT: u64 = 280;
+
+/// THOS-native calls (not part of the Linux ABI's own number space), same
+/// shape as `nt::NT_BASE` — a caller does `mov eax, THOS_BASE|idx; syscall`.
+/// Safe from collision: every real Linux x86-64 syscall number is well
+/// under `0xFFFF`, let alone this base.
+const THOS_BASE: u64 = 0x5448_0000; // 'T' 'H'
+const SYS_THOS_ELEVATE: u64 = THOS_BASE;
 const SYS_POLL: u64 = 7;
 const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
@@ -390,6 +399,50 @@ fn sys_chown(path_ptr: u64, uid: u64, gid: u64) -> i64 {
     match fs.chown_path(&path, uid as u32, gid as u32) {
         Ok(()) => 0,
         Err(_) => ENOENT,
+    }
+}
+
+/// THOS-native `elevate(path, argv, password)`: re-authenticate the calling
+/// session's own credentials, then spawn `path` as a brand-new process
+/// running uid/gid 0 — see `process::spawn_elevated` for why this is a new
+/// process and not an in-place privilege upgrade. Two checks, both real:
+///
+/// - **Admin-only policy**: only the session that logged in as the (one)
+///   admin principal may call this at all — `task.uid != cred::ADMIN_UID`
+///   is `EPERM` before the password is even looked at. THOS has exactly
+///   one principal that can ever be admin (`cred.rs`), so "caller in the
+///   admin group" collapses to this one comparison.
+/// - **Re-authentication**: the caller's freshly typed password is checked
+///   against the real credential store (`cred::load` + `Cred::verify`),
+///   not merely "you're already logged in" — a session left unlocked at a
+///   desk can't silently elevate.
+///
+/// Deliberately not yet built: the **trusted path** (a secure-attention key
+/// so no app can draw a fake password prompt) — that needs a global
+/// keyboard-capture mechanism this slice doesn't add. Documented as a real
+/// gap, not silently skipped: today `password_ptr` is whatever the calling
+/// process handed the kernel directly, trusted only because THOS has
+/// exactly one interactive session and no other app that could impersonate
+/// this prompt yet.
+#[cfg(feature = "interactive")]
+fn sys_elevate(path_ptr: u64, argv_ptr: u64, password_ptr: u64) -> i64 {
+    let Some(task) = sched::current().task() else { return EBADF };
+    if task.uid != cred::ADMIN_UID {
+        return EPERM;
+    }
+    let Some(fs) = ext2::open().ok() else { return EIO };
+    let Some(stored) = cred::load(&fs) else { return EPERM };
+    let password = user_cstr(password_ptr);
+    if !stored.verify(&stored.name, &password) {
+        return EACCES;
+    }
+    let path = process::resolve_path(&user_cstr(path_ptr));
+    let Some(bytes) = fs.read_path(&path) else { return ENOENT };
+    let argv = user_cstr_array(argv_ptr);
+    let argv_refs: alloc::vec::Vec<&str> = argv.iter().map(alloc::string::String::as_str).collect();
+    match process::spawn_elevated(task.pid, &bytes, &argv_refs, &[], 0, 0) {
+        Ok(pid) => pid as i64,
+        Err(_) => EINVAL,
     }
 }
 
@@ -920,6 +973,15 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
 
         // NT-personality calls from a PE's import stubs.
         n if n & !0xFFFF == crate::nt::NT_BASE => crate::nt::dispatch((n & 0xFFFF) as u16, frame),
+
+        // THOS-native calls — outside the Linux ABI's own number space,
+        // same shape as the NT range above. Just `elevate` so far — and
+        // there is no credential store (`cred.rs`) to re-authenticate
+        // against outside the `interactive` build, so it's ENOSYS there.
+        #[cfg(feature = "interactive")]
+        SYS_THOS_ELEVATE => sys_elevate(a1, a2, a3),
+        #[cfg(not(feature = "interactive"))]
+        SYS_THOS_ELEVATE => ENOSYS,
 
         n => {
             kprintln!("THOS: unhandled syscall {}", n);
