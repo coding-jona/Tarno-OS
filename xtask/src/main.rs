@@ -67,6 +67,11 @@ fn main() {
             let iso = build_iso();
             integrity_test(&iso);
         }
+        "registry-crash-test" => {
+            build_kernel(&["regcrashtest"]);
+            let iso = build_iso();
+            registry_crash_test(&iso);
+        }
         "smp-test" => {
             build_kernel(&["stress"]);
             let iso = build_iso();
@@ -3818,6 +3823,75 @@ fn integrity_test(iso: &Path) {
         println!("integrity-test: OK — baseline recorded, verified clean, tamper detected on the third boot");
     } else {
         eprintln!("integrity-test: FAIL — tamper not detected\n--- serial ---\n{out}\n---");
+        exit(1);
+    }
+}
+
+/// A real, deterministic crash injection (not blkdebug fault-injection — a
+/// controlled `isa-debug-exit` right inside `write_path_owned`'s overwrite
+/// path, at the exact instant "the new content is committed, the old
+/// blocks aren't freed yet"), proving the reordering fix in
+/// `ext2::write_path_owned` is actually crash-safe: the file's own content
+/// survives, and the only footprint left behind is a benign, fsck-fixable
+/// leaked-block trace — never structural corruption.
+fn registry_crash_test(iso: &Path) {
+    let root = workspace_root();
+    let _ = std::fs::remove_file(root.join("target/disk.img")); // start from a pristine fs
+    let disk = disk_image();
+
+    // Boot 1 — fresh disk: seed, then overwrite; the overwrite is what
+    // hits the injected crash point and halts QEMU (a clean `isa-debug-exit`,
+    // so `boot_kernel_headless` itself doesn't treat this as a failure).
+    let s1 = boot_kernel_headless("regcrash1", iso, &disk, 4);
+    if !s1.contains("THOS: regcrash         simulating a crash") {
+        eprintln!("registry-crash-test: FAIL — the injected crash point never fired\n{s1}");
+        exit(1);
+    }
+
+    // The old blocks were never freed (the crash landed right before that
+    // step) — a real, *expected* "leaked blocks" finding, not corruption.
+    // `-fn` (report only) must find something (proving the leak is real,
+    // not a no-op test); `-fy` (auto-fix) must resolve it cleanly, and a
+    // follow-up `-fn` must then be clean.
+    let dirty = Command::new("e2fsck").args(["-fn", disk.to_str().unwrap()]).output().expect("e2fsck -fn");
+    if dirty.status.success() {
+        eprintln!(
+            "registry-crash-test: FAIL — e2fsck -fn found nothing to fix; the leaked-block scenario didn't happen (or something over-corrected)"
+        );
+        exit(1);
+    }
+    let fixed = Command::new("e2fsck").args(["-fy", disk.to_str().unwrap()]).output().expect("e2fsck -fy");
+    // e2fsck's exit status is a bitmask: bit 0 = errors corrected (expected
+    // here), bit 2 = errors left uncorrected, bit 3 = operational error —
+    // anything beyond "corrected" is a real failure, not the benign leak.
+    let code = fixed.status.code().unwrap_or(-1);
+    if code & !1 != 0 {
+        eprintln!(
+            "registry-crash-test: FAIL — e2fsck -fy found more than a simple, correctable leak (exit {code})\n{}",
+            String::from_utf8_lossy(&fixed.stdout)
+        );
+        exit(1);
+    }
+    let clean = Command::new("e2fsck").args(["-fn", disk.to_str().unwrap()]).output().expect("e2fsck -fn (post-fix)");
+    if !clean.status.success() {
+        eprintln!(
+            "registry-crash-test: FAIL — filesystem still not clean after e2fsck -fy\n{}",
+            String::from_utf8_lossy(&clean.stdout)
+        );
+        exit(1);
+    }
+
+    // Boot 2 — same disk, same (regcrashtest) kernel: idempotent, since the
+    // file now already holds the new content, so this boot just reads it
+    // back instead of re-seeding/re-crashing. Proves the commit is durable:
+    // it survived both the simulated crash and the fsck fixup.
+    let s2 = boot_kernel_headless("regcrash2", iso, &disk, 4);
+    if s2.contains("THOS: regcrash ok") && s2.contains("NEW-CONTENT-LONGER-THAN-OLD-ONE-DELIBERATELY") {
+        println!(
+            "registry-crash-test: OK — commit survived a simulated crash (inode patched before blocks freed); e2fsck found only the expected leaked-block trace, not corruption"
+        );
+    } else {
+        eprintln!("registry-crash-test: FAIL — boot 2 didn't read back the new content\n{s2}");
         exit(1);
     }
 }

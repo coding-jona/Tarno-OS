@@ -780,6 +780,36 @@ fn registry_notify_check() {
     kprintln!("THOS: registry notify ok one-shot fire, WatchTree depth, no-fire-before-change");
 }
 
+/// `cargo xtask registry-crash-test`'s kernel-side half — the `regcrashtest`
+/// feature only. Idempotent across the test's two boots via the target
+/// file's own content, the same pattern `integrity_check` uses to tell
+/// "first boot" from "later boot": missing → seed it, then overwrite it
+/// (the overwrite is what hits `ext2::write_path_owned`'s injected crash
+/// point and halts QEMU right after the inode commit, before the old
+/// blocks are freed — simulating a real crash at exactly that instant);
+/// present → the second boot, after xtask has run `e2fsck` on the
+/// "crashed" disk image, just reads it back and reports what's there,
+/// proving the commit itself survived.
+#[cfg(feature = "regcrashtest")]
+fn registry_crash_check(fs: &ext2::Ext2) {
+    const PATH: &str = "/regcrash-test.bin";
+    const OLD: &[u8] = b"OLD-CONTENT-1";
+    const NEW: &[u8] = b"NEW-CONTENT-LONGER-THAN-OLD-ONE-DELIBERATELY";
+    match fs.read_path(PATH) {
+        None => {
+            fs.write_path(PATH, OLD).expect("seed regcrash-test.bin");
+            fs.write_path(PATH, NEW).expect("overwrite regcrash-test.bin (should crash mid-way)");
+            // Only reached if the injected crash point in ext2.rs didn't
+            // fire — a real test-harness bug, worth a loud, distinct marker
+            // rather than silently falling through to a normal boot.
+            kprintln!("THOS: regcrash FAIL    the injected crash point never fired");
+        }
+        Some(bytes) => {
+            kprintln!("THOS: regcrash ok      {:?} after a simulated crash mid-overwrite", core::str::from_utf8(&bytes));
+        }
+    }
+}
+
 /// `execgate::check`'s detection logic, exercised directly — the algorithm
 /// shared by both `spawn_pe` (`PE reject`/exec-gate check below, a real
 /// `pe::load` round trip) and `execve` (wired the same way, not yet
@@ -1085,6 +1115,10 @@ fn storage_milestone() {
     }
 
     let fs = ext2::open().expect("mount ext2");
+
+    #[cfg(feature = "regcrashtest")]
+    registry_crash_check(&fs);
+
     // Before anything can touch the registry (PE syscalls included).
     let loaded_hives = registry::load_hives(&fs);
     kprintln!(

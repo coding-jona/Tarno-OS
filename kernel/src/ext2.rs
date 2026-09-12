@@ -683,12 +683,34 @@ impl Ext2 {
         match self.lookup(parent_ino, name) {
             Some(ino) => {
                 let old = self.read_inode(ino);
-                self.free_all_blocks(&old);
                 let (mode, old_uid, old_gid) = (old.mode, old.uid, old.gid);
+                // Commit the new blocks *before* freeing the old ones — the
+                // inode patch below is a single-sector write (one ext2 inode
+                // never straddles a sector: `inode_size` divides `SECTOR`
+                // evenly, and offsets are inode-aligned), so it's the one
+                // truly atomic step in this whole operation: a crash before
+                // it, the file is still exactly its old self; a crash after
+                // it, exactly its new self. Freeing first (the old order)
+                // opened a real corruption window — a crash between "mark
+                // old blocks free" and "repoint the inode" left the bitmap
+                // and the inode disagreeing about who owns those blocks,
+                // not just "lost this write". The only residual cost of the
+                // new order is a leaked (never-freed) set of blocks if a
+                // crash lands between the two writes below — recoverable by
+                // fsck, not corruption.
                 self.patch_inode(ino, |raw| {
                     let links = le16(&raw[26..]);
                     set_inode(raw, mode, old_uid, old_gid, data.len() as u64, links, blocks512, &block);
                 });
+                #[cfg(feature = "regcrashtest")]
+                if path == "/regcrash-test.bin" {
+                    crate::kprintln!(
+                        "THOS: regcrash         simulating a crash: inode committed, blocks not yet freed"
+                    );
+                    crate::exit_qemu(crate::ExitCode::Success);
+                    crate::hcf();
+                }
+                self.free_all_blocks(&old);
             }
             None => {
                 let ino = self.alloc_inode(false).ok_or("no free inode")?;
