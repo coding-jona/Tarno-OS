@@ -1016,6 +1016,41 @@ exec gate reuses the loader internals that are being built now. Designed in
 from the start (loaders already hostile-input hardened; identity model already
 capability-shaped), implemented as its own phase once M3 lands.
 
+**First slice done — `kernel/src/execgate.rs`, the kernel-side skeleton.**
+M3 landed, so the gate's sequencing condition is met; the real YARA /
+heuristics / quarantine-store work stays the isolated-userspace Security
+Service's job — "the scanner never runs in the kernel" is the whole point of
+that split — this slice is only `format detect → parse headers` (already
+`pe::load`/`elf::load`'s job, right after) `→ hash/signature check → policy
+engine`. `execgate::check(bytes)`: the EICAR Standard Anti-Virus Test File
+string anywhere in the buffer, or a SHA-256 match against a (today: empty)
+known-bad list, both `Verdict::Quarantine`; anything else `Allow`. Wired into
+both native-process entry points: `spawn_pe` (`Result`-based, same shape as
+an already-existing malformed-PE rejection — `Err`, kernel alive) and
+`execve` (no `Result` to hand back through that ABI — the calling thread's
+own image is what's being replaced — so quarantine there ends the calling
+thread cleanly instead, exit code 126, the shell convention for "found but
+not executable").
+Verified two ways: `execgate::check`'s detection logic directly
+(kernel-internal — ordinary bytes pass, an EICAR string buried in an
+otherwise arbitrary buffer doesn't); and a real PE round trip in `pe-test` —
+`/pe-hello.exe`'s own already-proven-runnable bytes (`THOS: pe exited` earlier
+in the same boot) with the EICAR string appended are quarantined before
+`pe::load` ever parses a header, so a rejection here can only be the gate, not
+a malformed-file fluke. `execve`'s wiring is the same shape but not yet
+exercised by a dedicated live test — no test binary `execve`s malicious
+content today.
+**A real, pre-existing kernel bug found and fixed along the way** (`seh.rs`):
+`thos_fault_dispatch` unconditionally read the PE-only vectored-exception-
+handler slot (`PE_EXC_ADDR`) for *every* user-mode fault, PE or plain ELF —
+that page is only ever mapped for a PE process, so any ELF program's fault
+(e.g. an ordinary segfault) took the fault dispatcher itself down with a
+second, unhandled `#PF` instead of just killing the faulting process, right
+as `kbd-test` was extended to add a command past the exec-gate work. Fixed
+with a new `process::current_is_pe()` gating the read. Full regression sweep
+green afterward: ext2-test, pe-test, smp-test, login-test, integrity-test,
+kbd-test.
+
 ### In-system AI
 
 THOS grows its own AI, built from scratch (*user, 2026-09-04*): a small
