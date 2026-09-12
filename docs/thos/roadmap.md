@@ -1225,6 +1225,39 @@ into ring 0."
   firewall / IDS. Talks to the Security Core over a narrow capability-gated
   interface; a crash there degrades to a policy default, it does not take the
   kernel down.
+  - **First slice done.** Not the YARA / heuristics / quarantine store yet —
+    the structural part: the hash verdict genuinely lives in a real,
+    separate, crash-isolated process now, not kernel code. `secsvc.rs`
+    (kernel side): a real IPC channel (two ordinary pipes — the same
+    `pipe()`/`pipe2()` primitive user processes get, held directly by the
+    kernel, no fd/task indirection); `spawn(fs)` loads `/secsvc` off ext2
+    and starts it (new `process::spawn_with_fds`) with its stdio wired to
+    the pipes instead of the console. Protocol: one request = a 32-byte
+    SHA-256 hash, one response = one verdict byte — the smallest real thing
+    that moves the decision out of ring 0. `execgate::check` asks the
+    service first; `BLOCKED_HASHES` is now explicitly documented as the
+    local fallback, not the primary authority.
+    **Crash safety needed no new mechanism**: `process::set_exit_status`
+    already clears a task's fd table the instant it exits, for any reason —
+    documented there as existing exactly so "the other end of any pipe sees
+    EOF/EPIPE immediately". The moment the service is gone, the kernel's
+    blocking read on the response pipe returns a real EOF, and
+    `check_hash` treats that as "unavailable", falling back to the local
+    list — the actual, verified "a crash there degrades to a policy
+    default" property, not a separate mechanism bolted on.
+    A real bug found getting this far: the test service's `std::io::Stdout`
+    is buffered, so without an explicit `.flush()` after each reply the
+    verdict byte never reached the actual `write()` syscall at all — caught
+    by a real first test run coming back with the wrong verdict, not
+    assumed correct.
+    Verified end to end (`secsvc_check`, main.rs): while the service is
+    alive, a hash *only its own list* knows about is quarantined with a
+    verdict naming the service (not the local list); ordinary content is
+    genuinely allowed. A test-only poison-pill hash then makes the service
+    exit (simulating a crash); the next checks prove the local fallback
+    takes over correctly, and that the earlier quarantine really was the
+    service's own verdict (now allowed, since the local list never knew
+    it). Full regression sweep green.
 - **Milestone (Security):** a known-malicious EICAR-class test PE and ELF are
   caught by the exec gate before their first instruction runs, quarantined, and
   logged — with the scanner process killable and restartable without touching
@@ -1249,9 +1282,10 @@ Service's job — "the scanner never runs in the kernel" is the whole point of
 that split — this slice is only `format detect → parse headers` (already
 `pe::load`/`elf::load`'s job, right after) `→ hash/signature check → policy
 engine`. `execgate::check(bytes)`: the EICAR Standard Anti-Virus Test File
-string anywhere in the buffer, or a SHA-256 match against a known-bad list
-(see below — a THOS-authored test marker today, not a real malware
-database), both `Verdict::Quarantine`; anything else `Allow`. Wired into
+string anywhere in the buffer, or a SHA-256 match — checked against the
+real, isolated Security Service now (see "Security Service" below), a
+local list only as its crash-degrade fallback — both `Verdict::Quarantine`;
+anything else `Allow`. Wired into
 both native-process entry points: `spawn_pe` (`Result`-based, same shape as
 an already-existing malformed-PE rejection — `Err`, kernel alive) and
 `execve` (no `Result` to hand back through that ABI — the calling thread's
