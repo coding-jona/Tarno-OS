@@ -41,6 +41,7 @@ mod gdi;
 mod gdt;
 mod gpt;
 mod idt;
+mod integrity;
 #[cfg(feature = "interactive")]
 mod login;
 mod mm;
@@ -722,6 +723,34 @@ fn section_sharing_check(fs: &ext2::Ext2) {
     kprintln!("THOS: sections ok      shared frames across views; file-backed flush writes through to ext2");
 }
 
+/// File-integrity baselines: first boot with none stored records SHA-256
+/// hashes of `integrity::BASELINE_FILES`; every later boot recomputes and
+/// compares against that record. Detection only — nothing here stops a
+/// write to a baselined file, it just notices one happened.
+fn integrity_check(fs: &ext2::Ext2) {
+    if !integrity::exists(fs) {
+        let checks = integrity::record(fs, integrity::BASELINE_FILES);
+        let missing = checks.iter().filter(|c| c.outcome == integrity::Outcome::Missing).count();
+        kprintln!(
+            "THOS: integrity ok     baseline recorded for {}/{} files (first boot){}",
+            checks.len() - missing,
+            checks.len(),
+            if missing == 0 { "" } else { " — some missing" }
+        );
+        return;
+    }
+    let checks = integrity::verify(fs);
+    let tampered: alloc::vec::Vec<_> =
+        checks.iter().filter(|c| c.outcome == integrity::Outcome::Tampered).collect();
+    if tampered.is_empty() {
+        kprintln!("THOS: integrity ok     {} files verified against baseline, no tampering", checks.len());
+    } else {
+        for c in &tampered {
+            kprintln!("THOS: integrity FAIL   {} does not match its baseline hash", c.path);
+        }
+    }
+}
+
 /// Phase 2 milestone: a VFS with an in-memory file opened through the handle
 /// table, and the AHCI driver reading real sectors off the SATA disk.
 /// Process isolation's other half, closing a gap `process.rs`'s own module
@@ -827,6 +856,7 @@ fn storage_milestone() {
     );
     registry_enum_check();
     section_sharing_check(&fs);
+    integrity_check(&fs);
     let init = fs.read_path("/init").expect("read /init from ext2");
     kprintln!("THOS: ext2 ok          /init = {} bytes", init.len());
 

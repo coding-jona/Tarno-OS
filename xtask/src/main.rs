@@ -62,6 +62,11 @@ fn main() {
             let iso = build_iso();
             ext2_test(&iso);
         }
+        "integrity-test" => {
+            build_kernel(&[]);
+            let iso = build_iso();
+            integrity_test(&iso);
+        }
         "smp-test" => {
             build_kernel(&["stress"]);
             let iso = build_iso();
@@ -95,7 +100,7 @@ fn main() {
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|bootpick-tpm-test|ahci-test|ext2-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test|pe-test] [--gui]"
+                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|bootpick-tpm-test|ahci-test|ext2-test|integrity-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test|pe-test] [--gui]"
             );
             exit(2);
         }
@@ -3668,6 +3673,85 @@ fn ext2_test(iso: &Path) {
         println!("ext2-test: OK — e2fsck clean (primary + backup); create + unlink/rmdir verified");
     } else {
         eprintln!("ext2-test: FAIL — survivor={survivor:?} deleted-still-there={deleted:?}");
+        exit(1);
+    }
+}
+
+/// Three real boots on the *same* disk image, proving the file-integrity
+/// baseline round-trip end to end — including genuine tamper detection, not
+/// a mocked one: boot 1 (fresh disk) records the baseline; boot 2 (same
+/// disk, untouched) verifies clean; then `/init` is overwritten directly on
+/// the disk image from the host (simulating an external tamper) and boot 3
+/// must report the mismatch.
+///
+/// Boot 3 doesn't use [`boot_kernel_headless`] — once past the integrity
+/// check, the kernel goes on to try loading the now-corrupt `/init` as an
+/// ELF and legitimately panics (a real consequence of the tamper, not a
+/// test bug, and further proof the check ran *before* that crash rather
+/// than being skipped); `boot_kernel_headless` requires a clean halt, so
+/// this drives qemu directly and just greps the log for the detection line.
+fn integrity_test(iso: &Path) {
+    use std::time::{Duration, Instant};
+
+    let root = workspace_root();
+    let _ = std::fs::remove_file(root.join("target/disk.img")); // start from a pristine fs
+    let disk = disk_image();
+
+    let s1 = boot_kernel_headless("integrity1", iso, &disk, 4);
+    if !s1.contains("THOS: integrity ok     baseline recorded for 2/2 files (first boot)") {
+        eprintln!("integrity-test: FAIL — first boot didn't record a clean baseline\n{s1}");
+        exit(1);
+    }
+
+    let s2 = boot_kernel_headless("integrity2", iso, &disk, 4);
+    if !s2.contains("THOS: integrity ok     2 files verified against baseline, no tampering") {
+        eprintln!("integrity-test: FAIL — second boot didn't verify clean\n{s2}");
+        exit(1);
+    }
+
+    // Tamper /init directly on the disk image, from the host — nothing THOS
+    // itself did, exactly the "something changed a baselined file" scenario
+    // the check exists to notice.
+    let tampered = root.join("target/tampered-init");
+    std::fs::write(&tampered, b"not an ELF; deliberately tampered for integrity-test\n").unwrap();
+    run(Command::new("debugfs").args(["-w", "-R", "rm /init", disk.to_str().unwrap()]));
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} init", tampered.to_str().unwrap()),
+        disk.to_str().unwrap(),
+    ]));
+
+    let log = root.join("target/integrity3-serial.log");
+    let _ = std::fs::remove_file(&log);
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu.args(["-M", "q35", "-m", "512M", "-smp", "4", "-cdrom", iso.to_str().unwrap()]);
+    qemu.args([
+        "-drive", &format!("id=disk0,if=none,format=raw,file={}", disk.to_str().unwrap()),
+        "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0",
+    ]);
+    qemu.args(["-display", "none", "-no-reboot"]);
+    qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
+    for ovmf in ["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/ovmf/OVMF.fd"] {
+        if Path::new(ovmf).exists() {
+            qemu.args(["-drive", &format!("if=pflash,format=raw,readonly=on,file={ovmf}")]);
+            break;
+        }
+    }
+
+    let mut child = qemu.spawn().expect("spawn qemu");
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && !read_log().contains("THOS: integrity FAIL") {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let out = read_log();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if out.contains("THOS: integrity FAIL   /init does not match its baseline hash") {
+        println!("integrity-test: OK — baseline recorded, verified clean, tamper detected on the third boot");
+    } else {
+        eprintln!("integrity-test: FAIL — tamper not detected\n--- serial ---\n{out}\n---");
         exit(1);
     }
 }
