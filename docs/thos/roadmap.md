@@ -601,6 +601,33 @@ late.
       `FRAME_ALLOC`'s free count is back exactly where it started. Passes on
       real boot; full regression sweep green (ext2-test, pe-test, smp-test —
       the concurrency-heaviest one, unaffected — login-test, kbd-test).
+  - **Real W^X / per-page memory protection** — the other half of "Security
+    Core: … W^X + memory protection" from the security-architecture section
+    below, and the other piece `nt.rs` used to flag as a stub
+    (`VirtualProtect`/`VirtualFree`: "no teardown / per-page protection yet"
+    — `VirtualAlloc` granted RW/NX regardless of the `flProtect` a caller
+    asked for). `Process::protect` (`vmm::protect_page_in`, `update_flags` +
+    an immediate `invlpg` — the caller may keep running on this CR3 right
+    after and must not still see the old permissions) now really flips the
+    `WRITABLE`/`NO_EXECUTE` PTE bits, wired into both `VirtualProtect`
+    (Win32) and `NtProtectVirtualMemory` (native), including the
+    previous-protection readback (`lpflOldProtect`/`OldProtect`) both report.
+    Real `VirtualProtect` semantics: the whole region must already be
+    committed or the call fails entirely, unchanged (`vmm::page_present_in`
+    pre-validates every page before touching any of them).
+    Known simplification, stated rather than silently wrong:
+    `PAGE_NOACCESS` isn't supported (THOS has no true mapped-but-inaccessible
+    page state yet — rejected rather than granting access anyway); the
+    `_WRITECOPY` variants collapse to plain read-write (no real
+    copy-on-write yet, same gap `process.rs`'s own module doc already names).
+    Verified with genuine hardware-level enforcement in `pe-test`, not just
+    bookkeeping: `VirtualAlloc` a page (RW/NX by default), hand-write a tiny
+    function into it, `VirtualProtect` it to `PAGE_EXECUTE_READ` (checking
+    the reported old protection is `PAGE_READWRITE`), then actually *call*
+    into it — only reachable if the NX bit genuinely got cleared, not merely
+    recorded — then flip to `PAGE_READONLY` and check that old-protection
+    readback too. Passes on real boot first try, prints `PE protect OK`;
+    full regression sweep green (ext2-test, pe-test, smp-test, login-test).
   - **Then (the phase):** the rest of process isolation / integrity for the
     security phase — the NT personality's remaining phase-3 items (below)
     are mostly done; a compositor / real window rendering is a plausible
