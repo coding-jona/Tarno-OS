@@ -224,6 +224,7 @@ const INVALID_HANDLE_VALUE: i64 = -1;
 
 // A few Win32 error codes.
 const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_PARAMETER: u32 = 87;
@@ -1690,21 +1691,56 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
                 set_last_error(ERROR_FILE_NOT_FOUND);
                 return INVALID_HANDLE_VALUE;
             }
-            let path = win_path_to_thos(&name);
             // `access` (a1): GENERIC_READ=0x8000_0000, GENERIC_WRITE=0x4000_0000
             // — the same DAC check `open`/`openat` go through now, just fed
             // from `DesiredAccess` instead of `O_ACCMODE`.
             let want_read = a1 & 0x8000_0000 != 0;
             let want_write = a1 & 0x4000_0000 != 0;
-            let fd = crate::syscall::open_resolved_access(&path, want_read, want_write);
-            if fd == crate::syscall::EACCES {
-                set_last_error(ERROR_ACCESS_DENIED);
-                INVALID_HANDLE_VALUE
-            } else if fd < 0 {
-                set_last_error(ERROR_FILE_NOT_FOUND);
-                INVALID_HANDLE_VALUE
-            } else {
-                fd // the fd is the HANDLE
+            // The `\Device\` + drive-letter object namespace resolves the
+            // drive letter (or an explicit `\Device\...` name) to an actual
+            // backing device *before* any path lookup happens — a typo'd or
+            // unmapped drive letter is a real failure now, not a silent
+            // alias onto the ext2 root.
+            let Some((dev, path)) = crate::device::resolve(&name) else {
+                set_last_error(ERROR_PATH_NOT_FOUND);
+                return INVALID_HANDLE_VALUE;
+            };
+            match dev {
+                crate::device::Device::Ext2 => {
+                    let fd = crate::syscall::open_resolved_access(&path, want_read, want_write);
+                    if fd == crate::syscall::EACCES {
+                        set_last_error(ERROR_ACCESS_DENIED);
+                        INVALID_HANDLE_VALUE
+                    } else if fd < 0 {
+                        set_last_error(ERROR_FILE_NOT_FOUND);
+                        INVALID_HANDLE_VALUE
+                    } else {
+                        fd // the fd is the HANDLE
+                    }
+                }
+                // `\Device\CdRom0`: real FAT32 content, genuinely read-only
+                // — a real CD-ROM device wouldn't accept GENERIC_WRITE
+                // either, so that's checked before touching the volume at
+                // all, not discovered only once a write is attempted.
+                crate::device::Device::Cdrom => {
+                    if want_write {
+                        set_last_error(ERROR_ACCESS_DENIED);
+                        return INVALID_HANDLE_VALUE;
+                    }
+                    let Some(vol) = crate::device::open_cdrom() else {
+                        set_last_error(ERROR_FILE_NOT_FOUND);
+                        return INVALID_HANDLE_VALUE;
+                    };
+                    let Some(bytes) = vol.read_path(&path) else {
+                        set_last_error(ERROR_FILE_NOT_FOUND);
+                        return INVALID_HANDLE_VALUE;
+                    };
+                    let Some(task) = sched::current().task() else {
+                        set_last_error(ERROR_INVALID_HANDLE);
+                        return INVALID_HANDLE_VALUE;
+                    };
+                    task.fd_alloc(crate::file::FatFile::new(bytes)) as i64
+                }
             }
         }
 
@@ -2288,26 +2324,6 @@ fn dispatch_msvcrt(idx: u16, frame: &mut UserFrame) -> i64 {
             0
         }
     }
-}
-
-/// A crude Windows→THOS path map: strip a leading `X:\`, turn `\` into `/`,
-/// force absolute. Good enough for `C:\...` / bare names until the
-/// `\Device\` + drive-letter VFS view lands.
-fn win_path_to_thos(win: &str) -> alloc::string::String {
-    let b = win.as_bytes();
-    let s = if b.len() >= 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
-        &win[2..] // drop the "X:" drive prefix, keep the separator
-    } else {
-        win
-    };
-    let mut out = alloc::string::String::from("/");
-    for part in s.split(|c| c == '\\' || c == '/').filter(|p| !p.is_empty()) {
-        if out.len() > 1 {
-            out.push('/');
-        }
-        out.push_str(part);
-    }
-    out
 }
 
 /// Normalise a module name for an `Ldr` lookup: drop any directory, lowercase,

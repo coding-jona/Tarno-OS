@@ -26,6 +26,7 @@ const EISDIR: i64 = -21;
 const ENOTDIR: i64 = -20;
 const EPIPE: i64 = -32;
 const EIO: i64 = -5;
+const EROFS: i64 = -30;
 
 pub trait FileOps: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> i64;
@@ -166,6 +167,58 @@ impl FileOps for Ext2File {
     }
     fn stat(&self) -> (u32, u64) {
         (S_IFREG | 0o644, self.buf.lock().len() as u64)
+    }
+}
+
+// --- a real, read-only FAT-backed file (the boot ISO's ESP) ---
+
+/// A file read off the FAT-formatted ESP (`\Device\CdRom0` in the NT object
+/// namespace — see `device.rs`) — same whole-file-buffer shape as
+/// `Ext2File`, but genuinely read-only: `fat.rs` has no write side at all,
+/// and a real CD-ROM device wouldn't accept one either.
+pub struct FatFile {
+    buf: Vec<u8>,
+    pos: AtomicUsize,
+}
+
+impl FatFile {
+    pub fn new(data: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self { buf: data, pos: AtomicUsize::new(0) })
+    }
+}
+
+impl FileOps for FatFile {
+    fn read(&self, buf: &mut [u8]) -> i64 {
+        let pos = self.pos.load(Ordering::Relaxed);
+        if pos >= self.buf.len() {
+            return 0;
+        }
+        let n = buf.len().min(self.buf.len() - pos);
+        buf[..n].copy_from_slice(&self.buf[pos..pos + n]);
+        self.pos.store(pos + n, Ordering::Relaxed);
+        n as i64
+    }
+    fn write(&self, _src: &[u8]) -> i64 {
+        EROFS
+    }
+    fn seek(&self, offset: i64, whence: u32) -> i64 {
+        let len = self.buf.len() as i64;
+        let pos = self.pos.load(Ordering::Relaxed) as i64;
+        let base = match whence {
+            SEEK_SET => 0i64,
+            SEEK_CUR => pos,
+            SEEK_END => len,
+            _ => return EINVAL,
+        };
+        let np = base + offset;
+        if np < 0 {
+            return EINVAL;
+        }
+        self.pos.store(np as usize, Ordering::Relaxed);
+        np
+    }
+    fn stat(&self) -> (u32, u64) {
+        (S_IFREG | 0o444, self.buf.len() as u64)
     }
 }
 

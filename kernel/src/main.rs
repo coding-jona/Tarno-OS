@@ -33,6 +33,7 @@ mod console;
 mod cpu;
 #[cfg(feature = "interactive")]
 mod cred;
+mod device;
 mod elf;
 mod execgate;
 mod ext2;

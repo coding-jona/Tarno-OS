@@ -4042,6 +4042,11 @@ fn pe_test(iso: &Path) {
         // Milestone 3: a real mingw-w64 compiler-built Win32 console .exe.
         && serial.contains("WINCON: hello from mingw")
         && serial.contains("WINCON: read C:\\pe-read.txt -> PE ReadFile OK via CreateFileA")
+        // `\Device\` + drive-letter namespace: D: is a real, separate
+        // device (the boot ISO's FAT32 ESP), not an alias onto C:'s ext2.
+        && serial.contains("WINCON: read D:\\EFI\\THOS\\HELLO.TXT -> THOS reads FAT")
+        && serial.contains("WINCON: D: write-open correctly denied")
+        && serial.contains("WINCON: Z: unmapped drive correctly failed")
         && serial.contains("WINCON: WaitForSingleObject ok")
         && serial.contains("WINCON: exit ok")
         && serial.contains("THOS: wincon exited")
