@@ -1258,6 +1258,23 @@ into ring 0."
     takes over correctly, and that the earlier quarantine really was the
     service's own verdict (now allowed, since the local list never knew
     it). Full regression sweep green.
+  - **Quarantine store — done.** Lives where the roadmap puts it: the
+    service's own job, not the kernel's. The kernel still only ever asks
+    "allow or quarantine?" over the pipe; the *record* of why is the
+    service's own business, written through ordinary POSIX file I/O like
+    any other process — no new kernel API. Every quarantine verdict appends
+    a line (`seq=<n> reason=<...> hash=<hex>`) to `/etc/thos/quarantine.log`
+    before the reply goes out. `seq` is a boot-relative counter, not a
+    wall-clock timestamp — no RTC yet (`syscall.rs`'s own `SYS_TIME` stub),
+    a real, stated limitation. No `O_APPEND` in THOS yet either — open
+    doesn't truncate existing content (no `O_TRUNC` either), so an explicit
+    seek-to-end before writing is what actually makes this an append.
+    Verified by reading the real on-disk bytes off ext2, not the service's
+    in-memory state: a record naming the right hash exists while the
+    service is alive, and — checked again, identically — still exists
+    after the test poison pill makes the service exit, proving the record
+    survives independent of the process that wrote it. Full regression
+    sweep green.
 - **Milestone (Security):** a known-malicious EICAR-class test PE and ELF are
   caught by the exec gate before their first instruction runs, quarantined, and
   logged — with the scanner process killable and restartable without touching
