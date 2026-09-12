@@ -878,8 +878,13 @@ Phasing:
     the session `Principal` (uid 1000 — the admin session is unprivileged) is
     stamped onto every task and returned by `getuid`/`getgid`. `cargo xtask
     login-test`: setup runs once, reboot goes straight to login, a wrong
-    password is rejected. Still stub: PBKDF2 not argon2id, no `Principal`
-    object proper, no file-owner enforcement, no `elevate` yet, password
+    password is rejected. **File-owner enforcement and a first `elevate`
+    are done too now** — see "Capability policy" under Security Core below
+    (DAC owner/group/other + `O_CREAT`/`chmod`/`chown` + real gid; and
+    `elevate(path, argv, password)`, admin-only + re-authenticated, spawns
+    a brand-new uid-0 process — no trusted path / secure-attention key
+    yet). Still stub: PBKDF2 not argon2id, no `Principal` object proper
+    (uid/gid stand in for it), no NT SID / token / DACL side, password
     changing is "rewrite the store + reboot" not a settings action.
 - **Phase 3 (full):** SID / token model, NT DACL ↔ canonical-ACL translation, the
   UAC path, the trusted-path prompt, privilege sets (`SeDebugPrivilege` …).
@@ -1040,6 +1045,31 @@ into ring 0."
     sharing the file's gid gets read only, a uid matching neither gets
     nothing, uid 0 always passes. Full regression sweep green: ext2-test,
     pe-test, smp-test, login-test, integrity-test, kbd-test.
+  - **`elevate()` — first slice done.** The first real step off "no root
+    login — admin elevates" (Identity, privilege & login, above): a new
+    THOS-native syscall range (`THOS_BASE`, same shape as `nt::NT_BASE`)
+    carries `elevate(path, argv, password)`. Two real checks — admin-only
+    (`task.uid != cred::ADMIN_UID` is `EPERM` before the password is even
+    looked at; THOS has exactly one principal that can ever be admin) and
+    re-authentication (the freshly typed password checked against the real
+    credential store, not "you're already logged in") — then
+    `process::spawn_elevated` starts a **brand-new process** with uid/gid
+    forced to 0. THOS has no in-place token upgrade, so "scoped to that
+    process" falls out of the design for free: there is no elevated shell
+    or standing token to leak or reuse for a later action. Not yet built,
+    stated rather than skipped: the **trusted path** (a secure-attention
+    key so no app can draw a fake password prompt) — needs a global
+    keyboard-capture mechanism; today the password is just whatever the
+    calling process handed the kernel, trusted only because THOS has
+    exactly one interactive session and nothing else that could impersonate
+    the prompt yet.
+    Verified with a genuine round trip, not "the syscall returned 0": a new
+    test binary `/do-elevate` calls the real syscall via a raw `syscall`
+    instruction (no libc) with the actual admin password `drive_login`
+    sets up; on success it has spawned `/elevated-check`, which itself
+    calls `getuid()` and prints the result — proof the *spawned* process
+    really has uid 0. `cargo xtask kbd-test`: `elevate returned 22` (a real
+    pid) followed by `elevated-check uid=0`. Full regression sweep green.
 - **Security Service (isolated userspace) — the full AV:** real-time (on-access
   + on-exec) and on-demand scanning; file scanner (YARA + open-source signature
   sets, e.g. ClamAV-style DBs); exec scanner (PE/ELF static analysis, reusing
