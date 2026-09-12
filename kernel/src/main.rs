@@ -54,6 +54,7 @@ mod pe;
 mod process;
 mod registry;
 mod sched;
+mod secsvc;
 mod seh;
 mod serial;
 mod smp;
@@ -829,32 +830,77 @@ fn execgate_check() {
         "EICAR string buried in the middle of a buffer wasn't caught"
     );
 
-    // The hash/signature side of the pipeline (`BLOCKED_HASHES`), on content
-    // the EICAR substring check has no way to catch at all — proves the hash
-    // path is actually wired, not just non-empty. First, the hash itself:
-    // computed fresh here rather than trusted from execgate.rs's own
-    // hand-transcribed hex constant blindly — a real check, not an assumption.
+    // `MARKER_STRING`'s own hash-list entry (`BLOCKED_HASHES`, the *local*
+    // fallback) is exercised end-to-end by `secsvc_check` right after this
+    // — it controls the Security Service's lifecycle, and the verdict for
+    // this hash now genuinely depends on whether the service is up (it
+    // isn't on the service's own list — Allow) or down (the local fallback
+    // catches it — Quarantine). Here, just confirm the hand-transcribed hex
+    // constant in execgate.rs really is this string's SHA-256, independent
+    // of that lifecycle — a real check, not trusting the bytes blindly.
     let mut h = Sha256::new();
     h.update(execgate::MARKER_STRING);
     let digest: [u8; 32] = h.finalize().into();
     assert_eq!(
-        execgate::check(execgate::MARKER_STRING),
-        execgate::Verdict::Quarantine("known-bad hash"),
-        "MARKER_STRING's real SHA-256 ({digest:02x?}) doesn't match execgate.rs's BLOCKED_HASHES entry"
+        digest,
+        execgate::marker_hash(),
+        "MARKER_STRING's real SHA-256 doesn't match execgate.rs's BLOCKED_HASHES entry"
     );
-    // A byte-for-byte-different buffer that merely *contains* the marker as
-    // a substring must NOT be caught — this is a whole-file hash match, not
-    // another substring scan; different coverage than the EICAR check above.
+
+    kprintln!("THOS: exec gate check ok EICAR signature detected, clean content passes");
+}
+
+/// The Security Service round trip — real process isolation, a real
+/// kernel↔service channel, and a real crash-degrade fallback, not assumed.
+/// `secsvc::spawn` already ran in `kmain`; this exercises `execgate::check`
+/// both while the service is alive and after it (deliberately) exits.
+fn secsvc_check() {
+    // While alive: a hash *only the service's own list* knows about —
+    // `SECSVC_ONLY_MARKER` is deliberately absent from the kernel's local
+    // `BLOCKED_HASHES` — must be quarantined, and the reason must name the
+    // service, not the local fallback.
+    assert_eq!(
+        execgate::check(execgate::SECSVC_ONLY_MARKER),
+        execgate::Verdict::Quarantine("Security Service: known-bad hash"),
+        "the service-alive verdict must come from the service, not the local list"
+    );
+    // Still alive: ordinary content the service has never heard of either
+    // — a real Allow verdict from the round trip, not a rejection-by-default.
+    assert_eq!(execgate::check(b"nothing interesting, service should allow this"), execgate::Verdict::Allow);
+
+    // The test poison pill: makes the service process exit immediately,
+    // simulating a crash. `set_exit_status` (process.rs) clears its fd
+    // table the instant it does, so the kernel's next `check_hash` sees a
+    // real EOF, not a guess or a timeout.
+    assert_eq!(secsvc::check_hash(&[0xFFu8; 32]), None, "the poison pill itself has no verdict");
+    for _ in 0..64 {
+        sched::yield_now(); // let the service's exit actually run
+    }
+
+    // Now degraded: the kernel's own local fallback must still catch what
+    // it always could (`MARKER_STRING`, in `BLOCKED_HASHES`) — the actual
+    // "crash there degrades to a policy default" property, not a crash.
+    assert_eq!(
+        execgate::check(execgate::MARKER_STRING),
+        execgate::Verdict::Quarantine("known-bad hash (local fallback)"),
+        "the local fallback must still work once the service is gone"
+    );
+    // The local fallback is still a whole-file hash match, not a substring
+    // scan — a buffer that merely *contains* the marker must not fire.
     let mut wrapped = alloc::vec![0xCCu8; 8];
     wrapped.extend_from_slice(execgate::MARKER_STRING);
     wrapped.extend_from_slice(&[0xDDu8; 8]);
     assert_eq!(
         execgate::check(&wrapped),
         execgate::Verdict::Allow,
-        "the hash check must require an exact whole-file match, not fire on a substring"
+        "the local fallback must require an exact whole-file match, not fire on a substring"
     );
+    // And the service-only hash — genuinely unknown to the local list — is
+    // now allowed, proving the earlier quarantine really was the service's
+    // own verdict, not a coincidental local hit.
+    assert_eq!(execgate::check(execgate::SECSVC_ONLY_MARKER), execgate::Verdict::Allow);
 
-    kprintln!("THOS: exec gate check ok EICAR signature + known-bad hash detected, clean content passes");
+    kprintln!("THOS: secsvc check ok  service-backed verdict, crash detected, local fallback took over");
 }
 
 /// `NtCreateSection`/`NtMapViewOfSection`/`NtUnmapViewOfSection`/
@@ -1130,7 +1176,12 @@ fn storage_milestone() {
     registry_enum_check();
     registry_security_check(&fs);
     registry_notify_check();
+    // Before the exec gate's own check — a real, isolated userspace
+    // process, not kernel code (`secsvc.rs`'s own module doc). Its exact
+    // shutdown/crash behavior is what `execgate_check` below exercises.
+    secsvc::spawn(&fs);
     execgate_check();
+    secsvc_check();
     section_sharing_check(&fs);
     integrity_check(&fs);
     posix_owner_check(&fs);

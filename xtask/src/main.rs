@@ -293,7 +293,14 @@ fn disk_image() -> PathBuf {
     // elevate() round trip: /do-elevate calls the real THOS-native syscall
     // (re-authenticating with the admin password), which — if it accepts —
     // spawns /elevated-check as uid 0. Same static-musl recipe as rusthello.
-    for (src, name) in [("do-elevate.rs", "do-elevate"), ("elevated-check.rs", "elevated-check")] {
+    for (src, name) in [
+        ("do-elevate.rs", "do-elevate"),
+        ("elevated-check.rs", "elevated-check"),
+        // The Security Service test binary — spawned by the kernel at boot
+        // (`secsvc::spawn`) on every config, stdio wired to the
+        // kernel<->service pipes instead of the console. Same recipe.
+        ("secsvc.rs", "secsvc"),
+    ] {
         let rs = root.join("xtask/testdata").join(src);
         let bin = root.join("target").join(name);
         run(Command::new("rustc").args([

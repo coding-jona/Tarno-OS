@@ -624,7 +624,7 @@ pub struct FdEntry {
     pub obj: HandleObject,
     pub cloexec: bool,
 }
-type Fd = Option<FdEntry>;
+pub(crate) type Fd = Option<FdEntry>;
 
 /// One queued user-mode APC (see [`crate::apc`]). `routine` is the
 /// `PKNORMAL_ROUTINE`; `arg1..arg3` are `NtQueueApcThread`'s `ApcArgument1..3`
@@ -1196,6 +1196,34 @@ pub fn spawn_elevated(ppid: u64, bytes: &[u8], argv: &[&str], envp: &[&str], uid
     let rsp = space.init_stack(stack_top, argv, envp, &img);
     let task = Task::new_with_ids(ppid, space, uid, gid);
     sched::spawn_user("elevated", task.clone(), img.entry, rsp);
+    Ok(task.pid)
+}
+
+/// Like [`spawn_elevated`], but the new task's fd table is `fds` instead of
+/// the usual console-backed `seed_fds()` — the primitive behind spawning
+/// the Security Service (`secsvc.rs`) with its stdin/stdout wired to the
+/// kernel<->service pipes instead of the console, so nothing it prints or
+/// reads is visible to (or forgeable by) any other process.
+pub fn spawn_with_fds(
+    ppid: u64,
+    bytes: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    uid: u32,
+    gid: u32,
+    fds: Vec<Fd>,
+) -> Result<u64, &'static str> {
+    if let crate::execgate::Verdict::Quarantine(reason) = crate::execgate::check(bytes) {
+        crate::kprintln!("THOS: exec gate        quarantined a spawn_with_fds exec — {reason}");
+        return Err("quarantined by the native-exec gate");
+    }
+    let space = Process::new();
+    let img = elf::load(&space, bytes)?;
+    let stack_top = space.new_user_stack();
+    let rsp = space.init_stack(stack_top, argv, envp, &img);
+    let task = Task::new_with_ids(ppid, space, uid, gid);
+    *task.fds.lock() = fds;
+    sched::spawn_user("secsvc", task.clone(), img.entry, rsp);
     Ok(task.pid)
 }
 
