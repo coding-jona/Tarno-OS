@@ -921,6 +921,28 @@ into ring 0."
   direction), W^X + memory protection, file-integrity baselines. Small, auditable,
   no parsing of untrusted formats beyond what the loaders already do (now
   hostile-input hardened).
+  - **Measured boot — done, in `loaders/thos-boot`** (the boot picker, not the
+    kernel — measurement only means anything if it happens *before* the next
+    stage runs, so it belongs to whatever hands off to that stage). Right
+    before `StartImage` on the chosen loader, `measure()` hashes its
+    already-`LoadImage`d bytes into the TPM via `EFI_TCG2_PROTOCOL` and logs
+    the event, into PCR 4 ("Boot Manager Code and Boot Attempts" per the TCG
+    PC Client spec — the right PCR for a boot manager extending whatever it's
+    about to hand control to). No TPM/TCG2 present (most dev/test machines,
+    plenty of real ones) → silently skipped, same boot either way —
+    measuring is additive, never a requirement. **Secure boot** (signing) is
+    a separate, mostly non-code concern noted where the boot picker's own
+    risks are listed (chainloading Microsoft's loader is fine; loading our
+    own *unsigned* kernel needs Secure Boot off or our keys enrolled on the
+    target board) — not attempted here.
+    Verified against a **real TPM 2.0**, not just "compiles": a new
+    `cargo xtask bootpick-tpm-test` attaches a real `swtpm` (TCG2, via QEMU's
+    `tpm-crb` device) to the same 3-disk OVMF picker test `bootpick-test`
+    already uses, and asserts the serial log shows the actual measurement
+    event (`measured \`THOS\` into TPM PCR 4`) — not a mocked success path.
+    Skips (not fails) if `swtpm` isn't on `PATH`, since it's optional test
+    tooling. `bootpick-test` itself (no TPM attached) still passes unchanged,
+    confirming the TPM path is genuinely optional. Both pass on real boot.
 - **Security Service (isolated userspace) — the full AV:** real-time (on-access
   + on-exec) and on-demand scanning; file scanner (YARA + open-source signature
   sets, e.g. ClamAV-style DBs); exec scanner (PE/ELF static analysis, reusing
