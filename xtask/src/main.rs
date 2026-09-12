@@ -697,6 +697,7 @@ fn write_pe_hello(path: &Path) {
     let apc_flag_tag = u32::MAX - 51;
     let apc_handler_tag = u32::MAX - 52;
     let msg_apc_tag = u32::MAX - 53;
+    let msg_apc_alert_tag = u32::MAX - 116;
     let nckname_tag = u32::MAX - 54;
     let nokname_tag = u32::MAX - 55;
     let nsvkname_tag = u32::MAX - 56;
@@ -1209,6 +1210,60 @@ fn write_pe_hello(path: &Path) {
     code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
     rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_apc_tag);
     let apc_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2m7b) alertable wait: a *second* APC (different marker, 0x5678, so
+    //       this can't pass by accident from the previous test's leftover
+    //       state), queued to self, then NtWaitForSingleObject(evh,
+    //       Alertable=TRUE, Timeout=NULL) — real NT delivers an already-
+    //       pending APC instead of blocking at all. `evh`'s prior handle
+    //       was already NtClose'd in 2m3, so it's free to reuse for a
+    //       fresh, unsignalled event. If the short-circuit doesn't fire,
+    //       this blocks forever (NULL timeout, nothing ever signals it) —
+    //       the whole test hangs and times out, a loud failure either way.
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], apc_flag_tag); // mov [rip+apc_flag], rax
+    // NtCreateEvent(&evh, 0, 0, 0, FALSE)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], evh_tag); // lea rcx, [rip+evh]
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9]); // xor edx,edx; xor r8d,r8d; xor r9d,r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], ce_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtQueueApcThread(NtCurrentThread=-2, apc_handler, 0x5678, 0, 0)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFE, 0xFF, 0xFF, 0xFF]); // mov rcx, -2
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], apc_handler_tag); // lea rdx, [rip+apc_handler]
+    code.extend_from_slice(&[0x41, 0xB8, 0x78, 0x56, 0, 0]); // mov r8d, 0x5678
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], apcq_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtWaitForSingleObject(evh, Alertable=TRUE, Timeout=NULL) -> STATUS_USER_APC
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag); // mov rcx, [rip+evh]
+    code.extend_from_slice(&[0xBA, 0x01, 0, 0, 0]); // mov edx, 1 (Alertable=TRUE)
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d (Timeout=NULL)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x3D, 0xC0, 0, 0, 0, 0x74, 0x01, 0xCC]); // cmp eax,0xC0; je +1; int3
+    // apc_flag must now be 0x5678 — the APC really ran, not just "the wait
+    // returned some status".
+    rel!([0x48, 0x8B, 0x05, 0, 0, 0, 0], apc_flag_tag); // mov rax, [rip+apc_flag]
+    code.extend_from_slice(&[0x3D, 0x78, 0x56, 0, 0, 0x74, 0x01, 0xCC]);
+    // NtClose(evh)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], close_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // WriteFile(1, msg_apc_alert, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_apc_alert_tag);
+    let apc_alert_r8 = code.len() + 2;
     code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
     rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
@@ -2209,6 +2264,9 @@ fn write_pe_hello(path: &Path) {
     let msg_apc: &[u8] = b"PE APC OK\n";
     let msg_apc_off = code.len();
     code.extend_from_slice(msg_apc);
+    let msg_apc_alert: &[u8] = b"PE APC alertable-wait OK\n";
+    let msg_apc_alert_off = code.len();
+    code.extend_from_slice(msg_apc_alert);
     let msg_reg: &[u8] = b"PE registry OK\n";
     let msg_reg_off = code.len();
     code.extend_from_slice(msg_reg);
@@ -2247,6 +2305,7 @@ fn write_pe_hello(path: &Path) {
     code[sync_r8..sync_r8 + 4].copy_from_slice(&(msg_sync.len() as u32).to_le_bytes());
     code[reg_r8..reg_r8 + 4].copy_from_slice(&(msg_reg.len() as u32).to_le_bytes());
     code[apc_r8..apc_r8 + 4].copy_from_slice(&(msg_apc.len() as u32).to_le_bytes());
+    code[apc_alert_r8..apc_alert_r8 + 4].copy_from_slice(&(msg_apc_alert.len() as u32).to_le_bytes());
     code[seh2_r8..seh2_r8 + 4].copy_from_slice(&(msg_seh2.len() as u32).to_le_bytes());
     code[seh_r8..seh_r8 + 4].copy_from_slice(&(msg_seh.len() as u32).to_le_bytes());
     code[evt2_r8..evt2_r8 + 4].copy_from_slice(&(msg_evt2.len() as u32).to_le_bytes());
@@ -2343,6 +2402,7 @@ fn write_pe_hello(path: &Path) {
             t if t == apc_flag_tag => text_rva + apc_flag_off as u32,
             t if t == apc_handler_tag => text_rva + apc_handler_off as u32,
             t if t == msg_apc_tag => text_rva + msg_apc_off as u32,
+            t if t == msg_apc_alert_tag => text_rva + msg_apc_alert_off as u32,
             t if t == nckname_tag => text_rva + nckname_off as u32,
             t if t == nokname_tag => text_rva + nokname_off as u32,
             t if t == nsvkname_tag => text_rva + nsvkname_off as u32,
@@ -4022,6 +4082,7 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE SEH OK") // #UD -> KiUserExceptionDispatcher -> vectored handler -> NtContinue
         && serial.contains("PE SEH2 OK") // #PF via the error-code fault stub, same handler resumes
         && serial.contains("PE APC OK") // NtQueueApcThread + NtTestAlert -> KiUserApcDispatcher -> NtContinue
+        && serial.contains("PE APC alertable-wait OK") // NtWaitForSingleObject(Alertable=TRUE) delivers a pending APC instead of blocking
         && serial.contains("PE registry OK") // NtCreateKey/SetValue/OpenKey/QueryValue/DeleteKey round-trip
         && serial.contains("PE sync OK") // semaphore + mutant + NtWaitForMultipleObjects
         && serial.contains("PE delay OK") // NtDelayExecution -> real executive block on the timer wheel

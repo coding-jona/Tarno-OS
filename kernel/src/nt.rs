@@ -281,6 +281,8 @@ const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 const STATUS_NO_MORE_ENTRIES: u32 = 0x8000_001A;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_TIMEOUT: u32 = 0x0000_0102;
+/// A pending user APC was delivered instead of the wait completing normally.
+const STATUS_USER_APC: u32 = 0x0000_00C0;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
@@ -884,6 +886,22 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let Some(w) = process::current_waitable(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
             };
+            // Alertable (`a1`) + an already-pending user APC: deliver it
+            // instead of blocking at all, same as real NT — the object
+            // itself is never even touched. Note the other half of a real
+            // alertable wait — a *cross-thread* APC arriving while this
+            // thread is already blocked, interrupting the sleep early —
+            // isn't reachable yet: `NtQueueApcThread` only ever targets the
+            // calling thread itself today (see `apc.rs`), so no other
+            // thread can queue one here while this one sleeps.
+            if a1 != 0 && process::current_apc_pending() {
+                let r = frame_regs(frame, STATUS_USER_APC);
+                if let Some((rsp, rip)) = crate::apc::take_and_stage(&r) {
+                    frame.rsp = rsp;
+                    frame.rip = rip;
+                }
+                return STATUS_USER_APC as i64;
+            }
             let tid = process::current_tid();
             if a2 == 0 {
                 w.wait(tid);
@@ -1256,29 +1274,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // this thread's return through `KiUserApcDispatcher`; the staged CONTEXT
         // carries STATUS_SUCCESS in `Rax` so the eventual resume returns it.
         NT_NTTESTALERT => {
-            let (cs, ss) = process::user_selectors();
-            let r = crate::apc::Regs {
-                rax: STATUS_SUCCESS as u64,
-                rcx: 0,
-                rdx: frame.rdx,
-                rbx: frame.rbx,
-                rsp: frame.rsp,
-                rbp: frame.rbp,
-                rsi: frame.rsi,
-                rdi: frame.rdi,
-                r8: frame.r8,
-                r9: frame.r9,
-                r10: frame.r10,
-                r11: frame.r11,
-                r12: frame.r12,
-                r13: frame.r13,
-                r14: frame.r14,
-                r15: frame.r15,
-                rip: frame.rip,
-                rflags: frame.rflags,
-                cs,
-                ss,
-            };
+            let r = frame_regs(frame, STATUS_SUCCESS);
             if let Some((rsp, rip)) = crate::apc::take_and_stage(&r) {
                 frame.rsp = rsp;
                 frame.rip = rip;
@@ -1594,6 +1590,37 @@ unsafe fn write_iosb(iosb: u64, status: u32, information: u64) {
     if iosb != 0 {
         *(iosb as *mut u32) = status;
         *((iosb + 8) as *mut u64) = information;
+    }
+}
+
+/// Capture `frame`'s register state as `apc::Regs`, with `status_ax`
+/// pre-loaded as `Rax` — what the interrupted call will appear to have
+/// returned once whatever APC gets staged over this state finally resumes
+/// via `NtContinue`'s own tail. Shared by `NtTestAlert` (`STATUS_SUCCESS`)
+/// and an alertable `NtWaitForSingleObject` short-circuit (`STATUS_USER_APC`).
+fn frame_regs(frame: &UserFrame, status_ax: u32) -> crate::apc::Regs {
+    let (cs, ss) = process::user_selectors();
+    crate::apc::Regs {
+        rax: status_ax as u64,
+        rcx: 0,
+        rdx: frame.rdx,
+        rbx: frame.rbx,
+        rsp: frame.rsp,
+        rbp: frame.rbp,
+        rsi: frame.rsi,
+        rdi: frame.rdi,
+        r8: frame.r8,
+        r9: frame.r9,
+        r10: frame.r10,
+        r11: frame.r11,
+        r12: frame.r12,
+        r13: frame.r13,
+        r14: frame.r14,
+        r15: frame.r15,
+        rip: frame.rip,
+        rflags: frame.rflags,
+        cs,
+        ss,
     }
 }
 

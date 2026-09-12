@@ -1039,9 +1039,9 @@ pub fn current_take_apc() -> Option<ApcEntry> {
     sched::current().task().and_then(|t| t.apc_take())
 }
 
-/// `true` if the current task has a user APC queued. (Used by the alertable
-/// wait path, which lands with the executive timer wheel.)
-#[allow(dead_code)]
+/// `true` if the current task has a user APC queued — the alertable
+/// `NtWaitForSingleObject` short-circuit (`nt.rs`) checks this before
+/// blocking.
 pub fn current_apc_pending() -> bool {
     sched::current().task().map(|t| t.apc_pending()).unwrap_or(false)
 }
