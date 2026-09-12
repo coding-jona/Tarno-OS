@@ -1102,8 +1102,9 @@ Service's job — "the scanner never runs in the kernel" is the whole point of
 that split — this slice is only `format detect → parse headers` (already
 `pe::load`/`elf::load`'s job, right after) `→ hash/signature check → policy
 engine`. `execgate::check(bytes)`: the EICAR Standard Anti-Virus Test File
-string anywhere in the buffer, or a SHA-256 match against a (today: empty)
-known-bad list, both `Verdict::Quarantine`; anything else `Allow`. Wired into
+string anywhere in the buffer, or a SHA-256 match against a known-bad list
+(see below — a THOS-authored test marker today, not a real malware
+database), both `Verdict::Quarantine`; anything else `Allow`. Wired into
 both native-process entry points: `spawn_pe` (`Result`-based, same shape as
 an already-existing malformed-PE rejection — `Err`, kernel alive) and
 `execve` (no `Result` to hand back through that ABI — the calling thread's
@@ -1129,6 +1130,22 @@ as `kbd-test` was extended to add a command past the exec-gate work. Fixed
 with a new `process::current_is_pe()` gating the read. Full regression sweep
 green afterward: ext2-test, pe-test, smp-test, login-test, integrity-test,
 kbd-test.
+
+**`BLOCKED_HASHES` given a real, non-empty entry.** It had sat empty since
+the first slice — meaning the hash-match branch of `check()` was dead in
+every real boot. THOS has no malware corpus and isn't building one for the
+kernel (that data belongs to the Security Service's real signature
+database later, sourced from actual threat-intel feeds — not hand-picked
+into kernel source), so what's there now is a THOS-authored synthetic test
+marker (`execgate::MARKER_STRING`, not malware, not derived from any real
+sample), purely so the hash pipeline stage is provably wired. Different
+coverage than the EICAR substring check, not a redundant copy of it: hash
+matching is whole-file, so a buffer merely *containing* the marker as a
+substring sails through (verified `Allow`), where EICAR's substring check
+would catch that same wrapping. `execgate_check` (main.rs) computes the
+marker's SHA-256 fresh with `sha2` and asserts it against `execgate.rs`'s
+hand-transcribed hex constant — a real check that the two agree, not a
+blind trust of the hardcoded bytes. Full regression sweep green.
 
 ### In-system AI
 
