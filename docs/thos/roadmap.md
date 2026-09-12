@@ -967,6 +967,30 @@ into ring 0."
     tamper, not a test bug — further proof the check ran, not skipped).
     Full regression sweep otherwise unaffected: ext2-test, pe-test,
     smp-test, login-test all still pass.
+  - **Capability policy — first slice done: real DAC file permissions.**
+    Before this, `ext2::Inode` didn't even parse `i_uid`/`i_gid` and no
+    syscall checked `mode` against the calling task's identity at all —
+    `open()` granted access regardless of owner or permission bits. Now
+    `Inode::access_ok(uid, want_write)` (owner/other tiers — no group tier
+    yet, THOS's identity model has no real group membership beyond the
+    `gid` a file carries; that gap is exactly what the wider capability-
+    policy work above this slice is meant to fill in, and uid `0` — the
+    system account, never an interactive session, see `cred.rs` — always
+    passes, matching real Unix root semantics) is the DAC check both
+    `open`/`openat` (finally reading the `O_ACCMODE` bits out of `flags`,
+    silently dropped before) and the NT personality's `CreateFileA`
+    (decided from `DesiredAccess` instead) now go through before handing
+    back a handle — `EACCES`/`ERROR_ACCESS_DENIED` otherwise.
+    Verified two ways: a real interactive-shell round trip (`cargo xtask
+    kbd-test`, extended) — logged in as the uid-1000 admin session,
+    `echo x > /etc/thos/admin.cred` against that mode-644-root-owned file
+    (every file `write_path` creates is `0`-owned today) genuinely fails at
+    the kernel's DAC check, and BusyBox's own shell reports it:
+    `sh: can't create /etc/thos/admin.cred: Permission denied` — not a
+    mocked denial. Full regression sweep otherwise green (ext2-test,
+    pe-test, smp-test, login-test, integrity-test) — every existing test
+    runs pre-login as uid `0`, so the bypass path keeps them all passing
+    unchanged.
 - **Security Service (isolated userspace) — the full AV:** real-time (on-access
   + on-exec) and on-demand scanning; file scanner (YARA + open-source signature
   sets, e.g. ClamAV-style DBs); exec scanner (PE/ELF static analysis, reusing
