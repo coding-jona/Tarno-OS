@@ -991,6 +991,37 @@ into ring 0."
     pe-test, smp-test, login-test, integrity-test) — every existing test
     runs pre-login as uid `0`, so the bypass path keeps them all passing
     unchanged.
+  - **Capability policy — second slice done: real file creation (`O_CREAT`)
+    + `chmod`/`chown`.** The first slice's own gap — `open()` could deny an
+    existing file, but there was no way to *create* one through a syscall
+    at all, and a file's owner/mode were permanent from the moment
+    `write_path` first wrote it. `open_resolved`'s `O_CREAT` now creates an
+    empty file owned by the calling task, gated on that task having write
+    permission on the *parent directory* (creating an entry is a write to
+    the directory, not the not-yet-existing file) — the same check
+    `SYS_MKDIR` now applies (a gap found live: a first pass had `mkdir`
+    skip it entirely, and a test `mkdir /newdir` at the real, root-owned
+    `/` silently succeeded before the fix). `chmod` requires owner-or-root;
+    `chown` is root-only — stricter, matching modern Unix, where not even
+    the owner can give a file away. A freshly provisioned uid otherwise had
+    no writable location anywhere on disk (every directory ever created was
+    system-owned mode 755) — `cred::save` now also creates `/home/<name>`
+    for the new account, closing that off, same as `useradd` making a real
+    Linux account a home directory.
+    Verified two ways: a real interactive-shell round trip (`cargo xtask
+    kbd-test`, extended) — logged in as `thos`, `cd /home/thos && touch
+    newfile && mkdir newdir && ls` shows both, genuine new inodes through
+    the syscall ABI (this is also what caught BusyBox `touch` needing a
+    real `SYS_UTIMENSAT` — it tries that first and only falls back to its
+    own `open(O_CREAT)` on `ENOENT`, so an unhandled syscall there silently
+    broke `touch` even after `O_CREAT` itself worked). `chmod`/`chown` have
+    no BusyBox applet to drive live, so they're proven at the ext2-layer +
+    permission-policy-logic level instead (`posix_owner_check`,
+    kernel-internal, same shape as `execgate_check`) — real, just not yet
+    exercised through the live syscall ABI by a dedicated test, same honest
+    scoping as `execve`'s exec-gate wiring below. Full regression sweep
+    green: ext2-test, pe-test, smp-test, login-test, integrity-test,
+    kbd-test.
 - **Security Service (isolated userspace) — the full AV:** real-time (on-access
   + on-exec) and on-demand scanning; file scanner (YARA + open-source signature
   sets, e.g. ClamAV-style DBs); exec scanner (PE/ELF static analysis, reusing
