@@ -274,6 +274,7 @@ const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_NOT_MAPPED_VIEW: u32 = 0xC000_0019;
 const STATUS_MUTANT_NOT_OWNED: u32 = 0xC000_0046;
 const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = 0xC000_005F;
@@ -1310,7 +1311,14 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 return STATUS_INVALID_PARAMETER as i64;
             };
             let existed = crate::registry::open(&path);
-            if !crate::registry::create(&path) {
+            let uid = process::current_uid();
+            // Opening an existing key is a read (always allowed); *creating*
+            // a new one is a write to the nearest existing ancestor —
+            // per-key security's real enforcement point.
+            if !existed && !crate::registry::create_write_ok(&path, uid) {
+                return STATUS_ACCESS_DENIED as i64;
+            }
+            if !crate::registry::create_owned(&path, uid) {
                 return STATUS_INVALID_PARAMETER as i64;
             }
             let h = process::current_alloc_regkey(crate::registry::canon(&path));
@@ -1347,6 +1355,9 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let Some(path) = process::current_regkey(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
             };
+            if !crate::registry::write_key_ok(&path, process::current_uid()) {
+                return STATUS_ACCESS_DENIED as i64;
+            }
             let name = unsafe { unicode_string_ascii(a1) };
             let (data_ptr, size) = (stack(0), stack(1) as usize);
             let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, size) };
@@ -1394,6 +1405,9 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let Some(path) = process::current_regkey(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
             };
+            if !crate::registry::write_key_ok(&path, process::current_uid()) {
+                return STATUS_ACCESS_DENIED as i64;
+            }
             status(crate::registry::delete_key(&path), STATUS_OBJECT_NAME_NOT_FOUND)
         }
 

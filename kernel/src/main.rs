@@ -672,6 +672,62 @@ fn registry_enum_check() {
     kprintln!("THOS: registry enum ok NtEnumerateKey/Value order + STATUS_NO_MORE_ENTRIES");
 }
 
+/// Per-key registry security — `registry::create_write_ok`/`write_key_ok`,
+/// the predicates `nt.rs`'s `NtCreateKey`/`NtSetValueKey`/`NtDeleteKey`
+/// actually enforce. A key owned by a non-system uid accepts its own
+/// owner's write and root's, rejects a stranger's; *creating* a new subkey
+/// is checked against the nearest existing ancestor (the new key doesn't
+/// exist yet to have an owner of its own) — same "write to the parent"
+/// shape the filesystem's DAC already established, generalized for the
+/// registry's own auto-vivified ancestors.
+fn registry_security_check(fs: &ext2::Ext2) {
+    let base = r"\Registry\Machine\Software\ThosSecCheck";
+    assert!(registry::create_owned(base, 1000), "create_owned as uid 1000");
+    assert_eq!(registry::owner_of(base), Some(1000));
+
+    assert!(registry::write_key_ok(base, 1000), "the owner must be able to write their own key");
+    assert!(registry::write_key_ok(base, 0), "root must always be able to write");
+    assert!(!registry::write_key_ok(base, 2000), "a different uid must be denied");
+
+    // Creating a *new* subkey: checked against the nearest existing
+    // ancestor (`base`, owned 1000), not the not-yet-existing subkey.
+    let child = alloc::format!("{base}\\Sub");
+    assert!(registry::create_write_ok(&child, 1000), "the owner may create a subkey under their own key");
+    assert!(
+        !registry::create_write_ok(&child, 2000),
+        "a stranger may not create a subkey under someone else's key"
+    );
+    assert!(registry::create_owned(&child, 1000), "actually create the subkey");
+    assert_eq!(registry::owner_of(&child), Some(1000));
+
+    // A system-owned key (uid 0, `create`'s default — every pre-existing
+    // hive key from before this increment) is writable by root, same as
+    // always, but now genuinely denied to a normal uid — the DAC gap this
+    // slice closes.
+    let sys_child = alloc::format!("{base}\\SysSub");
+    assert!(registry::create(&sys_child), "system-owned create");
+    assert_eq!(registry::owner_of(&sys_child), Some(0));
+    assert!(registry::write_key_ok(&sys_child, 0), "root may always write a system-owned key");
+    assert!(!registry::write_key_ok(&sys_child, 4000), "a normal uid may not write a system-owned key");
+
+    // Persistence: `create_owned` under a hive path (`Machine\Software`)
+    // already went through `persist()` above, same path every other
+    // registry write takes — confirm the owner genuinely made it into the
+    // on-disk hive bytes, not just in-memory state.
+    let hive = fs.read_path("/etc/thos/registry/software.hiv").expect("read software.hiv");
+    let text = core::str::from_utf8(&hive).expect("hive is valid utf8");
+    assert!(
+        text.lines().any(|l| l.starts_with("O ") && l.ends_with(" 1000")),
+        "no 'O <relpath> 1000' owner record found in the persisted hive"
+    );
+
+    for sub in ["sub", "syssub"] {
+        registry::delete_key(&alloc::format!("{base}\\{sub}"));
+    }
+    registry::delete_key(base);
+    kprintln!("THOS: registry sec ok  per-key owner, write DAC, ancestor-create check, persisted to hive");
+}
+
 /// `execgate::check`'s detection logic, exercised directly — the algorithm
 /// shared by both `spawn_pe` (`PE reject`/exec-gate check below, a real
 /// `pe::load` round trip) and `execve` (wired the same way, not yet
@@ -985,6 +1041,7 @@ fn storage_milestone() {
         if loaded_hives == 0 { " (first boot — defaults seeded)" } else { "" }
     );
     registry_enum_check();
+    registry_security_check(&fs);
     execgate_check();
     section_sharing_check(&fs);
     integrity_check(&fs);

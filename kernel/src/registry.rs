@@ -12,7 +12,19 @@
 //! durable by default, no explicit flush needed (the tradeoff: every write is
 //! an ext2 write; fine for a registry, which isn't a hot path). Not yet
 //! transactional (a crash mid-write can still lose that one write), no
-//! per-key security, no change-notify.
+//! change-notify.
+//!
+//! **Per-key security** (real, not a stub): every key carries an
+//! `owner_uid`, persisted in the hive right alongside its subkeys/values.
+//! Seeded roots and anything loaded from an old (pre-owner) hive default to
+//! uid `0` (system), matching `ext2::Inode`'s own "unset owner reads as
+//! system" convention. Same two-tier model as the filesystem's first DAC
+//! slice — uid `0` or the key's own owner may write, anyone may read — no
+//! group tier here yet (the registry has no `gid` concept at all, a real,
+//! scoped-out gap, same starting point the filesystem's DAC had before its
+//! own group-tier slice). `nt.rs` is what actually enforces this on
+//! `NtCreateKey`/`NtSetValueKey`/`NtDeleteKey`; this module just carries the
+//! ownership data and the policy predicate ([`write_ok`]).
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -33,11 +45,26 @@ pub struct Value {
 struct Key {
     subkeys: BTreeMap<String, Key>,
     values: BTreeMap<String, Value>,
+    /// `0` (system) unless created by `create_owned` with a real uid, or
+    /// loaded from a hive's own `O` record.
+    owner_uid: u32,
 }
 impl Key {
     const fn new() -> Self {
-        Self { subkeys: BTreeMap::new(), values: BTreeMap::new() }
+        Self { subkeys: BTreeMap::new(), values: BTreeMap::new(), owner_uid: 0 }
     }
+    fn owned(uid: u32) -> Self {
+        Self { owner_uid: uid, ..Self::new() }
+    }
+}
+
+/// The real DAC check: uid `0` (system) always passes; otherwise the
+/// caller's uid must match the key's own owner. Read access (`open`,
+/// `query_value`, both `enumerate_*`) is unchecked — anyone may read any
+/// key, same as the registry's real-Windows HKLM subtrees are typically
+/// world-readable, admin-write.
+fn write_ok(owner_uid: u32, uid: u32) -> bool {
+    uid == 0 || uid == owner_uid
 }
 
 static ROOT: Mutex<Key> = Mutex::new(Key::new());
@@ -68,16 +95,21 @@ fn run<R>(f: impl FnOnce(&mut Key) -> R) -> R {
     let mut root = ROOT.lock();
     if !SEEDED.swap(true, Ordering::Relaxed) {
         for h in ["machine", "user", "machine\\software", "machine\\system"] {
-            make(&mut root, &components(h));
+            make(&mut root, &components(h), 0);
         }
     }
     f(&mut root)
 }
 
-fn make<'a>(root: &'a mut Key, comps: &[String]) -> &'a mut Key {
+/// Find-or-create the key at `comps`. `uid` is the owner stamped on any key
+/// *newly* created along the way (an already-existing key's owner is left
+/// alone) — every implicitly created ancestor gets the same owner as the
+/// leaf, matching real Windows `RegCreateKeyEx`'s own ancestor-creation
+/// behavior.
+fn make<'a>(root: &'a mut Key, comps: &[String], uid: u32) -> &'a mut Key {
     let mut k = root;
     for c in comps {
-        k = k.subkeys.entry(c.clone()).or_insert_with(Key::new);
+        k = k.subkeys.entry(c.clone()).or_insert_with(|| Key::owned(uid));
     }
     k
 }
@@ -96,17 +128,55 @@ fn find_mut<'a>(root: &'a mut Key, comps: &[String]) -> Option<&'a mut Key> {
     Some(k)
 }
 
-/// Create `path` (and any missing ancestors). `false` only for an empty path.
+/// Create `path` (and any missing ancestors), system-owned (uid `0`).
 pub fn create(path: &str) -> bool {
+    create_owned(path, 0)
+}
+
+/// Create `path` (and any missing ancestors) — newly created keys along the
+/// way are owned by `uid`; an already-existing key keeps its owner
+/// unchanged (same "overwrite never changes the owner" rule
+/// `ext2::write_path_owned` follows). `false` only for an empty path.
+pub fn create_owned(path: &str, uid: u32) -> bool {
     let comps = components(path);
     if comps.is_empty() {
         return false;
     }
     run(|root| {
-        make(root, &comps);
+        make(root, &comps, uid);
     });
     persist(&comps);
     true
+}
+
+/// The owner uid of `path`'s key, if it exists.
+pub fn owner_of(path: &str) -> Option<u32> {
+    let comps = components(path);
+    run(|root| find(root, &comps).map(|k| k.owner_uid))
+}
+
+/// The write-permission check for *creating something new* at `path`: the
+/// registry auto-creates missing ancestors (unlike the filesystem, there is
+/// no single guaranteed-existing parent), so this walks up from `path` to
+/// the nearest ancestor that already exists and checks that ancestor's
+/// owner — generalizing the filesystem's "creating an entry is a write to
+/// the parent it lands in" rule. Always terminates: the root itself
+/// (`comps == []`) always "exists" (the whole in-memory tree), system-owned
+/// by default.
+pub fn create_write_ok(path: &str, uid: u32) -> bool {
+    let mut comps = components(path);
+    loop {
+        if let Some(owner) = run(|root| find(root, &comps).map(|k| k.owner_uid)) {
+            return write_ok(owner, uid);
+        }
+        comps.pop();
+    }
+}
+
+/// Can `uid` write to (set a value on, or delete) the already-existing key
+/// at `path`? `false` if the key doesn't exist at all.
+pub fn write_key_ok(path: &str, uid: u32) -> bool {
+    owner_of(path).is_some_and(|owner| write_ok(owner, uid))
 }
 
 /// `true` if `path` names an existing key.
@@ -232,7 +302,7 @@ pub fn load_hives(fs: &Ext2) -> usize {
         n += 1;
         let root_comps: Vec<String> = root.iter().map(|s| s.to_string()).collect();
         run(|r| {
-            let base = make(r, &root_comps);
+            let base = make(r, &root_comps, 0);
             *base = Key::new(); // the file is authoritative — drop the seed
             deserialize_hive(base, &bytes);
         });
@@ -244,12 +314,19 @@ pub fn load_hives(fs: &Ext2) -> usize {
 /// hex-encoded so any byte (a name or data from a hostile PE) round-trips
 /// with no escaping rules to get wrong.
 ///   K <hex relpath>                        -- a subkey exists
+///   O <hex relpath> <uid>                  -- that key's owner (omitted if 0)
 ///   V <hex relpath> <hex name> <type> <hex data>  -- a value on that key
 /// `relpath` is `\`-joined, relative to the hive root (empty = the root
 /// itself); re-parsed with the same `components()` as every other path here.
+/// `O` records are new (per-key security) — an old hive with none loads
+/// every key as uid `0`, exactly its prior behavior, so this is backward
+/// compatible without a format-version bump.
 fn serialize_hive(base: &Key) -> Vec<u8> {
     let mut out = String::from("thos-hive v1\n");
     fn walk(k: &Key, prefix: &str, out: &mut String) {
+        if k.owner_uid != 0 {
+            let _ = writeln!(out, "O {} {}", hex(prefix.as_bytes()), k.owner_uid);
+        }
         for (name, v) in &k.values {
             let _ = writeln!(
                 out,
@@ -277,7 +354,18 @@ fn deserialize_hive(base: &mut Key, bytes: &[u8]) {
         match it.next() {
             Some("K") => {
                 let Some(rp) = it.next().and_then(unhex_string) else { continue };
-                make(base, &components(&rp));
+                make(base, &components(&rp), 0);
+            }
+            Some("O") => {
+                let (Some(rp), Some(uid)) =
+                    (it.next().and_then(unhex_string), it.next().and_then(|s| s.parse::<u32>().ok()))
+                else {
+                    continue;
+                };
+                // The owning key always has (or will have) its own "K" line
+                // too — order between the two doesn't matter, `make` is
+                // idempotent and this always sets the final owner explicitly.
+                make(base, &components(&rp), 0).owner_uid = uid;
             }
             Some("V") => {
                 let (Some(rp), Some(name), Some(ty), Some(data)) = (
@@ -288,7 +376,7 @@ fn deserialize_hive(base: &mut Key, bytes: &[u8]) {
                 ) else {
                     continue;
                 };
-                let k = make(base, &components(&rp));
+                let k = make(base, &components(&rp), 0);
                 k.values.insert(name.to_ascii_lowercase(), Value { ty, data });
             }
             _ => {} // blank line, the "thos-hive v1" header, or garbage — skip
