@@ -48,6 +48,10 @@ fn main() {
             build_uefi();
             bootpick_test();
         }
+        "bootpick-tpm-test" => {
+            build_uefi();
+            bootpick_tpm_test();
+        }
         "ahci-test" => {
             build_kernel(&[]);
             let iso = build_iso();
@@ -57,6 +61,16 @@ fn main() {
             build_kernel(&[]);
             let iso = build_iso();
             ext2_test(&iso);
+        }
+        "integrity-test" => {
+            build_kernel(&[]);
+            let iso = build_iso();
+            integrity_test(&iso);
+        }
+        "registry-crash-test" => {
+            build_kernel(&["regcrashtest"]);
+            let iso = build_iso();
+            registry_crash_test(&iso);
         }
         "smp-test" => {
             build_kernel(&["stress"]);
@@ -91,7 +105,7 @@ fn main() {
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test|ext2-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test|pe-test] [--gui]"
+                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|bootpick-tpm-test|ahci-test|ext2-test|integrity-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test|pe-test] [--gui]"
             );
             exit(2);
         }
@@ -275,6 +289,34 @@ fn disk_image() -> PathBuf {
         "-w", "-R", &format!("write {} sh", shbin.to_str().unwrap()),
         img.to_str().unwrap(),
     ]));
+
+    // elevate() round trip: /do-elevate calls the real THOS-native syscall
+    // (re-authenticating with the admin password), which — if it accepts —
+    // spawns /elevated-check as uid 0. Same static-musl recipe as rusthello.
+    for (src, name) in [
+        ("do-elevate.rs", "do-elevate"),
+        ("elevated-check.rs", "elevated-check"),
+        // The Security Service test binary — spawned by the kernel at boot
+        // (`secsvc::spawn`) on every config, stdio wired to the
+        // kernel<->service pipes instead of the console. Same recipe.
+        ("secsvc.rs", "secsvc"),
+    ] {
+        let rs = root.join("xtask/testdata").join(src);
+        let bin = root.join("target").join(name);
+        run(Command::new("rustc").args([
+            "--target", "x86_64-unknown-linux-musl",
+            "-C", "relocation-model=static",
+            "-C", "link-args=-no-pie",
+            "-C", "strip=symbols",
+            "-O",
+            "-o", bin.to_str().unwrap(),
+            rs.to_str().unwrap(),
+        ]));
+        run(Command::new("debugfs").args([
+            "-w", "-R", &format!("write {} {name}", bin.to_str().unwrap()),
+            img.to_str().unwrap(),
+        ]));
+    }
 
     // A real, unmodified statically-linked BusyBox -> /busybox (Milestone 2:
     // stock Linux x86-64 ELF binaries run as-is). From the `busybox-static`
@@ -488,11 +530,24 @@ fn write_pe_hello(path: &Path) {
         b"HeapAlloc",        // 14
         b"GetProcAddress",   // 16
         b"LoadLibraryA",     // 17
+        b"VirtualProtect",   // 12
     ];
     // A func spelled `#N` is imported by ordinal N instead of by name.
-    let imports: [(&[u8], &[&[u8]]); 2] = [
+    let imports: [(&[u8], &[&[u8]]); 3] = [
         (b"KERNEL32.dll", k32_funcs),
         (b"thoscrt.dll", &[b"thos_add", b"#2", b"thos_fwd"]),
+        (
+            b"USER32.dll",
+            &[
+                b"CallWindowProcA",
+                b"RegisterClassA",
+                b"CreateWindowExA",
+                b"PostMessageA",
+                b"GetMessageA",
+                b"DispatchMessageA",
+                b"PostQuitMessage",
+            ],
+        ),
     ];
     let n_imp = imports.len();
     let import_dir_size = ((n_imp + 1) * 20) as u32;
@@ -572,9 +627,17 @@ fn write_pe_hello(path: &Path) {
     let iat_ha = iat0 + 80; // HeapAlloc
     let iat_gpa = iat0 + 88; // GetProcAddress
     let iat_ll = iat0 + 96; // LoadLibraryA
+    let iat_vp = iat0 + 104; // VirtualProtect
     let iat_add = idata_rva + iat_at[1]; // thoscrt!thos_add  (by name)
     let iat_mul = idata_rva + iat_at[1] + 8; // thoscrt!thos_mul (by ordinal 2)
     let iat_fwd = idata_rva + iat_at[1] + 16; // thoscrt!thos_fwd (forwarded to KERNEL32.GetProcessHeap)
+    let iat_cwp = idata_rva + iat_at[2]; // USER32!CallWindowProcA
+    let iat_rca = idata_rva + iat_at[2] + 8; // USER32!RegisterClassA
+    let iat_cwx = idata_rva + iat_at[2] + 16; // USER32!CreateWindowExA
+    let iat_pma = idata_rva + iat_at[2] + 24; // USER32!PostMessageA
+    let iat_gma = idata_rva + iat_at[2] + 32; // USER32!GetMessageA
+    let iat_dma = idata_rva + iat_at[2] + 40; // USER32!DispatchMessageA
+    let iat_pqm = idata_rva + iat_at[2] + 48; // USER32!PostQuitMessage
 
     // --- entry machine code (x86-64) ---
     // Deferred RIP-relative fixups: (disp32 position in `code`, target RVA).
@@ -641,6 +704,7 @@ fn write_pe_hello(path: &Path) {
     let apc_flag_tag = u32::MAX - 51;
     let apc_handler_tag = u32::MAX - 52;
     let msg_apc_tag = u32::MAX - 53;
+    let msg_apc_alert_tag = u32::MAX - 116;
     let nckname_tag = u32::MAX - 54;
     let nokname_tag = u32::MAX - 55;
     let nsvkname_tag = u32::MAX - 56;
@@ -694,6 +758,14 @@ fn write_pe_hello(path: &Path) {
     let vbase_tag = u32::MAX - 104;
     let vsize_tag = u32::MAX - 105;
     let msg_sec_tag = u32::MAX - 106;
+    let cbfn_tag = u32::MAX - 107;
+    let msg_cb_tag = u32::MAX - 108;
+    let wndclass_tag = u32::MAX - 109;
+    let classname_tag = u32::MAX - 110;
+    let msgbuf_tag = u32::MAX - 111;
+    let msg_win_tag = u32::MAX - 113;
+    let old_protect_tag = u32::MAX - 114;
+    let msg_prot_tag = u32::MAX - 115;
 
     // 1) write(1, msg1, len1)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 1, 0, 0, 0]); // mov rax, 1
@@ -1151,6 +1223,60 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2m7b) alertable wait: a *second* APC (different marker, 0x5678, so
+    //       this can't pass by accident from the previous test's leftover
+    //       state), queued to self, then NtWaitForSingleObject(evh,
+    //       Alertable=TRUE, Timeout=NULL) — real NT delivers an already-
+    //       pending APC instead of blocking at all. `evh`'s prior handle
+    //       was already NtClose'd in 2m3, so it's free to reuse for a
+    //       fresh, unsignalled event. If the short-circuit doesn't fire,
+    //       this blocks forever (NULL timeout, nothing ever signals it) —
+    //       the whole test hangs and times out, a loud failure either way.
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    rel!([0x48, 0x89, 0x05, 0, 0, 0, 0], apc_flag_tag); // mov [rip+apc_flag], rax
+    // NtCreateEvent(&evh, 0, 0, 0, FALSE)
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], evh_tag); // lea rcx, [rip+evh]
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9]); // xor edx,edx; xor r8d,r8d; xor r9d,r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], ce_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtQueueApcThread(NtCurrentThread=-2, apc_handler, 0x5678, 0, 0)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFE, 0xFF, 0xFF, 0xFF]); // mov rcx, -2
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], apc_handler_tag); // lea rdx, [rip+apc_handler]
+    code.extend_from_slice(&[0x41, 0xB8, 0x78, 0x56, 0, 0]); // mov r8d, 0x5678
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], apcq_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // NtWaitForSingleObject(evh, Alertable=TRUE, Timeout=NULL) -> STATUS_USER_APC
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag); // mov rcx, [rip+evh]
+    code.extend_from_slice(&[0xBA, 0x01, 0, 0, 0]); // mov edx, 1 (Alertable=TRUE)
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d (Timeout=NULL)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], wfso_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x3D, 0xC0, 0, 0, 0, 0x74, 0x01, 0xCC]); // cmp eax,0xC0; je +1; int3
+    // apc_flag must now be 0x5678 — the APC really ran, not just "the wait
+    // returned some status".
+    rel!([0x48, 0x8B, 0x05, 0, 0, 0, 0], apc_flag_tag); // mov rax, [rip+apc_flag]
+    code.extend_from_slice(&[0x3D, 0x78, 0x56, 0, 0, 0x74, 0x01, 0xCC]);
+    // NtClose(evh)
+    rel!([0x48, 0x8B, 0x0D, 0, 0, 0, 0], evh_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], close_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x01, 0xCC]);
+    // WriteFile(1, msg_apc_alert, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_apc_alert_tag);
+    let apc_alert_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2m8) minimal registry. Resolve the five Nt* key calls, then: create
     //      \Registry\Machine\Software\THOSREG, set a REG_DWORD value, close,
     //      re-open, query the value back (type + data), delete the key, close,
@@ -1522,6 +1648,179 @@ fn write_pe_hello(path: &Path) {
     rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
 
+    // 2n0) CallWindowProcA(&cb_fn, 0x1111, 100, 50, 7) — the ring-3 callback
+    //      mechanism: cb_fn is *our own inline code*, called back by the
+    //      kernel (NtContinue-style resume, not a real x86 CALL) with the
+    //      Win64 WNDPROC args (hWnd/Msg/wParam/lParam) in rcx/rdx/r8/r9,
+    //      computing msg+wParam-lParam = 143 and returning it as this
+    //      syscall's own LRESULT (via NtCallbackReturn resuming *this*
+    //      frame). Trap unless the round-trip landed exactly right.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], cbfn_tag); // lea rcx, [rip+cb_fn]
+    code.extend_from_slice(&[0xBA, 0x11, 0x11, 0, 0]); // mov edx, 0x1111 (hWnd)
+    code.extend_from_slice(&[0x41, 0xB8, 100, 0, 0, 0]); // mov r8d, 100 (Msg)
+    code.extend_from_slice(&[0x41, 0xB9, 50, 0, 0, 0]); // mov r9d, 50 (wParam)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 7, 0, 0, 0]); // [rsp+0x20]=7 (lParam)
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_cwp); // call [rip+iat_CallWindowProcA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    code.extend_from_slice(&[0x3D, 143, 0, 0, 0]); // cmp eax, 143
+    code.extend_from_slice(&[0x74, 0x01]); // je +1
+    code.extend_from_slice(&[0xCC]); // int3 (wrong LRESULT — callback mechanism broken)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_cb_tag); // lea rdx, [rip+msg_cb]
+    let cb_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]); // mov r8d, len (patched)
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag); // lea r9, [rip+written]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2n0.5) real windows: RegisterClassA -> CreateWindowExA -> PostMessageA
+    //        a custom message carrying wParam=77 -> a real GetMessageA /
+    //        DispatchMessageA loop drives our WndProc (ring-3, via the same
+    //        callback mechanism CallWindowProcA uses); the WndProc ignores
+    //        WM_CREATE and calls PostQuitMessage(wParam) on anything else.
+    //        GetMessageA sees WM_QUIT, the loop exits; check that the
+    //        MSG's wParam is still 77 — the whole round trip through real
+    //        window/message-queue state, not just the callback mechanism.
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], wndclass_tag); // lea rcx, [rip+wndclass]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_rca); // call [rip+iat_RegisterClassA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x75, 0x01, 0xCC]); // test eax,eax; jne+1; int3
+
+    // CreateWindowExA(0, classname, 0, 0, 0, 0, 100, 100, 0, 0, 0, 0)
+    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], classname_tag); // lea rdx, [rip+classname]
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x68]);
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // x=0
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0]); // y=0
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x30, 100, 0, 0, 0]); // nWidth
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x38, 100, 0, 0, 0]); // nHeight
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x40, 0, 0, 0, 0]); // hWndParent
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x48, 0, 0, 0, 0]); // hMenu
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x50, 0, 0, 0, 0]); // hInstance
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x58, 0, 0, 0, 0]); // lpParam
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_cwx); // call [rip+iat_CreateWindowExA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x68]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (hwnd)
+    code.extend_from_slice(&[0x85, 0xC0, 0x75, 0x01, 0xCC]); // test eax,eax; jne+1; int3
+
+    // PostMessageA(hwnd, 0x0400 /*WM_USER*/, 77, 0)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    code.extend_from_slice(&[0xBA, 0, 4, 0, 0]); // mov edx, 0x400
+    code.extend_from_slice(&[0x41, 0xB8, 77, 0, 0, 0]); // mov r8d, 77
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_pma); // call [rip+iat_PostMessageA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x75, 0x01, 0xCC]); // test eax,eax; jne+1; int3
+
+    // message loop
+    let loop_start = code.len();
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], msgbuf_tag); // lea rcx, [rip+msgbuf]
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_gma); // call [rip+iat_GetMessageA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+    code.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]); // je .done (patched below)
+    let je_done_pos = code.len() - 4;
+    rel!([0x48, 0x8D, 0x0D, 0, 0, 0, 0], msgbuf_tag); // lea rcx, [rip+msgbuf]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_dma); // call [rip+iat_DispatchMessageA]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.push(0xE9); // jmp loop_start (rel32, patched below)
+    let jmp_loop_pos = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    let disp = loop_start as i64 - (jmp_loop_pos as i64 + 4);
+    code[jmp_loop_pos..jmp_loop_pos + 4].copy_from_slice(&(disp as i32).to_le_bytes());
+    let done_off = code.len();
+    let disp = done_off as i64 - (je_done_pos as i64 + 4);
+    code[je_done_pos..je_done_pos + 4].copy_from_slice(&(disp as i32).to_le_bytes());
+
+    // WM_QUIT's wParam must still be 77 — the value our WndProc passed to
+    // PostQuitMessage, round-tripped through the real message queue.
+    rel!([0x48, 0x8D, 0x05, 0, 0, 0, 0], msgbuf_tag); // lea rax, [rip+msgbuf]
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x10]); // mov rax, [rax+0x10]  ; MSG.wParam
+    code.extend_from_slice(&[0x48, 0x83, 0xF8, 77]); // cmp rax, 77
+    code.extend_from_slice(&[0x74, 0x01]); // je +1
+    code.extend_from_slice(&[0xCC]); // int3
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]); // mov ecx, 1
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_win_tag); // lea rdx, [rip+msg_win]
+    let win_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
+    // 2n0.7) VirtualProtect: real per-page W^X. VirtualAlloc a fresh page
+    //        (RW, NX by default), write a tiny function into it by hand,
+    //        VirtualProtect it to PAGE_EXECUTE_READ (checking the reported
+    //        previous protection is PAGE_READWRITE), then actually CALL
+    //        into it — only possible if the NX bit genuinely got cleared,
+    //        not just bookkeeping — then flip it to PAGE_READONLY and
+    //        check that reported previous protection too.
+    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx (lpAddress = NULL)
+    code.extend_from_slice(&[0xBA, 0x00, 0x10, 0, 0]); // mov edx, 0x1000
+    code.extend_from_slice(&[0x41, 0xB8, 0x00, 0x30, 0, 0]); // mov r8d, MEM_COMMIT|MEM_RESERVE
+    code.extend_from_slice(&[0x41, 0xB9, 0x04, 0, 0, 0]); // mov r9d, PAGE_READWRITE
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_va); // call [rip+iat_VirtualAlloc]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (page base)
+
+    // Hand-write "mov eax, 42 ; ret" (B8 2A 00 00 00 C3) at [rbx].
+    code.extend_from_slice(&[0xC7, 0x03, 0xB8, 0x2A, 0x00, 0x00]); // mov dword [rbx], 0x00002AB8
+    code.extend_from_slice(&[0x66, 0xC7, 0x43, 0x04, 0x00, 0xC3]); // mov word [rbx+4], 0xC300
+
+    // VirtualProtect(rbx, 0x1000, PAGE_EXECUTE_READ, &old_protect)
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    code.extend_from_slice(&[0xBA, 0x00, 0x10, 0, 0]); // mov edx, 0x1000
+    code.extend_from_slice(&[0x41, 0xB8, 0x20, 0, 0, 0]); // mov r8d, PAGE_EXECUTE_READ
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], old_protect_tag); // lea r9, [rip+old_protect]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_vp); // call [rip+iat_VirtualProtect]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x75, 0x01, 0xCC]); // test eax,eax; jne+1; int3
+    rel!([0x8B, 0x05, 0, 0, 0, 0], old_protect_tag); // mov eax, [rip+old_protect]
+    code.extend_from_slice(&[0x83, 0xF8, 0x04]); // cmp eax, PAGE_READWRITE
+    code.extend_from_slice(&[0x74, 0x01, 0xCC]); // je +1; int3
+
+    // Call into the now-executable page — only reachable if EXEC really works.
+    code.extend_from_slice(&[0xFF, 0xD3]); // call rbx
+    code.extend_from_slice(&[0x83, 0xF8, 0x2A]); // cmp eax, 42
+    code.extend_from_slice(&[0x74, 0x01, 0xCC]); // je +1; int3
+
+    // VirtualProtect(rbx, 0x1000, PAGE_READONLY, &old_protect) — chain-check
+    // the previous-protection readback a second time.
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    code.extend_from_slice(&[0xBA, 0x00, 0x10, 0, 0]); // mov edx, 0x1000
+    code.extend_from_slice(&[0x41, 0xB8, 0x02, 0, 0, 0]); // mov r8d, PAGE_READONLY
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], old_protect_tag); // lea r9, [rip+old_protect]
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_vp);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    code.extend_from_slice(&[0x85, 0xC0, 0x75, 0x01, 0xCC]); // test eax,eax; jne+1; int3
+    rel!([0x8B, 0x05, 0, 0, 0, 0], old_protect_tag); // mov eax, [rip+old_protect]
+    code.extend_from_slice(&[0x83, 0xF8, 0x20]); // cmp eax, PAGE_EXECUTE_READ
+    code.extend_from_slice(&[0x74, 0x01, 0xCC]); // je +1; int3
+
+    // WriteFile(1, msg_prot, len, &written, 0)
+    code.extend_from_slice(&[0xB9, 0x01, 0, 0, 0]);
+    rel!([0x48, 0x8D, 0x15, 0, 0, 0, 0], msg_prot_tag);
+    let prot_r8 = code.len() + 2;
+    code.extend_from_slice(&[0x41, 0xB8, 0, 0, 0, 0]);
+    rel!([0x4C, 0x8D, 0x0D, 0, 0, 0, 0], wr_slot_tag);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_wf);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+
     // 2n) thoscrt.dll — a real on-disk PE DLL from C:\Windows\System32. Call
     //     its exported thos_add(40, 2) through the IAT the loader bound to the
     //     DLL's real export; trap unless it returns 42, then print the line.
@@ -1668,6 +1967,33 @@ fn write_pe_hello(path: &Path) {
     rel!([0x48, 0x89, 0x0D, 0, 0, 0, 0], apc_flag_tag); // mov [rip+apc_flag], rcx
     code.extend_from_slice(&[0xC3]); // ret
 
+    // cb_fn — a WNDPROC-shaped callback: LRESULT cb_fn(HWND hwnd /*rcx,
+    // unused*/, UINT msg /*rdx*/, WPARAM wparam /*r8*/, LPARAM lparam /*r9*/)
+    // { return msg + wparam - lparam; } — proves the args the ring-3 callback
+    // mechanism delivers are the real ones, not garbage.
+    let cbfn_off = code.len();
+    code.extend_from_slice(&[0x48, 0x89, 0xD0]); // mov rax, rdx
+    code.extend_from_slice(&[0x4C, 0x01, 0xC0]); // add rax, r8
+    code.extend_from_slice(&[0x4C, 0x29, 0xC8]); // sub rax, r9
+    code.extend_from_slice(&[0xC3]); // ret
+
+    // wndproc — the test window's real WndProc, called by DispatchMessageA
+    // through the ring-3 callback mechanism: LRESULT wndproc(HWND hwnd
+    // /*rcx, unused*/, UINT msg /*rdx*/, WPARAM wparam /*r8*/, LPARAM lparam
+    // /*r9, unused*/). Ignores WM_CREATE(1) (the message CreateWindowExA
+    // itself queues); anything else (our PostMessageA'd custom message) is
+    // treated as "the test is done" — PostQuitMessage(wparam) then return 0.
+    let wndproc_off = code.len();
+    code.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1
+    code.extend_from_slice(&[0x74, 0x11]); // je .ret0 (+0x11, patched by hand below)
+    code.extend_from_slice(&[0x4C, 0x89, 0xC1]); // mov rcx, r8       ; nExitCode = wParam
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    rel!([0xFF, 0x15, 0, 0, 0, 0], iat_pqm); // call [rip+iat_PostQuitMessage]
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    // .ret0:
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    code.extend_from_slice(&[0xC3]); // ret
+
     // thread_fn — a worker thread's StartRoutine (arg in rcx, ignored):
     // WriteFile(1, msg_thread, len, &written, 0); return 0.
     let thread_fn_off = code.len();
@@ -1687,6 +2013,14 @@ fn write_pe_hello(path: &Path) {
     }
     let ptr_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // absolute ptr to msg1 (DIR64-relocated)
+    let wndclass_off = code.len();
+    code.extend_from_slice(&[0u8; 0x48]); // WNDCLASSA (lpfnWndProc @8, lpszClassName @0x40 patched below)
+    let classname_off = code.len();
+    code.extend_from_slice(b"THOSTestClass\0");
+    let msgbuf_off = code.len();
+    code.extend_from_slice(&[0u8; 0x30]); // MSG
+    let old_protect_off = code.len();
+    code.extend_from_slice(&[0u8; 8]); // DWORD old_protect (+ pad)
     let wr_off = code.len();
     code.extend_from_slice(&[0u8; 8]); // DWORD `written` (+ pad)
     let stdout_off = code.len();
@@ -1937,6 +2271,9 @@ fn write_pe_hello(path: &Path) {
     let msg_apc: &[u8] = b"PE APC OK\n";
     let msg_apc_off = code.len();
     code.extend_from_slice(msg_apc);
+    let msg_apc_alert: &[u8] = b"PE APC alertable-wait OK\n";
+    let msg_apc_alert_off = code.len();
+    code.extend_from_slice(msg_apc_alert);
     let msg_reg: &[u8] = b"PE registry OK\n";
     let msg_reg_off = code.len();
     code.extend_from_slice(msg_reg);
@@ -1955,7 +2292,19 @@ fn write_pe_hello(path: &Path) {
     let msg_sec: &[u8] = b"PE section OK\n";
     let msg_sec_off = code.len();
     code.extend_from_slice(msg_sec);
+    let msg_cb: &[u8] = b"PE callback OK\n";
+    let msg_cb_off = code.len();
+    code.extend_from_slice(msg_cb);
+    let msg_win: &[u8] = b"PE window OK\n";
+    let msg_win_off = code.len();
+    code.extend_from_slice(msg_win);
+    let msg_prot: &[u8] = b"PE protect OK\n";
+    let msg_prot_off = code.len();
+    code.extend_from_slice(msg_prot);
 
+    code[prot_r8..prot_r8 + 4].copy_from_slice(&(msg_prot.len() as u32).to_le_bytes());
+    code[win_r8..win_r8 + 4].copy_from_slice(&(msg_win.len() as u32).to_le_bytes());
+    code[cb_r8..cb_r8 + 4].copy_from_slice(&(msg_cb.len() as u32).to_le_bytes());
     code[sec_r8..sec_r8 + 4].copy_from_slice(&(msg_sec.len() as u32).to_le_bytes());
     code[thread_fn_r8..thread_fn_r8 + 4].copy_from_slice(&(msg_thread.len() as u32).to_le_bytes());
     code[thr_r8..thr_r8 + 4].copy_from_slice(&(msg_thr.len() as u32).to_le_bytes());
@@ -1963,6 +2312,7 @@ fn write_pe_hello(path: &Path) {
     code[sync_r8..sync_r8 + 4].copy_from_slice(&(msg_sync.len() as u32).to_le_bytes());
     code[reg_r8..reg_r8 + 4].copy_from_slice(&(msg_reg.len() as u32).to_le_bytes());
     code[apc_r8..apc_r8 + 4].copy_from_slice(&(msg_apc.len() as u32).to_le_bytes());
+    code[apc_alert_r8..apc_alert_r8 + 4].copy_from_slice(&(msg_apc_alert.len() as u32).to_le_bytes());
     code[seh2_r8..seh2_r8 + 4].copy_from_slice(&(msg_seh2.len() as u32).to_le_bytes());
     code[seh_r8..seh_r8 + 4].copy_from_slice(&(msg_seh.len() as u32).to_le_bytes());
     code[evt2_r8..evt2_r8 + 4].copy_from_slice(&(msg_evt2.len() as u32).to_le_bytes());
@@ -1998,6 +2348,10 @@ fn write_pe_hello(path: &Path) {
         .copy_from_slice(&(ib + keyname_u16_off as u64).to_le_bytes());
     code[rvalname_us_off + 8..rvalname_us_off + 16]
         .copy_from_slice(&(ib + valname_u16_off as u64).to_le_bytes());
+    // WNDCLASSA.lpfnWndProc / .lpszClassName: absolute preferred-base VAs,
+    // DIR64-relocated at load like the fields above.
+    code[wndclass_off + 0x08..wndclass_off + 0x10].copy_from_slice(&(ib + wndproc_off as u64).to_le_bytes());
+    code[wndclass_off + 0x40..wndclass_off + 0x48].copy_from_slice(&(ib + classname_off as u64).to_le_bytes());
 
     for (pos, target) in fixups {
         let target_rva = match target {
@@ -2055,6 +2409,7 @@ fn write_pe_hello(path: &Path) {
             t if t == apc_flag_tag => text_rva + apc_flag_off as u32,
             t if t == apc_handler_tag => text_rva + apc_handler_off as u32,
             t if t == msg_apc_tag => text_rva + msg_apc_off as u32,
+            t if t == msg_apc_alert_tag => text_rva + msg_apc_alert_off as u32,
             t if t == nckname_tag => text_rva + nckname_off as u32,
             t if t == nokname_tag => text_rva + nokname_off as u32,
             t if t == nsvkname_tag => text_rva + nsvkname_off as u32,
@@ -2108,6 +2463,14 @@ fn write_pe_hello(path: &Path) {
             t if t == vbase_tag => text_rva + vbase_off as u32,
             t if t == vsize_tag => text_rva + vsize_off as u32,
             t if t == msg_sec_tag => text_rva + msg_sec_off as u32,
+            t if t == cbfn_tag => text_rva + cbfn_off as u32,
+            t if t == msg_cb_tag => text_rva + msg_cb_off as u32,
+            t if t == wndclass_tag => text_rva + wndclass_off as u32,
+            t if t == classname_tag => text_rva + classname_off as u32,
+            t if t == msgbuf_tag => text_rva + msgbuf_off as u32,
+            t if t == msg_win_tag => text_rva + msg_win_off as u32,
+            t if t == old_protect_tag => text_rva + old_protect_off as u32,
+            t if t == msg_prot_tag => text_rva + msg_prot_off as u32,
             rva => rva,
         };
         let next_rva = text_rva as i64 + pos as i64 + 4;
@@ -2125,6 +2488,8 @@ fn write_pe_hello(path: &Path) {
         text_rva + roa_off as u32 + 0x10,   // OBJECT_ATTRIBUTES.ObjectName
         text_rva + keyname_us_off as u32 + 8, // key UNICODE_STRING.Buffer
         text_rva + rvalname_us_off as u32 + 8, // value UNICODE_STRING.Buffer
+        text_rva + wndclass_off as u32 + 0x08, // WNDCLASSA.lpfnWndProc
+        text_rva + wndclass_off as u32 + 0x40, // WNDCLASSA.lpszClassName
     ];
     dir64.sort_unstable();
     let mut reloc: Vec<u8> = Vec::new();
@@ -2754,6 +3119,7 @@ fn type_line(sock: &Path, text: &str) {
             '.' => "dot",
             ',' => "comma",
             '|' => "altgr-less", // DE: AltGr + the key left of Y
+            '>' => "shift-less", // DE: Shift + the key left of Y (plain = `<`)
             '$' => "shift-4",
             '(' => "shift-8",
             ')' => "shift-9",
@@ -2822,6 +3188,59 @@ fn kbd_test(iso: &Path) {
     // running CI can be slow enough that a 2 MiB BusyBox applet takes seconds.
     let _ = wait_for(&log, "hello a file read via open+lseek+read", 30);
 
+    // Capability policy: the logged-in session is uid 1000 (`thos`, per
+    // `drive_login`); `/etc/thos/admin.cred` is owned by uid 0 (the system
+    // account — every file `write_path` creates is, today) at mode 644 —
+    // world-readable, owner-only-writable. A real DAC denial, not a mocked
+    // one: `>` opens for write, the kernel's `Inode::access_ok` check
+    // rejects it, and BusyBox's own shell reports the failure.
+    type_line(&sock, "echo x > /etc/thos/admin.cred");
+    let _ = wait_for(&log, "Permission denied", 15);
+
+    // Real POSIX file creation (O_CREAT, wired this increment): `touch`
+    // opens with O_CREAT and no prior existence — a genuine new inode, owned
+    // by the logged-in uid (1000), not just an existing-file open. `mkdir`
+    // likewise, through the new SYS_MKDIR dispatch. Both run against
+    // `/home/thos` — the account's own home dir (created by `cred::save` on
+    // first-run setup) — not `/`, which is root-owned mode 755 and
+    // (correctly, per DAC) denies uid 1000 write access to create anything
+    // there directly.
+    type_line(&sock, "cd /home/thos");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    type_line(&sock, "touch newfile");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    type_line(&sock, "mkdir newdir");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    type_line(&sock, "ls");
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
+    // elevate(): the uid-1000 session calls the real THOS-native syscall,
+    // re-authenticating with its own password, to spawn /elevated-check as
+    // uid 0 — /elevated-check then genuinely reads back `getuid() == 0`
+    // itself, so this is proof the spawned process actually got the
+    // privileged identity, not just that the syscall returned success.
+    type_line(&sock, "/do-elevate");
+    let _ = wait_for(&log, "elevated-check uid=0", 20);
+
+    // The trusted path: Ctrl+Alt+Delete, sent as a real QEMU key combo (not
+    // typed characters the shell could ever see) — the kernel's own
+    // console driver intercepts it below any process, prints its own
+    // banner, and reads the password with no app in the loop at all. A
+    // wrong password first (must be denied, no privileged spawn), then the
+    // real one (must spawn a second, independent `elevated-check` — the
+    // first `elevated-check uid=0` in the log came from `/do-elevate`
+    // above, so requiring a *second* occurrence proves this path actually
+    // ran its own spawn, not just re-reading the earlier one).
+    mon(&sock, "sendkey ctrl-alt-delete");
+    let _ = wait_for(&log, "admin password:", 10);
+    type_line(&sock, "wrongpw");
+    let _ = wait_for(&log, "THOS: SAK denied", 10);
+    mon(&sock, "sendkey ctrl-alt-delete");
+    let _ = wait_for(&log, "admin password:", 10);
+    type_line(&sock, "pass");
+    let _ = wait_for(&log, "THOS: SAK accepted", 10);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     let out = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = child.kill();
     let _ = child.wait();
@@ -2833,11 +3252,37 @@ fn kbd_test(iso: &Path) {
     // `pwd` prints the cwd we chdir'd into.
     let cwd_ok = after.contains("\n/bin\n");
     let cat_ok = after.contains("hello a file read via open+lseek+read");
-    if shell_ok && ls_ok && cwd_ok && cat_ok {
-        println!("kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls)");
+    let perm_ok = after.contains("Permission denied");
+    // The `ls` after touch+mkdir must show both new names — real inodes
+    // created via the syscall path, not just commands that ran without error.
+    let create_ok = {
+        let tail = after.rsplit("thos$ ls\n").next().unwrap_or("");
+        tail.contains("newfile") && tail.contains("newdir")
+    };
+    let elevate_ok = after.contains("elevated-check uid=0");
+    let sak_denied_ok = after.contains("THOS: SAK denied");
+    let sak_accepted_ok = after.contains("THOS: SAK accepted");
+    // Two independent elevated-check spawns: one from `/do-elevate`, one
+    // from the SAK flow — proves the trusted path really spawned its own,
+    // not just that the earlier marker was still sitting in the log.
+    let sak_spawn_ok = after.matches("elevated-check uid=0").count() >= 2;
+    if shell_ok
+        && ls_ok
+        && cwd_ok
+        && cat_ok
+        && perm_ok
+        && create_ok
+        && elevate_ok
+        && sak_denied_ok
+        && sak_accepted_ok
+        && sak_spawn_ok
+    {
+        println!(
+            "kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), DAC write denial, O_CREAT/mkdir, elevate(), SAK trusted path"
+        );
     } else {
         eprintln!(
-            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok})\n---\n{after}\n---"
+            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} perm_ok={perm_ok} create_ok={create_ok} elevate_ok={elevate_ok} sak_denied_ok={sak_denied_ok} sak_accepted_ok={sak_accepted_ok} sak_spawn_ok={sak_spawn_ok})\n---\n{after}\n---"
         );
         exit(1);
     }
@@ -3092,6 +3537,124 @@ fn bootpick_test() {
     }
 }
 
+/// Same picker/disk setup as [`bootpick_test`], but with a real TPM 2.0
+/// (`swtpm`, TCG2-attached to OVMF) — the actual proof that `thos-boot`'s
+/// `measure()` reaches a real TPM, not just "compiles". Skips (not fails) if
+/// `swtpm` isn't on `PATH`, since it is optional test tooling, not something
+/// every dev box has.
+fn bootpick_tpm_test() {
+    use std::time::{Duration, Instant};
+
+    if Command::new("swtpm").arg("--version").output().is_err() {
+        println!("bootpick-tpm-test: SKIP — `swtpm` not found on PATH");
+        return;
+    }
+
+    let root = workspace_root();
+    let dir = root.join("target/bootpick-tpm");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tpmstate = dir.join("tpmstate");
+    std::fs::create_dir_all(&tpmstate).unwrap();
+    let sock = dir.join("swtpm-sock");
+    let _ = std::fs::remove_file(&sock);
+
+    let picker = uefi_efi("thos-boot");
+    let stub = uefi_efi("thos-boot-stub");
+    let conf = dir.join("boot.conf");
+    std::fs::write(&conf, b"timeout=1\ndefault=THOS\n").unwrap();
+    let thos = make_fat(
+        &dir,
+        "bptpm-thos.img",
+        &[
+            ("/EFI/BOOT/BOOTX64.EFI", picker),
+            ("/EFI/limine/BOOTX64.EFI", stub),
+            ("/EFI/thos/boot.conf", conf),
+        ],
+    );
+
+    let mut swtpm = Command::new("swtpm")
+        .args(["socket", "--tpm2", "--terminate"])
+        .arg("--tpmstate")
+        .arg(format!("dir={}", tpmstate.to_str().unwrap()))
+        .arg("--ctrl")
+        .arg(format!("type=unixio,path={}", sock.to_str().unwrap()))
+        .spawn()
+        .expect("spawn swtpm");
+    // swtpm creates the control socket asynchronously; give it a moment
+    // before qemu tries to connect.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !sock.exists() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let log = dir.join("serial.log");
+    let _ = std::fs::remove_file(&log);
+
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu.args(["-M", "q35", "-m", "256M", "-no-reboot", "-display", "none"]);
+    qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
+    qemu.arg("-device").arg("ahci,id=ahci0");
+    qemu.args([
+        "-drive",
+        &format!("id=d0,if=none,format=raw,file={}", thos.to_str().unwrap()),
+        "-device",
+        "ide-hd,drive=d0,bus=ahci0.0",
+    ]);
+    qemu.args(["-chardev", &format!("socket,id=chrtpm,path={}", sock.to_str().unwrap())]);
+    qemu.args(["-tpmdev", "emulator,id=tpm0,chardev=chrtpm"]);
+    qemu.args(["-device", "tpm-crb,tpmdev=tpm0"]);
+    if Path::new("/usr/share/ovmf/OVMF.fd").exists() {
+        let v = dir.join("OVMF.fd");
+        std::fs::copy("/usr/share/ovmf/OVMF.fd", &v).unwrap();
+        qemu.args(["-drive", &format!("if=pflash,format=raw,file={}", v.to_str().unwrap())]);
+    } else if Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd").exists() {
+        let v = dir.join("OVMF_VARS.fd");
+        std::fs::copy("/usr/share/OVMF/OVMF_VARS_4M.fd", &v).unwrap();
+        qemu.args([
+            "-drive",
+            "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "-drive",
+            &format!("if=pflash,format=raw,file={}", v.to_str().unwrap()),
+        ]);
+    } else {
+        eprintln!("bootpick-tpm-test: no OVMF firmware found");
+        let _ = swtpm.kill();
+        exit(1);
+    }
+
+    let mut child = qemu.spawn().expect("spawn qemu");
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && !read_log().contains("STUB OK") {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let out = read_log();
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = swtpm.kill();
+    let _ = swtpm.wait();
+
+    let want = [
+        ("picker banner", "THOS boot picker"),
+        ("chainloaded a stub", "STUB OK"),
+        ("measured the picker's own load into the TPM", "measured `THOS` into TPM PCR 4"),
+    ];
+    let mut ok = true;
+    for (what, needle) in want {
+        if !out.contains(needle) {
+            eprintln!("bootpick-tpm-test: FAIL — missing {what} ({needle:?})");
+            ok = false;
+        }
+    }
+    if ok {
+        println!("bootpick-tpm-test: OK — real swtpm attached, TCG2 measured the chainloaded image into PCR 4");
+    } else {
+        eprintln!("--- serial log ---\n{out}\n---");
+        exit(1);
+    }
+}
+
 // ===========================================================================
 //  Disk write tests — boot the kernel's storage milestone headless, then verify
 //  the result from the host against the raw disk image.
@@ -3287,6 +3850,154 @@ fn ext2_test(iso: &Path) {
     }
 }
 
+/// Three real boots on the *same* disk image, proving the file-integrity
+/// baseline round-trip end to end — including genuine tamper detection, not
+/// a mocked one: boot 1 (fresh disk) records the baseline; boot 2 (same
+/// disk, untouched) verifies clean; then `/init` is overwritten directly on
+/// the disk image from the host (simulating an external tamper) and boot 3
+/// must report the mismatch.
+///
+/// Boot 3 doesn't use [`boot_kernel_headless`] — once past the integrity
+/// check, the kernel goes on to try loading the now-corrupt `/init` as an
+/// ELF and legitimately panics (a real consequence of the tamper, not a
+/// test bug, and further proof the check ran *before* that crash rather
+/// than being skipped); `boot_kernel_headless` requires a clean halt, so
+/// this drives qemu directly and just greps the log for the detection line.
+fn integrity_test(iso: &Path) {
+    use std::time::{Duration, Instant};
+
+    let root = workspace_root();
+    let _ = std::fs::remove_file(root.join("target/disk.img")); // start from a pristine fs
+    let disk = disk_image();
+
+    let s1 = boot_kernel_headless("integrity1", iso, &disk, 4);
+    if !s1.contains("THOS: integrity ok     baseline recorded for 2/2 files (first boot)") {
+        eprintln!("integrity-test: FAIL — first boot didn't record a clean baseline\n{s1}");
+        exit(1);
+    }
+
+    let s2 = boot_kernel_headless("integrity2", iso, &disk, 4);
+    if !s2.contains("THOS: integrity ok     2 files verified against baseline, no tampering") {
+        eprintln!("integrity-test: FAIL — second boot didn't verify clean\n{s2}");
+        exit(1);
+    }
+
+    // Tamper /init directly on the disk image, from the host — nothing THOS
+    // itself did, exactly the "something changed a baselined file" scenario
+    // the check exists to notice.
+    let tampered = root.join("target/tampered-init");
+    std::fs::write(&tampered, b"not an ELF; deliberately tampered for integrity-test\n").unwrap();
+    run(Command::new("debugfs").args(["-w", "-R", "rm /init", disk.to_str().unwrap()]));
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} init", tampered.to_str().unwrap()),
+        disk.to_str().unwrap(),
+    ]));
+
+    let log = root.join("target/integrity3-serial.log");
+    let _ = std::fs::remove_file(&log);
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu.args(["-M", "q35", "-m", "512M", "-smp", "4", "-cdrom", iso.to_str().unwrap()]);
+    qemu.args([
+        "-drive", &format!("id=disk0,if=none,format=raw,file={}", disk.to_str().unwrap()),
+        "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0",
+    ]);
+    qemu.args(["-display", "none", "-no-reboot"]);
+    qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
+    for ovmf in ["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/ovmf/OVMF.fd"] {
+        if Path::new(ovmf).exists() {
+            qemu.args(["-drive", &format!("if=pflash,format=raw,readonly=on,file={ovmf}")]);
+            break;
+        }
+    }
+
+    let mut child = qemu.spawn().expect("spawn qemu");
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && !read_log().contains("THOS: integrity FAIL") {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let out = read_log();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if out.contains("THOS: integrity FAIL   /init does not match its baseline hash") {
+        println!("integrity-test: OK — baseline recorded, verified clean, tamper detected on the third boot");
+    } else {
+        eprintln!("integrity-test: FAIL — tamper not detected\n--- serial ---\n{out}\n---");
+        exit(1);
+    }
+}
+
+/// A real, deterministic crash injection (not blkdebug fault-injection — a
+/// controlled `isa-debug-exit` right inside `write_path_owned`'s overwrite
+/// path, at the exact instant "the new content is committed, the old
+/// blocks aren't freed yet"), proving the reordering fix in
+/// `ext2::write_path_owned` is actually crash-safe: the file's own content
+/// survives, and the only footprint left behind is a benign, fsck-fixable
+/// leaked-block trace — never structural corruption.
+fn registry_crash_test(iso: &Path) {
+    let root = workspace_root();
+    let _ = std::fs::remove_file(root.join("target/disk.img")); // start from a pristine fs
+    let disk = disk_image();
+
+    // Boot 1 — fresh disk: seed, then overwrite; the overwrite is what
+    // hits the injected crash point and halts QEMU (a clean `isa-debug-exit`,
+    // so `boot_kernel_headless` itself doesn't treat this as a failure).
+    let s1 = boot_kernel_headless("regcrash1", iso, &disk, 4);
+    if !s1.contains("THOS: regcrash         simulating a crash") {
+        eprintln!("registry-crash-test: FAIL — the injected crash point never fired\n{s1}");
+        exit(1);
+    }
+
+    // The old blocks were never freed (the crash landed right before that
+    // step) — a real, *expected* "leaked blocks" finding, not corruption.
+    // `-fn` (report only) must find something (proving the leak is real,
+    // not a no-op test); `-fy` (auto-fix) must resolve it cleanly, and a
+    // follow-up `-fn` must then be clean.
+    let dirty = Command::new("e2fsck").args(["-fn", disk.to_str().unwrap()]).output().expect("e2fsck -fn");
+    if dirty.status.success() {
+        eprintln!(
+            "registry-crash-test: FAIL — e2fsck -fn found nothing to fix; the leaked-block scenario didn't happen (or something over-corrected)"
+        );
+        exit(1);
+    }
+    let fixed = Command::new("e2fsck").args(["-fy", disk.to_str().unwrap()]).output().expect("e2fsck -fy");
+    // e2fsck's exit status is a bitmask: bit 0 = errors corrected (expected
+    // here), bit 2 = errors left uncorrected, bit 3 = operational error —
+    // anything beyond "corrected" is a real failure, not the benign leak.
+    let code = fixed.status.code().unwrap_or(-1);
+    if code & !1 != 0 {
+        eprintln!(
+            "registry-crash-test: FAIL — e2fsck -fy found more than a simple, correctable leak (exit {code})\n{}",
+            String::from_utf8_lossy(&fixed.stdout)
+        );
+        exit(1);
+    }
+    let clean = Command::new("e2fsck").args(["-fn", disk.to_str().unwrap()]).output().expect("e2fsck -fn (post-fix)");
+    if !clean.status.success() {
+        eprintln!(
+            "registry-crash-test: FAIL — filesystem still not clean after e2fsck -fy\n{}",
+            String::from_utf8_lossy(&clean.stdout)
+        );
+        exit(1);
+    }
+
+    // Boot 2 — same disk, same (regcrashtest) kernel: idempotent, since the
+    // file now already holds the new content, so this boot just reads it
+    // back instead of re-seeding/re-crashing. Proves the commit is durable:
+    // it survived both the simulated crash and the fsck fixup.
+    let s2 = boot_kernel_headless("regcrash2", iso, &disk, 4);
+    if s2.contains("THOS: regcrash ok") && s2.contains("NEW-CONTENT-LONGER-THAN-OLD-ONE-DELIBERATELY") {
+        println!(
+            "registry-crash-test: OK — commit survived a simulated crash (inode patched before blocks freed); e2fsck found only the expected leaked-block trace, not corruption"
+        );
+    } else {
+        eprintln!("registry-crash-test: FAIL — boot 2 didn't read back the new content\n{s2}");
+        exit(1);
+    }
+}
+
 /// Boot the `stress` kernel at a realistic CPU count (24 = the target's 8P×2 +
 /// 8E threads) and require its SMP scheduler stress milestone to pass.
 fn smp_test(iso: &Path) {
@@ -3413,12 +4124,16 @@ fn pe_test(iso: &Path) {
         && serial.contains("PE SEH OK") // #UD -> KiUserExceptionDispatcher -> vectored handler -> NtContinue
         && serial.contains("PE SEH2 OK") // #PF via the error-code fault stub, same handler resumes
         && serial.contains("PE APC OK") // NtQueueApcThread + NtTestAlert -> KiUserApcDispatcher -> NtContinue
+        && serial.contains("PE APC alertable-wait OK") // NtWaitForSingleObject(Alertable=TRUE) delivers a pending APC instead of blocking
         && serial.contains("PE registry OK") // NtCreateKey/SetValue/OpenKey/QueryValue/DeleteKey round-trip
         && serial.contains("PE sync OK") // semaphore + mutant + NtWaitForMultipleObjects
         && serial.contains("PE delay OK") // NtDelayExecution -> real executive block on the timer wheel
         && serial.contains("PE thread ran") // NtCreateThreadEx worker ran its StartRoutine
         && serial.contains("PE thread OK") // main thread waited on the thread handle + resumed
         && serial.contains("PE section OK") // NtCreateSection + NtMapViewOfSection, sentinel round-trip
+        && serial.contains("PE callback OK") // CallWindowProcA: ring-3 callback mechanism, args + LRESULT round-trip
+        && serial.contains("PE window OK") // RegisterClassA/CreateWindowExA/PostMessageA/GetMessageA/DispatchMessageA
+        && serial.contains("PE protect OK") // VirtualProtect: real W^X — EXEC granted then called, old-protect readback
         && serial.contains("PE dll thos_add=42 (DllMain ran)") // System32 DLL + recursive imports + DllMain before exe entry
         && serial.contains("PE dll Ldr OK") // file DLL in PEB Ldr: GetModuleHandleA + GetProcAddress at runtime
         && serial.contains("PE dll ordinal OK") // import-by-ordinal from a file DLL
@@ -3430,6 +4145,11 @@ fn pe_test(iso: &Path) {
         // Milestone 3: a real mingw-w64 compiler-built Win32 console .exe.
         && serial.contains("WINCON: hello from mingw")
         && serial.contains("WINCON: read C:\\pe-read.txt -> PE ReadFile OK via CreateFileA")
+        // `\Device\` + drive-letter namespace: D: is a real, separate
+        // device (the boot ISO's FAT32 ESP), not an alias onto C:'s ext2.
+        && serial.contains("WINCON: read D:\\EFI\\THOS\\HELLO.TXT -> THOS reads FAT")
+        && serial.contains("WINCON: D: write-open correctly denied")
+        && serial.contains("WINCON: Z: unmapped drive correctly failed")
         && serial.contains("WINCON: WaitForSingleObject ok")
         && serial.contains("WINCON: exit ok")
         && serial.contains("THOS: wincon exited")

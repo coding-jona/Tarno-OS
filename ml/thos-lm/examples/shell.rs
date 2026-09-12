@@ -491,6 +491,23 @@ fn handle_train(sub: &str, extra: Option<&str>, weights: &str) {
     }
 }
 
+/// `/game on|off|toggle|status [cores]` — caps training's CPU share (via a
+/// cgroup, in run.sh) instead of pausing it, so a game gets the machine back
+/// while training keeps inching forward in the background.
+fn handle_game(sub: &str, weights: &str) {
+    let Some((run_sh, dir)) = run_sh_and_config_dir() else {
+        println!("  {C_YELLOW}can't find ml/train/run.sh from here{C_RESET}");
+        return;
+    };
+    let sub = if sub.is_empty() { "status" } else { sub };
+    let mut cmd = Command::new("bash");
+    cmd.arg(&run_sh).arg("game").arg(sub);
+    if let Some(s) = default_stem(weights, &dir) {
+        cmd.env("CONFIG", format!("{dir}/config/{s}.toml"));
+    }
+    run_inherit(cmd);
+}
+
 /// Picks whichever out/<config>/ under `train_dir` has the most recently
 /// updated log.csv — i.e. whatever's actively (or most recently) training.
 fn most_recent_run(train_dir: &str) -> Option<String> {
@@ -763,6 +780,24 @@ fn handle_command(
         }
         "reload" => return Cmd::Reload,
         "train" => handle_train(arg, it.next(), weights),
+        "game" => handle_game(arg, weights),
+        "run" => {
+            let Some((run_sh, dir)) = run_sh_and_config_dir() else {
+                println!("  {C_YELLOW}can't find ml/train/run.sh from here{C_RESET}");
+                return Cmd::Continue;
+            };
+            let rest: Vec<&str> = it.collect();
+            if arg.is_empty() {
+                println!("  {C_YELLOW}usage: /run <run.sh subcommand> [args...]  (any run.sh command, passed through){C_RESET}");
+            } else {
+                let mut cmd = Command::new("bash");
+                cmd.arg(&run_sh).arg(arg).args(&rest);
+                if let Some(s) = default_stem(weights, &dir) {
+                    cmd.env("CONFIG", format!("{dir}/config/{s}.toml"));
+                }
+                run_inherit(cmd);
+            }
+        }
         "lang" => {
             if arg.is_empty() {
                 match &set.lang {
@@ -826,6 +861,8 @@ fn print_help() {
         ("/train staged [h]", "start the gentle-then-full-throttle pipeline (staged.sh)"),
         ("/train stop|pause|resume", "control the active run (writes the same control.json as run.sh ctl)"),
         ("/train status", "step / loss / lr / tok/s of whichever run is most recently active"),
+        ("/game on|off|toggle|status", "cap training's CPU share for a game — training keeps running, just slower"),
+        ("/run <cmd> [args]", "any other run.sh subcommand, passed straight through (dashboard, watch-export, ...)"),
         ("/exit", "quit (also Ctrl-D)"),
     ];
     println!("  {C_BOLD}commands{C_RESET}");

@@ -43,3 +43,8 @@ pipetest = []
 # `petest`: load and run a statically linked Win64 `.exe` via the native PE
 # loader. Driven by `cargo xtask pe-test`.
 petest = []
+# `regcrashtest`: deliberately "crash" (a controlled QEMU exit) partway
+# through `ext2::write_path_owned`'s overwrite path — right after the new
+# content's inode commit, before the old blocks are freed — to prove that
+# ordering is really crash-safe. Driven by `cargo xtask registry-crash-test`.
+regcrashtest = []

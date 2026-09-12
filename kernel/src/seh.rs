@@ -177,7 +177,13 @@ extern "C" {
 #[no_mangle]
 extern "C" fn thos_fault_dispatch(frame: &mut ExcFrame, vector: u64, error_code: u64, cr2: u64) {
     let from_user = frame.cs & 3 == 3;
-    let handler = if from_user {
+    // `PE_EXC_ADDR` is only ever mapped for a *PE* process (`pe.rs`'s
+    // loader) — a plain ELF one never gets that page, so reading it
+    // unconditionally for every user fault (the bug this comment replaces)
+    // turned any ELF segfault into a second, unhandled #PF right here,
+    // taking the fault dispatcher itself down instead of just killing the
+    // faulting process.
+    let handler = if from_user && crate::process::current_is_pe() {
         unsafe { core::ptr::read_volatile(PE_EXC_ADDR as *const u64) }
     } else {
         0

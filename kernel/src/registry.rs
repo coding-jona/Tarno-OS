@@ -1,17 +1,50 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! A minimal NT-style configuration registry.
+//! An NT-style configuration registry, grown to persisted hives.
 //!
 //! One global key tree of typed values, addressed by a `\`-separated path
-//! (`\Registry\Machine\Software\...`). Enough to back `NtCreateKey`,
-//! `NtOpenKey`, `NtSetValueKey`, `NtQueryValueKey` and `NtDeleteKey`. Not yet
-//! transactional, not persisted to disk, no enumeration / security / notify —
-//! those come with the real registry hive work.
+//! (`\Registry\Machine\Software\...`). Backs `NtCreateKey`, `NtOpenKey`,
+//! `NtSetValueKey`, `NtQueryValueKey`, `NtDeleteKey`, `NtEnumerateKey` and
+//! `NtEnumerateValueKey`.
+//!
+//! Each top-level root in [`HIVES`] is a **hive**: its own backing file under
+//! `/etc/thos/registry/`, loaded once at boot ([`load_hives`]) and rewritten
+//! on every mutation under it ([`create`] / [`set_value`] / [`delete_key`]) —
+//! durable by default, no explicit flush needed (the tradeoff: every write is
+//! an ext2 write; fine for a registry, which isn't a hot path). Not yet
+//! transactional (a crash mid-write can still lose that one write).
+//!
+//! **Change-notify** (real, not a stub): [`watch`] registers a one-shot
+//! signal on an already-created `Event` object, fired the next time a given
+//! key (or, with `watch_tree`, anything under it) actually changes —
+//! `nt.rs`'s `NtNotifyChangeKey` is the asynchronous, Event-driven shape of
+//! the real NT call; THOS already has real event/wait primitives
+//! (`wait.rs`), so this is "wire the registry into them", not new blocking
+//! machinery. One-shot, same as real NT: a fired watch needs a fresh
+//! `NtNotifyChangeKey` to re-arm.
+//!
+//! **Per-key security** (real, not a stub): every key carries an
+//! `owner_uid`, persisted in the hive right alongside its subkeys/values.
+//! Seeded roots and anything loaded from an old (pre-owner) hive default to
+//! uid `0` (system), matching `ext2::Inode`'s own "unset owner reads as
+//! system" convention. Same two-tier model as the filesystem's first DAC
+//! slice — uid `0` or the key's own owner may write, anyone may read — no
+//! group tier here yet (the registry has no `gid` concept at all, a real,
+//! scoped-out gap, same starting point the filesystem's DAC had before its
+//! own group-tier slice). `nt.rs` is what actually enforces this on
+//! `NtCreateKey`/`NtSetValueKey`/`NtDeleteKey`; this module just carries the
+//! ownership data and the policy predicate ([`write_ok`]).
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
+
+use crate::ext2::Ext2;
+use crate::wait::Event;
 
 /// One stored value: an `REG_*` type tag plus its raw bytes.
 pub struct Value {
@@ -22,15 +55,80 @@ pub struct Value {
 struct Key {
     subkeys: BTreeMap<String, Key>,
     values: BTreeMap<String, Value>,
+    /// `0` (system) unless created by `create_owned` with a real uid, or
+    /// loaded from a hive's own `O` record.
+    owner_uid: u32,
 }
 impl Key {
     const fn new() -> Self {
-        Self { subkeys: BTreeMap::new(), values: BTreeMap::new() }
+        Self { subkeys: BTreeMap::new(), values: BTreeMap::new(), owner_uid: 0 }
     }
+    fn owned(uid: u32) -> Self {
+        Self { owner_uid: uid, ..Self::new() }
+    }
+}
+
+/// The real DAC check: uid `0` (system) always passes; otherwise the
+/// caller's uid must match the key's own owner. Read access (`open`,
+/// `query_value`, both `enumerate_*`) is unchecked — anyone may read any
+/// key, same as the registry's real-Windows HKLM subtrees are typically
+/// world-readable, admin-write.
+fn write_ok(owner_uid: u32, uid: u32) -> bool {
+    uid == 0 || uid == owner_uid
 }
 
 static ROOT: Mutex<Key> = Mutex::new(Key::new());
 static SEEDED: AtomicBool = AtomicBool::new(false);
+
+/// A registered [`watch`]: `event` is signalled the next time `path`
+/// changes (or, with `watch_tree`, anything under it) — removed from
+/// [`WATCHES`] the moment it fires (one-shot).
+struct WatchEntry {
+    path: Vec<String>,
+    watch_tree: bool,
+    event: Arc<Event>,
+}
+static WATCHES: Mutex<Vec<WatchEntry>> = Mutex::new(Vec::new());
+
+/// `NtNotifyChangeKey`'s backing call: signal `event` the next time `path`
+/// changes. `false` if `path` doesn't currently exist (nothing to watch —
+/// real NT requires an open handle to the key, which already implies it
+/// exists).
+pub fn watch(path: &str, watch_tree: bool, event: Arc<Event>) -> bool {
+    let comps = components(path);
+    if !run(|root| find(root, &comps).is_some()) {
+        return false;
+    }
+    WATCHES.lock().push(WatchEntry { path: comps, watch_tree, event });
+    true
+}
+
+/// Does a watch on `watch_path` (optionally covering its whole subtree)
+/// cover a change that happened at `changed`? A change *on* the watched key
+/// itself always counts (a value changed on it, or a direct subkey
+/// appeared/disappeared under it); anything deeper needs `watch_tree`.
+fn watch_matches(watch_path: &[String], watch_tree: bool, changed: &[String]) -> bool {
+    if changed.len() < watch_path.len() || changed[..watch_path.len()] != *watch_path {
+        return false;
+    }
+    let depth = changed.len() - watch_path.len();
+    depth == 0 || depth == 1 || watch_tree
+}
+
+/// Fire (and drop — one-shot) every watch that covers a real change at
+/// `changed`.
+fn fire(changed: &[String]) {
+    let mut list = WATCHES.lock();
+    let mut i = 0;
+    while i < list.len() {
+        if watch_matches(&list[i].path, list[i].watch_tree, changed) {
+            let w = list.remove(i);
+            w.event.signal();
+        } else {
+            i += 1;
+        }
+    }
+}
 
 /// Split a path into normalised components (lowercased, non-empty). A leading
 /// `registry` element is dropped, so `\Registry\Machine` and `Machine` name the
@@ -57,16 +155,21 @@ fn run<R>(f: impl FnOnce(&mut Key) -> R) -> R {
     let mut root = ROOT.lock();
     if !SEEDED.swap(true, Ordering::Relaxed) {
         for h in ["machine", "user", "machine\\software", "machine\\system"] {
-            make(&mut root, &components(h));
+            make(&mut root, &components(h), 0);
         }
     }
     f(&mut root)
 }
 
-fn make<'a>(root: &'a mut Key, comps: &[String]) -> &'a mut Key {
+/// Find-or-create the key at `comps`. `uid` is the owner stamped on any key
+/// *newly* created along the way (an already-existing key's owner is left
+/// alone) — every implicitly created ancestor gets the same owner as the
+/// leaf, matching real Windows `RegCreateKeyEx`'s own ancestor-creation
+/// behavior.
+fn make<'a>(root: &'a mut Key, comps: &[String], uid: u32) -> &'a mut Key {
     let mut k = root;
     for c in comps {
-        k = k.subkeys.entry(c.clone()).or_insert_with(Key::new);
+        k = k.subkeys.entry(c.clone()).or_insert_with(|| Key::owned(uid));
     }
     k
 }
@@ -85,16 +188,61 @@ fn find_mut<'a>(root: &'a mut Key, comps: &[String]) -> Option<&'a mut Key> {
     Some(k)
 }
 
-/// Create `path` (and any missing ancestors). `false` only for an empty path.
+/// Create `path` (and any missing ancestors), system-owned (uid `0`).
 pub fn create(path: &str) -> bool {
+    create_owned(path, 0)
+}
+
+/// Create `path` (and any missing ancestors) — newly created keys along the
+/// way are owned by `uid`; an already-existing key keeps its owner
+/// unchanged (same "overwrite never changes the owner" rule
+/// `ext2::write_path_owned` follows). `false` only for an empty path.
+pub fn create_owned(path: &str, uid: u32) -> bool {
     let comps = components(path);
     if comps.is_empty() {
         return false;
     }
+    // Only a genuine new key is a change — re-"creating" an existing one
+    // (`NtCreateKey`'s open-if-present behavior) must not fire a watch.
+    let existed = run(|root| find(root, &comps).is_some());
     run(|root| {
-        make(root, &comps);
+        make(root, &comps, uid);
     });
+    persist(&comps);
+    if !existed {
+        fire(&comps);
+    }
     true
+}
+
+/// The owner uid of `path`'s key, if it exists.
+pub fn owner_of(path: &str) -> Option<u32> {
+    let comps = components(path);
+    run(|root| find(root, &comps).map(|k| k.owner_uid))
+}
+
+/// The write-permission check for *creating something new* at `path`: the
+/// registry auto-creates missing ancestors (unlike the filesystem, there is
+/// no single guaranteed-existing parent), so this walks up from `path` to
+/// the nearest ancestor that already exists and checks that ancestor's
+/// owner — generalizing the filesystem's "creating an entry is a write to
+/// the parent it lands in" rule. Always terminates: the root itself
+/// (`comps == []`) always "exists" (the whole in-memory tree), system-owned
+/// by default.
+pub fn create_write_ok(path: &str, uid: u32) -> bool {
+    let mut comps = components(path);
+    loop {
+        if let Some(owner) = run(|root| find(root, &comps).map(|k| k.owner_uid)) {
+            return write_ok(owner, uid);
+        }
+        comps.pop();
+    }
+}
+
+/// Can `uid` write to (set a value on, or delete) the already-existing key
+/// at `path`? `false` if the key doesn't exist at all.
+pub fn write_key_ok(path: &str, uid: u32) -> bool {
+    owner_of(path).is_some_and(|owner| write_ok(owner, uid))
 }
 
 /// `true` if `path` names an existing key.
@@ -103,17 +251,43 @@ pub fn open(path: &str) -> bool {
     run(|root| find(root, &comps).is_some())
 }
 
+/// The name of the `index`-th direct subkey of `path` (natural — sorted —
+/// order, stable as long as the key set doesn't change mid-enumeration).
+/// `None` once `index` runs past the last one, for `NtEnumerateKey`.
+pub fn enumerate_key(path: &str, index: usize) -> Option<String> {
+    let comps = components(path);
+    run(|root| find(root, &comps)?.subkeys.keys().nth(index).cloned())
+}
+
+/// The `(name, type, byte length)` of the `index`-th value directly on
+/// `path`. `None` past the last one, for `NtEnumerateValueKey`.
+pub fn enumerate_value(path: &str, index: usize) -> Option<(String, u32, usize)> {
+    let comps = components(path);
+    run(|root| {
+        find(root, &comps)?
+            .values
+            .iter()
+            .nth(index)
+            .map(|(n, v)| (n.clone(), v.ty, v.data.len()))
+    })
+}
+
 /// Set (or replace) a value on an existing key. `false` if the key is missing.
 pub fn set_value(path: &str, name: &str, ty: u32, data: &[u8]) -> bool {
     let comps = components(path);
-    run(|root| match find_mut(root, &comps) {
+    let ok = run(|root| match find_mut(root, &comps) {
         Some(k) => {
             k.values
                 .insert(name.to_ascii_lowercase(), Value { ty, data: data.to_vec() });
             true
         }
         None => false,
-    })
+    });
+    if ok {
+        persist(&comps);
+        fire(&comps);
+    }
+    ok
 }
 
 /// Read a value back as `(type, bytes)`.
@@ -135,8 +309,179 @@ pub fn delete_key(path: &str) -> bool {
         return false;
     }
     let (parent, leaf) = comps.split_at(comps.len() - 1);
-    run(|root| match find_mut(root, parent) {
+    let ok = run(|root| match find_mut(root, parent) {
         Some(p) => p.subkeys.remove(&leaf[0]).is_some(),
         None => false,
-    })
+    });
+    if ok {
+        persist(&comps);
+        // The change is on the *parent* — a subkey disappeared from its
+        // list, same as `create_owned`'s "a subkey appeared" fires the
+        // parent, not (today) a dedicated "the watched key itself was
+        // deleted" notification on `comps` — a real, scoped-out gap
+        // relative to full NT semantics.
+        fire(parent);
+    }
+    ok
+}
+
+// --- hives: persistence to ext2 ---------------------------------------
+
+/// Top-level hive roots and their backing file. A path under one of these
+/// gets rewritten to disk on every mutation; a path outside all of them
+/// (there is none today — every seeded root is hived) just stays in memory.
+const HIVES: &[(&[&str], &str)] = &[
+    (&["machine", "software"], "/etc/thos/registry/software.hiv"),
+    (&["machine", "system"], "/etc/thos/registry/system.hiv"),
+    (&["user"], "/etc/thos/registry/user.hiv"),
+];
+
+fn under_hive(comps: &[String], root: &[&str]) -> bool {
+    comps.len() >= root.len() && comps.iter().zip(root.iter()).all(|(a, b)| a == b)
+}
+
+/// Rewrite whichever hive (if any) `comps` falls under. Best-effort: a
+/// mid-boot ext2 hiccup must not make the in-memory registry unusable, so
+/// failures are silently swallowed — the change still lives in RAM.
+fn persist(comps: &[String]) {
+    let Some((root, path)) = HIVES.iter().find(|(root, _)| under_hive(comps, root)) else {
+        return;
+    };
+    let Ok(fs) = crate::ext2::open() else { return };
+    let root_comps: Vec<String> = root.iter().map(|s| s.to_string()).collect();
+    let Some(bytes) = run(|r| find(r, &root_comps).map(serialize_hive)) else {
+        return;
+    };
+    let _ = fs.mkdir_path("/etc");
+    let _ = fs.mkdir_path("/etc/thos");
+    let _ = fs.mkdir_path("/etc/thos/registry");
+    let _ = fs.write_path(path, &bytes);
+}
+
+/// Load every hive's backing file (if present — first boot has none) into the
+/// in-memory tree. Call once, after ext2 is mounted, before anything else
+/// touches the registry (the seeded defaults are harmless to overwrite: a
+/// loaded hive fully replaces its root's subtree).
+static HIVES_LOADED: AtomicBool = AtomicBool::new(false);
+
+/// Returns how many of [`HIVES`] had a backing file to load (0 on first boot).
+pub fn load_hives(fs: &Ext2) -> usize {
+    if HIVES_LOADED.swap(true, Ordering::Relaxed) {
+        return 0;
+    }
+    let mut n = 0;
+    for (root, path) in HIVES {
+        let Some(bytes) = fs.read_path(path) else { continue };
+        n += 1;
+        let root_comps: Vec<String> = root.iter().map(|s| s.to_string()).collect();
+        run(|r| {
+            let base = make(r, &root_comps, 0);
+            *base = Key::new(); // the file is authoritative — drop the seed
+            deserialize_hive(base, &bytes);
+        });
+    }
+    n
+}
+
+/// `thos-hive v1` text format: one record per line, all string fields
+/// hex-encoded so any byte (a name or data from a hostile PE) round-trips
+/// with no escaping rules to get wrong.
+///   K <hex relpath>                        -- a subkey exists
+///   O <hex relpath> <uid>                  -- that key's owner (omitted if 0)
+///   V <hex relpath> <hex name> <type> <hex data>  -- a value on that key
+/// `relpath` is `\`-joined, relative to the hive root (empty = the root
+/// itself); re-parsed with the same `components()` as every other path here.
+/// `O` records are new (per-key security) — an old hive with none loads
+/// every key as uid `0`, exactly its prior behavior, so this is backward
+/// compatible without a format-version bump.
+fn serialize_hive(base: &Key) -> Vec<u8> {
+    let mut out = String::from("thos-hive v1\n");
+    fn walk(k: &Key, prefix: &str, out: &mut String) {
+        if k.owner_uid != 0 {
+            let _ = writeln!(out, "O {} {}", hex(prefix.as_bytes()), k.owner_uid);
+        }
+        for (name, v) in &k.values {
+            let _ = writeln!(
+                out,
+                "V {} {} {} {}",
+                hex(prefix.as_bytes()),
+                hex(name.as_bytes()),
+                v.ty,
+                hex(&v.data)
+            );
+        }
+        for (name, sub) in &k.subkeys {
+            let child = if prefix.is_empty() { name.clone() } else { format!("{prefix}\\{name}") };
+            let _ = writeln!(out, "K {}", hex(child.as_bytes()));
+            walk(sub, &child, out);
+        }
+    }
+    walk(base, "", &mut out);
+    out.into_bytes()
+}
+
+fn deserialize_hive(base: &mut Key, bytes: &[u8]) {
+    let Ok(text) = core::str::from_utf8(bytes) else { return };
+    for line in text.lines() {
+        let mut it = line.split(' ');
+        match it.next() {
+            Some("K") => {
+                let Some(rp) = it.next().and_then(unhex_string) else { continue };
+                make(base, &components(&rp), 0);
+            }
+            Some("O") => {
+                let (Some(rp), Some(uid)) =
+                    (it.next().and_then(unhex_string), it.next().and_then(|s| s.parse::<u32>().ok()))
+                else {
+                    continue;
+                };
+                // The owning key always has (or will have) its own "K" line
+                // too — order between the two doesn't matter, `make` is
+                // idempotent and this always sets the final owner explicitly.
+                make(base, &components(&rp), 0).owner_uid = uid;
+            }
+            Some("V") => {
+                let (Some(rp), Some(name), Some(ty), Some(data)) = (
+                    it.next().and_then(unhex_string),
+                    it.next().and_then(unhex_string),
+                    it.next().and_then(|s| s.parse::<u32>().ok()),
+                    it.next().and_then(unhex_bytes),
+                ) else {
+                    continue;
+                };
+                let k = make(base, &components(&rp), 0);
+                k.values.insert(name.to_ascii_lowercase(), Value { ty, data });
+            }
+            _ => {} // blank line, the "thos-hive v1" header, or garbage — skip
+        }
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0xF) as u32, 16).unwrap());
+    }
+    if s.is_empty() {
+        s.push('-'); // a would-be-empty field, so `split(' ')` still sees a token
+    }
+    s
+}
+
+fn unhex_bytes(s: &str) -> Option<Vec<u8>> {
+    if s == "-" {
+        return Some(Vec::new());
+    }
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+fn unhex_string(s: &str) -> Option<String> {
+    String::from_utf8(unhex_bytes(s)?).ok()
 }

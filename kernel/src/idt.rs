@@ -17,6 +17,103 @@ fn a(f: unsafe extern "C" fn()) -> VirtAddr {
     VirtAddr::new(f as *const () as u64)
 }
 
+// --- hand-rolled entry stubs for the asynchronous hardware IRQs ---
+//
+// The compiler's `extern "x86-interrupt"` stubs never touch `%gs`. That is
+// fine as long as `%gs` is always the per-CPU base wherever an IRQ can land —
+// true for kernel code and for POSIX ring 3 (its user `%gs` base *is* the
+// per-CPU pointer). It stops being true once a **PE** thread runs in ring 3
+// with `%gs` = its TEB: a timer / AHCI IRQ taken there would run
+// `sched::on_tick()` etc. with `gs:0` pointing into the TEB, not `PerCpu`.
+//
+// So these vectors get the same conditional-`swapgs` shim the SEH fault
+// stubs already use (`crate::seh`): `swapgs` on entry iff the saved `CS`
+// says we interrupted ring 3, `swapgs` back on the way out iff we did on the
+// way in. This is what lets a PE thread finally run with `IF=1` (preemptible)
+// instead of being cooperatively scheduled with `IF=0`.
+//
+// No error code is pushed for these vectors, so on entry the stack is
+// [rip][cs][rflags][rsp][ss]; `lfence` after `swapgs` is the CVE-2019-1125
+// ("SWAPGS") speculation guard.
+core::arch::global_asm!(
+    r#"
+.text
+
+.macro IRQ_ENTRY name, body
+.globl \name
+\name:
+    test byte ptr [rsp + 8], 3      // saved CS.RPL: did we interrupt ring 3?
+    jz   1f
+    swapgs
+    lfence
+1:  push rax
+    push rcx
+    push rdx
+    push rbx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov  rbp, rsp
+    and  rsp, -16                   // dynamic 16-byte align for the SysV call
+    call \body
+    mov  rsp, rbp
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  r11
+    pop  r10
+    pop  r9
+    pop  r8
+    pop  rdi
+    pop  rsi
+    pop  rbp
+    pop  rbx
+    pop  rdx
+    pop  rcx
+    pop  rax
+    test byte ptr [rsp + 8], 3      // symmetric: unswap iff we swapped
+    jz   2f
+    swapgs
+2:  iretq
+.endm
+
+IRQ_ENTRY thos_irq_timer, thos_irq_timer_body
+IRQ_ENTRY thos_irq_ahci,  thos_irq_ahci_body
+"#
+);
+
+extern "C" {
+    fn thos_irq_timer();
+    fn thos_irq_ahci();
+}
+
+/// Body of the APIC timer IRQ — see the removed `apic_timer` for the previous
+/// (compiler-stub) form. Runs with `IF=0` and `%gs` guaranteed to be the
+/// per-CPU base by the `thos_irq_timer` shim.
+#[no_mangle]
+extern "C" fn thos_irq_timer_body() {
+    apic::on_timer_tick();
+    apic::eoi();
+    crate::ahci::poll_wake(); // safety net for a dropped AHCI completion IRQ
+    crate::timer::tick(); // advance the monotonic clock + wake timed sleepers
+    crate::sched::on_tick();
+}
+
+#[no_mangle]
+extern "C" fn thos_irq_ahci_body() {
+    crate::ahci::on_irq();
+    apic::eoi();
+}
+
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
 
@@ -41,9 +138,14 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_stack_index(gdt::PAGE_FAULT_IST_INDEX);
     }
 
-    // APIC vectors (>= 32).
-    idt[apic::TIMER_VECTOR].set_handler_fn(apic_timer);
-    idt[apic::AHCI_VECTOR].set_handler_fn(ahci_irq);
+    // APIC vectors (>= 32). Timer + AHCI use hand-rolled entry stubs with a
+    // conditional `swapgs` (see the `global_asm!` above) so they are safe to
+    // take while a PE thread is in ring 3 with `%gs` = TEB. The spurious
+    // handler touches no per-CPU state, so the compiler stub is fine there.
+    unsafe {
+        idt[apic::TIMER_VECTOR].set_handler_addr(a(thos_irq_timer));
+        idt[apic::AHCI_VECTOR].set_handler_addr(a(thos_irq_ahci));
+    }
     idt[apic::SPURIOUS_VECTOR].set_handler_fn(apic_spurious);
 
     idt
@@ -60,19 +162,6 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
         "THOS trap: #BP at {:#x}",
         frame.instruction_pointer.as_u64()
     );
-}
-
-extern "x86-interrupt" fn apic_timer(_frame: InterruptStackFrame) {
-    apic::on_timer_tick();
-    apic::eoi();
-    crate::ahci::poll_wake(); // safety net for a dropped AHCI completion IRQ
-    crate::timer::tick(); // advance the monotonic clock + wake timed sleepers
-    crate::sched::on_tick();
-}
-
-extern "x86-interrupt" fn ahci_irq(_frame: InterruptStackFrame) {
-    crate::ahci::on_irq();
-    apic::eoi();
 }
 
 extern "x86-interrupt" fn apic_spurious(_frame: InterruptStackFrame) {

@@ -35,6 +35,16 @@ pub struct Process {
     next_user_va: AtomicU64,
     /// Program break for `brk`.
     brk: AtomicU64,
+    /// Active `NtMapViewOfSection` views in this address space, so
+    /// `NtUnmapViewOfSection` / `NtFlushVirtualMemory` can find which
+    /// `Section` (and how many pages) a base VA names.
+    views: Mutex<Vec<SectionView>>,
+}
+
+struct SectionView {
+    base: u64,
+    pages: usize,
+    section: Arc<Section>,
 }
 
 /// User virtual space for `mmap` / stacks, clear of typical ELF load addresses.
@@ -67,6 +77,7 @@ impl Process {
             pml4_phys,
             next_user_va: AtomicU64::new(USER_ALLOC_BASE),
             brk: AtomicU64::new(BRK_BASE),
+            views: Mutex::new(Vec::new()),
         })
     }
 
@@ -166,6 +177,146 @@ impl Process {
             v += 4096;
         }
         base
+    }
+
+    /// `NtMapViewOfSection`: map `sec`'s frames covering `[offset, offset+len)`
+    /// into a freshly reserved VA range in *this* address space. Unlike
+    /// `mmap_anon`, no new physical memory is allocated — the same frames get
+    /// mapped, so a write here is a write into `sec` itself, visible to every
+    /// other view of it (this process or any other) with no copy. Returns the
+    /// view's base VA; the view is remembered so `unmap_view`/`flush_view` can
+    /// find `sec` again from that VA.
+    pub fn map_section_view(&self, sec: &Arc<Section>, offset: usize, len: usize) -> u64 {
+        let frames = sec.frames_for(offset, len);
+        let base = self.next_user_va.fetch_add(frames.len() as u64 * 4096 + 0x1000, Ordering::Relaxed);
+        for (i, f) in frames.iter().enumerate() {
+            self.map(base + i as u64 * 4096, f.start_address().as_u64(), true, false);
+        }
+        self.views.lock().push(SectionView { base, pages: frames.len(), section: sec.clone() });
+        base
+    }
+
+    fn view_at(&self, base: u64) -> Option<Arc<Section>> {
+        self.views.lock().iter().find(|v| v.base == base).map(|v| v.section.clone())
+    }
+
+    /// `NtFlushVirtualMemory`: write the view at `base`'s section back to its
+    /// file (a no-op success for an anonymous section). Keeps the mapping.
+    pub fn flush_view(&self, base: u64) -> bool {
+        self.view_at(base).is_some_and(|s| s.flush())
+    }
+
+    /// `NtUnmapViewOfSection`: flush (best-effort — the unmap proceeds either
+    /// way, matching real NT), then tear down the PTEs and forget the view.
+    /// `false` if `base` doesn't name an active view in this process.
+    pub fn unmap_view(&self, base: u64) -> bool {
+        let removed = {
+            let mut views = self.views.lock();
+            let pos = views.iter().position(|v| v.base == base);
+            pos.map(|i| views.swap_remove(i))
+        };
+        let Some(v) = removed else { return false };
+        v.section.flush();
+        for i in 0..v.pages {
+            vmm::unmap_page_in(self.pml4_phys, v.base + i as u64 * 4096);
+        }
+        true
+    }
+
+    /// `NtProtectVirtualMemory`/`VirtualProtect`: change `writable`/`exec` on
+    /// every page in `[virt, virt+len)` (rounded outward to page
+    /// boundaries). Real `VirtualProtect` validates the *whole* region is
+    /// committed before changing anything and fails the call entirely
+    /// otherwise (`ERROR_INVALID_ADDRESS`) — so this checks every page is
+    /// present first, then applies. `None` if any page in the range isn't
+    /// mapped; otherwise `Some((old_writable, old_exec))` from the first
+    /// page (real NT reports one previous-protection value for the region
+    /// too, so this matches even though THOS doesn't track per-page history
+    /// beyond what the PTE itself already encodes).
+    pub fn protect(&self, virt: u64, len: u64, writable: bool, exec: bool) -> Option<(bool, bool)> {
+        let start = virt & !0xFFF;
+        let end = (virt + len + 0xFFF) & !0xFFF;
+        let mut v = start;
+        while v < end {
+            vmm::page_present_in(self.pml4_phys, v).then_some(())?;
+            v += 4096;
+        }
+        let mut old = None;
+        let mut v = start;
+        while v < end {
+            let this_old = vmm::protect_page_in(self.pml4_phys, v, writable, exec)?;
+            old.get_or_insert(this_old);
+            v += 4096;
+        }
+        old
+    }
+
+    /// Reclaim this address space's frames back to `FRAME_ALLOC`: every
+    /// section view's PTEs (never the frames — those belong to the
+    /// `Section`, which may still be live elsewhere), then every remaining
+    /// present user-half page (now provably this process's *own* — ELF/PE
+    /// image, stacks, heap, TLS, TEB/PEB/stub pages) plus the PT/PD/PDPT
+    /// frames that mapped them, and finally the PML4 frame itself.
+    ///
+    /// **Caller's responsibility, not this function's**: this process's
+    /// `pml4_phys` must not be the live CR3 on *any* CPU, now or later — the
+    /// two call sites (`execve`, right after its own `Cr3::write` off this
+    /// space; `sched::reap`, once the last `Thread` referencing this
+    /// `Process`'s `Task` is confirmed not running anywhere) each establish
+    /// that before calling this.
+    fn teardown(&self) {
+        let bases: alloc::vec::Vec<u64> = self.views.lock().iter().map(|v| v.base).collect();
+        for base in bases {
+            self.unmap_view(base);
+        }
+        self.free_user_address_space();
+    }
+
+    /// The raw page-table walk `teardown` uses: PML4[0..256] only (the
+    /// user half — PML4[256..512] plus the low identity map that PML4[0]'s
+    /// *kernel* half briefly overlapped are the kernel's own frames, shared
+    /// by pointer, never this process's to free). A 1 GiB/2 MiB entry is
+    /// skipped rather than freed as if it were a 4 KiB frame — THOS never
+    /// creates a user huge-page mapping, but this is not the place to first
+    /// notice one exists.
+    fn free_user_address_space(&self) {
+        let hhdm = hhdm_offset();
+        let tbl = |phys: u64| unsafe { &*((phys + hhdm) as *const PageTable) };
+        let mut fa = FRAME_ALLOC.lock();
+
+        for i4 in 0..256usize {
+            let e4 = &tbl(self.pml4_phys)[i4];
+            if !e4.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            let pdpt_phys = e4.addr().as_u64();
+            for i3 in 0..512usize {
+                let e3 = &tbl(pdpt_phys)[i3];
+                let f3 = e3.flags();
+                if !f3.contains(PageTableFlags::PRESENT) || f3.contains(PageTableFlags::HUGE_PAGE) {
+                    continue;
+                }
+                let pd_phys = e3.addr().as_u64();
+                for i2 in 0..512usize {
+                    let e2 = &tbl(pd_phys)[i2];
+                    let f2 = e2.flags();
+                    if !f2.contains(PageTableFlags::PRESENT) || f2.contains(PageTableFlags::HUGE_PAGE) {
+                        continue;
+                    }
+                    let pt_phys = e2.addr().as_u64();
+                    for i1 in 0..512usize {
+                        let e1 = &tbl(pt_phys)[i1];
+                        if e1.flags().contains(PageTableFlags::PRESENT) {
+                            fa.dealloc(PhysFrame::containing_address(e1.addr()));
+                        }
+                    }
+                    fa.dealloc(PhysFrame::containing_address(PhysAddr::new(pt_phys)));
+                }
+                fa.dealloc(PhysFrame::containing_address(PhysAddr::new(pd_phys)));
+            }
+            fa.dealloc(PhysFrame::containing_address(PhysAddr::new(pdpt_phys)));
+        }
+        fa.dealloc(PhysFrame::containing_address(PhysAddr::new(self.pml4_phys)));
     }
 
     /// Allocate + map a fresh user stack; returns the (page-aligned) stack top.
@@ -311,15 +462,90 @@ pub fn current_uid() -> u32 {
     sched::current().task().map(|t| t.uid).unwrap_or(0)
 }
 
+/// This task's primary group id (see `Task::gid`).
+pub fn current_gid() -> u32 {
+    sched::current().task().map(|t| t.gid).unwrap_or(0)
+}
+
+/// Is the calling task a native PE image? `false` (never PE) if there is no
+/// current task at all. The one place this matters: whether it's safe to
+/// even *look* at the PE-only vectored-exception-handler slot (`seh.rs`) —
+/// that page is only ever mapped for a PE process; reading it for a plain
+/// ELF one faults.
+pub fn current_is_pe() -> bool {
+    sched::current().task().is_some_and(|t| t.is_pe.load(Ordering::Relaxed))
+}
+
 /// What a HANDLE / file descriptor points at. Both personalities share one
 /// per-process table: a POSIX fd and a Win32 `HANDLE` are the same integer
 /// into the same `Vec` — a file, or an executive object.
-/// A section object's backing store. Anonymous ⇒ zeroed; file-backed ⇒ a copy
-/// of the file's bytes at create time. No shared writeback / copy-on-write yet —
-/// `NtMapViewOfSection` copies the range into fresh private pages.
+/// A section object's backing store: physical frames, not a plain buffer.
+/// Every view any process maps of this section (`Process::map_section_view`)
+/// maps these *same* frames — a write through one view is visible through
+/// every other view immediately, in any process, with no copy. That's what
+/// makes it "shared": the sharing happens at the MMU, not in this struct.
+///
+/// Anonymous (`file: None`) ⇒ frames start zeroed, no writeback target.
+/// File-backed ⇒ frames start as a copy of the file's bytes, and the file is
+/// kept open so [`Section::flush`] (`NtFlushVirtualMemory`, or an implicit
+/// flush on `NtUnmapViewOfSection`) can write the current bytes back to it —
+/// the "writeback" half.
 pub struct Section {
     pub size: usize,
-    pub data: Vec<u8>,
+    frames: Vec<PhysFrame>,
+    file: Option<Arc<dyn FileOps>>,
+}
+
+impl Section {
+    /// Distribute `init` across freshly allocated physical frames (the tail
+    /// of the last page, past `init.len()`, is zeroed). `file`, if given, is
+    /// the source this section can write its current contents back to.
+    pub fn new(init: &[u8], file: Option<Arc<dyn FileOps>>) -> Self {
+        let pages = init.len().div_ceil(4096).max(1);
+        let mut frames = Vec::with_capacity(pages);
+        for i in 0..pages {
+            let f = FRAME_ALLOC.lock().alloc().expect("no frame for section");
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(phys_to_virt(f.start_address()).as_mut_ptr::<u8>(), 4096)
+            };
+            let start = i * 4096;
+            let end = (start + 4096).min(init.len());
+            dst[..end - start].copy_from_slice(&init[start..end]);
+            dst[end - start..].fill(0);
+            frames.push(f);
+        }
+        Self { size: init.len(), frames, file }
+    }
+
+    /// The frames covering `[offset, offset+len)`, page-rounded outward.
+    fn frames_for(&self, offset: usize, len: usize) -> &[PhysFrame] {
+        let first = offset / 4096;
+        let last = (offset + len).div_ceil(4096).min(self.frames.len());
+        &self.frames[first..last]
+    }
+
+    /// Write every backing frame's bytes back to the file this section was
+    /// created from. `true` (no-op) for an anonymous section — there is
+    /// nothing to write back to. THOS writes the *whole* section back rather
+    /// than tracking dirty pages — simpler, correct, just not incremental.
+    pub fn flush(&self) -> bool {
+        let Some(f) = &self.file else { return true };
+        if f.seek(0, crate::file::SEEK_SET) < 0 {
+            return false;
+        }
+        let mut remaining = self.size;
+        for frame in &self.frames {
+            let n = remaining.min(4096);
+            let src = unsafe {
+                core::slice::from_raw_parts(phys_to_virt(frame.start_address()).as_ptr::<u8>(), n)
+            };
+            if f.write(src) != n as i64 {
+                return false;
+            }
+            remaining -= n;
+        }
+        true
+    }
 }
 
 #[derive(Clone)]
@@ -360,12 +586,33 @@ impl Waitable {
             Waitable::Mutant(m) => m.acquire(tid),
         }
     }
+
+    /// Timed [`wait`]: fully blocking (enqueued on the object *and* the timer
+    /// wheel — no yield-poll). `true` = signalled + consumed, `false` = timed
+    /// out at `deadline` (a timer-wheel tick count).
+    pub fn wait_until(&self, tid: u64, deadline: u64) -> bool {
+        match self {
+            Waitable::Event(e) => e.wait_until(deadline),
+            Waitable::Semaphore(s) => s.wait_until(deadline),
+            Waitable::Mutant(m) => m.acquire_until(tid, deadline),
+        }
+    }
     /// Would `try_take` succeed right now? (No consume.)
     pub fn is_signaled(&self, tid: u64) -> bool {
         match self {
             Waitable::Event(e) => e.is_signaled(),
             Waitable::Semaphore(s) => s.is_signaled(),
             Waitable::Mutant(m) => m.is_signaled(tid),
+        }
+    }
+
+    /// The underlying wait queue — for `wait::wait_any_until`
+    /// (`NtWaitForMultipleObjects`'s real multi-object block).
+    pub fn queue(&self) -> &crate::wait::WaitQueue {
+        match self {
+            Waitable::Event(e) => e.queue(),
+            Waitable::Semaphore(s) => s.queue(),
+            Waitable::Mutant(m) => m.queue(),
         }
     }
 }
@@ -377,7 +624,7 @@ pub struct FdEntry {
     pub obj: HandleObject,
     pub cloexec: bool,
 }
-type Fd = Option<FdEntry>;
+pub(crate) type Fd = Option<FdEntry>;
 
 /// One queued user-mode APC (see [`crate::apc`]). `routine` is the
 /// `PKNORMAL_ROUTINE`; `arg1..arg3` are `NtQueueApcThread`'s `ApcArgument1..3`
@@ -394,6 +641,10 @@ pub struct Task {
     pub pid: u64,
     pub ppid: u64,
     pub uid: u32,
+    /// Primary (and, today, only) group id. THOS has no supplementary
+    /// groups yet — every account is its own "user private group", gid ==
+    /// uid, same convention `cred::save`'s `/home/<name>` already assumes.
+    pub gid: u32,
     space: Mutex<Arc<Process>>,
     exit_status: Mutex<Option<i32>>,
     exited: AtomicBool,
@@ -405,6 +656,16 @@ pub struct Task {
     apcs: Mutex<VecDeque<ApcEntry>>,
     /// `true` for a native PE image, `false` for an ELF — for a `ps` view.
     is_pe: AtomicBool,
+    /// How many of this task's threads are still alive — *not* the same
+    /// thing as this `Arc<Task>`'s own strong count, which stays >= 2 for
+    /// the task's entire lifetime (one held by `TASKS`, permanently, until
+    /// some parent `wait4`s it — many of THOS's test-spawned processes never
+    /// get one). Threads are what actually run on a CR3, so this is the
+    /// right signal for "is it safe to reclaim the address space now" —
+    /// `sched::spawn_user`/`spawn_user_pe`/`spawn_user_frame` increment it,
+    /// `sched::reap` decrements it once a thread's stack is confirmed safe
+    /// to free, and reclaims the address space right when it hits zero.
+    active_threads: AtomicU64,
 }
 
 fn seed_fds() -> Vec<Fd> {
@@ -416,10 +677,22 @@ fn seed_fds() -> Vec<Fd> {
 
 impl Task {
     fn new(ppid: u64, space: Arc<Process>) -> Arc<Self> {
+        let uid = SESSION_UID.load(Ordering::Relaxed) as u32;
+        Self::new_with_ids(ppid, space, uid, uid)
+    }
+
+    /// Like `new`, but with an explicit uid/gid instead of inheriting the
+    /// session's — the primitive behind `elevate()`: a process that is
+    /// privileged from the moment it starts, not one that started
+    /// unprivileged and had its token upgraded in place (THOS has no
+    /// in-place token upgrade — a fresh process is the only way a task ever
+    /// becomes uid 0).
+    fn new_with_ids(ppid: u64, space: Arc<Process>, uid: u32, gid: u32) -> Arc<Self> {
         let t = Arc::new(Self {
             pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
             ppid,
-            uid: SESSION_UID.load(Ordering::Relaxed) as u32,
+            uid,
+            gid,
             space: Mutex::new(space),
             exit_status: Mutex::new(None),
             exited: AtomicBool::new(false),
@@ -427,6 +700,7 @@ impl Task {
             cwd: Mutex::new(String::from("/")),
             apcs: Mutex::new(VecDeque::new()),
             is_pe: AtomicBool::new(false),
+            active_threads: AtomicU64::new(0),
         });
         TASKS.lock().insert(t.pid, t.clone());
         t
@@ -440,8 +714,44 @@ impl Task {
         self.space.lock().clone()
     }
 
-    fn set_space(&self, s: Arc<Process>) {
-        *self.space.lock() = s;
+    /// Install `new`, returning the *old* space still alive (not dropped
+    /// here) — unlike `set_space`, so a caller that is still running on the
+    /// old space's CR3 (`execve`, until its own `Cr3::write` a few
+    /// instructions later) controls exactly when it becomes safe to free.
+    fn swap_space(&self, new: Arc<Process>) -> Arc<Process> {
+        core::mem::replace(&mut *self.space.lock(), new)
+    }
+
+    /// Record that a new thread of this task just started (`sched::spawn_user`
+    /// / `spawn_user_pe` / `spawn_user_frame` — every path that creates a
+    /// `Thread` bound to this `Task`, the initial one included).
+    pub(crate) fn thread_spawned(&self) {
+        self.active_threads.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Record that one of this task's threads is confirmed gone (`sched::reap`,
+    /// right as it is about to free that thread's kernel stack — i.e. once
+    /// nothing is running on it anywhere). `true` if that was the *last* one —
+    /// the task's address space is then provably safe to reclaim: whatever CR3
+    /// its threads used cannot be loaded on any CPU with none of them left.
+    pub(crate) fn thread_exited(&self) -> bool {
+        self.active_threads.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+
+    /// Reclaim this task's address-space frames — called once `thread_exited`
+    /// reports the last thread gone. The `Arc<Process>` strong-count check is
+    /// still a belt-and-suspenders guard, not the trigger: a `Task`'s own
+    /// strong count stays >= 2 for its whole life (one held by `TASKS`
+    /// permanently — many of THOS's test-spawned processes are never
+    /// `wait4`'d — one by this thread), so it was never a usable signal for
+    /// "safe to free"; this only skips the rare case something else (a
+    /// concurrent `execve` mid-swap, a `ps` snapshot) holds a temporary extra
+    /// clone of the `Process` itself at this exact moment.
+    pub(crate) fn teardown_space_if_unreferenced(&self) {
+        let space = self.space.lock();
+        if Arc::strong_count(&space) == 1 {
+            space.teardown();
+        }
     }
 
     pub fn fd_get(&self, fd: i32) -> Option<Arc<dyn FileOps>> {
@@ -729,9 +1039,9 @@ pub fn current_take_apc() -> Option<ApcEntry> {
     sched::current().task().and_then(|t| t.apc_take())
 }
 
-/// `true` if the current task has a user APC queued. (Used by the alertable
-/// wait path, which lands with the executive timer wheel.)
-#[allow(dead_code)]
+/// `true` if the current task has a user APC queued — the alertable
+/// `NtWaitForSingleObject` short-circuit (`nt.rs`) checks this before
+/// blocking.
 pub fn current_apc_pending() -> bool {
     sched::current().task().map(|t| t.apc_pending()).unwrap_or(false)
 }
@@ -749,6 +1059,34 @@ static THREAD_EXITS: Mutex<BTreeMap<u64, Arc<Event>>> = Mutex::new(BTreeMap::new
 
 pub fn register_thread_exit(tid: u64, ev: Arc<Event>) {
     THREAD_EXITS.lock().insert(tid, ev);
+}
+
+/// The ring-3 callback mechanism's save stack (`CallWindowProcA` /
+/// `NtCallbackReturn` — see `nt::dispatch_user32`): the syscall frame a
+/// thread was in when it asked the kernel to call back into ring-3 code, so
+/// `NtCallbackReturn` can resume *that* context (with the callback's result
+/// in `rax`) instead of the trampoline that invoked it. A `Vec` per thread,
+/// not just one slot, so a callback that itself triggers another callback
+/// nests correctly (LIFO, matching real call/return order).
+static CALLBACK_FRAMES: Mutex<BTreeMap<u64, Vec<crate::syscall::UserFrame>>> =
+    Mutex::new(BTreeMap::new());
+
+/// Stash `frame` before diverging into a ring-3 callback.
+pub fn push_callback_frame(tid: u64, frame: crate::syscall::UserFrame) {
+    CALLBACK_FRAMES.lock().entry(tid).or_default().push(frame);
+}
+
+/// Pop the most recently stashed frame for `tid` (`NtCallbackReturn`'s doing
+/// the popping) — `None` if the thread has no callback in flight (a stray or
+/// duplicate `NtCallbackReturn`).
+pub fn pop_callback_frame(tid: u64) -> Option<crate::syscall::UserFrame> {
+    let mut frames = CALLBACK_FRAMES.lock();
+    let stack = frames.get_mut(&tid)?;
+    let f = stack.pop();
+    if stack.is_empty() {
+        frames.remove(&tid);
+    }
+    f
 }
 
 /// Signal + forget `tid`'s exit event. `false` if none was registered (i.e. the
@@ -838,6 +1176,57 @@ fn should_block_in_wait4(me: u64, pid: i64) -> bool {
     has_child
 }
 
+/// The primitive behind `elevate()` (`syscall::sys_elevate` does the
+/// re-authentication and admin-only policy check *before* calling this):
+/// spawn `bytes` as a brand-new process with an explicit uid/gid instead of
+/// the caller's session identity. Scoped to exactly that one process —
+/// there is no elevated token or elevated shell that outlives it or that a
+/// later, unrelated action could reuse; the next privileged action needs
+/// its own `elevate` call. Goes through the same native-exec gate every
+/// other entry point into the system does.
+#[cfg_attr(not(feature = "interactive"), allow(dead_code))] // only sys_elevate (interactive-only: needs cred.rs) calls this
+pub fn spawn_elevated(ppid: u64, bytes: &[u8], argv: &[&str], envp: &[&str], uid: u32, gid: u32) -> Result<u64, &'static str> {
+    if let crate::execgate::Verdict::Quarantine(reason) = crate::execgate::check(bytes) {
+        crate::kprintln!("THOS: exec gate        quarantined an elevated exec — {reason}");
+        return Err("quarantined by the native-exec gate");
+    }
+    let space = Process::new();
+    let img = elf::load(&space, bytes)?;
+    let stack_top = space.new_user_stack();
+    let rsp = space.init_stack(stack_top, argv, envp, &img);
+    let task = Task::new_with_ids(ppid, space, uid, gid);
+    sched::spawn_user("elevated", task.clone(), img.entry, rsp);
+    Ok(task.pid)
+}
+
+/// Like [`spawn_elevated`], but the new task's fd table is `fds` instead of
+/// the usual console-backed `seed_fds()` — the primitive behind spawning
+/// the Security Service (`secsvc.rs`) with its stdin/stdout wired to the
+/// kernel<->service pipes instead of the console, so nothing it prints or
+/// reads is visible to (or forgeable by) any other process.
+pub fn spawn_with_fds(
+    ppid: u64,
+    bytes: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    uid: u32,
+    gid: u32,
+    fds: Vec<Fd>,
+) -> Result<u64, &'static str> {
+    if let crate::execgate::Verdict::Quarantine(reason) = crate::execgate::check(bytes) {
+        crate::kprintln!("THOS: exec gate        quarantined a spawn_with_fds exec — {reason}");
+        return Err("quarantined by the native-exec gate");
+    }
+    let space = Process::new();
+    let img = elf::load(&space, bytes)?;
+    let stack_top = space.new_user_stack();
+    let rsp = space.init_stack(stack_top, argv, envp, &img);
+    let task = Task::new_with_ids(ppid, space, uid, gid);
+    *task.fds.lock() = fds;
+    sched::spawn_user("secsvc", task.clone(), img.entry, rsp);
+    Ok(task.pid)
+}
+
 /// `spawn` the initial user program: build its address space + entry stack and
 /// hand it to the scheduler. Returns the pid.
 pub fn spawn_init(bytes: &[u8], argv: &[&str], envp: &[&str]) -> u64 {
@@ -857,6 +1246,13 @@ pub fn spawn_init(bytes: &[u8], argv: &[&str], envp: &[&str]) -> u64 {
 /// syscalls runs on this alone.
 #[allow(dead_code)] // only the `petest` milestone calls this so far
 pub fn spawn_pe(bytes: &[u8]) -> Result<u64, &'static str> {
+    // The native-exec gate: every program entering the system passes the
+    // hash/signature check + policy engine before `pe::load` ever parses a
+    // header. Same rejection shape as a malformed PE — `Err`, kernel alive.
+    if let crate::execgate::Verdict::Quarantine(reason) = crate::execgate::check(bytes) {
+        crate::kprintln!("THOS: exec gate        quarantined a PE — {reason}");
+        return Err("quarantined by the native-exec gate");
+    }
     let space = Process::new();
     let stack_top = space.new_user_stack();
     let img = crate::pe::load(&space, bytes, stack_top)?; // malformed .exe -> Err, never panic
@@ -905,6 +1301,20 @@ pub fn fork(frame: &UserFrame) -> i64 {
 
 /// `execve`: replace the current task's image. Does not return on success.
 pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
+    // The native-exec gate: same check `spawn_pe` runs, here for the path a
+    // *running* process takes to become a different program. A malformed
+    // image already can't panic the kernel past this point (`elf::load`
+    // below), but there's no `Result` to hand back through `execve`'s own
+    // ABI (the calling thread's image is what's being replaced) — quarantine
+    // ends the calling thread cleanly instead, exit code 126 (the shell
+    // convention for "found but not executable"), kernel alive either way.
+    if let crate::execgate::Verdict::Quarantine(reason) = crate::execgate::check(bytes) {
+        crate::kprintln!("THOS: exec gate        quarantined an ELF — {reason}");
+        set_exit_status(126);
+        crate::syscall::note_user_exit();
+        sched::exit();
+    }
+
     let cur = sched::current();
     let task = cur.task().expect("execve: not a user task");
 
@@ -918,7 +1328,12 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
     task.close_on_exec(); // drop O_CLOEXEC fds before the new image sees them
 
     let new_cr3 = space.pml4_phys();
-    task.set_space(space);
+    // `swap_space`, not `set_space`: this thread is still running on the
+    // *old* space's CR3 for a few more instructions (the actual register
+    // switch is the explicit `Cr3::write` below) — dropping the old
+    // `Process` here, before that, would free its page tables out from
+    // under the very code currently executing off them.
+    let old_space = task.swap_space(space);
     cur.set_cr3(new_cr3);
     cur.set_fsbase(0); // fresh image: TLS is re-established by its own arch_prctl
 
@@ -938,6 +1353,13 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
             PhysFrame::from_start_address(PhysAddr::new(new_cr3)).unwrap(),
             Cr3Flags::empty(),
         );
+        // This CPU is off the old space now — safe to reclaim it, provided
+        // nothing else still references it (a concurrent `wait4`/`ps`
+        // snapshot could in principle hold a clone; if so, just leave it —
+        // whoever does hold the last reference will drop it in turn).
+        if Arc::strong_count(&old_space) == 1 {
+            old_space.teardown();
+        }
         syscall::thos_user_resume(&f)
     }
 }

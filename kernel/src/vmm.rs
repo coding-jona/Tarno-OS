@@ -17,6 +17,7 @@ use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::registers::model_specific::{Efer, EferFlags};
 use x86_64::structures::paging::{
     Mapper, OffsetPageTable, Page, PageTable, PageTableFlags as F, PhysFrame, Size1GiB, Size4KiB,
+    Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -142,6 +143,78 @@ pub fn map_mmio(phys: u64, len: u64) -> u64 {
         p += two_m;
     }
     hhdm + phys
+}
+
+/// Unmap a 4 KiB page from an *arbitrary* PML4 (given by physical base) —
+/// `NtUnmapViewOfSection` tearing down a section view. Unlike `map_page_in`,
+/// this `invlpg`s immediately: the caller may keep running on this same CR3
+/// right after and must not still be able to see the old mapping. Does not
+/// free the underlying frame — a section's frames are owned by the `Section`
+/// object, not by any one mapping of them.
+pub fn unmap_page_in(pml4_phys: u64, virt: u64) {
+    let hhdm = crate::mm::hhdm_offset();
+    let pml4: &mut PageTable = unsafe {
+        &mut *crate::mm::phys_to_virt(x86_64::PhysAddr::new(pml4_phys)).as_mut_ptr::<PageTable>()
+    };
+    let mut m = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(hhdm)) };
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    if let Ok((_, flush)) = m.unmap(page) {
+        flush.flush();
+    }
+}
+
+/// Is `virt` currently mapped (present) in an *arbitrary* PML4? Used to
+/// pre-validate a whole `VirtualProtect` region is committed before changing
+/// any of it — real `VirtualProtect` fails the entire call, unchanged, if
+/// any page in the range isn't.
+pub fn page_present_in(pml4_phys: u64, virt: u64) -> bool {
+    let hhdm = crate::mm::hhdm_offset();
+    let pml4: &mut PageTable = unsafe {
+        &mut *crate::mm::phys_to_virt(x86_64::PhysAddr::new(pml4_phys)).as_mut_ptr::<PageTable>()
+    };
+    let m = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(hhdm)) };
+    m.translate_addr(VirtAddr::new(virt)).is_some()
+}
+
+/// Change protection (writable / executable) on an already-mapped 4 KiB page
+/// in an *arbitrary* PML4 — `NtProtectVirtualMemory`/`VirtualProtect`. `None`
+/// if `virt` isn't currently mapped (real `VirtualProtect` fails the whole
+/// call on an uncommitted page, so the caller stops at the first one);
+/// otherwise `Some((old_writable, old_exec))`, so the caller can hand back
+/// the previous protection the way `VirtualProtect`'s `lpflOldProtect`
+/// (`NtProtectVirtualMemory`'s `OldProtect`) does. Flushes immediately, like
+/// `unmap_page_in` — the caller may keep running on this same CR3 right
+/// after, and a page whose protection just got *stricter* (e.g. losing
+/// `WRITABLE`) must not still be writable through a stale TLB entry.
+pub fn protect_page_in(pml4_phys: u64, virt: u64, writable: bool, exec: bool) -> Option<(bool, bool)> {
+    let hhdm = crate::mm::hhdm_offset();
+    let pml4: &mut PageTable = unsafe {
+        &mut *crate::mm::phys_to_virt(x86_64::PhysAddr::new(pml4_phys)).as_mut_ptr::<PageTable>()
+    };
+    let mut m = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(hhdm)) };
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+
+    let old = match m.translate(VirtAddr::new(virt)) {
+        x86_64::structures::paging::mapper::TranslateResult::Mapped { flags, .. } => {
+            (flags.contains(F::WRITABLE), !flags.contains(F::NO_EXECUTE))
+        }
+        _ => return None,
+    };
+
+    let mut f = F::PRESENT | F::USER_ACCESSIBLE;
+    if writable {
+        f |= F::WRITABLE;
+    }
+    if !exec {
+        f |= F::NO_EXECUTE;
+    }
+    match unsafe { m.update_flags(page, f) } {
+        Ok(flush) => {
+            flush.flush();
+            Some(old)
+        }
+        Err(_) => None,
+    }
 }
 
 /// Map a 4 KiB page into an *arbitrary* PML4 (given by physical base). Used for

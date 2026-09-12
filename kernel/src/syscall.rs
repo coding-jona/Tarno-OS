@@ -19,6 +19,8 @@ use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, 
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
 
+#[cfg(feature = "interactive")]
+use crate::cred;
 use crate::{ext2, gdt, kprintln, process, sched, smp};
 
 static USER_EXITS: AtomicU64 = AtomicU64::new(0);
@@ -67,6 +69,21 @@ const SYS_OPENAT: u64 = 257;
 const SYS_UNLINK: u64 = 87;
 const SYS_RMDIR: u64 = 84;
 const SYS_UNLINKAT: u64 = 263;
+const SYS_MKDIR: u64 = 83;
+const SYS_MKDIRAT: u64 = 258;
+const SYS_CHMOD: u64 = 90;
+const SYS_FCHMODAT: u64 = 268;
+const SYS_CHOWN: u64 = 92;
+const SYS_LCHOWN: u64 = 94;
+const SYS_FCHOWNAT: u64 = 260;
+const SYS_UTIMENSAT: u64 = 280;
+
+/// THOS-native calls (not part of the Linux ABI's own number space), same
+/// shape as `nt::NT_BASE` — a caller does `mov eax, THOS_BASE|idx; syscall`.
+/// Safe from collision: every real Linux x86-64 syscall number is well
+/// under `0xFFFF`, let alone this base.
+const THOS_BASE: u64 = 0x5448_0000; // 'T' 'H'
+const SYS_THOS_ELEVATE: u64 = THOS_BASE;
 const SYS_POLL: u64 = 7;
 const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
@@ -119,9 +136,12 @@ const EINVAL: i64 = -22;
 const ENOTTY: i64 = -25;
 const ENOENT: i64 = -2;
 const EIO: i64 = -5;
+pub(crate) const EACCES: i64 = -13;
 const EISDIR: i64 = -21;
 const ENOTDIR: i64 = -20;
 const ENOTEMPTY: i64 = -39;
+const EEXIST: i64 = -17;
+const EPERM: i64 = -1;
 
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
@@ -320,26 +340,185 @@ fn sys_unlink(path_ptr: u64, dir: bool) -> i64 {
     }
 }
 
-fn sys_open(path_ptr: u64) -> i64 {
-    open_resolved(&process::resolve_path(&user_cstr(path_ptr)))
+fn sys_open(path_ptr: u64, flags: u64) -> i64 {
+    open_resolved(&process::resolve_path(&user_cstr(path_ptr)), flags)
 }
 
+/// `mkdir(path, mode)` — `mode` isn't honoured yet (new directories are
+/// always `0755`, matching `ext2::mkdir_path`'s prior hardcoded behaviour);
+/// what's new here is a real owner (the calling task's uid) instead of the
+/// permanent system uid every directory got before this increment.
+fn sys_mkdir(path_ptr: u64) -> i64 {
+    let path = process::resolve_path(&user_cstr(path_ptr));
+    let Some(task) = sched::current().task() else { return EBADF };
+    let Some(fs) = ext2::open().ok() else { return EIO };
+    // Same rule as O_CREAT in `open_resolved`: creating an entry is a write
+    // to the *parent* directory, checked against the parent's own mode bits.
+    if let Some(parent) = parent_of(&path) {
+        if let Some(pino) = fs.path_lookup(parent) {
+            if !fs.read_inode(pino).access_ok(task.uid, task.gid, true) {
+                return EACCES;
+            }
+        }
+    }
+    match fs.mkdir_path_owned(&path, task.uid, task.gid) {
+        Ok(()) => 0,
+        Err("already exists") => EEXIST,
+        Err("parent dir missing") | Err("no such directory") => ENOENT,
+        Err("not a directory") => ENOTDIR,
+        Err(_) => EINVAL,
+    }
+}
+
+/// `chmod(path, mode)` — only the owner or root (uid 0) may change a file's
+/// permission bits, checked here (`ext2::chmod_path` itself does no check —
+/// see its doc comment).
+fn sys_chmod(path_ptr: u64, mode: u64) -> i64 {
+    let path = process::resolve_path(&user_cstr(path_ptr));
+    let Some(task) = sched::current().task() else { return EBADF };
+    let Some(fs) = ext2::open().ok() else { return EIO };
+    let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
+    if task.uid != 0 && task.uid != fs.read_inode(ino).uid {
+        return EPERM;
+    }
+    match fs.chmod_path(&path, mode as u16) {
+        Ok(()) => 0,
+        Err(_) => EINVAL,
+    }
+}
+
+/// `chown(path, uid, gid)` — root-only (matches modern Unix: even the owner
+/// can't give a file away), stricter than `chmod`'s owner-or-root.
+fn sys_chown(path_ptr: u64, uid: u64, gid: u64) -> i64 {
+    let path = process::resolve_path(&user_cstr(path_ptr));
+    let Some(task) = sched::current().task() else { return EBADF };
+    if task.uid != 0 {
+        return EPERM;
+    }
+    let Some(fs) = ext2::open().ok() else { return EIO };
+    match fs.chown_path(&path, uid as u32, gid as u32) {
+        Ok(()) => 0,
+        Err(_) => ENOENT,
+    }
+}
+
+/// THOS-native `elevate(path, argv, password)`: re-authenticate the calling
+/// session's own credentials, then spawn `path` as a brand-new process
+/// running uid/gid 0 — see `process::spawn_elevated` for why this is a new
+/// process and not an in-place privilege upgrade. Two checks, both real:
+///
+/// - **Admin-only policy**: only the session that logged in as the (one)
+///   admin principal may call this at all — `task.uid != cred::ADMIN_UID`
+///   is `EPERM` before the password is even looked at. THOS has exactly
+///   one principal that can ever be admin (`cred.rs`), so "caller in the
+///   admin group" collapses to this one comparison.
+/// - **Re-authentication**: the caller's freshly typed password is checked
+///   against the real credential store (`cred::load` + `Cred::verify`),
+///   not merely "you're already logged in" — a session left unlocked at a
+///   desk can't silently elevate.
+///
+/// Deliberately not yet built: the **trusted path** (a secure-attention key
+/// so no app can draw a fake password prompt) — that needs a global
+/// keyboard-capture mechanism this slice doesn't add. Documented as a real
+/// gap, not silently skipped: today `password_ptr` is whatever the calling
+/// process handed the kernel directly, trusted only because THOS has
+/// exactly one interactive session and no other app that could impersonate
+/// this prompt yet.
+#[cfg(feature = "interactive")]
+fn sys_elevate(path_ptr: u64, argv_ptr: u64, password_ptr: u64) -> i64 {
+    let Some(task) = sched::current().task() else { return EBADF };
+    if task.uid != cred::ADMIN_UID {
+        return EPERM;
+    }
+    let Some(fs) = ext2::open().ok() else { return EIO };
+    let Some(stored) = cred::load(&fs) else { return EPERM };
+    let password = user_cstr(password_ptr);
+    if !stored.verify(&stored.name, &password) {
+        return EACCES;
+    }
+    let path = process::resolve_path(&user_cstr(path_ptr));
+    let Some(bytes) = fs.read_path(&path) else { return ENOENT };
+    let argv = user_cstr_array(argv_ptr);
+    let argv_refs: alloc::vec::Vec<&str> = argv.iter().map(alloc::string::String::as_str).collect();
+    match process::spawn_elevated(task.pid, &bytes, &argv_refs, &[], 0, 0) {
+        Ok(pid) => pid as i64,
+        Err(_) => EINVAL,
+    }
+}
+
+const O_CREAT: u64 = 0o100;
+const O_EXCL: u64 = 0o200;
+
 /// Open an already-resolved absolute path, returning a new fd (or `-errno`).
-/// Shared by `open`/`openat` and the NT personality's `CreateFileA`.
-pub fn open_resolved(path: &str) -> i64 {
+/// `flags`' `O_ACCMODE` bits (`O_RDONLY`=0, `O_WRONLY`=1, `O_RDWR`=2) decide
+/// which permission(s) to actually check — shared by `open`/`openat`.
+///
+/// `O_CREAT`: if `path` doesn't exist yet, create it as an empty file owned
+/// by the calling task's uid/gid, *provided* that task has write permission
+/// on the parent directory (`Inode::access_ok`'s owner/group/other tiers) —
+/// creating a file is a write to the directory it lands in, not to the
+/// (not yet existing) file itself. `O_CREAT|O_EXCL` against an existing
+/// path is `EEXIST`, same as Linux. `O_CREAT` against an existing path with
+/// no `O_EXCL` is a no-op (POSIX: the flag is ignored).
+pub fn open_resolved(path: &str, flags: u64) -> i64 {
+    if flags & O_CREAT != 0 {
+        let Some(task) = sched::current().task() else {
+            return EBADF;
+        };
+        let Some(fs) = ext2::open().ok() else { return EIO };
+        match fs.path_lookup(path) {
+            Some(_) if flags & O_EXCL != 0 => return EEXIST,
+            Some(_) => {}
+            None => {
+                if let Some(parent) = parent_of(path) {
+                    if let Some(pino) = fs.path_lookup(parent) {
+                        if !fs.read_inode(pino).access_ok(task.uid, task.gid, true) {
+                            return EACCES;
+                        }
+                    }
+                }
+                if fs.write_path_owned(path, &[], task.uid, task.gid).is_err() {
+                    return ENOENT; // parent dir missing (or similar layout failure)
+                }
+            }
+        }
+    }
+    let accmode = flags & 0x3;
+    open_resolved_access(path, accmode != 1, accmode != 0)
+}
+
+/// The directory component of an absolute path (`"/"` for a top-level name).
+fn parent_of(path: &str) -> Option<&str> {
+    let idx = path.rfind('/')?;
+    Some(if idx == 0 { "/" } else { &path[..idx] })
+}
+
+/// The permission-checked open underneath [`open_resolved`] — also the NT
+/// personality's `CreateFileA`, which decides `want_read`/`want_write` from
+/// `DesiredAccess` instead of `O_ACCMODE`. `EACCES` if the calling task's
+/// uid/gid don't clear whichever of `want_read`/`want_write` it asked for
+/// against the target inode's owner/group/other mode bits
+/// (`Inode::access_ok`) — the DAC check every file open goes through now,
+/// not just a mode-bits-ignored lookup.
+pub fn open_resolved_access(path: &str, want_read: bool, want_write: bool) -> i64 {
     let Some(task) = sched::current().task() else {
         return EBADF;
     };
     let Some(fs) = ext2::open().ok() else { return EIO };
-    let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
+    let Some(ino) = fs.path_lookup(path) else { return ENOENT };
     let node = fs.read_inode(ino);
+    if (want_read && !node.access_ok(task.uid, task.gid, false))
+        || (want_write && !node.access_ok(task.uid, task.gid, true))
+    {
+        return EACCES;
+    }
     if node.mode & 0xF000 == 0x4000 {
         // A directory: hand back a `getdents64`-able stream.
         let entries: alloc::vec::Vec<(u64, u8, alloc::string::String)> =
             fs.read_dir(ino).into_iter().map(|(i, t, n)| (i as u64, t, n)).collect();
         task.fd_alloc(crate::file::DirFile::new(&entries)) as i64
     } else {
-        task.fd_alloc(crate::file::MemFile::new(fs.read_file(&node))) as i64
+        task.fd_alloc(crate::file::Ext2File::new(path.into(), fs.read_file(&node))) as i64
     }
 }
 
@@ -530,12 +709,38 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             total
         }
 
-        SYS_OPEN => sys_open(a1),
-        SYS_OPENAT => sys_open(a2), // dirfd ignored; paths are absolute
+        SYS_OPEN => sys_open(a1, a2),
+        SYS_OPENAT => sys_open(a2, a3), // dirfd ignored; paths are absolute
 
         SYS_UNLINK => sys_unlink(a1, false),
         SYS_RMDIR => sys_unlink(a1, true),
         SYS_UNLINKAT => sys_unlink(a2, a3 & 0x200 != 0), // flags=a3; AT_REMOVEDIR=0x200
+        SYS_MKDIR => sys_mkdir(a1),
+        SYS_MKDIRAT => sys_mkdir(a2), // dirfd ignored; paths are absolute
+        SYS_CHMOD => sys_chmod(a1, a2),
+        SYS_FCHMODAT => sys_chmod(a2, a3), // dirfd ignored; flags (a4) ignored
+        SYS_CHOWN => sys_chown(a1, a2, a3),
+        SYS_LCHOWN => sys_chown(a1, a2, a3), // no symlinks yet, so == chown
+        SYS_FCHOWNAT => sys_chown(a2, a3, a4), // dirfd ignored; flags (a5) ignored
+
+        // utimensat(dirfd, path, times, flags): no mtime storage yet, so
+        // `times` is ignored — success is "the path exists" (a real touch of
+        // an existing file becomes a no-op). A NULL path (a2==0) means
+        // futimens on dirfd itself, always fine. ENOENT on a missing path
+        // is deliberate: BusyBox `touch` tries utimensat first and falls
+        // back to its own open(O_CREAT) only on ENOENT — this is what makes
+        // that fallback actually fire instead of touch just giving up.
+        SYS_UTIMENSAT => {
+            if a2 == 0 {
+                0
+            } else {
+                let path = process::resolve_path(&user_cstr(a2));
+                match ext2::open().ok().and_then(|fs| fs.path_lookup(&path)) {
+                    Some(_) => 0,
+                    None => ENOENT,
+                }
+            }
+        }
         SYS_CLOSE => {
             if sched::current().task().map(|t| t.fd_close(a1 as i32)).unwrap_or(false) {
                 0
@@ -598,7 +803,8 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
 
         SYS_GETPID | SYS_GETTID => process::current_pid() as i64,
         SYS_GETPPID => process::current_ppid() as i64,
-        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => process::current_uid() as i64,
+        SYS_GETUID | SYS_GETEUID => process::current_uid() as i64,
+        SYS_GETGID | SYS_GETEGID => process::current_gid() as i64,
         SYS_SET_TID_ADDRESS => process::current_pid() as i64,
         SYS_IOCTL => sys_ioctl(a1, a2, a3),
         SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_RT_SIGRETURN | SYS_SET_ROBUST_LIST
@@ -767,6 +973,15 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
 
         // NT-personality calls from a PE's import stubs.
         n if n & !0xFFFF == crate::nt::NT_BASE => crate::nt::dispatch((n & 0xFFFF) as u16, frame),
+
+        // THOS-native calls — outside the Linux ABI's own number space,
+        // same shape as the NT range above. Just `elevate` so far — and
+        // there is no credential store (`cred.rs`) to re-authenticate
+        // against outside the `interactive` build, so it's ENOSYS there.
+        #[cfg(feature = "interactive")]
+        SYS_THOS_ELEVATE => sys_elevate(a1, a2, a3),
+        #[cfg(not(feature = "interactive"))]
+        SYS_THOS_ELEVATE => ENOSYS,
 
         n => {
             kprintln!("THOS: unhandled syscall {}", n);

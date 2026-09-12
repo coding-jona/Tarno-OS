@@ -92,6 +92,12 @@ pub fn load(fs: &Ext2) -> Option<Cred> {
 }
 
 /// Persist `cred` to `/etc/thos/admin.cred`, creating `/etc` and `/etc/thos`.
+/// Also creates `/home/<name>`, owned by the new account itself — otherwise
+/// a freshly created uid has no writable location anywhere on disk at all
+/// (every other directory `mkdir_path` ever created is system-owned, mode
+/// 755, so DAC correctly denies a non-root uid write access to all of them —
+/// the same real gap a plain new Linux user would hit without `useradd`
+/// making them a home directory).
 pub fn save(fs: &Ext2, cred: &Cred) -> Result<(), &'static str> {
     for dir in ["/etc", STORE_DIR] {
         match fs.mkdir_path(dir) {
@@ -99,7 +105,17 @@ pub fn save(fs: &Ext2, cred: &Cred) -> Result<(), &'static str> {
             Err(e) => return Err(e),
         }
     }
-    fs.write_path(STORE_PATH, &cred.serialize())
+    fs.write_path(STORE_PATH, &cred.serialize())?;
+
+    match fs.mkdir_path("/home") {
+        Ok(()) | Err("already exists") => {}
+        Err(e) => return Err(e),
+    }
+    let home = format!("/home/{}", cred.name);
+    match fs.mkdir_path_owned(&home, ADMIN_UID, ADMIN_UID) {
+        Ok(()) | Err("already exists") => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 // --- primitives ---------------------------------------------------------

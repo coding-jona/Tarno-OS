@@ -77,7 +77,7 @@ class GPT(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, ignore_index: int = -100):
         b, t = idx.shape
         assert t <= self.cfg.block_size
         pos = torch.arange(t, device=idx.device)
@@ -88,7 +88,11 @@ class GPT(nn.Module):
         logits = x @ self.wte.weight.T          # tied output
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            # ignore_index lets SFT mask the loss to assistant-turn tokens
+            # only (targets set to -100 elsewhere) — a no-op for base
+            # pre-training, whose targets are always real token ids >= 0.
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                    ignore_index=ignore_index)
         return logits, loss
 
     @torch.no_grad()

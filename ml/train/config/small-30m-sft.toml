@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Track A — SFT (instruction/chat tuning) on top of the small-30m base model.
+# [model] must match small-30m.toml exactly (checkpoint compatibility) — do
+# not edit those values independently of that file.
+#
+# Not meant to run before the base run (out/small-30m) has a decent
+# checkpoint — needs the language fundamentals in place first (see
+# ml/DATASETS.md / the P1 roadmap notes). Once ready:
+#
+#   CONFIG=ml/train/config/small-30m-sft.toml \
+#   INIT_FROM=ml/train/out/small-30m/latest.pt \
+#   TLM=small-30m-sft.tlm ml/train/run.sh train-bg
+#
+# (INIT_FROM only matters the first time this run starts — once
+# out/small-30m-sft/latest.pt exists, --resume takes over and INIT_FROM is
+# ignored, so it's safe to leave set.)
+
+[model]
+n_layer    = 8
+n_head     = 8
+n_embd     = 512
+block_size = 256
+vocab_size = 16384
+dropout    = 0.1
+norm_eps   = 1e-5
+
+[train]
+seed          = 20260905
+batch_size    = 24
+grad_accum    = 2
+# SFT needs far fewer steps than base pre-training -- the model already
+# knows grammar/spelling; it only needs to learn the ChatML turn-taking
+# format and to stop at <|im_end|>. Low LR so it doesn't overwrite what
+# base training already learned (catastrophic forgetting).
+max_steps     = 2500
+warmup_steps  = 100
+lr            = 1e-5
+min_lr        = 1e-6
+weight_decay  = 0.1
+grad_clip     = 1.0
+eval_interval = 30
+eval_batches  = 10
+ckpt_interval = 30
+num_threads   = 0
+
+[data]
+train_bin  = "data/sft_train.bin"
+val_bin    = "data/sft_val.bin"
+train_mask = "data/sft_train_mask.bin"
+val_mask   = "data/sft_val_mask.bin"

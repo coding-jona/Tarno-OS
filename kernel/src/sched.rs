@@ -64,25 +64,16 @@ thos_thread_trampoline:
 .globl thos_user_thread_start
 // entered via `ret` from thos_ctx_switch with
 //   r12=user rip, r13=user rsp, r14=user cs, r15=user ss
+//
+// IF=1: the thread is timer-preemptible in ring 3. This is now used for PE
+// threads too — the conditional-`swapgs` shim on the timer / AHCI IRQ entry
+// stubs (`crate::idt`) makes a ring-3 preemption of a PE thread (with
+// `%gs` = TEB) safe, which it wasn't when PE threads had to run IF=0.
 thos_user_thread_start:
     call thos_finish_switch        // release the thread that yielded to us
     push r15
     push r13
     push 0x202          // RFLAGS with IF=1 -> the user thread is preemptible
-    push r14
-    push r12
-    swapgs
-    iretq
-
-// Same, but IF=0: the thread is *not* timer-preemptible in user mode. Used for
-// PE threads so the ring-3 `swapgs` discipline stays trivial (a preempted PE
-// thread would need a ring-3 IRQ swapgs shim — a later item).
-.globl thos_user_thread_start_coop
-thos_user_thread_start_coop:
-    call thos_finish_switch
-    push r15
-    push r13
-    push 0x002          // RFLAGS with IF=0
     push r14
     push r12
     swapgs
@@ -94,7 +85,6 @@ extern "C" {
     fn thos_ctx_switch(save_to: *mut u64, load_from: *const u64);
     fn thos_thread_trampoline() -> !;
     fn thos_user_thread_start() -> !;
-    fn thos_user_thread_start_coop() -> !;
 }
 
 #[no_mangle]
@@ -150,6 +140,18 @@ pub struct Thread {
     /// into `IA32_KERNEL_GS_BASE` on every switch in, so the exit `swapgs`
     /// brings it live for ring 3.
     gsbase: AtomicU64,
+    /// Set by [`unblock`], cleared by [`mark_blocking`]. Read by `reschedule`
+    /// (only while blocking, under the `SCHED` lock) to catch a waker that
+    /// raced the prepare-to-wait window: the thread enqueued itself on a
+    /// `WaitQueue` / the timer wheel and a `wake_*` (or `timer::tick`) on
+    /// another CPU tried to `unblock` it before it reached `reschedule(true)`.
+    /// If a wake is pending the thread stays runnable and re-checks its
+    /// condition instead of blocking — which would otherwise strand it (blocked
+    /// state, no queue entry, or a phantom entry that double-schedules it off a
+    /// stale `ctx`). Also serialises the two `unblock`s of a dual-enqueued
+    /// timed wait: `false` at rest, so the requeue is deduped by the ready-queue
+    /// scan in `unblock` rather than a claim flag.
+    wake_pending: AtomicBool,
 }
 
 unsafe impl Send for Thread {}
@@ -183,6 +185,7 @@ impl Thread {
             running: AtomicBool::new(true), // it is running right now
             fsbase: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
+            wake_pending: AtomicBool::new(false),
         })
     }
 
@@ -207,7 +210,13 @@ impl Thread {
         (stack, sp as u64, top as u64)
     }
 
-    fn spawned(id: u64, name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -> Arc<Self> {
+    fn spawned(
+        id: u64,
+        name: &'static str,
+        entry: extern "C" fn(usize) -> !,
+        arg: usize,
+        is_idle: bool,
+    ) -> Arc<Self> {
         let (stack, sp, top) = Self::build_stack(
             thos_thread_trampoline as *const () as u64,
             entry as u64,
@@ -221,7 +230,7 @@ impl Thread {
             state: Mutex::new(State::Ready),
             ctx: UnsafeCell::new(sp),
             _stack: Some(stack),
-            is_idle: false,
+            is_idle,
             cr3: AtomicU64::new(vmm::kernel_pml4_phys()),
             kstack_top: Some(top),
             task: None,
@@ -229,6 +238,7 @@ impl Thread {
             running: AtomicBool::new(false),
             fsbase: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
+            wake_pending: AtomicBool::new(false),
         })
     }
 
@@ -238,18 +248,12 @@ impl Thread {
         task: Arc<Task>,
         entry: u64,
         user_rsp: u64,
-        cooperative: bool,
         gsbase: u64,
     ) -> Arc<Self> {
         let s = gdt::selectors();
         let cr3 = task.space().pml4_phys();
-        let trampoline = if cooperative {
-            thos_user_thread_start_coop as *const () as u64
-        } else {
-            thos_user_thread_start as *const () as u64
-        };
         let (stack, sp, top) = Self::build_stack(
-            trampoline,
+            thos_user_thread_start as *const () as u64,
             entry,
             user_rsp,
             (s.user_code.0 | 3) as u64,
@@ -269,6 +273,7 @@ impl Thread {
             running: AtomicBool::new(false),
             fsbase: AtomicU64::new(0),
             gsbase: AtomicU64::new(gsbase),
+            wake_pending: AtomicBool::new(false),
         })
     }
 
@@ -303,6 +308,7 @@ impl Thread {
             running: AtomicBool::new(false),
             fsbase: AtomicU64::new(fsbase),
             gsbase: AtomicU64::new(0),
+            wake_pending: AtomicBool::new(false),
         })
     }
 
@@ -395,7 +401,7 @@ pub fn current_proc() -> Option<Arc<crate::process::Process>> {
 /// thread. Scheduling becomes active on return.
 pub fn init_bsp() {
     let boot = Thread::adopting(0, "cpu0/boot", false);
-    let idle = Thread::spawned(idle_tid(0), "cpu0/idle", idle_entry, 0);
+    let idle = Thread::spawned(idle_tid(0), "cpu0/idle", idle_entry, 0, true);
     {
         let mut s = SCHED.lock();
         s.cpus[0].current = Some(boot);
@@ -435,7 +441,7 @@ extern "C" fn idle_entry(_arg: usize) -> ! {
 /// Create a runnable kernel thread.
 pub fn spawn(name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
-    let t = Thread::spawned(id, name, entry, arg);
+    let t = Thread::spawned(id, name, entry, arg, false);
     SCHED.lock().ready.push_back(t);
     id
 }
@@ -444,16 +450,19 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -
 /// the first time it is scheduled, in `proc`'s address space.
 pub fn spawn_user(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
-    let t = Thread::spawned_user(id, name, task, entry, user_rsp, false, 0);
+    task.thread_spawned();
+    let t = Thread::spawned_user(id, name, task, entry, user_rsp, 0);
     SCHED.lock().ready.push_back(t);
     id
 }
 
-/// A user thread for a native PE image: cooperatively scheduled (IF=0 in ring 3)
+/// A user thread for a native PE image: preemptible (IF=1) like any other user
+/// thread — the timer / AHCI IRQ entry stubs carry the conditional `swapgs` —
 /// and carrying `teb` as its `%gs` base.
 pub fn spawn_user_pe(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64, teb: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
-    let t = Thread::spawned_user(id, name, task, entry, user_rsp, true, teb);
+    task.thread_spawned();
+    let t = Thread::spawned_user(id, name, task, entry, user_rsp, teb);
     SCHED.lock().ready.push_back(t);
     id
 }
@@ -462,6 +471,7 @@ pub fn spawn_user_pe(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: 
 /// fork child).
 pub fn spawn_user_frame(name: &'static str, task: Arc<Task>, frame: UserFrame, fsbase: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    task.thread_spawned();
     let t = Thread::spawned_user_frame(id, name, task, frame, fsbase);
     SCHED.lock().ready.push_back(t);
     id
@@ -519,10 +529,40 @@ pub fn block_current() {
     interrupts::without_interrupts(|| reschedule(true));
 }
 
+/// Arm a thread for a blocking wait. `wait.rs` / `timer.rs` call this *before*
+/// they enqueue the thread on the wait object (and, for a dual-enqueued timed
+/// wait, on the timer wheel) and drop that object's lock — so a waker racing in
+/// on another CPU sees a cleared `wake_pending` and, if it fires, sets it,
+/// telling this thread's imminent `reschedule(true)` to abort the block.
+/// Mirrors Linux's `set_current_state()` before `schedule()`.
+pub fn mark_blocking(t: &Arc<Thread>) {
+    t.wake_pending.store(false, Ordering::Release);
+}
+
 /// Make a previously-blocked thread runnable again.
+///
+/// Only a genuinely blocked-and-parked thread (`Blocked`, `running` clear) is
+/// made `Ready` and pushed here. Every other state means another CPU owns the
+/// wake and this call must not queue it:
+///  - `Running`: the thread armed a wait ([`mark_blocking`]) and enqueued
+///    itself but has not yet reached `reschedule(true)` (or is mid-unwind right
+///    after committing) — recording `wake_pending` makes `reschedule` abort the
+///    block / `finish_switch` requeue it, on its own CPU.
+///  - `Ready`: already queued or being scheduled — don't double it.
+///  - `Exited`: a wait queue is holding a stale corpse reference — never
+///    resurrect it, or `pick_next` would resume it off a dead `ctx`.
+/// The push is also deduped against the ready queue, so the two `unblock`s of a
+/// dual-enqueued timed wait (object signal + wheel deadline) ready it once.
 pub fn unblock(t: Arc<Thread>) {
+    t.wake_pending.store(true, Ordering::Release);
+    let mut s = SCHED.lock();
+    if t.state() != State::Blocked || t.running.load(Ordering::Acquire) {
+        return;
+    }
     t.set_state(State::Ready);
-    SCHED.lock().ready.push_back(t);
+    if !s.ready.iter().any(|x| Arc::ptr_eq(x, &t)) {
+        s.ready.push_back(t);
+    }
 }
 
 /// Terminate the current thread. Never returns.
@@ -556,15 +596,47 @@ pub fn exit() -> ! {
     while next.running.swap(true, Ordering::Acquire) {
         core::hint::spin_loop();
     }
+    // `thos_ctx_switch` does not return for this call — this stack is dead
+    // the instant it jumps away, so `next`'s Drop glue would otherwise never
+    // run (the enclosing frame is never unwound to reach it). Drop it
+    // explicitly, now that its last use (`running`, above) is behind us, or
+    // this reference leaks onto `next` forever — whichever thread that
+    // happens to be, not necessarily this one.
+    drop(next);
     let mut scratch = 0u64;
     unsafe { thos_ctx_switch(&mut scratch, load) };
     unreachable!("switched back into an exited thread")
 }
 
+/// Pop the next runnable thread, **discarding stale phantom entries**. An Arc in
+/// the ready queue that is already `Running`/`Exited`, has `running` set, or is
+/// `current` on some CPU has no business there — a wake or requeue that raced
+/// the owning CPU double-enqueued it. Scheduling such an entry would resume the
+/// thread off a `ctx` its live copy has moved past (or `exit()` never saved) →
+/// `#PF` with a junk `rip`. A genuinely runnable thread is none of those, so it
+/// is never skipped. Falls back to this CPU's idle thread when nothing real is
+/// queued.
 fn pick_next(s: &mut Inner, cpu: usize) -> Arc<Thread> {
-    s.ready
-        .pop_front()
-        .unwrap_or_else(|| s.cpus[cpu].idle.clone().expect("cpu has no idle thread"))
+    while let Some(t) = s.ready.pop_front() {
+        let stale = matches!(t.state(), State::Running | State::Exited)
+            || t.running.load(Ordering::Acquire)
+            || s.cpus.iter().any(|c| {
+                c.current.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &t))
+            });
+        if !stale {
+            return t;
+        }
+        PHANTOMS_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    s.cpus[cpu].idle.clone().expect("cpu has no idle thread")
+}
+
+/// Count of phantom ready-queue entries [`pick_next`] has discarded — 0 in
+/// normal operation; the `smp` stress milestone prints it.
+static PHANTOMS_DROPPED: AtomicU64 = AtomicU64::new(0);
+#[allow(dead_code)] // read by the `stress` milestone only
+pub fn phantoms_dropped() -> u64 {
+    PHANTOMS_DROPPED.load(Ordering::Relaxed)
 }
 
 /// The core switch. `block` = don't return the current thread to the ready
@@ -575,6 +647,15 @@ fn reschedule(block: bool) {
         let cpu = smp::this_cpu() as usize;
 
         let prev = s.cpus[cpu].current.clone().expect("reschedule: no current thread");
+
+        // A waker on another CPU raced our prepare-to-wait window (it drained us
+        // off a `WaitQueue` / the timer wheel and called `unblock` while we were
+        // still `running`). Abort the block, stay runnable, and let the caller
+        // re-check its condition. Nothing has been mutated yet — nothing to undo.
+        if block && prev.wake_pending.load(Ordering::Acquire) {
+            return;
+        }
+
         let next = pick_next(&mut s, cpu);
 
         if Arc::ptr_eq(&prev, &next) {
@@ -586,7 +667,7 @@ fn reschedule(block: bool) {
         // Commit only now that we know a real switch is happening.
         if block {
             prev.set_state(State::Blocked);
-        } else if prev.state() == State::Running && !prev.is_idle {
+        } else if !prev.is_idle {
             prev.set_state(State::Ready);
         }
         next.set_state(State::Running);
@@ -640,7 +721,19 @@ fn finish_switch() {
     let Some((prev, was_blocking)) = s.cpus[cpu].handoff.take() else {
         return;
     };
-    if !was_blocking && prev.state() == State::Ready && !prev.is_idle {
+    let requeue = if prev.state() == State::Exited || prev.is_idle {
+        false
+    } else if !was_blocking {
+        // A plain yield / preemption: `prev` is still runnable.
+        true
+    } else {
+        // `prev` blocked — but if a waker raced in after it committed (so
+        // `unblock` saw `running` still set and skipped the queue), it is our
+        // job to make it runnable now that this CPU is off its stack.
+        prev.wake_pending.load(Ordering::Acquire)
+    };
+    if requeue && !s.ready.iter().any(|t| Arc::ptr_eq(t, &prev)) {
+        prev.set_state(State::Ready);
         s.ready.push_back(prev.clone());
     }
     prev.running.store(false, Ordering::Release);
@@ -649,7 +742,16 @@ fn finish_switch() {
 /// Free the kernel stacks of exited threads. Safe to call from anywhere: a
 /// corpse is only dropped once no CPU is on its stack (`running` cleared by
 /// `finish_switch`) and nothing else still holds a reference.
-#[allow(dead_code)] // driven by the `stress` milestone today; a reaper thread later
+///
+/// Also the safe point for reclaiming a *process's* address space: right
+/// before a dead thread's stack is freed (i.e. once nothing is running on
+/// it anywhere — the exact same proof that makes freeing the stack safe),
+/// `Task::thread_exited` records it gone; once it reports this was the
+/// task's *last* thread, no thread of that process can possibly still be
+/// executing anywhere, and `Task::teardown_space_if_unreferenced` may run.
+/// (Not `Arc<Task>`'s own strong count — that stays >= 2 for the task's
+/// whole life, since `TASKS` holds a permanent reference until some parent
+/// `wait4`s it, which plenty of THOS's test-spawned processes never get.)
 pub fn reap() {
     let mut s = SCHED.lock();
     let mut i = 0;
@@ -657,7 +759,13 @@ pub fn reap() {
         let dead =
             !s.graveyard[i].running.load(Ordering::Acquire) && Arc::strong_count(&s.graveyard[i]) == 1;
         if dead {
-            s.graveyard.swap_remove(i); // Arc drops -> the Box<[u8]> stack is freed
+            let corpse = s.graveyard.swap_remove(i); // about to be the last reference
+            if let Some(task) = &corpse.task {
+                if task.thread_exited() {
+                    task.teardown_space_if_unreferenced();
+                }
+            }
+            drop(corpse); // Arc drops -> the Box<[u8]> stack (and now-unreferenced Task) freed
         } else {
             i += 1;
         }

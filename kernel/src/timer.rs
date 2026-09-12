@@ -60,6 +60,23 @@ pub fn tick() {
     }
 }
 
+/// Register `t` to be `sched::unblock`ed once the clock reaches `deadline`.
+/// Pairs with [`disarm`]. Used both by [`sleep_until`] and by a dual-enqueued
+/// timed object wait (`wait::WaitQueue::wait_if_until`), which arms the wheel
+/// *and* enqueues on the object so whichever fires first wakes the thread.
+pub fn arm(deadline: u64, t: Arc<Thread>) {
+    WHEEL.lock().push((deadline, t));
+}
+
+/// Remove `t`'s wheel entry if it is still pending (it was woken by something
+/// else first, or the wait is over). Safe to call with no entry present.
+pub fn disarm(t: &Arc<Thread>) {
+    let mut wheel = WHEEL.lock();
+    if let Some(p) = wheel.iter().position(|(_, x)| Arc::ptr_eq(x, t)) {
+        wheel.swap_remove(p);
+    }
+}
+
 /// Block the current thread until tick `deadline` (or until something else wakes
 /// it — the caller re-checks its own condition). Safe from a PE syscall.
 pub fn sleep_until(deadline: u64) {
@@ -67,11 +84,8 @@ pub fn sleep_until(deadline: u64) {
         return;
     }
     let me = sched::current();
-    WHEEL.lock().push((deadline, me.clone()));
+    sched::mark_blocking(&me);
+    arm(deadline, me.clone());
     sched::block_current();
-    // Woken (deadline reached, or an unrelated wake). Drop any stale entry.
-    let mut wheel = WHEEL.lock();
-    if let Some(p) = wheel.iter().position(|(_, t)| Arc::ptr_eq(t, &me)) {
-        wheel.swap_remove(p);
-    }
+    disarm(&me); // woken (deadline or an unrelated wake) — drop any stale entry
 }

@@ -13,12 +13,14 @@ dependencies beyond the stdlib `curses` module.
 Right pane sends each message through the built `thos-lm` `generate` example
 (the same engine `run.sh shell` uses) against `--tlm`, so it always reflects
 whatever's on disk — pair it with 'run.sh watch-export' to chat with a model
-that's still training. It is a lighter companion to 'run.sh shell': no
-rolling temperature/top-k tuning, no /lang translation, no live token
-streaming (the whole reply prints at once) — use the dedicated shell for that.
+that's still training. It also understands the same control commands as
+`thos-shell` (/game, /full, /train, /temp, /topk, /tokens, /reset, /params, /help) —
+type /help in the chat box. Missing vs. the dedicated shell: /lang
+translation and live token-by-token streaming (the whole reply prints at
+once here).
 
 Keys:  F2 pause   F3 resume   F4 request a graceful stop+checkpoint
-       F1 quit the dashboard (training keeps running)
+       F1 quit the dashboard (training keeps running); F3 also restarts a training that F4 stopped
        type + Enter to chat; Backspace to edit; Esc clears the input line
 Pause/resume/stop write out/<config>/control.json, which train.py polls once
 per step — same file 'run.sh ctl' writes, so both are interchangeable.
@@ -130,30 +132,59 @@ def fmt_dur(seconds: float) -> str:
 def resolve_tlm(tlm: str) -> str | None:
     """Find the weights file regardless of whether `tlm` was given relative
     to the repo root, ml/train/, or as an absolute path — returns None (not
-    an exception) if it genuinely doesn't exist anywhere sensible yet."""
+    an exception) if it genuinely doesn't exist anywhere sensible yet.
+
+    When the same name exists in more than one place (the repo keeps a copy
+    of each .tlm in both the root and ml/train/), return the *newest* — that
+    is the one 'run.sh watch-export' just refreshed. Returning the first hit
+    by search order instead would silently pin the chat to a stale copy.
+    Always absolute: generate_reply's subprocess runs with cwd=ROOT."""
+    hits = []
     for base in (None, ROOT, HERE):
         p = tlm if base is None else os.path.join(base, tlm)
         if os.path.isfile(p):
-            return p
-    return None
+            hits.append(os.path.abspath(p))
+    if not hits:
+        return None
+    return max(set(hits), key=os.path.getmtime)
 
 
-def generate_reply(tlm: str, prompt: str, max_tokens: int = 180, temp: float = 0.9) -> str:
+GENERATE_BIN = os.path.join(ROOT, "target", RUST_TARGET, "release", "examples", "generate")
+
+
+def generate_reply(tlm: str, prompt: str, max_tokens: int = 100, temp: float = 0.9,
+                    top_k: int = 40) -> str:
     """One-shot call into the same Rust engine 'run.sh shell' uses. Blocking —
-    a few seconds for a small model. Returns just the new continuation (the
-    binary prints prompt+continuation decoded together)."""
+    thos-lm's matmuls are plain single-threaded Rust (no SIMD/BLAS — a
+    deliberate no_std-friendly tradeoff), so this runs at roughly
+    0.3-0.4s/token; 100 tokens is already ~30-40s. Runs the already-built
+    binary directly rather than through 'cargo run', which re-checks the
+    whole workspace on every call for no benefit once it's built once.
+    Returns just the new continuation (the binary prints prompt+continuation
+    decoded together)."""
     found = resolve_tlm(tlm)
     if found is None:
         return (
             f"(no weights at '{tlm}' yet — the model hasn't been exported. "
             f"Train further, then 'run.sh export' or 'run.sh watch-export'.)"
         )
+    binary = GENERATE_BIN
+    if not os.path.isfile(binary):
+        subprocess.run(
+            ["cargo", "build", "-q", "--release", "-p", "thos-lm", "--example", "generate",
+             "--target", RUST_TARGET],
+            cwd=ROOT, check=False,
+        )
     try:
         out = subprocess.run(
-            ["cargo", "run", "-q", "--release", "-p", "thos-lm", "--example", "generate",
-             "--target", RUST_TARGET, "--", "--weights", found, "--prompt", prompt,
-             "--max-tokens", str(max_tokens), "--temp", str(temp), "--seed", str(int(time.time()))],
-            cwd=ROOT, capture_output=True, text=True, timeout=120,
+            [binary, "--weights", found, "--prompt", prompt,
+             "--max-tokens", str(max_tokens), "--temp", str(temp), "--top-k", str(top_k),
+             "--seed", str(int(time.time())),
+             # Harmless for a base model (this text never naturally occurs);
+             # cuts a chat/SFT model's reply short at its own turn boundary
+             # instead of always running to max_tokens.
+             "--stop", "<|im_end|>", "--min-tokens", "1"],
+            capture_output=True, text=True, timeout=180,
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         return f"(generation failed: {e})"
@@ -164,20 +195,177 @@ def generate_reply(tlm: str, prompt: str, max_tokens: int = 180, temp: float = 0
             msg = msg.split("panicked at", 1)[1].split(":", 2)[-1].strip()
         return f"(generation failed: {msg[-300:] or 'unknown error'})"
     full = out.stdout.rstrip("\n")
-    return full[len(prompt):] if full.startswith(prompt) else full
+    reply = full[len(prompt):] if full.startswith(prompt) else full
+    return reply.split("<|im_end|>", 1)[0].rstrip()
+
+
+def run_sh(config_path: str, *args: str, timeout: float = 90.0) -> str:
+    """Shell out to run.sh the same way thos-shell's /game and /run do, with
+    CONFIG pointed at whichever config this dashboard is watching. Returns
+    combined, trimmed output for display in the chat pane."""
+    try:
+        out = subprocess.run(
+            ["bash", os.path.join(HERE, "run.sh"), *args],
+            cwd=HERE, env={**os.environ, "CONFIG": config_path},
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return f"(run.sh {' '.join(args)} failed: {e})"
+    text = (out.stdout + out.stderr).strip()
+    return text or f"(run.sh {' '.join(args)}: no output)"
+
+
+HELP_ROWS = [
+    ("<text>", "generate a continuation; the exchange is kept as context"),
+    ("/temp <f>", "sampling temperature (0 = greedy/argmax), default 0.9"),
+    ("/topk <n>", "top-k cutoff, default 40"),
+    ("/tokens <n>", "max new tokens per reply, default 100 (~30-40s — generation is single-threaded)"),
+    ("/params", "show current temp/top-k/tokens"),
+    ("/reset", "forget the chat context"),
+    ("/game on|off|toggle|status", "cap training's CPU share for a game — training keeps running"),
+    ("/full", "opposite of /game on: uncap, all cores, boosted priority (restarts the bg run)"),
+    ("/train start|stop|pause|resume|status", "control the run this dashboard is watching"),
+    ("/run <cmd> [args]", "any other run.sh subcommand, passed straight through"),
+    ("/model <stem|path>", "switch which weights the chat talks to, e.g. /model spike-1m"),
+    ("/models", "list all .tlm files found (repo root + ml/train/), with size/age"),
+    ("/help", "this list"),
+]
+
+
+def find_models() -> list[str]:
+    """All .tlm files under the repo root or ml/train/, deduped by *basename*
+    (the same weights are often copied to both dirs — keep only the newest
+    copy of each name), newest first."""
+    best: dict[str, str] = {}
+    for base in (ROOT, HERE):
+        try:
+            for name in os.listdir(base):
+                if not name.endswith(".tlm"):
+                    continue
+                p = os.path.join(base, name)
+                cur = best.get(name)
+                if cur is None or os.path.getmtime(p) > os.path.getmtime(cur):
+                    best[name] = os.path.abspath(p)
+        except OSError:
+            pass
+    return sorted(best.values(), key=lambda p: -os.path.getmtime(p))
 
 
 class ChatPane:
-    def __init__(self, tlm: str):
+    def __init__(self, tlm: str, config_path: str):
         self.tlm = tlm
+        self.config_path = config_path
         self.ctx = ""
         self.lines: list[tuple[str, int]] = []  # (text, curses attr) already wrapped
         self.input = ""
         self.busy = False
+        self.temperature = 0.9
+        self.top_k = 40
+        self.max_tokens = 100  # ~30-40s at thos-lm's current single-threaded speed
 
     def push(self, text: str, width: int, attr: int = 0) -> None:
         for chunk in textwrap.wrap(text, width=max(4, width)) or [""]:
             self.lines.append((chunk, attr))
+
+    def _dispatch_command(self, msg: str, width: int) -> None:
+        parts = msg[1:].split()
+        name = parts[0].lower() if parts else ""
+        arg = parts[1] if len(parts) > 1 else ""
+        rest = parts[2:]
+        if name in ("help", "?"):
+            for k, v in HELP_ROWS:
+                self.push(f"  {k:<32} {v}", width, curses.A_DIM)
+        elif name == "params":
+            self.push(
+                f"  temp {self.temperature}  top-k {self.top_k}  tokens {self.max_tokens}  "
+                f"ctx {len(self.ctx)} chars", width, curses.A_DIM,
+            )
+        elif name in ("temp", "temperature"):
+            try:
+                v = float(arg)
+                assert 0.0 <= v <= 5.0
+                self.temperature = v
+                self.push(f"  temp = {v}", width)
+            except (ValueError, AssertionError):
+                self.push("  usage: /temp <0..5>", width, curses.A_DIM)
+        elif name in ("topk", "top-k"):
+            try:
+                v = int(arg)
+                assert v >= 1
+                self.top_k = v
+                self.push(f"  top-k = {v}", width)
+            except (ValueError, AssertionError):
+                self.push("  usage: /topk <n>", width, curses.A_DIM)
+        elif name in ("tokens", "max"):
+            try:
+                v = int(arg)
+                assert 1 <= v <= 8192
+                self.max_tokens = v
+                self.push(f"  tokens = {v}", width)
+            except (ValueError, AssertionError):
+                self.push("  usage: /tokens <1..8192>", width, curses.A_DIM)
+        elif name in ("reset", "clear"):
+            self.ctx = ""
+            self.push("  context cleared", width)
+        elif name == "game":
+            sub = arg or "status"
+            self.push(run_sh(self.config_path, "game", sub), width, curses.A_DIM)
+        elif name == "full":
+            self.push(run_sh(self.config_path, "full", timeout=90), width, curses.A_DIM)
+        elif name == "train":
+            sub = arg or "status"
+            if sub == "start":
+                self.push(run_sh(self.config_path, "train-bg"), width, curses.A_DIM)
+            elif sub == "status":
+                self.push(run_sh(self.config_path, "status"), width, curses.A_DIM)
+            elif sub in ("stop", "pause", "resume"):
+                self.push(run_sh(self.config_path, "ctl", sub), width, curses.A_DIM)
+            else:
+                self.push(f"  unknown /train {sub} — start|stop|pause|resume|status", width, curses.A_DIM)
+        elif name == "models":
+            current = resolve_tlm(self.tlm)
+            models = find_models()
+            if not models:
+                self.push("  no .tlm files found under the repo root or ml/train/", width, curses.A_DIM)
+            for p in models:
+                mark = "* " if p == current else "  "
+                size_mb = os.path.getsize(p) / 1e6
+                age = fmt_dur(time.time() - os.path.getmtime(p))
+                self.push(f"{mark}{os.path.basename(p):<22} {size_mb:>7.1f} MB  {age} old",
+                          width, curses.A_BOLD if p == current else curses.A_DIM)
+        elif name == "model":
+            # Take everything after "/model" and drop stray spaces, so a
+            # fat-fingered "/model spike -1m" still resolves to "spike-1m"
+            # (.tlm stems never contain spaces).
+            stem = "".join(parts[1:])
+            if not stem:
+                self.push(f"  current model: {os.path.basename(self.tlm)}  "
+                          f"(usage: /model <stem|path>; /models to list)", width, curses.A_DIM)
+            else:
+                candidate = stem if stem.endswith(".tlm") else f"{stem}.tlm"
+                found = resolve_tlm(candidate)
+                if found is None:
+                    self.push(f"  no weights named '{candidate}'. Available:", width, curses.A_DIM)
+                    models = find_models()
+                    if not models:
+                        self.push("    (none — train + 'run.sh export' first)", width, curses.A_DIM)
+                    for p in models:
+                        self.push(f"    {os.path.basename(p)}", width, curses.A_DIM)
+                else:
+                    self.tlm = found
+                    self.ctx = ""
+                    self.push(f"  switched to {os.path.basename(found)} — context cleared", width)
+        elif name == "run":
+            if not arg:
+                self.push("  usage: /run <run.sh subcommand> [args...]", width, curses.A_DIM)
+            else:
+                self.push(run_sh(self.config_path, arg, *rest), width, curses.A_DIM)
+        else:
+            # Anything else: treat it as a run.sh subcommand. So a new
+            # subcommand (e.g. /full) works without restarting the dashboard.
+            self.push(f"  /{name} -> run.sh {name} {' '.join([arg, *rest])}".rstrip(), width, curses.A_DIM)
+            self.push(run_sh(self.config_path, name, *([arg] if arg else []), *rest, timeout=90),
+                      width, curses.A_DIM)
 
     def submit(self, width: int, generating_attr: int) -> None:
         msg = self.input.strip()
@@ -186,11 +374,7 @@ class ChatPane:
             return
         self.push(f"you> {msg}", width, curses.A_BOLD)
         if msg.startswith("/"):
-            self.push(
-                "  (slash-commands like /temp, /lang, /train aren't available in this "
-                "chat pane — use 'run.sh shell' for those; this box just talks to the model)",
-                width, curses.A_DIM,
-            )
+            self._dispatch_command(msg, width)
             return
         self.ctx = (self.ctx + "\n" + msg + "\n") if self.ctx else msg + "\n"
         if len(self.ctx) > 3000:
@@ -221,7 +405,7 @@ def run(stdscr, args) -> None:
     mc, tc = cfg["model"], cfg["train"]
     tokens_per_step = tc["batch_size"] * tc["grad_accum"] * mc["block_size"]
     msg = ""
-    chat = ChatPane(args.tlm)
+    chat = ChatPane(args.tlm, args.config)
     last_poll = 0.0
     rows: list[dict] = []
     ctl: dict = {}
@@ -282,6 +466,19 @@ def run(stdscr, args) -> None:
             putL(f" step {prog.get('step', step) + 1} micro {micro}/{of}", curses.A_DIM)
             putL(f" {bar(micro / of, max(4, left_w - 4))}", GREEN)
 
+        # Chat freshness: warn if the exported .tlm has fallen behind the
+        # checkpoint on disk (e.g. watch-export died) — this went unnoticed
+        # for hours once already, so surface it every frame, not just in
+        # 'run.sh status'.
+        ckpt_path = os.path.join(out_dir, "latest.pt")
+        found_tlm = resolve_tlm(chat.tlm)
+        if os.path.exists(ckpt_path) and found_tlm:
+            ckpt_t = os.path.getmtime(ckpt_path)
+            tlm_t = os.path.getmtime(found_tlm)
+            if ckpt_t - tlm_t > 120:
+                stale_min = int((ckpt_t - tlm_t) / 60)
+                putL(f" chat model stale by {stale_min}m — watch-export not running?", YELLOW)
+
         if last:
             tps = last["tps"]
             if not tps:
@@ -325,7 +522,7 @@ def run(stdscr, args) -> None:
         # --- right pane: chat ---
         chat_h = h - 3  # leave room for a heading + input line + blank
         stdscr.addnstr(0, right_x, f"chat — {os.path.basename(chat.tlm)}"
-                        + ("  (thinking…)" if chat.busy else ""),
+                        + (f"  (thinking… ~{chat.max_tokens * 0.35:.0f}s, single-threaded)" if chat.busy else ""),
                         right_w, curses.A_BOLD | (YELLOW if chat.busy else CYAN))
         visible = chat.lines[-chat_h:] if chat_h > 0 else []
         for i, (text, attr) in enumerate(visible):
@@ -338,7 +535,8 @@ def run(stdscr, args) -> None:
         stdscr.refresh()
 
         if chat.busy:
-            reply = generate_reply(chat.tlm, chat.ctx)
+            reply = generate_reply(chat.tlm, chat.ctx, max_tokens=chat.max_tokens,
+                                    temp=chat.temperature, top_k=chat.top_k)
             chat.push(f"model> {reply.strip()}", right_w, GREEN)
             chat.ctx += reply
             if len(chat.ctx) > 3000:
@@ -358,7 +556,21 @@ def run(stdscr, args) -> None:
             msg = "pause requested"
         elif ch == curses.KEY_F3:
             write_control(ctl_path, {})
-            msg = "resume requested"
+            pid_path = os.path.join(out_dir, "train.pid")
+            alive = False
+            try:
+                with open(pid_path) as fh:
+                    os.kill(int(fh.read().strip()), 0)
+                alive = True
+            except (OSError, ValueError, FileNotFoundError):
+                pass
+            if alive:
+                msg = "resume requested"
+            else:
+                # F4 (or a crash) actually exited train.py — clearing the flag
+                # can't revive it; relaunch (train-bg auto-resumes latest.pt).
+                msg = "no training process — restarting (resumes from latest.pt)"
+                run_sh(args.config, "train-bg", timeout=30)
         elif ch == curses.KEY_F4:
             write_control(ctl_path, {"stop": True})
             msg = "stop requested — checkpointing at end of step"

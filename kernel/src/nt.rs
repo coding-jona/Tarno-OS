@@ -16,7 +16,7 @@
 use alloc::sync::Arc;
 
 use crate::syscall::UserFrame;
-use crate::wait::{Event, EventMode};
+use crate::wait::{self, Event, EventMode};
 use crate::{process, sched};
 
 /// `rax` values `NT_BASE ..= NT_BASE|0xFFFF` are NT-personality calls.
@@ -140,7 +140,27 @@ pub const NT_NTCREATETHREADEX: u16 = 33;
 pub const NT_NTTERMINATETHREAD: u16 = 34;
 pub const NT_NTCREATESECTION: u16 = 35;
 pub const NT_NTMAPVIEWOFSECTION: u16 = 36;
-pub const NTDLL_STUB_COUNT: u16 = 37;
+pub const NT_NTENUMERATEKEY: u16 = 37;
+pub const NT_NTENUMERATEVALUEKEY: u16 = 38;
+pub const NT_NTUNMAPVIEWOFSECTION: u16 = 39;
+pub const NT_NTFLUSHVIRTUALMEMORY: u16 = 40;
+/// The ring-3 callback mechanism's other half — see `dispatch_user32`'s
+/// `CallWindowProcA` and `pe::PE_CALLBACK_RETURN_ADDR`. Not a real `Nt*`
+/// (real NT's equivalent, `NtCallbackReturn`, is `win32k`-only and userland
+/// never imports it directly — `user32.dll`'s callback dispatcher calls it).
+/// THOS's version lives on `ntdll`'s table anyway since it's the same
+/// syscall-number space and nothing else needs the name.
+pub const NT_NTCALLBACKRETURN: u16 = 41;
+/// Registers `Event` (an already-created event object) to be signalled the
+/// *next* time the watched key (or, with `WatchTree`, anything under it)
+/// changes — one-shot, same as real NT: a fired watch needs a fresh
+/// `NtNotifyChangeKey` call to re-arm. This is the asynchronous shape (a
+/// caller-supplied `Event`, checked with a normal `NtWaitForSingleObject`)
+/// — the synchronous one (`Event` omitted, the call itself blocks) isn't
+/// built; THOS already has real event/wait primitives, so this slice is
+/// "wire the registry into them", not new blocking machinery.
+pub const NT_NTNOTIFYCHANGEKEY: u16 = 42;
+pub const NTDLL_STUB_COUNT: u16 = 43;
 
 /// The `ntdll` service table — this **is** THOS's SSDT: the stub index is the
 /// service number, and `dispatch_ntdll` is a table-driven switch on it. The
@@ -185,6 +205,12 @@ pub const NTDLL_EXPORTS: [&str; NTDLL_STUB_COUNT as usize] = [
     "NtTerminateThread",
     "NtCreateSection",
     "NtMapViewOfSection",
+    "NtEnumerateKey",
+    "NtEnumerateValueKey",
+    "NtUnmapViewOfSection",
+    "NtFlushVirtualMemory",
+    "NtCallbackReturn",
+    "NtNotifyChangeKey",
 ];
 
 /// The sentinel `GetProcessHeap()` returns (and `PEB->ProcessHeap`). Handles are
@@ -198,7 +224,51 @@ const INVALID_HANDLE_VALUE: i64 = -1;
 
 // A few Win32 error codes.
 const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_PATH_NOT_FOUND: u32 = 3;
+const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_INVALID_ADDRESS: u32 = 487;
+
+// Win32 `PAGE_*` protection constants (`VirtualProtect`'s `flNewProtect` /
+// `NtProtectVirtualMemory`'s `NewProtect`).
+const PAGE_READONLY: u32 = 0x02;
+const PAGE_READWRITE: u32 = 0x04;
+const PAGE_WRITECOPY: u32 = 0x08;
+const PAGE_EXECUTE: u32 = 0x10;
+const PAGE_EXECUTE_READ: u32 = 0x20;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+
+/// Win32 `PAGE_*` → `(writable, exec)`. `None` for `PAGE_NOACCESS` or
+/// anything unrecognized — THOS doesn't have a true "mapped but
+/// inaccessible" page state yet, so there's nothing honest to enforce for
+/// it; treated as unsupported rather than silently granting access anyway.
+/// `PAGE_WRITECOPY`/`PAGE_EXECUTE_WRITECOPY` collapse to the plain
+/// read-write forms — no real copy-on-write yet (see `process.rs`'s own
+/// module doc), so a private mapping is the closest honest behavior.
+fn win32_protect_to_wx(flags: u32) -> Option<(bool, bool)> {
+    match flags & 0xFF {
+        PAGE_READONLY => Some((false, false)),
+        PAGE_READWRITE | PAGE_WRITECOPY => Some((true, false)),
+        PAGE_EXECUTE | PAGE_EXECUTE_READ => Some((false, true)),
+        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY => Some((true, true)),
+        _ => None,
+    }
+}
+
+/// The inverse of [`win32_protect_to_wx`] — for reporting `lpflOldProtect`/
+/// `OldProtect`. Picks the plain (non-writecopy) `PAGE_*` constant; THOS
+/// never distinguishes the writecopy variants once mapped (see above), so
+/// there is no way to report one back either.
+fn wx_to_win32_protect(writable: bool, exec: bool) -> u32 {
+    match (writable, exec) {
+        (false, false) => PAGE_READONLY,
+        (true, false) => PAGE_READWRITE,
+        (false, true) => PAGE_EXECUTE_READ,
+        (true, true) => PAGE_EXECUTE_READWRITE,
+    }
+}
 
 // NTSTATUS values the `Nt*` layer returns (low 32 bits; the high bit marks an
 // error, which a caller tests with `NT_SUCCESS`).
@@ -208,11 +278,17 @@ const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+const STATUS_NO_MORE_ENTRIES: u32 = 0x8000_001A;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_TIMEOUT: u32 = 0x0000_0102;
+/// A pending user APC was delivered instead of the wait completing normally.
+const STATUS_USER_APC: u32 = 0x0000_00C0;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_NOT_MAPPED_VIEW: u32 = 0xC000_0019;
 const STATUS_MUTANT_NOT_OWNED: u32 = 0xC000_0046;
 const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = 0xC000_005F;
 
@@ -239,6 +315,10 @@ pub fn dispatch(sel: u16, frame: &mut UserFrame) -> i64 {
         dispatch_ntdll(sel & !NT_NTDLL_FLAG, frame)
     } else if sel & NT_MSVCRT_FLAG != 0 {
         dispatch_msvcrt(sel & !NT_MSVCRT_FLAG, frame)
+    } else if sel & NT_USER32_FLAG != 0 {
+        dispatch_user32(sel & !NT_USER32_FLAG, frame)
+    } else if sel & NT_GDI32_FLAG != 0 {
+        dispatch_gdi32(sel & !NT_GDI32_FLAG, frame)
     } else {
         dispatch_kernel32(sel, frame)
     }
@@ -294,6 +374,261 @@ pub const MSVCRT_EXPORTS: [&str; MSVCRT_STUB_COUNT as usize] = [
 pub const MSVCRT_STUB_COUNT: u16 = 35;
 /// Indices whose EAT slot is a writable data cell, not a call trampoline.
 pub const MSVCRT_DATA_EXPORTS: [u16; 3] = [32, 33, 34];
+
+/// Selector bit for the synthetic `gdi32.dll` layer (`0x1000`) — the
+/// GDI32/User32 skeleton: `crate::gdi`'s pixel-level primitives against the
+/// boot framebuffer, no window manager yet.
+pub const NT_GDI32_FLAG: u16 = 0x1000;
+const GDI_GETSTOCKOBJECT: u16 = 0;
+const GDI_CREATESOLIDBRUSH: u16 = 1;
+const GDI_SELECTOBJECT: u16 = 2;
+const GDI_SETPIXEL: u16 = 3;
+const GDI_GETPIXEL: u16 = 4;
+const GDI_RECTANGLE: u16 = 5;
+pub const GDI32_STUB_COUNT: u16 = 6;
+pub const GDI32_EXPORTS: [&str; GDI32_STUB_COUNT as usize] =
+    ["GetStockObject", "CreateSolidBrush", "SelectObject", "SetPixel", "GetPixel", "Rectangle"];
+
+/// Selector bit for the synthetic `user32.dll` layer (`0x2000`).
+pub const NT_USER32_FLAG: u16 = 0x2000;
+const USER_GETSYSTEMMETRICS: u16 = 0;
+const USER_GETDC: u16 = 1;
+const USER_RELEASEDC: u16 = 2;
+const USER_CALLWINDOWPROCA: u16 = 3;
+const USER_REGISTERCLASSA: u16 = 4;
+const USER_CREATEWINDOWEXA: u16 = 5;
+const USER_SHOWWINDOW: u16 = 6;
+const USER_UPDATEWINDOW: u16 = 7;
+const USER_DEFWINDOWPROCA: u16 = 8;
+const USER_GETMESSAGEA: u16 = 9;
+const USER_DISPATCHMESSAGEA: u16 = 10;
+const USER_POSTQUITMESSAGE: u16 = 11;
+const USER_TRANSLATEMESSAGE: u16 = 12;
+const USER_POSTMESSAGEA: u16 = 13;
+pub const USER32_STUB_COUNT: u16 = 14;
+pub const USER32_EXPORTS: [&str; USER32_STUB_COUNT as usize] = [
+    "GetSystemMetrics",
+    "GetDC",
+    "ReleaseDC",
+    "CallWindowProcA",
+    "RegisterClassA",
+    "CreateWindowExA",
+    "ShowWindow",
+    "UpdateWindow",
+    "DefWindowProcA",
+    "GetMessageA",
+    "DispatchMessageA",
+    "PostQuitMessage",
+    "TranslateMessage",
+    "PostMessageA",
+];
+
+/// `GetStockObject`/`CreateSolidBrush`/`SelectObject`/`SetPixel`/`GetPixel`/
+/// `Rectangle` — thin syscall skin over `crate::gdi`. The `HDC` argument every
+/// one of these takes is ignored: there is exactly one DC (the whole screen)
+/// so far, `GetDC` always hands back the same fixed handle.
+fn dispatch_gdi32(idx: u16, frame: &mut UserFrame) -> i64 {
+    let a0 = frame.r10;
+    let a1 = frame.rdx;
+    let a2 = frame.r8;
+    let a3 = frame.r9;
+    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
+    match idx {
+        GDI_GETSTOCKOBJECT => crate::gdi::get_stock_object(a0 as i64) as i64,
+        GDI_CREATESOLIDBRUSH => crate::gdi::create_solid_brush(a0 as u32) as i64,
+        GDI_SELECTOBJECT => crate::gdi::select_object(a0, a1) as i64,
+        GDI_SETPIXEL => crate::gdi::set_pixel(a0, a1 as i64, a2 as i64, a3 as u32) as i64,
+        GDI_GETPIXEL => crate::gdi::get_pixel(a0, a1 as i64, a2 as i64) as i64,
+        GDI_RECTANGLE => {
+            let bottom = stack(0) as i64;
+            crate::gdi::fill_rect(a0, a1 as i64, a2 as i64, a3 as i64, bottom) as i64
+        }
+        _ => -1,
+    }
+}
+
+/// `GetSystemMetrics`/`GetDC`/`ReleaseDC` — no window objects yet, so this is
+/// deliberately tiny: `GetDC`/`ReleaseDC` don't need to track anything (one
+/// DC, never freed), `GetSystemMetrics` only knows the two screen-size
+/// indices `crate::gdi` can actually answer.
+fn dispatch_user32(idx: u16, frame: &mut UserFrame) -> i64 {
+    let a0 = frame.r10;
+    let a1 = frame.rdx;
+    let a2 = frame.r8;
+    let a3 = frame.r9;
+    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
+    match idx {
+        USER_GETSYSTEMMETRICS => {
+            let (w, h) = crate::gdi::screen_size();
+            match a0 as i64 {
+                crate::gdi::SM_CXSCREEN => w as i64,
+                crate::gdi::SM_CYSCREEN => h as i64,
+                _ => 0,
+            }
+        }
+        // GetDC(hWnd) -> HDC. `0` (the desktop/whole screen) is the fixed
+        // screen DC (`1`); a real window's HDC is tagged with its hwnd so
+        // gdi.rs's drawing calls know to offset/clip into that window's
+        // client rect instead of drawing in raw screen coordinates.
+        USER_GETDC => {
+            if a0 == 0 {
+                1
+            } else {
+                (crate::gdi::WINDOW_DC_TAG | a0) as i64
+            }
+        }
+        // ReleaseDC(hWnd, hDC) -> BOOL. DCs aren't allocated objects here
+        // (just a tagged integer), so there's nothing to release.
+        USER_RELEASEDC => 1,
+        // CallWindowProcA(lpPrevWndFunc, hWnd, Msg, wParam, lParam) — the
+        // ring-3 callback mechanism's first real user: call a WNDPROC-shaped
+        // function (a0) with the next four Win64 args shifted left by one
+        // (hWnd/Msg/wParam here, lParam on the stack) and hand its LRESULT
+        // back as this syscall's own return value.
+        USER_CALLWINDOWPROCA => {
+            let lparam = unsafe { *((frame.rsp + 0x28) as *const u64) };
+            invoke_ring3_callback(a0, [frame.rdx, frame.r8, frame.r9, lparam], frame)
+        }
+
+        // RegisterClassA(const WNDCLASSA *lpWndClass). Only the two fields
+        // CreateWindowExA actually needs: lpfnWndProc @0x08, lpszClassName
+        // @0x40 (real WNDCLASSA layout — natural alignment puts the pointer
+        // fields there after the leading `UINT style`). `0` (real
+        // `ATOM` failure value) if the class name is empty.
+        USER_REGISTERCLASSA => {
+            let wndproc = unsafe { *((a0 + 0x08) as *const u64) };
+            let name_ptr = unsafe { *((a0 + 0x40) as *const u64) };
+            let name = user_cstr(name_ptr);
+            if name.is_empty() {
+                0
+            } else {
+                crate::window::register_class(name, wndproc);
+                1 // a nonzero ATOM — THOS looks classes up by name again, never by it
+            }
+        }
+
+        // CreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle, x,
+        //                  y, nWidth, nHeight, hWndParent, hMenu, hInstance,
+        //                  lpParam) -> HWND (`0` on failure — unregistered
+        // class). hWndParent/hMenu/hInstance/lpParam aren't used yet (no
+        // parent/child windows, no menus).
+        USER_CREATEWINDOWEXA => {
+            let class = user_cstr(a1);
+            let (x, y, w, h) = (stack(0) as i32, stack(1) as i32, stack(2) as i32, stack(3) as i32);
+            crate::window::create_window(&class, x, y, w, h, process::current_tid()) as i64
+        }
+
+        // ShowWindow(hWnd, nCmdShow) -> BOOL. No compositor yet, so there is
+        // nothing to actually show — beyond queuing the WM_PAINT a real
+        // newly-shown window gets from its invalidated region.
+        USER_SHOWWINDOW => {
+            if a1 != 0 {
+                crate::window::post_message(a0 as u32, crate::window::WM_PAINT, 0, 0);
+            }
+            1
+        }
+
+        // UpdateWindow(hWnd) -> BOOL. Real UpdateWindow *sends* WM_PAINT
+        // directly (bypassing the queue) when the window has an invalid
+        // region — exactly a `CallWindowProcA`-shaped ring-3 call, so this
+        // reuses the same mechanism. `0` (failure) for an unknown HWND.
+        USER_UPDATEWINDOW => match crate::window::wndproc_of(a0 as u32) {
+            Some(wndproc) => invoke_ring3_callback(wndproc, [a0, crate::window::WM_PAINT as u64, 0, 0], frame),
+            None => 0,
+        },
+
+        // DefWindowProcA(hWnd, Msg, wParam, lParam) -> LRESULT. No default
+        // message handling implemented yet (no painting, no hit-testing) —
+        // `0`, same as real DefWindowProc's default case for anything it
+        // doesn't specifically handle.
+        USER_DEFWINDOWPROCA => 0,
+
+        // GetMessageA(&msg, hWnd, wMsgFilterMin, wMsgFilterMax) -> BOOL. The
+        // hWnd/filter args aren't applied yet (one queue per thread, no
+        // per-window or per-message filtering). `0` only for WM_QUIT, `1`
+        // otherwise — real GetMessageA's BOOL-shaped tri-state return.
+        USER_GETMESSAGEA => {
+            let m = crate::window::get_message(process::current_tid());
+            unsafe {
+                *(a0 as *mut u64) = m.hwnd as u64; // MSG.hwnd
+                *((a0 + 0x08) as *mut u32) = m.message; // MSG.message
+                *((a0 + 0x10) as *mut u64) = m.wparam; // MSG.wParam
+                *((a0 + 0x18) as *mut u64) = m.lparam; // MSG.lParam
+            }
+            (m.message != crate::window::WM_QUIT) as i64
+        }
+
+        // DispatchMessageA(const MSG *lpMsg) -> LRESULT. Calls the target
+        // window's WndProc in ring 3 (`invoke_ring3_callback`, the same
+        // mechanism `CallWindowProcA` uses) and hands its result back.
+        USER_DISPATCHMESSAGEA => {
+            let hwnd = unsafe { *(a0 as *const u64) } as u32;
+            let message = unsafe { *((a0 + 0x08) as *const u32) };
+            let wparam = unsafe { *((a0 + 0x10) as *const u64) };
+            let lparam = unsafe { *((a0 + 0x18) as *const u64) };
+            match crate::window::wndproc_of(hwnd) {
+                Some(wndproc) => invoke_ring3_callback(wndproc, [hwnd as u64, message as u64, wparam, lparam], frame),
+                None => 0,
+            }
+        }
+
+        // PostQuitMessage(nExitCode) — always targets the calling thread's
+        // own queue (real WM_QUIT isn't associated with any window).
+        USER_POSTQUITMESSAGE => {
+            crate::window::post_quit(process::current_tid(), a0);
+            0
+        }
+
+        // TranslateMessage(&msg) -> BOOL. No keyboard input feeds the
+        // message queue yet, so there is nothing to translate — `1` (TRUE),
+        // matching real TranslateMessage's success return for anything it
+        // doesn't act on.
+        USER_TRANSLATEMESSAGE => 1,
+
+        // PostMessageA(hWnd, Msg, wParam, lParam) -> BOOL.
+        USER_POSTMESSAGEA => crate::window::post_message(a0 as u32, a1 as u32, a2, a3) as i64,
+
+        _ => -1,
+    }
+}
+
+/// The ring-3 callback mechanism itself: call `target` (a WNDPROC-shaped
+/// `LRESULT CALLBACK(HWND, UINT, WPARAM, LPARAM)`) in ring 3, on the calling
+/// thread's own stack — below its current `rsp`, exactly as a real nested
+/// call would, since that stack is otherwise idle while this syscall runs —
+/// and eventually, via `NtCallbackReturn`, hand its return value back as if
+/// *this* syscall itself had returned it.
+///
+/// Diverges, like `NtContinue`: this never falls through to the normal
+/// syscall-return epilogue. `frame` (the syscall that asked for the
+/// callback — `CallWindowProcA` today) is stashed via
+/// `process::push_callback_frame` first; `NtCallbackReturn` resumes *that*
+/// saved frame later; instead of `NtContinue`'s ExcFrame the normal frame
+/// covers the callback's own ring-3 register loop.
+fn invoke_ring3_callback(target: u64, args: [u64; 4], frame: &UserFrame) -> i64 {
+    process::push_callback_frame(process::current_tid(), *frame);
+
+    // A fresh call frame below the caller's own stack: a return address
+    // (the trampoline) plus the Win64 shadow space the callback may
+    // scribble into, 16-aligned as if a real `call` had just landed here.
+    let ret_rsp = ((frame.rsp - 0x100) & !0xF) - 8;
+    unsafe { *(ret_rsp as *mut u64) = crate::pe::PE_CALLBACK_RETURN_ADDR };
+
+    let (cs, ss) = process::user_selectors();
+    let f = crate::seh::ExcFrame {
+        rip: target,
+        rsp: ret_rsp,
+        rcx: args[0],
+        rdx: args[1],
+        r8: args[2],
+        r9: args[3],
+        rflags: 0x202, // reserved bit + IF (ring 3 stays preemptible)
+        cs,
+        ss,
+        ..Default::default()
+    };
+    unsafe { crate::seh::thos_exc_resume(&f) }
+}
 
 const MSV_MEMCPY: u16 = 0;
 const MSV_MEMSET: u16 = 1;
@@ -420,7 +755,41 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             STATUS_SUCCESS as i64
         }
         // No teardown / per-page protection yet.
-        NT_NTFREEVIRTUALMEMORY | NT_NTPROTECTVIRTUALMEMORY => STATUS_SUCCESS as i64,
+        // No teardown yet for a live decommit/release of a sub-range (see
+        // process.rs's Process::teardown for whole-process reclaim).
+        NT_NTFREEVIRTUALMEMORY => STATUS_SUCCESS as i64,
+
+        // NtProtectVirtualMemory(ProcessHandle, *BaseAddress, *RegionSize,
+        //                        NewProtect, *OldProtect). Real per-page W^X
+        // now (Process::protect), not a no-op stub. `*BaseAddress`/
+        // `*RegionSize` are read only, not rounded-and-written-back like
+        // `NtAllocateVirtualMemory` does — a caller that wants the rounded
+        // range has to ask for it another way; good enough for the callers
+        // THOS actually has today.
+        NT_NTPROTECTVIRTUALMEMORY => {
+            let (base_pp, size_pp) = (a1, a2);
+            if base_pp == 0 || size_pp == 0 {
+                return STATUS_INVALID_PARAMETER as i64;
+            }
+            let base = unsafe { *(base_pp as *const u64) };
+            let size = unsafe { *(size_pp as *const u64) };
+            let Some((w, x)) = win32_protect_to_wx(a3 as u32) else {
+                return STATUS_INVALID_PARAMETER as i64;
+            };
+            let Some(proc) = sched::current_proc() else {
+                return STATUS_INVALID_PARAMETER as i64;
+            };
+            match proc.protect(base, size.max(1), w, x) {
+                Some((old_w, old_x)) => {
+                    let old_pp = stack(0);
+                    if old_pp != 0 {
+                        unsafe { *(old_pp as *mut u32) = wx_to_win32_protect(old_w, old_x) };
+                    }
+                    STATUS_SUCCESS as i64
+                }
+                None => STATUS_INVALID_PARAMETER as i64,
+            }
+        }
 
         // NtQueryInformationProcess(ProcessHandle, InfoClass, Buffer, Length,
         //                           *ReturnLength). Only ProcessBasicInformation
@@ -509,12 +878,30 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // NtWaitForSingleObject(Handle, Alertable, *Timeout) on any dispatcher
         // object (event / semaphore / mutant). NULL = block forever;
         // `*Timeout == 0` = poll; a negative `*Timeout` is a relative wait in
-        // 100 ns units — a bounded cooperative-yield spin (a real timed block on
-        // the executive timer wheel comes later). Positive (absolute) = poll.
+        // 100 ns units — a *fully blocking* timed wait: the thread is enqueued
+        // on the object **and** the timer wheel (`Waitable::wait_until`) and
+        // sleeps off the run queue until whichever fires first. Positive
+        // (absolute) = poll.
         NT_NTWAITFORSINGLEOBJECT => {
             let Some(w) = process::current_waitable(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
             };
+            // Alertable (`a1`) + an already-pending user APC: deliver it
+            // instead of blocking at all, same as real NT — the object
+            // itself is never even touched. Note the other half of a real
+            // alertable wait — a *cross-thread* APC arriving while this
+            // thread is already blocked, interrupting the sleep early —
+            // isn't reachable yet: `NtQueueApcThread` only ever targets the
+            // calling thread itself today (see `apc.rs`), so no other
+            // thread can queue one here while this one sleeps.
+            if a1 != 0 && process::current_apc_pending() {
+                let r = frame_regs(frame, STATUS_USER_APC);
+                if let Some((rsp, rip)) = crate::apc::take_and_stage(&r) {
+                    frame.rsp = rsp;
+                    frame.rip = rip;
+                }
+                return STATUS_USER_APC as i64;
+            }
             let tid = process::current_tid();
             if a2 == 0 {
                 w.wait(tid);
@@ -524,19 +911,12 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             if timeout >= 0 {
                 return if w.try_take(tid) { STATUS_SUCCESS as i64 } else { STATUS_TIMEOUT as i64 };
             }
-            // Relative timeout: real wall-clock deadline off the timer wheel.
-            // The wait itself still yield-polls the object between ticks (a
-            // fully-blocking timed object wait — dual-enqueue on the object's
-            // queue *and* the wheel — is the remaining refinement); the
-            // *duration* is now accurate.
             let deadline = crate::timer::deadline_from_relative_100ns(timeout);
-            while crate::timer::now() < deadline {
-                if w.try_take(tid) {
-                    return STATUS_SUCCESS as i64;
-                }
-                sched::yield_now();
+            if w.wait_until(tid, deadline) {
+                STATUS_SUCCESS as i64
+            } else {
+                STATUS_TIMEOUT as i64
             }
-            if w.try_take(tid) { STATUS_SUCCESS as i64 } else { STATUS_TIMEOUT as i64 }
         }
 
         // NtCreateMutant(*Handle, DesiredAccess, *ObjectAttributes, InitialOwner)
@@ -599,8 +979,12 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
 
         // NtWaitForMultipleObjects(Count, Handles[], WaitType, Alertable,
         //                          *Timeout). WaitType 0 = WaitAll, 1 = WaitAny.
-        // WaitAny returns STATUS_WAIT_0 + index. Cooperative-yield spin, same
-        // timeout rules as NtWaitForSingleObject; NULL timeout spins until ready.
+        // WaitAny returns STATUS_WAIT_0 + index. Fully blocking: the thread is
+        // parked on every object's WaitQueue at once (`wait::wait_any_until`,
+        // dedupes a repeated handle so it can't self-deadlock) and, for a
+        // relative timeout, the timer wheel too — no poll loop. Whichever
+        // object is signalled, or the deadline, wakes it; the loop then
+        // re-checks the real WaitAll/WaitAny condition itself.
         NT_NTWAITFORMULTIPLEOBJECTS => {
             let count = a0 as usize;
             if count == 0 || count > 64 {
@@ -645,7 +1029,17 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 if poll_once || deadline.is_some_and(|d| crate::timer::now() >= d) {
                     return STATUS_TIMEOUT as i64;
                 }
-                sched::yield_now();
+                let queues: alloc::vec::Vec<&wait::WaitQueue> = objs.iter().map(|w| w.queue()).collect();
+                let timed_out = wait::wait_any_until(&queues, deadline, || {
+                    if wait_all {
+                        !objs.iter().all(|w| w.is_signaled(tid))
+                    } else {
+                        !objs.iter().any(|w| w.is_signaled(tid))
+                    }
+                });
+                if timed_out {
+                    return STATUS_TIMEOUT as i64;
+                }
             }
         }
 
@@ -698,15 +1092,14 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // NtCreateSection(*Handle, DesiredAccess, *ObjectAttributes,
         //                 *MaximumSize, PageProtection, AllocationAttributes,
         //                 FileHandle). FileHandle 0 = anonymous zeroed section;
-        // otherwise a copy of the file's bytes at create time. No shared
-        // writeback / COW; protection is not enforced yet.
+        // otherwise seeded from the file's bytes at create time, and the file
+        // kept for `NtFlushVirtualMemory` / unmap-time writeback. Protection is
+        // not enforced yet.
         NT_NTCREATESECTION => {
             const CAP: usize = 16 * 1024 * 1024;
             let file_h = stack(2) as i32;
-            let data: alloc::vec::Vec<u8> = if file_h != 0 {
-                let Some(f) = process::current_fd(file_h) else {
-                    return STATUS_INVALID_HANDLE as i64;
-                };
+            let file = if file_h != 0 { process::current_fd(file_h) } else { None };
+            let data: alloc::vec::Vec<u8> = if let Some(f) = &file {
                 let mut buf = alloc::vec::Vec::new();
                 let mut chunk = [0u8; 4096];
                 loop {
@@ -720,6 +1113,8 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                     }
                 }
                 buf
+            } else if file_h != 0 {
+                return STATUS_INVALID_HANDLE as i64; // a handle was given but didn't resolve
             } else {
                 let max = if a3 != 0 { (unsafe { *(a3 as *const i64) }) as usize } else { 0 };
                 if max == 0 || max > CAP {
@@ -727,7 +1122,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 }
                 alloc::vec![0u8; max]
             };
-            let sec = Arc::new(process::Section { size: data.len(), data });
+            let sec = Arc::new(process::Section::new(&data, file));
             let h = process::current_alloc_section(sec);
             if h < 0 {
                 return STATUS_NO_MEMORY as i64;
@@ -739,8 +1134,9 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // NtMapViewOfSection(SectionHandle, ProcessHandle, *BaseAddress,
         //                    ZeroBits, CommitSize, *SectionOffset, *ViewSize,
         //                    InheritDisposition, AllocationType, Win32Protect).
-        // Copies the requested range into fresh private RW pages (CR3 is this
-        // process's here, so the copy writes straight into the user VA).
+        // Maps the section's own frames — this view and every other view of
+        // the same section (this process or any other) share the physical
+        // pages, so a write through one is visible through all of them.
         NT_NTMAPVIEWOFSECTION => {
             let Some(sec) = process::current_section(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
@@ -755,12 +1151,11 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             }
             let want = if vsize_pp != 0 { (unsafe { *(vsize_pp as *const u64) }) as usize } else { 0 };
             let view = if want != 0 { want.min(sec.size - offset) } else { sec.size - offset };
-            let base = mem_alloc_core(view as u64);
-            if base == 0 {
-                return STATUS_NO_MEMORY as i64;
-            }
+            let Some(proc) = sched::current_proc() else {
+                return STATUS_INVALID_PARAMETER as i64; // not a user task
+            };
+            let base = proc.map_section_view(&sec, offset, view);
             unsafe {
-                core::ptr::copy_nonoverlapping(sec.data.as_ptr().add(offset), base as *mut u8, view);
                 *(a2 as *mut u64) = base;
                 if vsize_pp != 0 {
                     *(vsize_pp as *mut u64) = view as u64;
@@ -768,6 +1163,55 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             }
             STATUS_SUCCESS as i64
         }
+
+        // NtUnmapViewOfSection(ProcessHandle, BaseAddress). Writes the section
+        // back to its file (best-effort — the unmap proceeds either way),
+        // then tears down the mapping. STATUS_NOT_MAPPED_VIEW if `BaseAddress`
+        // doesn't name a view this process has mapped.
+        NT_NTUNMAPVIEWOFSECTION => {
+            let Some(proc) = sched::current_proc() else {
+                return STATUS_INVALID_PARAMETER as i64;
+            };
+            status(proc.unmap_view(a1), STATUS_NOT_MAPPED_VIEW)
+        }
+
+        // NtFlushVirtualMemory(ProcessHandle, **BaseAddress, *RegionSize,
+        //                      *IoStatusBlock). Writes the view's section back
+        // to its file; the mapping stays. `**BaseAddress` because real NT
+        // takes the address by reference and can round it down to the view's
+        // actual base — THOS requires the exact base `NtMapViewOfSection`
+        // returned (no partial-range flush).
+        NT_NTFLUSHVIRTUALMEMORY => {
+            let Some(proc) = sched::current_proc() else {
+                return STATUS_INVALID_PARAMETER as i64;
+            };
+            let base = unsafe { *(a1 as *const u64) };
+            status(proc.flush_view(base), STATUS_NOT_MAPPED_VIEW)
+        }
+
+        // NtCallbackReturn(Result) — the ring-3 callback mechanism's other
+        // half (see `dispatch_user32`'s `CallWindowProcA`): resume whichever
+        // syscall frame is stashed for this thread, with `Result` as that
+        // syscall's own return value, instead of returning to the trampoline
+        // that made this call. A stray call (nothing stashed) has nothing
+        // sane to resume into — end the thread rather than fall into the
+        // trampoline's `jmp $` safety net.
+        NT_NTCALLBACKRETURN => match process::pop_callback_frame(process::current_tid()) {
+            Some(mut saved) => {
+                saved.rax = a0;
+                // `saved` was captured on the normal syscall fast path, where
+                // `UserFrame.cs`/`.ss` are dead slots (`sysretq` needs neither
+                // — see the entry stub's `sub rsp, 16`) and so hold whatever
+                // garbage was on the kernel stack, not real selectors.
+                // `thos_user_resume` (unlike `sysretq`) does IRETQ and reads
+                // both — fill them in for real or the IRETQ #GPs.
+                let (cs, ss) = process::user_selectors();
+                saved.cs = cs;
+                saved.ss = ss;
+                unsafe { crate::syscall::thos_user_resume(&saved) }
+            }
+            None => sched::exit(),
+        },
 
         // NtContinue(*Context, TestAlert) — resume ring 3 from the CONTEXT the
         // exception / APC dispatcher (maybe) fixed up. When `TestAlert` is set
@@ -830,29 +1274,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // this thread's return through `KiUserApcDispatcher`; the staged CONTEXT
         // carries STATUS_SUCCESS in `Rax` so the eventual resume returns it.
         NT_NTTESTALERT => {
-            let (cs, ss) = process::user_selectors();
-            let r = crate::apc::Regs {
-                rax: STATUS_SUCCESS as u64,
-                rcx: 0,
-                rdx: frame.rdx,
-                rbx: frame.rbx,
-                rsp: frame.rsp,
-                rbp: frame.rbp,
-                rsi: frame.rsi,
-                rdi: frame.rdi,
-                r8: frame.r8,
-                r9: frame.r9,
-                r10: frame.r10,
-                r11: frame.r11,
-                r12: frame.r12,
-                r13: frame.r13,
-                r14: frame.r14,
-                r15: frame.r15,
-                rip: frame.rip,
-                rflags: frame.rflags,
-                cs,
-                ss,
-            };
+            let r = frame_regs(frame, STATUS_SUCCESS);
             if let Some((rsp, rip)) = crate::apc::take_and_stage(&r) {
                 frame.rsp = rsp;
                 frame.rip = rip;
@@ -896,7 +1318,14 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 return STATUS_INVALID_PARAMETER as i64;
             };
             let existed = crate::registry::open(&path);
-            if !crate::registry::create(&path) {
+            let uid = process::current_uid();
+            // Opening an existing key is a read (always allowed); *creating*
+            // a new one is a write to the nearest existing ancestor —
+            // per-key security's real enforcement point.
+            if !existed && !crate::registry::create_write_ok(&path, uid) {
+                return STATUS_ACCESS_DENIED as i64;
+            }
+            if !crate::registry::create_owned(&path, uid) {
                 return STATUS_INVALID_PARAMETER as i64;
             }
             let h = process::current_alloc_regkey(crate::registry::canon(&path));
@@ -933,6 +1362,9 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let Some(path) = process::current_regkey(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
             };
+            if !crate::registry::write_key_ok(&path, process::current_uid()) {
+                return STATUS_ACCESS_DENIED as i64;
+            }
             let name = unsafe { unicode_string_ascii(a1) };
             let (data_ptr, size) = (stack(0), stack(1) as usize);
             let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, size) };
@@ -980,7 +1412,109 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let Some(path) = process::current_regkey(a0 as i32) else {
                 return STATUS_INVALID_HANDLE as i64;
             };
+            if !crate::registry::write_key_ok(&path, process::current_uid()) {
+                return STATUS_ACCESS_DENIED as i64;
+            }
             status(crate::registry::delete_key(&path), STATUS_OBJECT_NAME_NOT_FOUND)
+        }
+
+        // NtNotifyChangeKey(KeyHandle, Event, ApcRoutine, ApcContext,
+        //                   *IoStatusBlock, CompletionFilter, WatchTree,
+        //                   *Buffer, BufferSize, Asynchronous). Only the
+        // asynchronous, Event-driven shape: ApcRoutine/ApcContext/
+        // IoStatusBlock/CompletionFilter/Buffer/BufferSize/Asynchronous are
+        // all ignored — a caller waits on `Event` the normal way
+        // (`NtWaitForSingleObject`) instead of THOS delivering an APC or
+        // blocking this call itself. Registers a one-shot watch: `Event` is
+        // signalled the *next* time this key (or, with WatchTree != 0,
+        // anything under it) changes; a fired watch needs a fresh call to
+        // re-arm, same as real NT.
+        NT_NTNOTIFYCHANGEKEY => {
+            let Some(path) = process::current_regkey(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            let Some(ev) = process::current_event(a1 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            let watch_tree = stack(2) != 0;
+            crate::registry::watch(&path, watch_tree, ev);
+            STATUS_SUCCESS as i64
+        }
+
+        // NtEnumerateKey(KeyHandle, Index, KeyInformationClass,
+        //                *KeyInformation, Length, *ResultLength). Only
+        //                KeyBasicInformation (class 0): { i64 LastWriteTime
+        //                (zero — not tracked); u32 TitleIndex; u32 NameLength;
+        //                WCHAR Name[] }. Enumeration order is the tree's
+        //                natural (sorted) order; STATUS_NO_MORE_ENTRIES once
+        //                `Index` runs past the last subkey.
+        NT_NTENUMERATEKEY => {
+            let Some(path) = process::current_regkey(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            if a2 != 0 {
+                return STATUS_INVALID_INFO_CLASS as i64;
+            }
+            let Some(name) = crate::registry::enumerate_key(&path, a1 as usize) else {
+                return STATUS_NO_MORE_ENTRIES as i64;
+            };
+            let name_len = name.len() * 2; // UTF-16LE; registry names are ASCII here
+            let need = 16 + name_len;
+            let ret_len = stack(1);
+            if ret_len != 0 {
+                unsafe { *(ret_len as *mut u32) = need as u32 };
+            }
+            if (stack(0) as usize) < need {
+                return STATUS_BUFFER_TOO_SMALL as i64;
+            }
+            unsafe {
+                let b = a3 as *mut u8;
+                *(b as *mut i64) = 0; // LastWriteTime
+                *(b.add(8) as *mut u32) = 0; // TitleIndex
+                *(b.add(12) as *mut u32) = name_len as u32;
+                for (i, c) in name.encode_utf16().enumerate() {
+                    *(b.add(16 + i * 2) as *mut u16) = c;
+                }
+            }
+            STATUS_SUCCESS as i64
+        }
+
+        // NtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass,
+        //                     *KeyValueInformation, Length, *ResultLength).
+        //                     Only KeyValueBasicInformation (class 0):
+        //                     { u32 TitleIndex; u32 Type; u32 NameLength;
+        //                     WCHAR Name[] } — data itself comes from a
+        //                     follow-up NtQueryValueKey by name, same as real
+        //                     NT's typical RegEnumValue two-call pattern.
+        NT_NTENUMERATEVALUEKEY => {
+            let Some(path) = process::current_regkey(a0 as i32) else {
+                return STATUS_INVALID_HANDLE as i64;
+            };
+            if a2 != 0 {
+                return STATUS_INVALID_INFO_CLASS as i64;
+            }
+            let Some((name, ty, _len)) = crate::registry::enumerate_value(&path, a1 as usize) else {
+                return STATUS_NO_MORE_ENTRIES as i64;
+            };
+            let name_len = name.len() * 2;
+            let need = 12 + name_len;
+            let ret_len = stack(1);
+            if ret_len != 0 {
+                unsafe { *(ret_len as *mut u32) = need as u32 };
+            }
+            if (stack(0) as usize) < need {
+                return STATUS_BUFFER_TOO_SMALL as i64;
+            }
+            unsafe {
+                let b = a3 as *mut u8;
+                *(b as *mut u32) = 0; // TitleIndex
+                *(b.add(4) as *mut u32) = ty;
+                *(b.add(8) as *mut u32) = name_len as u32;
+                for (i, c) in name.encode_utf16().enumerate() {
+                    *(b.add(12 + i * 2) as *mut u16) = c;
+                }
+            }
+            STATUS_SUCCESS as i64
         }
 
         // LdrGetProcedureAddress(DllHandle, *AnsiName(STRING), Ordinal, *Address)
@@ -1056,6 +1590,37 @@ unsafe fn write_iosb(iosb: u64, status: u32, information: u64) {
     if iosb != 0 {
         *(iosb as *mut u32) = status;
         *((iosb + 8) as *mut u64) = information;
+    }
+}
+
+/// Capture `frame`'s register state as `apc::Regs`, with `status_ax`
+/// pre-loaded as `Rax` — what the interrupted call will appear to have
+/// returned once whatever APC gets staged over this state finally resumes
+/// via `NtContinue`'s own tail. Shared by `NtTestAlert` (`STATUS_SUCCESS`)
+/// and an alertable `NtWaitForSingleObject` short-circuit (`STATUS_USER_APC`).
+fn frame_regs(frame: &UserFrame, status_ax: u32) -> crate::apc::Regs {
+    let (cs, ss) = process::user_selectors();
+    crate::apc::Regs {
+        rax: status_ax as u64,
+        rcx: 0,
+        rdx: frame.rdx,
+        rbx: frame.rbx,
+        rsp: frame.rsp,
+        rbp: frame.rbp,
+        rsi: frame.rsi,
+        rdi: frame.rdi,
+        r8: frame.r8,
+        r9: frame.r9,
+        r10: frame.r10,
+        r11: frame.r11,
+        r12: frame.r12,
+        r13: frame.r13,
+        r14: frame.r14,
+        r15: frame.r15,
+        rip: frame.rip,
+        rflags: frame.rflags,
+        cs,
+        ss,
     }
 }
 
@@ -1153,13 +1718,56 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
                 set_last_error(ERROR_FILE_NOT_FOUND);
                 return INVALID_HANDLE_VALUE;
             }
-            let path = win_path_to_thos(&name);
-            let fd = crate::syscall::open_resolved(&path);
-            if fd < 0 {
-                set_last_error(ERROR_FILE_NOT_FOUND);
-                INVALID_HANDLE_VALUE
-            } else {
-                fd // the fd is the HANDLE
+            // `access` (a1): GENERIC_READ=0x8000_0000, GENERIC_WRITE=0x4000_0000
+            // — the same DAC check `open`/`openat` go through now, just fed
+            // from `DesiredAccess` instead of `O_ACCMODE`.
+            let want_read = a1 & 0x8000_0000 != 0;
+            let want_write = a1 & 0x4000_0000 != 0;
+            // The `\Device\` + drive-letter object namespace resolves the
+            // drive letter (or an explicit `\Device\...` name) to an actual
+            // backing device *before* any path lookup happens — a typo'd or
+            // unmapped drive letter is a real failure now, not a silent
+            // alias onto the ext2 root.
+            let Some((dev, path)) = crate::device::resolve(&name) else {
+                set_last_error(ERROR_PATH_NOT_FOUND);
+                return INVALID_HANDLE_VALUE;
+            };
+            match dev {
+                crate::device::Device::Ext2 => {
+                    let fd = crate::syscall::open_resolved_access(&path, want_read, want_write);
+                    if fd == crate::syscall::EACCES {
+                        set_last_error(ERROR_ACCESS_DENIED);
+                        INVALID_HANDLE_VALUE
+                    } else if fd < 0 {
+                        set_last_error(ERROR_FILE_NOT_FOUND);
+                        INVALID_HANDLE_VALUE
+                    } else {
+                        fd // the fd is the HANDLE
+                    }
+                }
+                // `\Device\CdRom0`: real FAT32 content, genuinely read-only
+                // — a real CD-ROM device wouldn't accept GENERIC_WRITE
+                // either, so that's checked before touching the volume at
+                // all, not discovered only once a write is attempted.
+                crate::device::Device::Cdrom => {
+                    if want_write {
+                        set_last_error(ERROR_ACCESS_DENIED);
+                        return INVALID_HANDLE_VALUE;
+                    }
+                    let Some(vol) = crate::device::open_cdrom() else {
+                        set_last_error(ERROR_FILE_NOT_FOUND);
+                        return INVALID_HANDLE_VALUE;
+                    };
+                    let Some(bytes) = vol.read_path(&path) else {
+                        set_last_error(ERROR_FILE_NOT_FOUND);
+                        return INVALID_HANDLE_VALUE;
+                    };
+                    let Some(task) = sched::current().task() else {
+                        set_last_error(ERROR_INVALID_HANDLE);
+                        return INVALID_HANDLE_VALUE;
+                    };
+                    task.fd_alloc(crate::file::FatFile::new(bytes)) as i64
+                }
             }
         }
 
@@ -1236,8 +1844,36 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
             }
             base => base as i64,
         },
-        // VirtualFree / VirtualProtect: no teardown / per-page protection yet.
-        NT_VIRTUALFREE | NT_VIRTUALPROTECT => 1,
+        // VirtualFree: no teardown yet (see process.rs's Process::teardown
+        // for whole-process reclaim; a live VirtualFree/decommit of a
+        // sub-range is still a stub).
+        NT_VIRTUALFREE => 1,
+
+        // VirtualProtect(lpAddress, dwSize, flNewProtect, lpflOldProtect).
+        // Real per-page W^X now (Process::protect / vmm::protect_page_in),
+        // not a no-op stub.
+        NT_VIRTUALPROTECT => {
+            let Some((w, x)) = win32_protect_to_wx(a2 as u32) else {
+                set_last_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            };
+            let Some(proc) = sched::current_proc() else {
+                set_last_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            };
+            match proc.protect(a0, a1.max(1), w, x) {
+                Some((old_w, old_x)) => {
+                    if a3 != 0 {
+                        unsafe { *(a3 as *mut u32) = wx_to_win32_protect(old_w, old_x) };
+                    }
+                    1
+                }
+                None => {
+                    set_last_error(ERROR_INVALID_ADDRESS);
+                    0
+                }
+            }
+        }
 
         NT_GETPROCESSHEAP => PE_PROCESS_HEAP as i64,
 
@@ -1280,13 +1916,7 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
             }
             let deadline =
                 crate::timer::now().saturating_add(((ms as u64) * crate::timer::TICK_HZ / 1000).max(1));
-            while crate::timer::now() < deadline {
-                if w.try_take(tid) {
-                    return 0;
-                }
-                sched::yield_now();
-            }
-            if w.try_take(tid) { 0 } else { WAIT_TIMEOUT }
+            if w.wait_until(tid, deadline) { 0 } else { WAIT_TIMEOUT }
         }
 
         // CRT-startup helpers. CriticalSection is a no-op (the CRT locks it
@@ -1721,26 +2351,6 @@ fn dispatch_msvcrt(idx: u16, frame: &mut UserFrame) -> i64 {
             0
         }
     }
-}
-
-/// A crude Windows→THOS path map: strip a leading `X:\`, turn `\` into `/`,
-/// force absolute. Good enough for `C:\...` / bare names until the
-/// `\Device\` + drive-letter VFS view lands.
-fn win_path_to_thos(win: &str) -> alloc::string::String {
-    let b = win.as_bytes();
-    let s = if b.len() >= 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
-        &win[2..] // drop the "X:" drive prefix, keep the separator
-    } else {
-        win
-    };
-    let mut out = alloc::string::String::from("/");
-    for part in s.split(|c| c == '\\' || c == '/').filter(|p| !p.is_empty()) {
-        if out.len() > 1 {
-            out.push('/');
-        }
-        out.push_str(part);
-    }
-    out
 }
 
 /// Normalise a module name for an `Ldr` lookup: drop any directory, lowercase,

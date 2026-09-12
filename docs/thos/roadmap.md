@@ -55,7 +55,23 @@ late.
     file), `mkdir_path`, `unlink_path`, `rmdir_path`; primary superblock +
     group-descriptor counts kept in sync, and the **backup SB + GDT re-synced
     from the primary after every mutation** (`sparse_super` honoured) so a
-    multi-group filesystem stays `e2fsck`-clean. `unlink`/`rmdir`/`unlinkat`
+    multi-group filesystem stays `e2fsck`-clean.
+    **`write_path_owned`'s overwrite path is crash-safe** — it used to free
+    the old blocks *before* repointing the inode to the new ones, so a
+    crash in that window left the bitmap and the inode disagreeing (real
+    structural inconsistency). Now the inode patch (a single-sector,
+    genuinely atomic write — one ext2 inode never straddles a sector) comes
+    *first*; freeing the old blocks after means a crash anywhere in the
+    operation leaves either the exact old file or the exact new one, never
+    something in between — the residual cost is at worst a leaked block,
+    `fsck`-recoverable, not corruption. Verified with a real crash
+    injection (a `regcrashtest` kernel feature halts QEMU with a controlled
+    `isa-debug-exit` planted *inside* the overwrite path, at the exact
+    instant under test — not a blkdebug approximation): `cargo xtask
+    registry-crash-test` boots once to trigger it, confirms `e2fsck` finds
+    exactly the expected leaked-block trace (not worse) and fixes it
+    cleanly, then reboots the same disk and confirms the new content
+    survived. `unlink`/`rmdir`/`unlinkat`
     syscalls wired. `cargo xtask ext2-test` runs on a **2-block-group** image:
     the kernel creates a file/dir/nested file, then deletes files + dirs
     (rejecting a non-empty `rmdir`), and the host runs `e2fsck -fn` against
@@ -385,19 +401,43 @@ late.
     the routine then `NtContinue(&ctx, TestAlert=TRUE)`, so a run of queued APCs
     unwinds one dispatcher call at a time before the interrupted code resumes.
     `pe-test` queues an APC to itself, `NtTestAlert`s, checks the handler ran
-    (`PE APC OK`). Kernel-mode APCs / alertable `NtWaitForSingleObject` land
-    with the timer wheel. `QueueUserAPC` (Win32) layers straight on top.
-  - **Minimal configuration registry.** `crate::registry`: one global key tree
-    of typed values addressed by `\`-separated path, seeded with
-    `\Registry\Machine` + `\Registry\User` on first use. Backs `NtCreateKey`,
-    `NtOpenKey`, `NtSetValueKey`, `NtQueryValueKey`
-    (`KeyValuePartialInformation`) and `NtDeleteKey` on the SSDT;
+    (`PE APC OK`).
+    **Alertable `NtWaitForSingleObject` — done.** `Alertable` (its 2nd
+    argument) used to be read by nobody at all. Now: an already-pending
+    APC is delivered instead of the wait ever touching the object — same
+    `apc::take_and_stage` mechanism `NtTestAlert` uses, `STATUS_USER_APC`
+    staged as `Rax` instead of `STATUS_SUCCESS`. Real, stated scope limit:
+    a *cross-thread* APC arriving while already blocked isn't reachable
+    yet — `NtQueueApcThread` only ever targets the calling thread itself
+    today (any other handle is `STATUS_INVALID_HANDLE`), so that half of
+    the real feature has no way to fire regardless. Verified in `pe-test`
+    with a call built to hang forever if the short-circuit doesn't fire
+    (`Alertable=TRUE`, `Timeout=NULL`, on an event nothing will ever
+    signal) — passed first try, `PE APC alertable-wait OK`.
+    `QueueUserAPC` (Win32) layers straight on top; kernel-mode APCs are
+    unrelated future work.
+  - **Configuration registry, grown to persisted hives.** `crate::registry`:
+    one global key tree of typed values addressed by `\`-separated path,
+    seeded with `\Registry\Machine` + `\Registry\User` on first use. Backs
+    `NtCreateKey`, `NtOpenKey`, `NtSetValueKey`, `NtQueryValueKey`
+    (`KeyValuePartialInformation`), `NtDeleteKey`, and **`NtEnumerateKey` /
+    `NtEnumerateValueKey`** (`KeyBasicInformation` / `KeyValueBasicInformation`,
+    index-based, `STATUS_NO_MORE_ENTRIES` past the end — the real
+    `RegEnumKey`/`RegEnumValue` two-call pattern) on the SSDT;
     `OBJECT_ATTRIBUTES.ObjectName` (+ `RootDirectory`) resolves to a path. A key
-    HANDLE is a `HandleObject::RegKey(path)` in the unified table. `pe-test`
+    HANDLE is a `HandleObject::RegKey(path)` in the unified table.
+    **Each top-level root (`machine\software`, `machine\system`, `user`) is a
+    hive** — its own backing file under `/etc/thos/registry/*.hiv` on ext2,
+    loaded once at boot before anything can touch the registry, rewritten on
+    every mutation under it (a from-scratch text format, not
+    regf-binary-compatible — THOS only reads its own hives). `pe-test`
     round-trips create → set → close → reopen → query → delete → reopen-fails
-    (`PE registry OK`). Not transactional / persisted / enumerable yet —
-    hive files, `NtEnumerateKey`/`Value`, change-notify and per-key security
-    come with the registry phase.
+    (`PE registry OK`); `registry_enum_check()` (every boot) exercises
+    enumeration order + `STATUS_NO_MORE_ENTRIES` directly. Verified with a
+    real two-boot round trip on one disk image (boot 1 writes the hive, boot 2
+    loads it back). Per-key security and change-notify landed with the
+    security phase (see "Capability policy" below); still not transactional
+    (a crash mid-write can lose that one write).
   - **Mutant + semaphore + `NtWaitForMultipleObjects`.** `wait.rs` gains a
     counting `Semaphore` and a recursive thread-owned `Mutant`; `process.rs` a
     polymorphic `Waitable` (event / semaphore / mutant) with
@@ -418,22 +458,245 @@ late.
     (`sched::current().id`) distinguishes threads within a process; a `THREAD_EXITS`
     map gives each worker a manual exit event, so `NtWaitForSingleObject` on the
     returned handle completes on exit. `PE thread ran` / `PE thread OK`.
-  - **Section objects.** `HandleObject::Section` — anonymous (zeroed) or a copy
-    of a file's bytes at create time. `NtCreateSection` / `NtMapViewOfSection`
-    (copies the range into fresh private RW pages; CR3 is the process's so the
-    copy writes straight to the user VA). No shared writeback / COW yet.
-    `PE section OK`.
-  - **Then (the phase):** the *full* boundary — either Wine's `__wine_unix_call`
-    unixlib + a wineserver-equivalent on the executive (run Wine's PE DLLs
-    unmodified), or a from-scratch `ntdll` — a preemption-safe path out of a PE
-    syscall (ring-3 IRQ `swapgs` shim so PE threads can run `IF=1`), a
-    fully-blocking timed object wait (dual-enqueue: object queue + wheel),
-    multiple threads per process, shared-writeback sections, the registry grown
-    to hives; then process isolation / integrity for the security phase.
+  - **Section objects.** `HandleObject::Section` — backed by real physical
+    frames (`process::Section`), not a copy: `NtMapViewOfSection` maps a
+    section's own frames into the caller's page tables, so every view of one
+    section (same process or a different one) shares the same memory — a
+    write through one view is visible through all the others immediately, at
+    the MMU, with no copy. Anonymous sections start zeroed; file-backed ones
+    seed from the file's bytes at create time and keep the file open so
+    `NtFlushVirtualMemory` (or an implicit flush on `NtUnmapViewOfSection`)
+    can write the current bytes back to it. `Process::unmap_view` tears the
+    PTEs down (`vmm::unmap_page_in`, `invlpg`'d) without freeing the shared
+    frames — a section's frames outlive any one view. `PE section OK`;
+    `section_sharing_check` proves cross-view write visibility and genuine
+    ext2 writeback on real boot (`ext2-test`).
+  - **`Ext2File`** (`file.rs`): the missing piece that makes file-backed
+    writeback real — a `FileOps` impl for actual ext2 regular files
+    (read/write, whole-file-rewrite-on-write via `Ext2::write_path`, same
+    "rewrite it all, synchronously" pattern as the registry hives). Replaces
+    the old read-only `MemFile` at the one call site (`syscall::open_resolved`,
+    shared by POSIX `open`/`openat` and `CreateFileA`) — every open handle,
+    including the ones `NtCreateSection` seeds a section from, is now
+    genuinely writable.
+  - **Done since:** the ring-3 IRQ `swapgs` shim (PE threads run `IF=1`,
+    preemptible — `3aabdbd`); a fully-blocking timed object wait (dual-enqueue:
+    object queue + timer wheel — `33a5c79`); a real **multi-object wait-block**
+    for `NtWaitForMultipleObjects` (`wait::wait_any_until` parks the thread on
+    every involved object's queue at once, locked in fixed address order so an
+    overlapping wait set can't deadlock, instead of the old re-poll-every-tick
+    loop — `b42e8eb`; `multi_wait_milestone` proves WaitAny/WaitAll both block
+    and wake correctly with two threads on an overlapping set concurrently);
+    a scheduler stale-`ctx`/phantom-ready-queue race found and fixed
+    (`db9e59f`, `1c2358a` — smp-test 46/46 incl. under host load); the
+    **registry** grown to persisted hives (three `.hiv` files under
+    `/etc/thos/registry`, loaded once at boot, rewritten synchronously on
+    every mutation — verified with a genuine two-boot load-from-disk
+    round-trip — `6cb2c10`); **shared-writeback sections** (above).
+  - **Decided: the Wine/`ntdll` boundary.** Staying on the from-scratch
+    `ntdll` — not Wine's `__wine_unix_call` unixlib + a wineserver-equivalent.
+    Wine isn't a component that bolts on: it brings its own object model, its
+    own wineserver IPC protocol, its own view of processes/handles/sync
+    objects, all of which would need reimplementing on THOS's executive
+    anyway — no less work than the from-scratch path, just against someone
+    else's moving target instead of THOS's own design, and it would mean
+    discarding a `ntdll` that already works (SSDT dispatch, PE loader,
+    sections, hive registry, multi-object wait, real mingw-CRT programs
+    running to exit).
+  - **GDI32/User32 skeleton** (new synthetic `gdi32.dll`/`user32.dll`,
+    alongside `kernel32`/`ntdll`/`msvcrt`, same trampoline-page mechanism):
+    `GetDC`/`ReleaseDC`/`GetSystemMetrics`, `GetStockObject`/
+    `CreateSolidBrush`/`SelectObject`, `SetPixel`/`GetPixel`/`Rectangle` —
+    real pixel writes into the boot framebuffer (mapped into THOS's own
+    tables via `vmm::map_mmio`, same VA Limine used), not a stub. One DC (the
+    whole screen), a brush is just a colour — no window objects, no
+    compositor, no WndProc callback yet. `gdi_paint_check` (kernel-internal,
+    same rationale as `registry_enum_check`/`section_sharing_check`) verifies
+    fill bounds, the SetPixel/GetPixel round-trip, and brush/select-object
+    semantics against the real framebuffer on boot.
+  - **The ring-3 callback mechanism.** The piece real windows need —
+    calling from a kernel syscall handler into arbitrary ring-3 code and
+    getting a return value back *within that same syscall* — is built and
+    proven: `CallWindowProcA` (`dispatch_user32`) stashes the calling
+    syscall's own `UserFrame` per-thread (`process::push/pop_callback_frame`,
+    LIFO — a callback that triggers another nests correctly), builds a fresh
+    ring-3 call frame on the caller's own (otherwise idle) stack — real
+    args in `rcx`/`rdx`/`r8`/`r9`, return address pointing at a small new
+    trampoline page (`pe::PE_CALLBACK_RETURN_ADDR`) — and resumes into it
+    via `seh::thos_exc_resume` (the same IRETQ-based primitive `NtContinue`
+    already uses to resume an arbitrary saved context). The trampoline runs
+    *after* the ring-3 function returns, on the caller's stack, and calls a
+    new `NtCallbackReturn` (`ntdll`, index 41), which pops the stashed frame,
+    writes the callback's result into its `rax`, and resumes *that* via
+    `syscall::thos_user_resume` — so the original syscall (`CallWindowProcA`)
+    ends up returning the callback's value, exactly as if it had done the
+    call itself. One real bug found and fixed en route: a stashed
+    `syscall::UserFrame` carries garbage in `.cs`/`.ss` (dead slots on the
+    normal `sysretq` fast path — `thos_user_resume`'s IRETQ needs both, and
+    without filling them in first, resuming faulted with `#GP`). Verified
+    with a genuine ring-3 round-trip (`CallWindowProcA` calling an inline
+    callback in the test PE's own code, computing `msg+wParam-lParam` and
+    handing the result back) — this is inherently a real-CPU-privilege-
+    transition test, not something a kernel-internal Rust check can stand
+    in for, so (unlike sections/registry/multi-wait) it's a hand-assembled
+    `pe-test` scenario, printing `PE callback OK`.
+  - **Real windows** (`window.rs`, new): `RegisterClassA` (class name →
+    `WndProc`), `CreateWindowExA` (→ `HWND`, queues its own `WM_CREATE`),
+    `PostMessageA`/`PostQuitMessage` and a genuine per-thread message queue
+    (`GetMessageA` really blocks on it — `WaitQueue`, same pattern as the
+    console's input queue), `DispatchMessageA`/`UpdateWindow` driving the
+    target `WndProc` for real, in ring 3, through the callback mechanism
+    above (`UpdateWindow` *sends* — a direct call, bypassing the queue,
+    matching real Win32). `ShowWindow`/`DefWindowProcA`/`TranslateMessage`
+    are still close to no-ops (no compositor, no default painting, no
+    keyboard→message pipeline yet) — deliberately: this increment was the
+    message-loop plumbing, not window rendering.
+    Verified with a real message-loop round trip in `pe-test`
+    (`RegisterClassA` → `CreateWindowExA` → `PostMessageA` a custom message
+    → a real `GetMessageA`/`DispatchMessageA` loop drives the test's own
+    `WndProc`, which calls `PostQuitMessage` with the message's `wParam` →
+    the loop exits on `WM_QUIT` → the `MSG`'s `wParam` is checked to have
+    survived the whole round trip) — prints `PE window OK`.
+  - **Window-relative GDI.** `GetDC(hwnd)` for a real window now returns a
+    DC tagged with that `hwnd` (`gdi::WINDOW_DC_TAG`, distinct from the
+    fixed screen DC `1` `GetDC(0)` still returns) instead of always meaning
+    "the whole screen". `gdi::resolve_dc` turns a tagged DC into an origin
+    (the window's `(x, y)`, from `window::rect_of`) and a clip rectangle
+    (the window's rect intersected with the screen) that `SetPixel`/
+    `GetPixel`/`Rectangle` all go through — client-relative coordinates in,
+    real (offset, clipped) screen pixels out, same as real Win32. Each DC
+    also got its own current-brush colour (`gdi::BRUSHES`, keyed by DC
+    handle) instead of the one global the whole-screen-only version had —
+    needed the moment more than one DC (screen + any window) can exist at
+    once. Verified by extending `gdi_paint_check` (kernel-internal, same
+    rationale as the earlier GDI/registry/section checks) with a real
+    window: drawing through its DC lands at the window's screen origin, not
+    the screen DC's own origin or the window's own drawing leaking outside
+    its rect — passes on real boot.
+  - **Process address-space teardown**, closing a gap `process.rs`'s own
+    module doc used to flag ("no address-space teardown (a reaper frees the
+    frames later)"): every process's PML4/page-table frames and image/stack/
+    heap pages now genuinely go back to `FRAME_ALLOC` when it exits or
+    `execve`s away, instead of leaking for the rest of the boot. A dead
+    process's memory not lingering (rather than sitting there, freeable by
+    accident, potential fodder for a use-after-free elsewhere) is itself
+    part of what "process isolation" means, alongside the per-process page
+    tables THOS already had.
+    - `Process::teardown`: unmaps every section view first (giving back the
+      PTEs, never the frames — those belong to the `Section`, still possibly
+      live elsewhere), then walks PML4[0..256] (the user half only) freeing
+      every present leaf frame plus the PT/PD/PDPT frames that mapped them,
+      then the PML4 itself.
+      **Caller's responsibility, not the function's**: the process's
+      `pml4_phys` must not be the live CR3 on *any* CPU, now or ever again.
+      Two call sites establish that: `execve`, right after its own explicit
+      `Cr3::write` off the old space (`Task::swap_space`, not `set_space` —
+      keeps the old `Process` alive until *this* code chooses to drop it,
+      not whenever the assignment happens to run); `sched::reap`, once
+      `Task::thread_exited` reports a task's last thread gone (not the
+      `Task`'s own `Arc` strong count — always >= 2 for its whole life,
+      since `TASKS` holds a permanent reference until some parent `wait4`s
+      it, which plenty of THOS's test-spawned processes never get; a new
+      `active_threads` counter, incremented by every `sched::spawn_user*`,
+      is the real signal for "no thread of this process can still be
+      running anywhere").
+    - **A real, pre-existing scheduler bug found and fixed along the way**:
+      `sched::exit()` held the thread it was switching *into* (`next`) in a
+      local variable across `thos_ctx_switch`, which never returns for that
+      call (the stack is dead the instant it jumps away) — so `next`'s Drop
+      glue never ran, permanently leaking one `Arc<Thread>` reference onto
+      whichever thread `next` happened to be. Invisible before (nothing
+      depended on an exact refcount), but it silently defeated `reap()`'s
+      own `Arc::strong_count == 1` liveness check for roughly half of every
+      batch of exited threads — always dropping to the exact same frame
+      count with 8 test processes and never budging across 40 retries. Found
+      by bisecting with a debug trace of `reap()`'s graveyard, `finish_switch`,
+      and `SCHED`'s per-CPU state until the missing drop was visible
+      directly. Fixed with one explicit `drop(next)` before the point of no
+      return.
+    - Also fixed along the way: an earlier attempt drove `reap()` from every
+      idle CPU's hot loop for automatic background reclaim — reverted after
+      it produced a real, timing-dependent hang (registry load one run,
+      mid-fork/exec the next) under concurrent idle-loop lock traffic on
+      `SCHED`. `reap()` stays explicitly-driven for now (a real reaper
+      thread, paced sanely rather than spinning every idle iteration, is
+      future work); the discipline that caught this — real boot tests, not
+      "it compiles" — held again.
+    - Verified with a genuine before/after frame-count check
+      (`process_teardown_check`, kernel-internal): spawn and exit a batch of
+      real user processes, force `reap()` (interleaved with `yield_now` so
+      an exiting thread's own CPU gets to run `finish_switch` first — same
+      pattern the stress milestone's reap-loop already used), and assert
+      `FRAME_ALLOC`'s free count is back exactly where it started. Passes on
+      real boot; full regression sweep green (ext2-test, pe-test, smp-test —
+      the concurrency-heaviest one, unaffected — login-test, kbd-test).
+  - **Real W^X / per-page memory protection** — the other half of "Security
+    Core: … W^X + memory protection" from the security-architecture section
+    below, and the other piece `nt.rs` used to flag as a stub
+    (`VirtualProtect`/`VirtualFree`: "no teardown / per-page protection yet"
+    — `VirtualAlloc` granted RW/NX regardless of the `flProtect` a caller
+    asked for). `Process::protect` (`vmm::protect_page_in`, `update_flags` +
+    an immediate `invlpg` — the caller may keep running on this CR3 right
+    after and must not still see the old permissions) now really flips the
+    `WRITABLE`/`NO_EXECUTE` PTE bits, wired into both `VirtualProtect`
+    (Win32) and `NtProtectVirtualMemory` (native), including the
+    previous-protection readback (`lpflOldProtect`/`OldProtect`) both report.
+    Real `VirtualProtect` semantics: the whole region must already be
+    committed or the call fails entirely, unchanged (`vmm::page_present_in`
+    pre-validates every page before touching any of them).
+    Known simplification, stated rather than silently wrong:
+    `PAGE_NOACCESS` isn't supported (THOS has no true mapped-but-inaccessible
+    page state yet — rejected rather than granting access anyway); the
+    `_WRITECOPY` variants collapse to plain read-write (no real
+    copy-on-write yet, same gap `process.rs`'s own module doc already names).
+    Verified with genuine hardware-level enforcement in `pe-test`, not just
+    bookkeeping: `VirtualAlloc` a page (RW/NX by default), hand-write a tiny
+    function into it, `VirtualProtect` it to `PAGE_EXECUTE_READ` (checking
+    the reported old protection is `PAGE_READWRITE`), then actually *call*
+    into it — only reachable if the NX bit genuinely got cleared, not merely
+    recorded — then flip to `PAGE_READONLY` and check that old-protection
+    readback too. Passes on real boot first try, prints `PE protect OK`;
+    full regression sweep green (ext2-test, pe-test, smp-test, login-test).
+  - **Then (the phase):** the rest of process isolation / integrity for the
+    security phase — the NT personality's remaining phase-3 items (below)
+    are mostly done; a compositor / real window rendering is a plausible
+    detour but not required to get there.
 - **NT personality**: SSDT dispatch; `Nt*` core (`NtCreateFile` / `NtReadFile` /
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
   transactional key-value store; **SEH** ↔ trap dispatch; **APC** delivery.
+  - **`\Device\` namespace + drive letters — done, `kernel/src/device.rs`.**
+    Real name resolution, the way NT actually does it, replacing what used
+    to be a crude "strip any `X:\` prefix" (every drive letter silently
+    aliased the same ext2 root — `D:\foo` and `C:\foo` were
+    indistinguishable, a typo'd drive letter just worked). A small, fixed
+    table (no dynamic mount/unmount yet): `\Device\HarddiskVolume1` (`C:`)
+    is the ext2 filesystem, read/write; `\Device\CdRom0` (`D:`) is the boot
+    ISO's FAT32 ESP, read-only — real, already-mounted content
+    (`/EFI/THOS/HELLO.TXT`, the same file the GPT/FAT boot milestone reads),
+    not a synthetic second volume invented just to exercise this. A path
+    can also name the device directly (`\Device\CdRom0\...`), bypassing the
+    drive letter. An unmapped drive letter or unrecognised `\Device\...`
+    name is now a real failure (`ERROR_PATH_NOT_FOUND`), not a silent alias.
+    `NtCreateFile`/`CreateFileA` resolves through this before any path
+    lookup; the `Cdrom` branch rejects `GENERIC_WRITE` up front (a real
+    CD-ROM wouldn't accept one either) and hands back a new `FatFile`
+    (`file.rs`) — same shape as `Ext2File` but genuinely read-only.
+    Verified with a real ring-3 round trip: `wincon.c` (already a real
+    mingw-w64-compiled PE) now also opens `D:\EFI\THOS\HELLO.TXT` and reads
+    the real FAT content back, confirms a `GENERIC_WRITE` open on that same
+    path is denied, and confirms `Z:\nope.txt` (unmapped) now genuinely
+    fails — three new `pe-test` markers, the existing `C:\pe-read.txt`
+    round trip unaffected (same device, same posix path). Full regression
+    sweep green.
+  - Registry status: hives (load/persist to ext2), **per-key security**,
+    **change-notify** (`NtNotifyChangeKey`), and **crash-safe overwrite
+    ordering** all done — see "Capability policy" under Security Core
+    below and the `write_path` crash-safety fix noted in Phase 2's own ext2
+    status. Not full transactions/journaling (still correctly listed as
+    missing in `ext2.rs`'s own module doc) — the one real corruption
+    window this operation had is closed; the residual cost of a crash
+    mid-write is a leaked, fsck-recoverable block, never inconsistency.
 - Write the `ntdll` lower boundary; layer **Wine PE-built DLLs** (`kernel32` /
   `kernelbase` / `user32` core) on top.
 - **Milestone 3:** a statically linked Win32 **console** `.exe` (`CreateFile`,
@@ -676,11 +939,18 @@ Phasing:
     the session `Principal` (uid 1000 — the admin session is unprivileged) is
     stamped onto every task and returned by `getuid`/`getgid`. `cargo xtask
     login-test`: setup runs once, reboot goes straight to login, a wrong
-    password is rejected. Still stub: PBKDF2 not argon2id, no `Principal`
-    object proper, no file-owner enforcement, no `elevate` yet, password
+    password is rejected. **File-owner enforcement, `elevate`, and its
+    trusted path (SAK) are done too now** — see "Capability policy" under
+    Security Core below (DAC owner/group/other + `O_CREAT`/`chmod`/`chown`
+    + real gid; `elevate(path, argv, password)`, admin-only +
+    re-authenticated, spawns a brand-new uid-0 process; and Ctrl+Alt+Delete,
+    intercepted below any user-mode process, as the one real trusted path
+    into it). Still stub: PBKDF2 not argon2id, no `Principal` object proper
+    (uid/gid stand in for it), no NT SID / token / DACL side, password
     changing is "rewrite the store + reboot" not a settings action.
 - **Phase 3 (full):** SID / token model, NT DACL ↔ canonical-ACL translation, the
-  UAC path, the trusted-path prompt, privilege sets (`SeDebugPrivilege` …).
+  UAC path (SAK now covers the trusted-path prompt itself), privilege sets
+  (`SeDebugPrivilege` …).
 
 ## Phase 4 — Real graphics (the GPU mountain)
 
@@ -719,6 +989,234 @@ into ring 0."
   direction), W^X + memory protection, file-integrity baselines. Small, auditable,
   no parsing of untrusted formats beyond what the loaders already do (now
   hostile-input hardened).
+  - **Measured boot — done, in `loaders/thos-boot`** (the boot picker, not the
+    kernel — measurement only means anything if it happens *before* the next
+    stage runs, so it belongs to whatever hands off to that stage). Right
+    before `StartImage` on the chosen loader, `measure()` hashes its
+    already-`LoadImage`d bytes into the TPM via `EFI_TCG2_PROTOCOL` and logs
+    the event, into PCR 4 ("Boot Manager Code and Boot Attempts" per the TCG
+    PC Client spec — the right PCR for a boot manager extending whatever it's
+    about to hand control to). No TPM/TCG2 present (most dev/test machines,
+    plenty of real ones) → silently skipped, same boot either way —
+    measuring is additive, never a requirement. **Secure boot** (signing) is
+    a separate, mostly non-code concern noted where the boot picker's own
+    risks are listed (chainloading Microsoft's loader is fine; loading our
+    own *unsigned* kernel needs Secure Boot off or our keys enrolled on the
+    target board) — not attempted here.
+    Verified against a **real TPM 2.0**, not just "compiles": a new
+    `cargo xtask bootpick-tpm-test` attaches a real `swtpm` (TCG2, via QEMU's
+    `tpm-crb` device) to the same 3-disk OVMF picker test `bootpick-test`
+    already uses, and asserts the serial log shows the actual measurement
+    event (`measured \`THOS\` into TPM PCR 4`) — not a mocked success path.
+    Skips (not fails) if `swtpm` isn't on `PATH`, since it's optional test
+    tooling. `bootpick-test` itself (no TPM attached) still passes unchanged,
+    confirming the TPM path is genuinely optional. Both pass on real boot.
+  - **File-integrity baselines — done, `kernel/src/integrity.rs`.** SHA-256
+    (already vendored for `cred.rs`'s PBKDF2 — no new crypto dependency)
+    hashes of `integrity::BASELINE_FILES` (`/init`, `/rusthello` today — the
+    files every boot configuration is guaranteed to have; grows as more of
+    the system becomes something every boot can rely on being there),
+    recorded once to `/etc/thos/integrity.baseline` (the registry hives' /
+    credential store's own "own text format, hex-encoded fields"
+    convention) on the first boot that finds none stored, and recomputed +
+    compared against on every boot after. **Detection, not prevention** —
+    nothing here stops a write to a baselined file, it only notices
+    afterward that one happened; the building block a later on-access
+    scanner or boot-attestation flow reads, not a scanner itself.
+    Verified with a genuine three-boot round trip (`cargo xtask
+    integrity-test`), including real tamper detection, not a mocked one:
+    boot 1 (fresh disk) records the baseline; boot 2 (same disk, untouched)
+    verifies clean; `/init` is then overwritten *directly on the disk image
+    from the host* (`debugfs`, simulating an external tamper THOS itself
+    never did); boot 3 must report the mismatch — and does
+    (`THOS: integrity FAIL   /init does not match its baseline hash`),
+    genuinely before the kernel goes on to legitimately panic trying to
+    load the now-corrupt `/init` as an ELF (a real consequence of the
+    tamper, not a test bug — further proof the check ran, not skipped).
+    Full regression sweep otherwise unaffected: ext2-test, pe-test,
+    smp-test, login-test all still pass.
+  - **Capability policy — first slice done: real DAC file permissions.**
+    Before this, `ext2::Inode` didn't even parse `i_uid`/`i_gid` and no
+    syscall checked `mode` against the calling task's identity at all —
+    `open()` granted access regardless of owner or permission bits. Now
+    `Inode::access_ok(uid, want_write)` (owner/other tiers — no group tier
+    yet, THOS's identity model has no real group membership beyond the
+    `gid` a file carries; that gap is exactly what the wider capability-
+    policy work above this slice is meant to fill in, and uid `0` — the
+    system account, never an interactive session, see `cred.rs` — always
+    passes, matching real Unix root semantics) is the DAC check both
+    `open`/`openat` (finally reading the `O_ACCMODE` bits out of `flags`,
+    silently dropped before) and the NT personality's `CreateFileA`
+    (decided from `DesiredAccess` instead) now go through before handing
+    back a handle — `EACCES`/`ERROR_ACCESS_DENIED` otherwise.
+    Verified two ways: a real interactive-shell round trip (`cargo xtask
+    kbd-test`, extended) — logged in as the uid-1000 admin session,
+    `echo x > /etc/thos/admin.cred` against that mode-644-root-owned file
+    (every file `write_path` creates is `0`-owned today) genuinely fails at
+    the kernel's DAC check, and BusyBox's own shell reports it:
+    `sh: can't create /etc/thos/admin.cred: Permission denied` — not a
+    mocked denial. Full regression sweep otherwise green (ext2-test,
+    pe-test, smp-test, login-test, integrity-test) — every existing test
+    runs pre-login as uid `0`, so the bypass path keeps them all passing
+    unchanged.
+  - **Capability policy — second slice done: real file creation (`O_CREAT`)
+    + `chmod`/`chown`.** The first slice's own gap — `open()` could deny an
+    existing file, but there was no way to *create* one through a syscall
+    at all, and a file's owner/mode were permanent from the moment
+    `write_path` first wrote it. `open_resolved`'s `O_CREAT` now creates an
+    empty file owned by the calling task, gated on that task having write
+    permission on the *parent directory* (creating an entry is a write to
+    the directory, not the not-yet-existing file) — the same check
+    `SYS_MKDIR` now applies (a gap found live: a first pass had `mkdir`
+    skip it entirely, and a test `mkdir /newdir` at the real, root-owned
+    `/` silently succeeded before the fix). `chmod` requires owner-or-root;
+    `chown` is root-only — stricter, matching modern Unix, where not even
+    the owner can give a file away. A freshly provisioned uid otherwise had
+    no writable location anywhere on disk (every directory ever created was
+    system-owned mode 755) — `cred::save` now also creates `/home/<name>`
+    for the new account, closing that off, same as `useradd` making a real
+    Linux account a home directory.
+    Verified two ways: a real interactive-shell round trip (`cargo xtask
+    kbd-test`, extended) — logged in as `thos`, `cd /home/thos && touch
+    newfile && mkdir newdir && ls` shows both, genuine new inodes through
+    the syscall ABI (this is also what caught BusyBox `touch` needing a
+    real `SYS_UTIMENSAT` — it tries that first and only falls back to its
+    own `open(O_CREAT)` on `ENOENT`, so an unhandled syscall there silently
+    broke `touch` even after `O_CREAT` itself worked). `chmod`/`chown` have
+    no BusyBox applet to drive live, so they're proven at the ext2-layer +
+    permission-policy-logic level instead (`posix_owner_check`,
+    kernel-internal, same shape as `execgate_check`) — real, just not yet
+    exercised through the live syscall ABI by a dedicated test, same honest
+    scoping as `execve`'s exec-gate wiring below. Full regression sweep
+    green: ext2-test, pe-test, smp-test, login-test, integrity-test,
+    kbd-test.
+  - **Capability policy — third slice done: real group-tier DAC.** The
+    first slice's own stated gap — `gid` parsed and stamped on every file
+    but never actually checked, so a non-owner always landed in "other"
+    regardless of group. `Task` now carries a `gid` (== its `uid` — no
+    supplementary groups yet, the "user private group" scheme `cred::save`
+    already assumed naming a new account's home directory) and
+    `Inode::access_ok(uid, gid, want_write)` is a real three-tier check:
+    owner, then group (caller's gid matches the file's gid), then other.
+    `SYS_GETGID`/`SYS_GETEGID` return the real gid instead of quietly
+    aliasing `SYS_GETUID`.
+    Verified kernel-internal (`group_tier_check`, main.rs — THOS is still a
+    single-admin-account system, so there's no second uid/gid to drive this
+    live through a real shell, same scoping as chmod/chown's own
+    verification): a real file owned `(1000, 1000)`, chmod'd to `0640` via
+    the real `chmod_path`; the owner gets read+write, a *different* uid
+    sharing the file's gid gets read only, a uid matching neither gets
+    nothing, uid 0 always passes. Full regression sweep green: ext2-test,
+    pe-test, smp-test, login-test, integrity-test, kbd-test.
+  - **`elevate()` — first slice done.** The first real step off "no root
+    login — admin elevates" (Identity, privilege & login, above): a new
+    THOS-native syscall range (`THOS_BASE`, same shape as `nt::NT_BASE`)
+    carries `elevate(path, argv, password)`. Two real checks — admin-only
+    (`task.uid != cred::ADMIN_UID` is `EPERM` before the password is even
+    looked at; THOS has exactly one principal that can ever be admin) and
+    re-authentication (the freshly typed password checked against the real
+    credential store, not "you're already logged in") — then
+    `process::spawn_elevated` starts a **brand-new process** with uid/gid
+    forced to 0. THOS has no in-place token upgrade, so "scoped to that
+    process" falls out of the design for free: there is no elevated shell
+    or standing token to leak or reuse for a later action.
+    Verified with a genuine round trip, not "the syscall returned 0": a new
+    test binary `/do-elevate` calls the real syscall via a raw `syscall`
+    instruction (no libc) with the actual admin password `drive_login`
+    sets up; on success it has spawned `/elevated-check`, which itself
+    calls `getuid()` and prints the result — proof the *spawned* process
+    really has uid 0. `cargo xtask kbd-test`: `elevate returned 22` (a real
+    pid) followed by `elevated-check uid=0`. Full regression sweep green.
+  - **`elevate()`'s trusted path (SAK) — done.** Closes exactly the gap the
+    slice above named: the password used to be whatever the calling
+    process handed the kernel, trusted only because THOS has one
+    interactive session and nothing else that could impersonate the
+    prompt. Now there's a real reason regardless: `console.rs` detects
+    Ctrl+Alt+Delete directly off the raw HID report the xHCI keyboard
+    thread feeds in — *before* any byte reaches the queue a `read()` on
+    fd 0 (any user-mode process) can ever see. No application-visible
+    input stream ever carries these keystrokes at all, so no app can fake
+    this prompt — not an approximation of "no app can impersonate it", the
+    actual property. On the combo: freezes normal input delivery, prints a
+    kernel-drawn banner straight to the console synchronously from the
+    keyboard interrupt path, reads the following keys into a private
+    buffer (masked, backspace-editable, never touching the normal queue)
+    until Enter, then re-authenticates against the real credential store
+    and calls `process::spawn_elevated` — the same primitive
+    `sys_elevate` uses — to run `/elevated-check` as uid 0 on success.
+    Deliberately the smallest real thing this can *lead to* (real Windows
+    SAK opens a whole secure desktop with several choices; THOS has no GUI
+    on this console) — one fixed, real privileged action, not a mocked
+    one.
+    Verified with genuine QEMU input, not typed characters the shell could
+    ever see: `cargo xtask kbd-test` sends the actual `ctrl-alt-delete`
+    combo via the QEMU monitor, confirms the kernel-drawn banner appears
+    outside any shell's own output, types a wrong password first (denied,
+    no spawn), then the real one (`THOS: SAK accepted` + a *second*,
+    independent `elevated-check uid=0` — the first came from `/do-elevate`
+    earlier in the same boot, so requiring a second proves this path
+    genuinely spawned its own process). Full regression sweep green.
+  - **Per-key registry security — done.** Closes one of `registry.rs`'s own
+    three stated gaps (transactions is still open — change-notify below).
+    Same
+    DAC shape as the filesystem: every `Key` gains an `owner_uid`
+    (default `0`, system — `ext2::Inode`'s own convention for an unset
+    owner); uid `0` or the key's own owner may write, anyone may still
+    read. `create`/`make` split the same way `write_path`/`mkdir_path`
+    were — `create_owned(path, uid)` stamps the real owner on every newly
+    auto-vivified ancestor (real `RegCreateKeyEx` behavior), an
+    already-existing key's owner is untouched by re-creating it. Because
+    the registry auto-creates missing ancestors (unlike the filesystem,
+    there's no single guaranteed-existing parent), `create_write_ok` walks
+    up to the nearest ancestor that *does* exist and checks that one — the
+    filesystem's "creating an entry is a write to the parent" rule,
+    generalized. The owner now persists too: the hive format gained an
+    `O <relpath> <uid>` record, omitted when `0` so an old hive with none
+    loads exactly as it always did — no format-version bump needed.
+    `nt.rs` is where this is actually enforced: `NtCreateKey` distinguishes
+    opening (read, unchecked) from creating (checked against the nearest
+    ancestor), `NtSetValueKey`/`NtDeleteKey` check the key itself —
+    `STATUS_ACCESS_DENIED` on a hit. Every process before a login session
+    exists runs as uid `0` — always permitted against any owner — so
+    `pe-test`'s existing NT registry round trip needed no changes at all.
+    Verified two ways: `registry_security_check` (main.rs, kernel-internal)
+    — a uid-1000-owned key accepts its own owner and root, rejects a
+    stranger; a system-owned key (every pre-existing hive key) is now
+    genuinely denied to a normal uid, the actual gap closed; persistence
+    checked for real by reading `/etc/thos/registry/software.hiv` straight
+    off ext2 afterward and asserting the raw hive text carries the `O`
+    record. Full regression sweep green: ext2-test, pe-test (the live NT
+    registry round trip, unaffected), smp-test, login-test,
+    integrity-test, kbd-test.
+  - **Registry change-notify (`NtNotifyChangeKey`) — done.** Closes the
+    second of `registry.rs`'s three stated gaps (only transactions left).
+    The asynchronous, Event-driven shape of the real call: THOS already has
+    real event/wait primitives (`wait.rs`), so this is "wire the registry
+    into them", not new blocking machinery — the synchronous shape (`Event`
+    omitted, the call itself blocks) isn't built. New `registry::watch(path,
+    watch_tree, event)` registers a one-shot signal, fired the next time
+    `path` (or, with `watch_tree`, anything under it) genuinely changes — a
+    change *on* the watched key or a *direct* child always counts (matches
+    real NT without `WatchTree`); anything deeper needs `watch_tree`. Wired
+    into `create_owned` (only on an actual new key, not a
+    `NtCreateKey`-open-if-present no-op), `set_value`, and `delete_key`
+    (fires the *parent* — a dedicated "the watched key itself was deleted"
+    notification isn't built, a real, scoped-out gap). `nt.rs`: new
+    `NT_NTNOTIFYCHANGEKEY` (ntdll stub 42), resolving the key + Event
+    handles and reading `WatchTree` off the stack; everything else in the
+    real signature (ApcRoutine, IoStatusBlock, …) is ignored.
+    Verified at the registry layer directly (`registry_notify_check`,
+    main.rs) — `watch` takes a plain `Arc<wait::Event>`, the same object a
+    real caller's handle resolves to, so the actual notify logic needs no
+    PE process to exercise: fires on a value change on the watched key;
+    one-shot proven with a fresh, never-re-registered event that stays
+    unsignalled after a second change; `WatchTree` correctly gates
+    grandchild-depth changes; watching a nonexistent key fails. `nt.rs`'s
+    own dispatch glue isn't exercised by a dedicated live PE test yet — no
+    hand-assembled PE scenario calls it today, same honest scoping already
+    used for `chmod`/`chown` and `execve`'s exec-gate wiring. Full
+    regression sweep green (`NTDLL_EXPORTS` grew by one entry; every
+    existing ordinal before it unchanged, `pe-test` confirms).
 - **Security Service (isolated userspace) — the full AV:** real-time (on-access
   + on-exec) and on-demand scanning; file scanner (YARA + open-source signature
   sets, e.g. ClamAV-style DBs); exec scanner (PE/ELF static analysis, reusing
@@ -727,6 +1225,56 @@ into ring 0."
   firewall / IDS. Talks to the Security Core over a narrow capability-gated
   interface; a crash there degrades to a policy default, it does not take the
   kernel down.
+  - **First slice done.** Not the YARA / heuristics / quarantine store yet —
+    the structural part: the hash verdict genuinely lives in a real,
+    separate, crash-isolated process now, not kernel code. `secsvc.rs`
+    (kernel side): a real IPC channel (two ordinary pipes — the same
+    `pipe()`/`pipe2()` primitive user processes get, held directly by the
+    kernel, no fd/task indirection); `spawn(fs)` loads `/secsvc` off ext2
+    and starts it (new `process::spawn_with_fds`) with its stdio wired to
+    the pipes instead of the console. Protocol: one request = a 32-byte
+    SHA-256 hash, one response = one verdict byte — the smallest real thing
+    that moves the decision out of ring 0. `execgate::check` asks the
+    service first; `BLOCKED_HASHES` is now explicitly documented as the
+    local fallback, not the primary authority.
+    **Crash safety needed no new mechanism**: `process::set_exit_status`
+    already clears a task's fd table the instant it exits, for any reason —
+    documented there as existing exactly so "the other end of any pipe sees
+    EOF/EPIPE immediately". The moment the service is gone, the kernel's
+    blocking read on the response pipe returns a real EOF, and
+    `check_hash` treats that as "unavailable", falling back to the local
+    list — the actual, verified "a crash there degrades to a policy
+    default" property, not a separate mechanism bolted on.
+    A real bug found getting this far: the test service's `std::io::Stdout`
+    is buffered, so without an explicit `.flush()` after each reply the
+    verdict byte never reached the actual `write()` syscall at all — caught
+    by a real first test run coming back with the wrong verdict, not
+    assumed correct.
+    Verified end to end (`secsvc_check`, main.rs): while the service is
+    alive, a hash *only its own list* knows about is quarantined with a
+    verdict naming the service (not the local list); ordinary content is
+    genuinely allowed. A test-only poison-pill hash then makes the service
+    exit (simulating a crash); the next checks prove the local fallback
+    takes over correctly, and that the earlier quarantine really was the
+    service's own verdict (now allowed, since the local list never knew
+    it). Full regression sweep green.
+  - **Quarantine store — done.** Lives where the roadmap puts it: the
+    service's own job, not the kernel's. The kernel still only ever asks
+    "allow or quarantine?" over the pipe; the *record* of why is the
+    service's own business, written through ordinary POSIX file I/O like
+    any other process — no new kernel API. Every quarantine verdict appends
+    a line (`seq=<n> reason=<...> hash=<hex>`) to `/etc/thos/quarantine.log`
+    before the reply goes out. `seq` is a boot-relative counter, not a
+    wall-clock timestamp — no RTC yet (`syscall.rs`'s own `SYS_TIME` stub),
+    a real, stated limitation. No `O_APPEND` in THOS yet either — open
+    doesn't truncate existing content (no `O_TRUNC` either), so an explicit
+    seek-to-end before writing is what actually makes this an append.
+    Verified by reading the real on-disk bytes off ext2, not the service's
+    in-memory state: a record naming the right hash exists while the
+    service is alive, and — checked again, identically — still exists
+    after the test poison pill makes the service exit, proving the record
+    survives independent of the process that wrote it. Full regression
+    sweep green.
 - **Milestone (Security):** a known-malicious EICAR-class test PE and ELF are
   caught by the exec gate before their first instruction runs, quarantined, and
   logged — with the scanner process killable and restartable without touching
@@ -743,6 +1291,59 @@ scanner has nothing to protect until Windows binaries actually run, and the
 exec gate reuses the loader internals that are being built now. Designed in
 from the start (loaders already hostile-input hardened; identity model already
 capability-shaped), implemented as its own phase once M3 lands.
+
+**First slice done — `kernel/src/execgate.rs`, the kernel-side skeleton.**
+M3 landed, so the gate's sequencing condition is met; the real YARA /
+heuristics / quarantine-store work stays the isolated-userspace Security
+Service's job — "the scanner never runs in the kernel" is the whole point of
+that split — this slice is only `format detect → parse headers` (already
+`pe::load`/`elf::load`'s job, right after) `→ hash/signature check → policy
+engine`. `execgate::check(bytes)`: the EICAR Standard Anti-Virus Test File
+string anywhere in the buffer, or a SHA-256 match — checked against the
+real, isolated Security Service now (see "Security Service" below), a
+local list only as its crash-degrade fallback — both `Verdict::Quarantine`;
+anything else `Allow`. Wired into
+both native-process entry points: `spawn_pe` (`Result`-based, same shape as
+an already-existing malformed-PE rejection — `Err`, kernel alive) and
+`execve` (no `Result` to hand back through that ABI — the calling thread's
+own image is what's being replaced — so quarantine there ends the calling
+thread cleanly instead, exit code 126, the shell convention for "found but
+not executable").
+Verified two ways: `execgate::check`'s detection logic directly
+(kernel-internal — ordinary bytes pass, an EICAR string buried in an
+otherwise arbitrary buffer doesn't); and a real PE round trip in `pe-test` —
+`/pe-hello.exe`'s own already-proven-runnable bytes (`THOS: pe exited` earlier
+in the same boot) with the EICAR string appended are quarantined before
+`pe::load` ever parses a header, so a rejection here can only be the gate, not
+a malformed-file fluke. `execve`'s wiring is the same shape but not yet
+exercised by a dedicated live test — no test binary `execve`s malicious
+content today.
+**A real, pre-existing kernel bug found and fixed along the way** (`seh.rs`):
+`thos_fault_dispatch` unconditionally read the PE-only vectored-exception-
+handler slot (`PE_EXC_ADDR`) for *every* user-mode fault, PE or plain ELF —
+that page is only ever mapped for a PE process, so any ELF program's fault
+(e.g. an ordinary segfault) took the fault dispatcher itself down with a
+second, unhandled `#PF` instead of just killing the faulting process, right
+as `kbd-test` was extended to add a command past the exec-gate work. Fixed
+with a new `process::current_is_pe()` gating the read. Full regression sweep
+green afterward: ext2-test, pe-test, smp-test, login-test, integrity-test,
+kbd-test.
+
+**`BLOCKED_HASHES` given a real, non-empty entry.** It had sat empty since
+the first slice — meaning the hash-match branch of `check()` was dead in
+every real boot. THOS has no malware corpus and isn't building one for the
+kernel (that data belongs to the Security Service's real signature
+database later, sourced from actual threat-intel feeds — not hand-picked
+into kernel source), so what's there now is a THOS-authored synthetic test
+marker (`execgate::MARKER_STRING`, not malware, not derived from any real
+sample), purely so the hash pipeline stage is provably wired. Different
+coverage than the EICAR substring check, not a redundant copy of it: hash
+matching is whole-file, so a buffer merely *containing* the marker as a
+substring sails through (verified `Allow`), where EICAR's substring check
+would catch that same wrapping. `execgate_check` (main.rs) computes the
+marker's SHA-256 fresh with `sha2` and asserts it against `execgate.rs`'s
+hand-transcribed hex constant — a real check that the two agree, not a
+blind trust of the hardcoded bytes. Full regression sweep green.
 
 ### In-system AI
 

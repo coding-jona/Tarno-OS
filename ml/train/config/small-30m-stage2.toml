@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Track A P1 — Stage 2: the real pretraining run for the ~34M byte-BPE GPT.
+# Same model as small-30m (8L/8H/d512, ctx 256) over the open web/edu corpus
+# (data_stage2/, ~1.86B tokens: TinyStories + FineWeb-Edu + Wikipedia +
+# Cosmopedia). See ml/train/fetch_web.py + prepare_web.py.
+#
+#   CONFIG=ml/train/config/small-30m-stage2.toml ml/train/run.sh train-bg
+#   ml/train/run.sh game on            # cap to 6 cores while you use the box
+#
+# NOTE: uses its own tokenizer (data_stage2/tokenizer.json, re-learned on the
+# new mix) so this is a FRESH run — not --resume-able from the small-30m P0
+# checkpoint. train.py memmaps the (multi-GB) bins — don't switch back to
+# np.fromfile or the box swaps.
+
+[model]
+n_layer    = 8
+n_head     = 8
+n_embd     = 512
+block_size = 256        # kept at 256 — 512 barely helps a 34M model and 2x's the wall time
+vocab_size = 16384      # set by prepare_web.py (byte-BPE on the stage-2 sample)
+dropout    = 0.1
+norm_eps   = 1e-5
+
+[train]
+seed          = 20260909
+batch_size    = 24
+grad_accum    = 2        # effective batch 48; 12288 tokens/step at ctx 256
+# 40k steps ~ 0.49B token-passes (~0.26 epoch of the 1.86B corpus, but still 2x
+# the entire P0 run). ~3-4 days full-throttle CPU, ~1-2 weeks capped to 6 cores.
+# Bump later if the val loss is still dropping.
+max_steps     = 30000    # ~1.8 epoch of the 208M-token subsample
+warmup_steps  = 1000
+lr            = 6e-4
+min_lr        = 6e-5
+weight_decay  = 0.1
+grad_clip     = 1.0
+eval_interval = 100
+eval_batches  = 20
+ckpt_interval = 100
+num_threads   = 6        # 6/24 threads (game gets 18)
+
+[data]
+train_bin = "data_stage2/train.bin"
+val_bin   = "data_stage2/val.bin"
