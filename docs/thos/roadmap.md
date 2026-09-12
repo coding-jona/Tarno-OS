@@ -55,7 +55,23 @@ late.
     file), `mkdir_path`, `unlink_path`, `rmdir_path`; primary superblock +
     group-descriptor counts kept in sync, and the **backup SB + GDT re-synced
     from the primary after every mutation** (`sparse_super` honoured) so a
-    multi-group filesystem stays `e2fsck`-clean. `unlink`/`rmdir`/`unlinkat`
+    multi-group filesystem stays `e2fsck`-clean.
+    **`write_path_owned`'s overwrite path is crash-safe** — it used to free
+    the old blocks *before* repointing the inode to the new ones, so a
+    crash in that window left the bitmap and the inode disagreeing (real
+    structural inconsistency). Now the inode patch (a single-sector,
+    genuinely atomic write — one ext2 inode never straddles a sector) comes
+    *first*; freeing the old blocks after means a crash anywhere in the
+    operation leaves either the exact old file or the exact new one, never
+    something in between — the residual cost is at worst a leaked block,
+    `fsck`-recoverable, not corruption. Verified with a real crash
+    injection (a `regcrashtest` kernel feature halts QEMU with a controlled
+    `isa-debug-exit` planted *inside* the overwrite path, at the exact
+    instant under test — not a blkdebug approximation): `cargo xtask
+    registry-crash-test` boots once to trigger it, confirms `e2fsck` finds
+    exactly the expected leaked-block trace (not worse) and fixes it
+    cleanly, then reboots the same disk and confirms the new content
+    survived. `unlink`/`rmdir`/`unlinkat`
     syscalls wired. `cargo xtask ext2-test` runs on a **2-block-group** image:
     the kernel creates a file/dir/nested file, then deletes files + dirs
     (rejecting a non-empty `rmdir`), and the host runs `e2fsck -fn` against
@@ -636,10 +652,14 @@ late.
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
   transactional key-value store; **SEH** ↔ trap dispatch; **APC** delivery.
-  - Registry status: hives (load/persist to ext2), **per-key security**, and
-    **change-notify** (`NtNotifyChangeKey`) done — see "Capability policy"
-    under Security Core below. Still open: real transactions (a crash
-    mid-write can still lose that one write).
+  - Registry status: hives (load/persist to ext2), **per-key security**,
+    **change-notify** (`NtNotifyChangeKey`), and **crash-safe overwrite
+    ordering** all done — see "Capability policy" under Security Core
+    below and the `write_path` crash-safety fix noted in Phase 2's own ext2
+    status. Not full transactions/journaling (still correctly listed as
+    missing in `ext2.rs`'s own module doc) — the one real corruption
+    window this operation had is closed; the residual cost of a crash
+    mid-write is a leaked, fsck-recoverable block, never inconsistency.
 - Write the `ntdll` lower boundary; layer **Wine PE-built DLLs** (`kernel32` /
   `kernelbase` / `user32` core) on top.
 - **Milestone 3:** a statically linked Win32 **console** `.exe` (`CreateFile`,
