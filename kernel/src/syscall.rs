@@ -67,6 +67,14 @@ const SYS_OPENAT: u64 = 257;
 const SYS_UNLINK: u64 = 87;
 const SYS_RMDIR: u64 = 84;
 const SYS_UNLINKAT: u64 = 263;
+const SYS_MKDIR: u64 = 83;
+const SYS_MKDIRAT: u64 = 258;
+const SYS_CHMOD: u64 = 90;
+const SYS_FCHMODAT: u64 = 268;
+const SYS_CHOWN: u64 = 92;
+const SYS_LCHOWN: u64 = 94;
+const SYS_FCHOWNAT: u64 = 260;
+const SYS_UTIMENSAT: u64 = 280;
 const SYS_POLL: u64 = 7;
 const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
@@ -123,6 +131,8 @@ pub(crate) const EACCES: i64 = -13;
 const EISDIR: i64 = -21;
 const ENOTDIR: i64 = -20;
 const ENOTEMPTY: i64 = -39;
+const EEXIST: i64 = -17;
+const EPERM: i64 = -1;
 
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
@@ -325,12 +335,109 @@ fn sys_open(path_ptr: u64, flags: u64) -> i64 {
     open_resolved(&process::resolve_path(&user_cstr(path_ptr)), flags)
 }
 
+/// `mkdir(path, mode)` — `mode` isn't honoured yet (new directories are
+/// always `0755`, matching `ext2::mkdir_path`'s prior hardcoded behaviour);
+/// what's new here is a real owner (the calling task's uid) instead of the
+/// permanent system uid every directory got before this increment.
+fn sys_mkdir(path_ptr: u64) -> i64 {
+    let path = process::resolve_path(&user_cstr(path_ptr));
+    let Some(task) = sched::current().task() else { return EBADF };
+    let Some(fs) = ext2::open().ok() else { return EIO };
+    // Same rule as O_CREAT in `open_resolved`: creating an entry is a write
+    // to the *parent* directory, checked against the parent's own mode bits.
+    if let Some(parent) = parent_of(&path) {
+        if let Some(pino) = fs.path_lookup(parent) {
+            if !fs.read_inode(pino).access_ok(task.uid, true) {
+                return EACCES;
+            }
+        }
+    }
+    match fs.mkdir_path_owned(&path, task.uid, task.uid) {
+        Ok(()) => 0,
+        Err("already exists") => EEXIST,
+        Err("parent dir missing") | Err("no such directory") => ENOENT,
+        Err("not a directory") => ENOTDIR,
+        Err(_) => EINVAL,
+    }
+}
+
+/// `chmod(path, mode)` — only the owner or root (uid 0) may change a file's
+/// permission bits, checked here (`ext2::chmod_path` itself does no check —
+/// see its doc comment).
+fn sys_chmod(path_ptr: u64, mode: u64) -> i64 {
+    let path = process::resolve_path(&user_cstr(path_ptr));
+    let Some(task) = sched::current().task() else { return EBADF };
+    let Some(fs) = ext2::open().ok() else { return EIO };
+    let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
+    if task.uid != 0 && task.uid != fs.read_inode(ino).uid {
+        return EPERM;
+    }
+    match fs.chmod_path(&path, mode as u16) {
+        Ok(()) => 0,
+        Err(_) => EINVAL,
+    }
+}
+
+/// `chown(path, uid, gid)` — root-only (matches modern Unix: even the owner
+/// can't give a file away), stricter than `chmod`'s owner-or-root.
+fn sys_chown(path_ptr: u64, uid: u64, gid: u64) -> i64 {
+    let path = process::resolve_path(&user_cstr(path_ptr));
+    let Some(task) = sched::current().task() else { return EBADF };
+    if task.uid != 0 {
+        return EPERM;
+    }
+    let Some(fs) = ext2::open().ok() else { return EIO };
+    match fs.chown_path(&path, uid as u32, gid as u32) {
+        Ok(()) => 0,
+        Err(_) => ENOENT,
+    }
+}
+
+const O_CREAT: u64 = 0o100;
+const O_EXCL: u64 = 0o200;
+
 /// Open an already-resolved absolute path, returning a new fd (or `-errno`).
 /// `flags`' `O_ACCMODE` bits (`O_RDONLY`=0, `O_WRONLY`=1, `O_RDWR`=2) decide
 /// which permission(s) to actually check — shared by `open`/`openat`.
+///
+/// `O_CREAT`: if `path` doesn't exist yet, create it as an empty file owned
+/// by the calling task (uid==gid, no group tier yet — see
+/// `Inode::access_ok`) *provided* that task has write permission on the
+/// parent directory — creating a file is a write to the directory it lands
+/// in, not to the (not yet existing) file itself. `O_CREAT|O_EXCL` against
+/// an existing path is `EEXIST`, same as Linux. `O_CREAT` against an
+/// existing path with no `O_EXCL` is a no-op (POSIX: the flag is ignored).
 pub fn open_resolved(path: &str, flags: u64) -> i64 {
+    if flags & O_CREAT != 0 {
+        let Some(task) = sched::current().task() else {
+            return EBADF;
+        };
+        let Some(fs) = ext2::open().ok() else { return EIO };
+        match fs.path_lookup(path) {
+            Some(_) if flags & O_EXCL != 0 => return EEXIST,
+            Some(_) => {}
+            None => {
+                if let Some(parent) = parent_of(path) {
+                    if let Some(pino) = fs.path_lookup(parent) {
+                        if !fs.read_inode(pino).access_ok(task.uid, true) {
+                            return EACCES;
+                        }
+                    }
+                }
+                if fs.write_path_owned(path, &[], task.uid, task.uid).is_err() {
+                    return ENOENT; // parent dir missing (or similar layout failure)
+                }
+            }
+        }
+    }
     let accmode = flags & 0x3;
     open_resolved_access(path, accmode != 1, accmode != 0)
+}
+
+/// The directory component of an absolute path (`"/"` for a top-level name).
+fn parent_of(path: &str) -> Option<&str> {
+    let idx = path.rfind('/')?;
+    Some(if idx == 0 { "/" } else { &path[..idx] })
 }
 
 /// The permission-checked open underneath [`open_resolved`] — also the NT
@@ -553,6 +660,32 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_UNLINK => sys_unlink(a1, false),
         SYS_RMDIR => sys_unlink(a1, true),
         SYS_UNLINKAT => sys_unlink(a2, a3 & 0x200 != 0), // flags=a3; AT_REMOVEDIR=0x200
+        SYS_MKDIR => sys_mkdir(a1),
+        SYS_MKDIRAT => sys_mkdir(a2), // dirfd ignored; paths are absolute
+        SYS_CHMOD => sys_chmod(a1, a2),
+        SYS_FCHMODAT => sys_chmod(a2, a3), // dirfd ignored; flags (a4) ignored
+        SYS_CHOWN => sys_chown(a1, a2, a3),
+        SYS_LCHOWN => sys_chown(a1, a2, a3), // no symlinks yet, so == chown
+        SYS_FCHOWNAT => sys_chown(a2, a3, a4), // dirfd ignored; flags (a5) ignored
+
+        // utimensat(dirfd, path, times, flags): no mtime storage yet, so
+        // `times` is ignored — success is "the path exists" (a real touch of
+        // an existing file becomes a no-op). A NULL path (a2==0) means
+        // futimens on dirfd itself, always fine. ENOENT on a missing path
+        // is deliberate: BusyBox `touch` tries utimensat first and falls
+        // back to its own open(O_CREAT) only on ENOENT — this is what makes
+        // that fallback actually fire instead of touch just giving up.
+        SYS_UTIMENSAT => {
+            if a2 == 0 {
+                0
+            } else {
+                let path = process::resolve_path(&user_cstr(a2));
+                match ext2::open().ok().and_then(|fs| fs.path_lookup(&path)) {
+                    Some(_) => 0,
+                    None => ENOENT,
+                }
+            }
+        }
         SYS_CLOSE => {
             if sched::current().task().map(|t| t.fd_close(a1 as i32)).unwrap_or(false) {
                 0

@@ -772,6 +772,51 @@ fn integrity_check(fs: &ext2::Ext2) {
     }
 }
 
+/// Real POSIX file creation (`open_resolved`'s `O_CREAT` slice) and
+/// `chmod`/`chown` (`ext2::chmod_path`/`chown_path` plus the permission
+/// policy `syscall::sys_chmod`/`sys_chown` apply around them).
+/// `open_resolved` itself needs a real task context (it reads the calling
+/// task's uid via `sched::current().task()`, not available this early at
+/// boot) so it's proven end-to-end through a live shell instead — kbd-test's
+/// `touch`/`mkdir`. BusyBox carries no `chmod`/`chown` applet, so those two
+/// are proven here at the ext2-layer + policy-logic level: real, just not
+/// yet exercised through the live syscall ABI by a dedicated test.
+fn posix_owner_check(fs: &ext2::Ext2) {
+    let path = "/owner_check.tmp";
+    fs.write_path_owned(path, b"x", 1000, 1000).expect("create owner_check.tmp as uid 1000");
+    let ino = fs.path_lookup(path).expect("find owner_check.tmp");
+    let node = fs.read_inode(ino);
+    assert_eq!((node.uid, node.gid), (1000, 1000), "write_path_owned didn't set the real owner");
+    assert_eq!(node.mode & 0xF000, 0x8000, "a newly created file should be a regular file");
+
+    // chmod policy (owner-or-root), mirrored from syscall::sys_chmod.
+    let chmod_allowed = |caller_uid: u32| caller_uid == 0 || caller_uid == node.uid;
+    assert!(chmod_allowed(1000), "the owner must be allowed to chmod their own file");
+    assert!(chmod_allowed(0), "root must be allowed to chmod any file");
+    assert!(!chmod_allowed(2000), "a non-owning, non-root uid must NOT be allowed to chmod");
+
+    fs.chmod_path(path, 0o600).expect("chmod owner_check.tmp");
+    let after_chmod = fs.read_inode(ino);
+    assert_eq!(
+        after_chmod.mode,
+        0x8000 | 0o600,
+        "chmod_path didn't set the new low bits (or clobbered the file-type nibble)"
+    );
+
+    // chown policy (root-only, stricter than chmod), mirrored from
+    // syscall::sys_chown — even the owner can't give a file away.
+    let chown_allowed = |caller_uid: u32| caller_uid == 0;
+    assert!(chown_allowed(0), "root must be allowed to chown");
+    assert!(!chown_allowed(1000), "even the owner must NOT be allowed to chown");
+
+    fs.chown_path(path, 2000, 2000).expect("chown owner_check.tmp");
+    let after_chown = fs.read_inode(ino);
+    assert_eq!((after_chown.uid, after_chown.gid), (2000, 2000), "chown_path didn't change the owner");
+
+    fs.unlink_path(path).ok();
+    kprintln!("THOS: posix owner ok   O_CREAT ownership + chmod/chown policy (O_CREAT/mkdir also proven live in kbd-test)");
+}
+
 /// Phase 2 milestone: a VFS with an in-memory file opened through the handle
 /// table, and the AHCI driver reading real sectors off the SATA disk.
 /// Process isolation's other half, closing a gap `process.rs`'s own module
@@ -879,6 +924,7 @@ fn storage_milestone() {
     execgate_check();
     section_sharing_check(&fs);
     integrity_check(&fs);
+    posix_owner_check(&fs);
     let init = fs.read_path("/init").expect("read /init from ext2");
     kprintln!("THOS: ext2 ok          /init = {} bytes", init.len());
 

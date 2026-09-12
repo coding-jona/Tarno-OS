@@ -162,9 +162,21 @@ fn split_parent(path: &str) -> Option<(&str, &str)> {
 }
 
 /// Patch the managed fields of a raw inode buffer in place.
-fn set_inode(raw: &mut [u8], mode: u16, size: u64, links: u16, blocks512: u32, block: &[u32; 15]) {
+#[allow(clippy::too_many_arguments)]
+fn set_inode(
+    raw: &mut [u8],
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    links: u16,
+    blocks512: u32,
+    block: &[u32; 15],
+) {
     raw[0..2].copy_from_slice(&mode.to_le_bytes());
+    raw[2..4].copy_from_slice(&(uid as u16).to_le_bytes());
     raw[4..8].copy_from_slice(&(size as u32).to_le_bytes());
+    raw[24..26].copy_from_slice(&(gid as u16).to_le_bytes());
     raw[26..28].copy_from_slice(&links.to_le_bytes());
     raw[28..32].copy_from_slice(&blocks512.to_le_bytes()); // i_blocks (512-byte units)
     for (i, b) in block.iter().enumerate() {
@@ -639,9 +651,21 @@ impl Ext2 {
         Ok(())
     }
 
-    /// Create `path` (or overwrite it) as a regular file holding `data`. The
-    /// parent directory must already exist.
+    /// Create `path` (or overwrite it) as a regular file holding `data`,
+    /// owned by the system account (`0`/`0`) — every existing kernel-internal
+    /// caller (registry hives, credential store, integrity baseline, the
+    /// ext2 write tests) wants exactly that, unchanged. [`Self::write_path_owned`]
+    /// is the version a real syscall-driven creation (`open(O_CREAT, ...)`)
+    /// goes through instead, to give the creating task's own uid.
     pub fn write_path(&self, path: &str, data: &[u8]) -> Result<(), &'static str> {
+        self.write_path_owned(path, data, 0, 0)
+    }
+
+    /// [`Self::write_path`], but a newly *created* file is owned by
+    /// `uid`/`gid` instead of always `0`/`0`. Overwriting an *existing* file
+    /// never changes its owner — matches real Unix: truncating a file you
+    /// have write access to doesn't let you take it over.
+    pub fn write_path_owned(&self, path: &str, data: &[u8], uid: u32, gid: u32) -> Result<(), &'static str> {
         let (parent, name) = split_parent(path).ok_or("bad path")?;
         let parent_ino = self.path_lookup(parent).ok_or("parent dir missing")?;
         if name.len() > 255 {
@@ -653,16 +677,16 @@ impl Ext2 {
             Some(ino) => {
                 let old = self.read_inode(ino);
                 self.free_all_blocks(&old);
-                let mode = old.mode;
+                let (mode, old_uid, old_gid) = (old.mode, old.uid, old.gid);
                 self.patch_inode(ino, |raw| {
                     let links = le16(&raw[26..]);
-                    set_inode(raw, mode, data.len() as u64, links, blocks512, &block);
+                    set_inode(raw, mode, old_uid, old_gid, data.len() as u64, links, blocks512, &block);
                 });
             }
             None => {
                 let ino = self.alloc_inode(false).ok_or("no free inode")?;
                 self.patch_inode(ino, |raw| {
-                    set_inode(raw, 0o100_644, data.len() as u64, 1, blocks512, &block);
+                    set_inode(raw, 0o100_644, uid, gid, data.len() as u64, 1, blocks512, &block);
                 });
                 self.dir_insert(parent_ino, name, ino, false)?;
             }
@@ -671,8 +695,15 @@ impl Ext2 {
         Ok(())
     }
 
-    /// Create directory `path`. The parent must exist; `path` must not.
+    /// [`Self::mkdir_path`], owned by the system account — see
+    /// `write_path`/`write_path_owned`'s split for why.
     pub fn mkdir_path(&self, path: &str) -> Result<(), &'static str> {
+        self.mkdir_path_owned(path, 0, 0)
+    }
+
+    /// Create directory `path`, owned by `uid`/`gid`. The parent must
+    /// exist; `path` must not.
+    pub fn mkdir_path_owned(&self, path: &str, uid: u32, gid: u32) -> Result<(), &'static str> {
         let (parent, name) = split_parent(path).ok_or("bad path")?;
         let parent_ino = self.path_lookup(parent).ok_or("parent dir missing")?;
         if self.lookup(parent_ino, name).is_some() {
@@ -700,11 +731,38 @@ impl Ext2 {
         let mut block = [0u32; 15];
         block[0] = bno;
         self.patch_inode(ino, |raw| {
-            set_inode(raw, 0o040_755, bs as u64, 2, self.block_size / 512, &block);
+            set_inode(raw, 0o040_755, uid, gid, bs as u64, 2, self.block_size / 512, &block);
         });
         self.dir_insert(parent_ino, name, ino, true)?;
         self.bump_links(parent_ino, 1); // the child's ".."
         self.sync_backups();
+        Ok(())
+    }
+
+    /// `chmod(2)`: replace `path`'s permission bits (the low 12 bits —
+    /// permissions plus setuid/setgid/sticky) with `perm`, leaving the file
+    /// type (the upper nibble `read_inode`/`Inode::access_ok` key off) alone.
+    /// The caller (`syscall::sys_chmod`) is responsible for the "only the
+    /// owner or root may do this" check — this just writes the bits.
+    pub fn chmod_path(&self, path: &str, perm: u16) -> Result<(), &'static str> {
+        let ino = self.path_lookup(path).ok_or("no such file")?;
+        let file_type = self.read_inode(ino).mode & 0xF000;
+        self.patch_inode(ino, |raw| {
+            let mode = file_type | (perm & 0o7777);
+            raw[0..2].copy_from_slice(&mode.to_le_bytes());
+        });
+        Ok(())
+    }
+
+    /// `chown(2)`: replace `path`'s owner/group. Same split as `chmod_path`
+    /// — the permission check (real `chown` is stricter: owner alone isn't
+    /// enough, it's root-only, matching modern Unix) lives in the caller.
+    pub fn chown_path(&self, path: &str, uid: u32, gid: u32) -> Result<(), &'static str> {
+        let ino = self.path_lookup(path).ok_or("no such file")?;
+        self.patch_inode(ino, |raw| {
+            raw[2..4].copy_from_slice(&(uid as u16).to_le_bytes());
+            raw[24..26].copy_from_slice(&(gid as u16).to_le_bytes());
+        });
         Ok(())
     }
 

@@ -3104,6 +3104,23 @@ fn kbd_test(iso: &Path) {
     type_line(&sock, "echo x > /etc/thos/admin.cred");
     let _ = wait_for(&log, "Permission denied", 15);
 
+    // Real POSIX file creation (O_CREAT, wired this increment): `touch`
+    // opens with O_CREAT and no prior existence — a genuine new inode, owned
+    // by the logged-in uid (1000), not just an existing-file open. `mkdir`
+    // likewise, through the new SYS_MKDIR dispatch. Both run against
+    // `/home/thos` — the account's own home dir (created by `cred::save` on
+    // first-run setup) — not `/`, which is root-owned mode 755 and
+    // (correctly, per DAC) denies uid 1000 write access to create anything
+    // there directly.
+    type_line(&sock, "cd /home/thos");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    type_line(&sock, "touch newfile");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    type_line(&sock, "mkdir newdir");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    type_line(&sock, "ls");
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
     let out = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = child.kill();
     let _ = child.wait();
@@ -3116,11 +3133,19 @@ fn kbd_test(iso: &Path) {
     let cwd_ok = after.contains("\n/bin\n");
     let cat_ok = after.contains("hello a file read via open+lseek+read");
     let perm_ok = after.contains("Permission denied");
-    if shell_ok && ls_ok && cwd_ok && cat_ok && perm_ok {
-        println!("kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), DAC write denial");
+    // The `ls` after touch+mkdir must show both new names — real inodes
+    // created via the syscall path, not just commands that ran without error.
+    let create_ok = {
+        let tail = after.rsplit("thos$ ls\n").next().unwrap_or("");
+        tail.contains("newfile") && tail.contains("newdir")
+    };
+    if shell_ok && ls_ok && cwd_ok && cat_ok && perm_ok && create_ok {
+        println!(
+            "kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), DAC write denial, O_CREAT/mkdir"
+        );
     } else {
         eprintln!(
-            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} perm_ok={perm_ok})\n---\n{after}\n---"
+            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} perm_ok={perm_ok} create_ok={create_ok})\n---\n{after}\n---"
         );
         exit(1);
     }
