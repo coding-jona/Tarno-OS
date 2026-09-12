@@ -406,9 +406,9 @@ late.
     (`PE registry OK`); `registry_enum_check()` (every boot) exercises
     enumeration order + `STATUS_NO_MORE_ENTRIES` directly. Verified with a
     real two-boot round trip on one disk image (boot 1 writes the hive, boot 2
-    loads it back). Still not transactional (a crash mid-write can lose that
-    one write) and no change-notify / per-key security — those come with the
-    security phase.
+    loads it back). Per-key security and change-notify landed with the
+    security phase (see "Capability policy" below); still not transactional
+    (a crash mid-write can lose that one write).
   - **Mutant + semaphore + `NtWaitForMultipleObjects`.** `wait.rs` gains a
     counting `Semaphore` and a recursive thread-owned `Mutant`; `process.rs` a
     polymorphic `Waitable` (event / semaphore / mutant) with
@@ -636,10 +636,10 @@ late.
   `Nt*VirtualMemory` / `NtWaitForSingleObject` …) onto executive primitives;
   **`\Device\` namespace** + drive letters as a VFS view; a minimal **registry** as a
   transactional key-value store; **SEH** ↔ trap dispatch; **APC** delivery.
-  - Registry status: hives (load/persist to ext2) and **per-key security**
-    done — see "Capability policy" under Security Core below. Still open:
-    real transactions (a crash mid-write can still lose that one write) and
-    change-notify.
+  - Registry status: hives (load/persist to ext2), **per-key security**, and
+    **change-notify** (`NtNotifyChangeKey`) done — see "Capability policy"
+    under Security Core below. Still open: real transactions (a crash
+    mid-write can still lose that one write).
 - Write the `ntdll` lower boundary; layer **Wine PE-built DLLs** (`kernel32` /
   `kernelbase` / `user32` core) on top.
 - **Milestone 3:** a statically linked Win32 **console** `.exe` (`CreateFile`,
@@ -1075,7 +1075,8 @@ into ring 0."
     really has uid 0. `cargo xtask kbd-test`: `elevate returned 22` (a real
     pid) followed by `elevated-check uid=0`. Full regression sweep green.
   - **Per-key registry security — done.** Closes one of `registry.rs`'s own
-    three stated gaps (transactions and change-notify are still open). Same
+    three stated gaps (transactions is still open — change-notify below).
+    Same
     DAC shape as the filesystem: every `Key` gains an `owner_uid`
     (default `0`, system — `ext2::Inode`'s own convention for an unset
     owner); uid `0` or the key's own owner may write, anyone may still
@@ -1105,6 +1106,35 @@ into ring 0."
     record. Full regression sweep green: ext2-test, pe-test (the live NT
     registry round trip, unaffected), smp-test, login-test,
     integrity-test, kbd-test.
+  - **Registry change-notify (`NtNotifyChangeKey`) — done.** Closes the
+    second of `registry.rs`'s three stated gaps (only transactions left).
+    The asynchronous, Event-driven shape of the real call: THOS already has
+    real event/wait primitives (`wait.rs`), so this is "wire the registry
+    into them", not new blocking machinery — the synchronous shape (`Event`
+    omitted, the call itself blocks) isn't built. New `registry::watch(path,
+    watch_tree, event)` registers a one-shot signal, fired the next time
+    `path` (or, with `watch_tree`, anything under it) genuinely changes — a
+    change *on* the watched key or a *direct* child always counts (matches
+    real NT without `WatchTree`); anything deeper needs `watch_tree`. Wired
+    into `create_owned` (only on an actual new key, not a
+    `NtCreateKey`-open-if-present no-op), `set_value`, and `delete_key`
+    (fires the *parent* — a dedicated "the watched key itself was deleted"
+    notification isn't built, a real, scoped-out gap). `nt.rs`: new
+    `NT_NTNOTIFYCHANGEKEY` (ntdll stub 42), resolving the key + Event
+    handles and reading `WatchTree` off the stack; everything else in the
+    real signature (ApcRoutine, IoStatusBlock, …) is ignored.
+    Verified at the registry layer directly (`registry_notify_check`,
+    main.rs) — `watch` takes a plain `Arc<wait::Event>`, the same object a
+    real caller's handle resolves to, so the actual notify logic needs no
+    PE process to exercise: fires on a value change on the watched key;
+    one-shot proven with a fresh, never-re-registered event that stays
+    unsignalled after a second change; `WatchTree` correctly gates
+    grandchild-depth changes; watching a nonexistent key fails. `nt.rs`'s
+    own dispatch glue isn't exercised by a dedicated live PE test yet — no
+    hand-assembled PE scenario calls it today, same honest scoping already
+    used for `chmod`/`chown` and `execve`'s exec-gate wiring. Full
+    regression sweep green (`NTDLL_EXPORTS` grew by one entry; every
+    existing ordinal before it unchanged, `pe-test` confirms).
 - **Security Service (isolated userspace) — the full AV:** real-time (on-access
   + on-exec) and on-demand scanning; file scanner (YARA + open-source signature
   sets, e.g. ClamAV-style DBs); exec scanner (PE/ELF static analysis, reusing
