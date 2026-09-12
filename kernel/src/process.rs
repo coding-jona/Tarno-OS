@@ -462,6 +462,11 @@ pub fn current_uid() -> u32 {
     sched::current().task().map(|t| t.uid).unwrap_or(0)
 }
 
+/// This task's primary group id (see `Task::gid`).
+pub fn current_gid() -> u32 {
+    sched::current().task().map(|t| t.gid).unwrap_or(0)
+}
+
 /// Is the calling task a native PE image? `false` (never PE) if there is no
 /// current task at all. The one place this matters: whether it's safe to
 /// even *look* at the PE-only vectored-exception-handler slot (`seh.rs`) —
@@ -636,6 +641,10 @@ pub struct Task {
     pub pid: u64,
     pub ppid: u64,
     pub uid: u32,
+    /// Primary (and, today, only) group id. THOS has no supplementary
+    /// groups yet — every account is its own "user private group", gid ==
+    /// uid, same convention `cred::save`'s `/home/<name>` already assumes.
+    pub gid: u32,
     space: Mutex<Arc<Process>>,
     exit_status: Mutex<Option<i32>>,
     exited: AtomicBool,
@@ -672,6 +681,7 @@ impl Task {
             pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
             ppid,
             uid: SESSION_UID.load(Ordering::Relaxed) as u32,
+            gid: SESSION_UID.load(Ordering::Relaxed) as u32,
             space: Mutex::new(space),
             exit_status: Mutex::new(None),
             exited: AtomicBool::new(false),

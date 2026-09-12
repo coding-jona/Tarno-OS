@@ -347,12 +347,12 @@ fn sys_mkdir(path_ptr: u64) -> i64 {
     // to the *parent* directory, checked against the parent's own mode bits.
     if let Some(parent) = parent_of(&path) {
         if let Some(pino) = fs.path_lookup(parent) {
-            if !fs.read_inode(pino).access_ok(task.uid, true) {
+            if !fs.read_inode(pino).access_ok(task.uid, task.gid, true) {
                 return EACCES;
             }
         }
     }
-    match fs.mkdir_path_owned(&path, task.uid, task.uid) {
+    match fs.mkdir_path_owned(&path, task.uid, task.gid) {
         Ok(()) => 0,
         Err("already exists") => EEXIST,
         Err("parent dir missing") | Err("no such directory") => ENOENT,
@@ -401,12 +401,12 @@ const O_EXCL: u64 = 0o200;
 /// which permission(s) to actually check — shared by `open`/`openat`.
 ///
 /// `O_CREAT`: if `path` doesn't exist yet, create it as an empty file owned
-/// by the calling task (uid==gid, no group tier yet — see
-/// `Inode::access_ok`) *provided* that task has write permission on the
-/// parent directory — creating a file is a write to the directory it lands
-/// in, not to the (not yet existing) file itself. `O_CREAT|O_EXCL` against
-/// an existing path is `EEXIST`, same as Linux. `O_CREAT` against an
-/// existing path with no `O_EXCL` is a no-op (POSIX: the flag is ignored).
+/// by the calling task's uid/gid, *provided* that task has write permission
+/// on the parent directory (`Inode::access_ok`'s owner/group/other tiers) —
+/// creating a file is a write to the directory it lands in, not to the
+/// (not yet existing) file itself. `O_CREAT|O_EXCL` against an existing
+/// path is `EEXIST`, same as Linux. `O_CREAT` against an existing path with
+/// no `O_EXCL` is a no-op (POSIX: the flag is ignored).
 pub fn open_resolved(path: &str, flags: u64) -> i64 {
     if flags & O_CREAT != 0 {
         let Some(task) = sched::current().task() else {
@@ -419,12 +419,12 @@ pub fn open_resolved(path: &str, flags: u64) -> i64 {
             None => {
                 if let Some(parent) = parent_of(path) {
                     if let Some(pino) = fs.path_lookup(parent) {
-                        if !fs.read_inode(pino).access_ok(task.uid, true) {
+                        if !fs.read_inode(pino).access_ok(task.uid, task.gid, true) {
                             return EACCES;
                         }
                     }
                 }
-                if fs.write_path_owned(path, &[], task.uid, task.uid).is_err() {
+                if fs.write_path_owned(path, &[], task.uid, task.gid).is_err() {
                     return ENOENT; // parent dir missing (or similar layout failure)
                 }
             }
@@ -443,10 +443,10 @@ fn parent_of(path: &str) -> Option<&str> {
 /// The permission-checked open underneath [`open_resolved`] — also the NT
 /// personality's `CreateFileA`, which decides `want_read`/`want_write` from
 /// `DesiredAccess` instead of `O_ACCMODE`. `EACCES` if the calling task's
-/// uid doesn't have whichever of `want_read`/`want_write` it asked for
-/// against the target inode's owner/mode bits (`Inode::access_ok`) — the
-/// DAC check every file open goes through now, not just a mode-bits-ignored
-/// lookup.
+/// uid/gid don't clear whichever of `want_read`/`want_write` it asked for
+/// against the target inode's owner/group/other mode bits
+/// (`Inode::access_ok`) — the DAC check every file open goes through now,
+/// not just a mode-bits-ignored lookup.
 pub fn open_resolved_access(path: &str, want_read: bool, want_write: bool) -> i64 {
     let Some(task) = sched::current().task() else {
         return EBADF;
@@ -454,7 +454,9 @@ pub fn open_resolved_access(path: &str, want_read: bool, want_write: bool) -> i6
     let Some(fs) = ext2::open().ok() else { return EIO };
     let Some(ino) = fs.path_lookup(path) else { return ENOENT };
     let node = fs.read_inode(ino);
-    if (want_read && !node.access_ok(task.uid, false)) || (want_write && !node.access_ok(task.uid, true)) {
+    if (want_read && !node.access_ok(task.uid, task.gid, false))
+        || (want_write && !node.access_ok(task.uid, task.gid, true))
+    {
         return EACCES;
     }
     if node.mode & 0xF000 == 0x4000 {
@@ -748,7 +750,8 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
 
         SYS_GETPID | SYS_GETTID => process::current_pid() as i64,
         SYS_GETPPID => process::current_ppid() as i64,
-        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => process::current_uid() as i64,
+        SYS_GETUID | SYS_GETEUID => process::current_uid() as i64,
+        SYS_GETGID | SYS_GETEGID => process::current_gid() as i64,
         SYS_SET_TID_ADDRESS => process::current_pid() as i64,
         SYS_IOCTL => sys_ioctl(a1, a2, a3),
         SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_RT_SIGRETURN | SYS_SET_ROBUST_LIST

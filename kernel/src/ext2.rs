@@ -47,25 +47,32 @@ pub struct Inode {
     /// with THOS having no interactive root login to actually confuse this
     /// with (see `cred.rs`).
     pub uid: u32,
-    #[allow(dead_code)] // parsed and available; `access_ok` has no group tier yet
     pub gid: u32,
 }
 
 impl Inode {
-    /// The DAC permission check every file open goes through: standard Unix
-    /// owner/other bits. No group tier yet — THOS's identity model doesn't
-    /// have real group membership beyond the single `gid` stamped on a
-    /// file, so a non-owner is checked against "other" directly; that's the
-    /// gap the wider capability-policy work this is a foundation for is
-    /// meant to fill in. uid `0` (the system account) always passes,
-    /// matching real Unix root semantics — consistent with THOS having no
-    /// interactive root login to actually confuse this with (`cred.rs`).
-    pub fn access_ok(&self, uid: u32, want_write: bool) -> bool {
+    /// The DAC permission check every file open goes through: real Unix
+    /// owner/group/other bits, three tiers. THOS's identity model has no
+    /// supplementary groups (yet) — every task carries exactly one primary
+    /// gid, the "user private group" scheme (gid == uid, same convention
+    /// `cred::save` already uses naming `/home/<name>`'s owner) — so the
+    /// group tier here is "does the caller's single primary gid match the
+    /// file's gid", not a membership-list lookup. uid `0` (the system
+    /// account) always passes, matching real Unix root semantics —
+    /// consistent with THOS having no interactive root login to actually
+    /// confuse this with (`cred.rs`).
+    pub fn access_ok(&self, uid: u32, gid: u32, want_write: bool) -> bool {
         if uid == 0 {
             return true;
         }
         let perm = self.mode & 0o777;
-        let bits = if uid == self.uid { (perm >> 6) & 0o7 } else { perm & 0o7 };
+        let bits = if uid == self.uid {
+            (perm >> 6) & 0o7
+        } else if gid == self.gid {
+            (perm >> 3) & 0o7
+        } else {
+            perm & 0o7
+        };
         let need = if want_write { 0o2 } else { 0o4 };
         bits & need == need
     }

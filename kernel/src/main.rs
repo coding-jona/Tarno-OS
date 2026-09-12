@@ -817,6 +817,43 @@ fn posix_owner_check(fs: &ext2::Ext2) {
     kprintln!("THOS: posix owner ok   O_CREAT ownership + chmod/chown policy (O_CREAT/mkdir also proven live in kbd-test)");
 }
 
+/// The group tier `Inode::access_ok` gained this increment — real Unix
+/// owner/group/other, not just owner/other. A file owned `(1000, 1000)` at
+/// mode `0640` (owner rw, group r, other none): the owner gets read+write;
+/// a *different* uid that shares the file's gid gets the group bits
+/// (read, not write); a uid matching neither the owning uid nor the owning
+/// gid falls through to "other" and gets nothing (0640 has no other bits at
+/// all). uid 0 always passes, any tier.
+fn group_tier_check(fs: &ext2::Ext2) {
+    let path = "/group_check.tmp";
+    fs.write_path_owned(path, b"x", 1000, 1000).expect("create group_check.tmp");
+    fs.chmod_path(path, 0o640).expect("chmod group_check.tmp to 0640");
+    let ino = fs.path_lookup(path).expect("find group_check.tmp");
+    let node = fs.read_inode(ino);
+
+    assert!(node.access_ok(1000, 1000, true), "the owner must get the owner (rw) bits");
+    assert!(node.access_ok(1000, 1000, false), "the owner must get read too");
+
+    assert!(
+        node.access_ok(2000, 1000, false),
+        "a different uid sharing the file's gid must get the group (read) bits"
+    );
+    assert!(
+        !node.access_ok(2000, 1000, true),
+        "the group tier is read-only at 0640 — write must still be denied"
+    );
+
+    assert!(
+        !node.access_ok(3000, 4000, false),
+        "a uid matching neither the owning uid nor the owning gid must not fall through to access anyway"
+    );
+
+    assert!(node.access_ok(0, 0, true), "uid 0 must always pass, regardless of tier");
+
+    fs.unlink_path(path).ok();
+    kprintln!("THOS: group tier ok    owner/group/other DAC tiers distinguished (0640: owner rw, group r-only, other none)");
+}
+
 /// Phase 2 milestone: a VFS with an in-memory file opened through the handle
 /// table, and the AHCI driver reading real sectors off the SATA disk.
 /// Process isolation's other half, closing a gap `process.rs`'s own module
@@ -925,6 +962,7 @@ fn storage_milestone() {
     section_sharing_check(&fs);
     integrity_check(&fs);
     posix_owner_check(&fs);
+    group_tier_check(&fs);
     let init = fs.read_path("/init").expect("read /init from ext2");
     kprintln!("THOS: ext2 ok          /init = {} bytes", init.len());
 
