@@ -854,7 +854,7 @@ fn execgate_check() {
 /// kernel↔service channel, and a real crash-degrade fallback, not assumed.
 /// `secsvc::spawn` already ran in `kmain`; this exercises `execgate::check`
 /// both while the service is alive and after it (deliberately) exits.
-fn secsvc_check() {
+fn secsvc_check(fs: &ext2::Ext2) {
     // While alive: a hash *only the service's own list* knows about —
     // `SECSVC_ONLY_MARKER` is deliberately absent from the kernel's local
     // `BLOCKED_HASHES` — must be quarantined, and the reason must name the
@@ -864,6 +864,26 @@ fn secsvc_check() {
         execgate::Verdict::Quarantine("Security Service: known-bad hash"),
         "the service-alive verdict must come from the service, not the local list"
     );
+
+    // Quarantine store: the service (a real process with its own ext2
+    // access, independent of the IPC pipes) is expected to have appended a
+    // record of that decision to `/etc/thos/quarantine.log` — checked here
+    // by reading the actual on-disk bytes straight off ext2, not trusting
+    // the service's in-memory state or the verdict alone. No RTC yet (a
+    // real, separate gap — `syscall.rs`'s own `SYS_TIME` stub), so this
+    // just confirms *a* record naming the right hash exists, not a
+    // timestamp.
+    let mut h = Sha256::new();
+    h.update(execgate::SECSVC_ONLY_MARKER);
+    let digest: [u8; 32] = h.finalize().into();
+    let hex: alloc::string::String = digest.iter().map(|b| alloc::format!("{b:02x}")).collect();
+    let log = fs.read_path("/etc/thos/quarantine.log").expect("read quarantine.log");
+    let text = core::str::from_utf8(&log).expect("quarantine.log is valid utf8");
+    assert!(
+        text.lines().any(|l| l.contains(&hex)),
+        "no quarantine.log record found for SECSVC_ONLY_MARKER's hash"
+    );
+
     // Still alive: ordinary content the service has never heard of either
     // — a real Allow verdict from the round trip, not a rejection-by-default.
     assert_eq!(execgate::check(b"nothing interesting, service should allow this"), execgate::Verdict::Allow);
@@ -900,7 +920,16 @@ fn secsvc_check() {
     // own verdict, not a coincidental local hit.
     assert_eq!(execgate::check(execgate::SECSVC_ONLY_MARKER), execgate::Verdict::Allow);
 
-    kprintln!("THOS: secsvc check ok  service-backed verdict, crash detected, local fallback took over");
+    // The quarantine record itself is on ext2, not in the (now-gone)
+    // service's memory — it must still be there, untouched, after the
+    // simulated crash.
+    let log_after = fs.read_path("/etc/thos/quarantine.log").expect("quarantine.log must survive the service exiting");
+    assert!(
+        core::str::from_utf8(&log_after).is_ok_and(|t| t.lines().any(|l| l.contains(&hex))),
+        "the quarantine record didn't survive the service's exit"
+    );
+
+    kprintln!("THOS: secsvc check ok  service-backed verdict, quarantine log persisted, crash + local fallback");
 }
 
 /// `NtCreateSection`/`NtMapViewOfSection`/`NtUnmapViewOfSection`/
@@ -1181,7 +1210,7 @@ fn storage_milestone() {
     // shutdown/crash behavior is what `execgate_check` below exercises.
     secsvc::spawn(&fs);
     execgate_check();
-    secsvc_check();
+    secsvc_check(&fs);
     section_sharing_check(&fs);
     integrity_check(&fs);
     posix_owner_check(&fs);
