@@ -4,10 +4,19 @@
 //! The xHCI keyboard thread feeds 8-byte HID boot reports here; this decodes
 //! them (with a US layout + shift), echoes to the serial console, does minimal
 //! line editing (backspace), and queues bytes for `read` on fd 0.
+//!
+//! Also the **secure attention key** — `elevate()`'s trusted path (see
+//! `syscall::sys_elevate`'s own doc comment for the gap this closes):
+//! Ctrl+Alt+Delete is detected directly off the raw HID report, *before*
+//! any byte reaches [`QUEUE`] — the only thing a `read()` on fd 0 (i.e. any
+//! user-mode process) can ever see. No app can draw a fake password prompt
+//! here, because no app-visible input stream ever carries these keystrokes
+//! at all; they're consumed entirely inside this module and never queued.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
 use spin::Mutex;
 
@@ -20,6 +29,11 @@ static INPUT_WQ: WaitQueue = WaitQueue::new();
 static PREV: Mutex<[u8; 6]> = Mutex::new([0; 6]);
 /// Bytes on the current line not yet consumed by a reader — for backspace.
 static LINE_LEN: Mutex<usize> = Mutex::new(0);
+
+/// `true` while a secure-attention sequence is being typed: every key goes
+/// to [`SAK_BUF`] instead of [`QUEUE`], masked, until Enter.
+static SAK_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SAK_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 /// Echo mode: 0 = echo the character, 1 = echo `*` (password entry),
 /// 2 = echo nothing.
@@ -92,12 +106,37 @@ fn ascii(code: u8, shift: bool, altgr: bool) -> u8 {
     }
 }
 
+/// HID Usage ID for the Delete key.
+const KC_DELETE: u8 = 0x4C;
+
 /// Feed one HID boot keyboard report (`[modifiers, reserved, k0..k5]`).
 pub fn feed_report(rpt: &[u8; 8]) {
     let shift = rpt[0] & 0b0010_0010 != 0; // L/R Shift
     let altgr = rpt[0] & 0b0100_0000 != 0; // Right Alt (AltGr)
+    let ctrl = rpt[0] & 0b0001_0001 != 0; // L/R Ctrl
+    let alt = rpt[0] & 0b0100_0100 != 0; // L/R Alt
     let keys = [rpt[2], rpt[3], rpt[4], rpt[5], rpt[6], rpt[7]];
     let mut prev = PREV.lock();
+
+    // Secure attention key: checked *before* anything else in this
+    // function ever runs, on the raw report — the whole point is that
+    // these keystrokes never become a byte any process could read.
+    if !SAK_ACTIVE.load(Ordering::Relaxed)
+        && ctrl
+        && alt
+        && keys.contains(&KC_DELETE)
+        && !prev.contains(&KC_DELETE)
+    {
+        *prev = keys;
+        drop(prev);
+        sak_begin();
+        return;
+    }
+    if SAK_ACTIVE.load(Ordering::Relaxed) {
+        sak_feed(&keys, &mut prev, shift, altgr);
+        return;
+    }
+
     let mut pushed = false;
 
     for &k in &keys {
@@ -140,6 +179,79 @@ pub fn feed_report(rpt: &[u8; 8]) {
     if pushed {
         INPUT_WQ.wake_all();
     }
+}
+
+/// Enter SAK mode: freeze normal input delivery and print a banner that
+/// only this module could have written — there is no way for a user-mode
+/// process to forge it appearing at exactly this moment, since it's
+/// printed synchronously from the keyboard interrupt path itself.
+fn sak_begin() {
+    SAK_ACTIVE.store(true, Ordering::Relaxed);
+    SAK_BUF.lock().clear();
+    serial::write_bytes(
+        b"\r\n-- THOS secure attention (kernel prompt, not an application) --\r\nadmin password: ",
+    );
+}
+
+/// Decode one HID report's worth of keys while a SAK sequence is being
+/// typed: same layout decode as the normal path, but every character is
+/// masked and appended to [`SAK_BUF`] instead of [`QUEUE`] — it never
+/// becomes readable by any process, elevated or not.
+fn sak_feed(keys: &[u8; 6], prev: &mut [u8; 6], shift: bool, altgr: bool) {
+    for &k in keys.iter() {
+        if k == 0 || prev.contains(&k) {
+            continue;
+        }
+        let c = ascii(k, shift, altgr);
+        if c == 0 {
+            continue;
+        }
+        if c == 0x08 {
+            if SAK_BUF.lock().pop().is_some() {
+                serial::write_bytes(b"\x08 \x08");
+            }
+        } else if c == b'\n' {
+            serial::write_bytes(b"\r\n");
+            *prev = *keys;
+            sak_finish();
+            return;
+        } else {
+            SAK_BUF.lock().push(c);
+            serial::write_bytes(b"*");
+        }
+    }
+    *prev = *keys;
+}
+
+/// Re-authenticate against the real credential store and, on success,
+/// spawn a trusted uid-0 process — the one action this first slice of the
+/// trusted path offers (real Windows SAK opens a whole secure desktop with
+/// several choices; THOS has no GUI here yet, so this is deliberately the
+/// smallest real thing "the trusted path leads somewhere privileged" can
+/// mean). Not available outside `interactive` builds — there's no
+/// credential store to check against without a login flow.
+#[cfg(feature = "interactive")]
+fn sak_finish() {
+    let pw = SAK_BUF.lock().clone();
+    SAK_BUF.lock().clear();
+    SAK_ACTIVE.store(false, Ordering::Relaxed);
+    let ok = crate::ext2::open().ok().and_then(|fs| crate::cred::load(&fs)).is_some_and(|c| {
+        core::str::from_utf8(&pw).is_ok_and(|s| c.verify(&c.name, s))
+    });
+    if !ok {
+        serial::write_bytes(b"THOS: SAK denied\r\n");
+        return;
+    }
+    serial::write_bytes(b"THOS: SAK accepted -- spawning a trusted uid-0 process\r\n");
+    let Some(fs) = crate::ext2::open().ok() else { return };
+    let Some(bytes) = fs.read_path("/elevated-check") else { return };
+    let _ = crate::process::spawn_elevated(0, &bytes, &["/elevated-check"], &[], 0, 0);
+}
+
+#[cfg(not(feature = "interactive"))]
+fn sak_finish() {
+    SAK_BUF.lock().clear();
+    SAK_ACTIVE.store(false, Ordering::Relaxed);
 }
 
 /// Non-blocking read into `buf`; returns bytes moved.

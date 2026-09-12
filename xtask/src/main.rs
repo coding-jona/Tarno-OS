@@ -3215,6 +3215,25 @@ fn kbd_test(iso: &Path) {
     type_line(&sock, "/do-elevate");
     let _ = wait_for(&log, "elevated-check uid=0", 20);
 
+    // The trusted path: Ctrl+Alt+Delete, sent as a real QEMU key combo (not
+    // typed characters the shell could ever see) — the kernel's own
+    // console driver intercepts it below any process, prints its own
+    // banner, and reads the password with no app in the loop at all. A
+    // wrong password first (must be denied, no privileged spawn), then the
+    // real one (must spawn a second, independent `elevated-check` — the
+    // first `elevated-check uid=0` in the log came from `/do-elevate`
+    // above, so requiring a *second* occurrence proves this path actually
+    // ran its own spawn, not just re-reading the earlier one).
+    mon(&sock, "sendkey ctrl-alt-delete");
+    let _ = wait_for(&log, "admin password:", 10);
+    type_line(&sock, "wrongpw");
+    let _ = wait_for(&log, "THOS: SAK denied", 10);
+    mon(&sock, "sendkey ctrl-alt-delete");
+    let _ = wait_for(&log, "admin password:", 10);
+    type_line(&sock, "pass");
+    let _ = wait_for(&log, "THOS: SAK accepted", 10);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     let out = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = child.kill();
     let _ = child.wait();
@@ -3234,13 +3253,29 @@ fn kbd_test(iso: &Path) {
         tail.contains("newfile") && tail.contains("newdir")
     };
     let elevate_ok = after.contains("elevated-check uid=0");
-    if shell_ok && ls_ok && cwd_ok && cat_ok && perm_ok && create_ok && elevate_ok {
+    let sak_denied_ok = after.contains("THOS: SAK denied");
+    let sak_accepted_ok = after.contains("THOS: SAK accepted");
+    // Two independent elevated-check spawns: one from `/do-elevate`, one
+    // from the SAK flow — proves the trusted path really spawned its own,
+    // not just that the earlier marker was still sitting in the log.
+    let sak_spawn_ok = after.matches("elevated-check uid=0").count() >= 2;
+    if shell_ok
+        && ls_ok
+        && cwd_ok
+        && cat_ok
+        && perm_ok
+        && create_ok
+        && elevate_ok
+        && sak_denied_ok
+        && sak_accepted_ok
+        && sak_spawn_ok
+    {
         println!(
-            "kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), DAC write denial, O_CREAT/mkdir, elevate()"
+            "kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), DAC write denial, O_CREAT/mkdir, elevate(), SAK trusted path"
         );
     } else {
         eprintln!(
-            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} perm_ok={perm_ok} create_ok={create_ok} elevate_ok={elevate_ok})\n---\n{after}\n---"
+            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} perm_ok={perm_ok} create_ok={create_ok} elevate_ok={elevate_ok} sak_denied_ok={sak_denied_ok} sak_accepted_ok={sak_accepted_ok} sak_spawn_ok={sak_spawn_ok})\n---\n{after}\n---"
         );
         exit(1);
     }
