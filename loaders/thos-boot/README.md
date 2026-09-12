@@ -6,11 +6,24 @@ kernel, finds the OS loaders on every disk the firmware can see, shows a menu,
 counts down to a default, and chainloads the choice with `LoadImage` +
 `StartImage`. It never rewrites `BootOrder`.
 
+## Measured boot
+
+Right before `StartImage` on the chosen loader, the picker measures that
+loader's already-`LoadImage`d bytes into the TPM (`EFI_TCG2_PROTOCOL`, PCR 4 —
+"Boot Manager Code and Boot Attempts" per the TCG PC Client spec) and logs the
+event. This only happens if a TPM 2.0 device and the TCG2 protocol are present
+— most dev/test machines (and plenty of real ones) have neither, and the
+picker boots exactly the same either way; measuring is additive, never a boot
+requirement.
+
 ## Build & test
 
 ```
-cargo xtask bootpick        # build target/x86_64-unknown-uefi/release/thos-boot.efi
-cargo xtask bootpick-test   # boot it under OVMF with 3 fake disks, assert it chainloads
+cargo xtask bootpick             # build target/x86_64-unknown-uefi/release/thos-boot.efi
+cargo xtask bootpick-test        # boot it under OVMF with 3 fake disks, assert it chainloads
+cargo xtask bootpick-tpm-test    # same, with a real swtpm attached — asserts the TCG2
+                                  # measurement actually reaches the TPM. Needs `swtpm` on
+                                  # PATH; skips (not fails) if it isn't.
 ```
 
 ## How it finds OSes

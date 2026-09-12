@@ -11,6 +11,11 @@
 //!
 //! Config (optional): `\EFI\thos\boot.conf` on the ESP we launched from —
 //! `timeout=<seconds>` and `default=<index>` or `default=<substring>`.
+//!
+//! Measured boot: right before `StartImage` on the chosen loader, its
+//! already-loaded bytes get hashed into the TPM (`EFI_TCG2_PROTOCOL`, PCR 4)
+//! and logged — see `measure`. Silently skipped if there's no TPM/TCG2;
+//! never a boot requirement.
 
 #![no_std]
 #![no_main]
@@ -31,6 +36,8 @@ use uefi::proto::device_path::DevicePath;
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::{Directory, File, FileAttribute, FileMode};
 use uefi::proto::media::fs::SimpleFileSystem;
+use uefi::proto::tcg::v2::{HashLogExtendEventFlags, PcrEventInputs, Tcg};
+use uefi::proto::tcg::{EventType, PcrIndex};
 use uefi::proto::BootPolicy;
 use uefi::runtime::VariableVendor;
 use uefi::{cstr16, CStr16, CString16, Char16, Status};
@@ -397,7 +404,47 @@ fn chainload(entry: &Entry) -> uefi::Result<()> {
         boot::image_handle(),
         LoadImageSource::FromDevicePath { device_path: dp, boot_policy: BootPolicy::ExactMatch },
     )?;
+    measure(image, &entry.label);
     boot::start_image(image).map(|_| ())
+}
+
+/// TCG PC Client spec: PCR 4 is "Boot Manager Code and Boot Attempts" — the
+/// right PCR for a boot manager (this picker) to extend with whatever it is
+/// about to hand control to.
+const PCR_BOOT_MANAGER: PcrIndex = PcrIndex(4);
+
+/// The measured half of "measured boot": hash `image`'s already-`LoadImage`d
+/// bytes into the TPM and log the event, *before* `StartImage` hands it
+/// control — so PCR 4 only ends up matching a later attestation/seal if
+/// every boot really loaded the same bytes. Silently does nothing if there
+/// is no TPM (most dev/test machines, and plenty of real ones) or the
+/// firmware doesn't expose TCG2 — this is additive, never a boot
+/// requirement, and a picker that can't measure still has to pick.
+fn measure(image: uefi::Handle, label: &CStr16) {
+    let Ok(handle) = boot::get_handle_for_protocol::<Tcg>() else { return };
+    let Ok(mut tcg) = boot::open_protocol_exclusive::<Tcg>(handle) else { return };
+    let Ok(cap) = tcg.get_capability() else { return };
+    if !cap.tpm_present() {
+        return;
+    }
+    let Ok(li) = boot::open_protocol_exclusive::<LoadedImage>(image) else { return };
+    let (base, size) = li.info();
+    if base.is_null() || size == 0 {
+        return;
+    }
+    // SAFETY: `base`/`size` come straight from the LoadedImage protocol on
+    // the handle `boot::load_image` just returned — the image's own loaded
+    // buffer, still valid (StartImage hasn't run yet).
+    let data = unsafe { core::slice::from_raw_parts(base as *const u8, size as usize) };
+    let desc = label.to_string();
+    let Ok(event) =
+        PcrEventInputs::new_in_box(PCR_BOOT_MANAGER, EventType::EFI_BOOT_SERVICES_APPLICATION, desc.as_bytes())
+    else {
+        return;
+    };
+    if tcg.hash_log_extend_event(HashLogExtendEventFlags::empty(), data, &event).is_ok() {
+        uefi::println!("  [measured `{label}` into TPM PCR 4]");
+    }
 }
 
 // --- small helpers --------------------------------------------------------

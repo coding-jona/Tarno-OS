@@ -48,6 +48,10 @@ fn main() {
             build_uefi();
             bootpick_test();
         }
+        "bootpick-tpm-test" => {
+            build_uefi();
+            bootpick_tpm_test();
+        }
         "ahci-test" => {
             build_kernel(&[]);
             let iso = build_iso();
@@ -91,7 +95,7 @@ fn main() {
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|ahci-test|ext2-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test|pe-test] [--gui]"
+                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|bootpick-tpm-test|ahci-test|ext2-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test|pe-test] [--gui]"
             );
             exit(2);
         }
@@ -3349,6 +3353,124 @@ fn bootpick_test() {
     }
     if ok {
         println!("bootpick-test: OK — enumerated 3 disks, counted down, chainloaded THOS");
+    } else {
+        eprintln!("--- serial log ---\n{out}\n---");
+        exit(1);
+    }
+}
+
+/// Same picker/disk setup as [`bootpick_test`], but with a real TPM 2.0
+/// (`swtpm`, TCG2-attached to OVMF) — the actual proof that `thos-boot`'s
+/// `measure()` reaches a real TPM, not just "compiles". Skips (not fails) if
+/// `swtpm` isn't on `PATH`, since it is optional test tooling, not something
+/// every dev box has.
+fn bootpick_tpm_test() {
+    use std::time::{Duration, Instant};
+
+    if Command::new("swtpm").arg("--version").output().is_err() {
+        println!("bootpick-tpm-test: SKIP — `swtpm` not found on PATH");
+        return;
+    }
+
+    let root = workspace_root();
+    let dir = root.join("target/bootpick-tpm");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tpmstate = dir.join("tpmstate");
+    std::fs::create_dir_all(&tpmstate).unwrap();
+    let sock = dir.join("swtpm-sock");
+    let _ = std::fs::remove_file(&sock);
+
+    let picker = uefi_efi("thos-boot");
+    let stub = uefi_efi("thos-boot-stub");
+    let conf = dir.join("boot.conf");
+    std::fs::write(&conf, b"timeout=1\ndefault=THOS\n").unwrap();
+    let thos = make_fat(
+        &dir,
+        "bptpm-thos.img",
+        &[
+            ("/EFI/BOOT/BOOTX64.EFI", picker),
+            ("/EFI/limine/BOOTX64.EFI", stub),
+            ("/EFI/thos/boot.conf", conf),
+        ],
+    );
+
+    let mut swtpm = Command::new("swtpm")
+        .args(["socket", "--tpm2", "--terminate"])
+        .arg("--tpmstate")
+        .arg(format!("dir={}", tpmstate.to_str().unwrap()))
+        .arg("--ctrl")
+        .arg(format!("type=unixio,path={}", sock.to_str().unwrap()))
+        .spawn()
+        .expect("spawn swtpm");
+    // swtpm creates the control socket asynchronously; give it a moment
+    // before qemu tries to connect.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !sock.exists() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let log = dir.join("serial.log");
+    let _ = std::fs::remove_file(&log);
+
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu.args(["-M", "q35", "-m", "256M", "-no-reboot", "-display", "none"]);
+    qemu.args(["-serial", &format!("file:{}", log.to_str().unwrap())]);
+    qemu.arg("-device").arg("ahci,id=ahci0");
+    qemu.args([
+        "-drive",
+        &format!("id=d0,if=none,format=raw,file={}", thos.to_str().unwrap()),
+        "-device",
+        "ide-hd,drive=d0,bus=ahci0.0",
+    ]);
+    qemu.args(["-chardev", &format!("socket,id=chrtpm,path={}", sock.to_str().unwrap())]);
+    qemu.args(["-tpmdev", "emulator,id=tpm0,chardev=chrtpm"]);
+    qemu.args(["-device", "tpm-crb,tpmdev=tpm0"]);
+    if Path::new("/usr/share/ovmf/OVMF.fd").exists() {
+        let v = dir.join("OVMF.fd");
+        std::fs::copy("/usr/share/ovmf/OVMF.fd", &v).unwrap();
+        qemu.args(["-drive", &format!("if=pflash,format=raw,file={}", v.to_str().unwrap())]);
+    } else if Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd").exists() {
+        let v = dir.join("OVMF_VARS.fd");
+        std::fs::copy("/usr/share/OVMF/OVMF_VARS_4M.fd", &v).unwrap();
+        qemu.args([
+            "-drive",
+            "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "-drive",
+            &format!("if=pflash,format=raw,file={}", v.to_str().unwrap()),
+        ]);
+    } else {
+        eprintln!("bootpick-tpm-test: no OVMF firmware found");
+        let _ = swtpm.kill();
+        exit(1);
+    }
+
+    let mut child = qemu.spawn().expect("spawn qemu");
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && !read_log().contains("STUB OK") {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let out = read_log();
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = swtpm.kill();
+    let _ = swtpm.wait();
+
+    let want = [
+        ("picker banner", "THOS boot picker"),
+        ("chainloaded a stub", "STUB OK"),
+        ("measured the picker's own load into the TPM", "measured `THOS` into TPM PCR 4"),
+    ];
+    let mut ok = true;
+    for (what, needle) in want {
+        if !out.contains(needle) {
+            eprintln!("bootpick-tpm-test: FAIL — missing {what} ({needle:?})");
+            ok = false;
+        }
+    }
+    if ok {
+        println!("bootpick-tpm-test: OK — real swtpm attached, TCG2 measured the chainloaded image into PCR 4");
     } else {
         eprintln!("--- serial log ---\n{out}\n---");
         exit(1);
