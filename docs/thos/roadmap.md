@@ -939,16 +939,18 @@ Phasing:
     the session `Principal` (uid 1000 — the admin session is unprivileged) is
     stamped onto every task and returned by `getuid`/`getgid`. `cargo xtask
     login-test`: setup runs once, reboot goes straight to login, a wrong
-    password is rejected. **File-owner enforcement and a first `elevate`
-    are done too now** — see "Capability policy" under Security Core below
-    (DAC owner/group/other + `O_CREAT`/`chmod`/`chown` + real gid; and
-    `elevate(path, argv, password)`, admin-only + re-authenticated, spawns
-    a brand-new uid-0 process — no trusted path / secure-attention key
-    yet). Still stub: PBKDF2 not argon2id, no `Principal` object proper
+    password is rejected. **File-owner enforcement, `elevate`, and its
+    trusted path (SAK) are done too now** — see "Capability policy" under
+    Security Core below (DAC owner/group/other + `O_CREAT`/`chmod`/`chown`
+    + real gid; `elevate(path, argv, password)`, admin-only +
+    re-authenticated, spawns a brand-new uid-0 process; and Ctrl+Alt+Delete,
+    intercepted below any user-mode process, as the one real trusted path
+    into it). Still stub: PBKDF2 not argon2id, no `Principal` object proper
     (uid/gid stand in for it), no NT SID / token / DACL side, password
     changing is "rewrite the store + reboot" not a settings action.
 - **Phase 3 (full):** SID / token model, NT DACL ↔ canonical-ACL translation, the
-  UAC path, the trusted-path prompt, privilege sets (`SeDebugPrivilege` …).
+  UAC path (SAK now covers the trusted-path prompt itself), privilege sets
+  (`SeDebugPrivilege` …).
 
 ## Phase 4 — Real graphics (the GPU mountain)
 
@@ -1117,13 +1119,7 @@ into ring 0."
     `process::spawn_elevated` starts a **brand-new process** with uid/gid
     forced to 0. THOS has no in-place token upgrade, so "scoped to that
     process" falls out of the design for free: there is no elevated shell
-    or standing token to leak or reuse for a later action. Not yet built,
-    stated rather than skipped: the **trusted path** (a secure-attention
-    key so no app can draw a fake password prompt) — needs a global
-    keyboard-capture mechanism; today the password is just whatever the
-    calling process handed the kernel, trusted only because THOS has
-    exactly one interactive session and nothing else that could impersonate
-    the prompt yet.
+    or standing token to leak or reuse for a later action.
     Verified with a genuine round trip, not "the syscall returned 0": a new
     test binary `/do-elevate` calls the real syscall via a raw `syscall`
     instruction (no libc) with the actual admin password `drive_login`
@@ -1131,6 +1127,35 @@ into ring 0."
     calls `getuid()` and prints the result — proof the *spawned* process
     really has uid 0. `cargo xtask kbd-test`: `elevate returned 22` (a real
     pid) followed by `elevated-check uid=0`. Full regression sweep green.
+  - **`elevate()`'s trusted path (SAK) — done.** Closes exactly the gap the
+    slice above named: the password used to be whatever the calling
+    process handed the kernel, trusted only because THOS has one
+    interactive session and nothing else that could impersonate the
+    prompt. Now there's a real reason regardless: `console.rs` detects
+    Ctrl+Alt+Delete directly off the raw HID report the xHCI keyboard
+    thread feeds in — *before* any byte reaches the queue a `read()` on
+    fd 0 (any user-mode process) can ever see. No application-visible
+    input stream ever carries these keystrokes at all, so no app can fake
+    this prompt — not an approximation of "no app can impersonate it", the
+    actual property. On the combo: freezes normal input delivery, prints a
+    kernel-drawn banner straight to the console synchronously from the
+    keyboard interrupt path, reads the following keys into a private
+    buffer (masked, backspace-editable, never touching the normal queue)
+    until Enter, then re-authenticates against the real credential store
+    and calls `process::spawn_elevated` — the same primitive
+    `sys_elevate` uses — to run `/elevated-check` as uid 0 on success.
+    Deliberately the smallest real thing this can *lead to* (real Windows
+    SAK opens a whole secure desktop with several choices; THOS has no GUI
+    on this console) — one fixed, real privileged action, not a mocked
+    one.
+    Verified with genuine QEMU input, not typed characters the shell could
+    ever see: `cargo xtask kbd-test` sends the actual `ctrl-alt-delete`
+    combo via the QEMU monitor, confirms the kernel-drawn banner appears
+    outside any shell's own output, types a wrong password first (denied,
+    no spawn), then the real one (`THOS: SAK accepted` + a *second*,
+    independent `elevated-check uid=0` — the first came from `/do-elevate`
+    earlier in the same boot, so requiring a second proves this path
+    genuinely spawned its own process). Full regression sweep green.
   - **Per-key registry security — done.** Closes one of `registry.rs`'s own
     three stated gaps (transactions is still open — change-notify below).
     Same
