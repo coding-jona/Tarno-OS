@@ -11,7 +11,15 @@ license. Every source file carries an `SPDX-License-Identifier` header.
   tarno-br2-external/ scripts/` → unchanged **AGPL-3.0** (see `FROZEN.md`).
 - `third_party/*` → upstream licenses, vendored unmodified.
 - Root `LICENSE` (AGPL-3.0 full text) stays as the repo default for the frozen parts.
-- TODO: add `LICENSES/GPL-2.0-or-later.txt` (full text) and a `.reuse/dep5` map.
+- `LICENSES/GPL-2.0-or-later.txt` (full text) added 2026-10-02. **Still open:** a `.reuse/dep5` map, and the licence of the frozen Devuan/Go parts — see *Open licensing questions* below.
+
+### Open licensing questions (found 2026-10-02, before making the repository public)
+
+1. The root `LICENSE` file is the **GPL-2.0** text, not the AGPL-3.0 text this document says it is.
+2. The frozen components (`main.go`, `cmd/`, `tarno/`, `scripts/`, `tarno-devuan-live/`) carry **no SPDX header at all**, so their licence is currently undefined in the files themselves.
+3. A copyright-holder line / `AUTHORS` has not been decided (the history has three committer identities).
+
+One licence for everything (GPL-2.0-or-later) would be the simplest open-source setup; keeping AGPL-3.0 for the frozen network-facing daemon is the alternative. Needs the maintainer's decision.
 
 ### Does hosting on GitHub complicate this?
 
