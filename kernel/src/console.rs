@@ -8,7 +8,7 @@
 //! Also the **secure attention key** — `elevate()`'s trusted path (see
 //! `syscall::sys_elevate`'s own doc comment for the gap this closes):
 //! Ctrl+Alt+Delete is detected directly off the raw HID report, *before*
-//! any byte reaches [`QUEUE`] — the only thing a `read()` on fd 0 (i.e. any
+//! any byte reaches [`TTY`] — the only thing a `read()` on fd 0 (i.e. any
 //! user-mode process) can ever see. No app can draw a fake password prompt
 //! here, because no app-visible input stream ever carries these keystrokes
 //! at all; they're consumed entirely inside this module and never queued.
@@ -23,15 +23,77 @@ use spin::Mutex;
 use crate::serial;
 use crate::wait::WaitQueue;
 
-static QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
-/// Woken when a byte lands in `QUEUE` — a blocked `read` on fd 0 sleeps on it.
+/// The terminal input buffer, in canonical (line-buffered) mode.
+///
+/// `q` holds every typed byte not yet read; the last `pending` of them are the
+/// line still being edited — **not readable yet**. Enter (or Ctrl+D) commits the
+/// line; until then Backspace / Ctrl+U / Ctrl+W can still take characters back,
+/// which is the whole point of a line discipline (the shell never sees what the
+/// user erased). One lock covers both fields so a reader can't observe them torn.
+struct Tty {
+    q: VecDeque<u8>,
+    pending: usize,
+}
+
+impl Tty {
+    const fn new() -> Self {
+        Self { q: VecDeque::new(), pending: 0 }
+    }
+    /// Append a typed byte; a newline commits the whole line.
+    fn push(&mut self, c: u8) {
+        self.q.push_back(c);
+        if c == b'\n' {
+            self.pending = 0;
+        } else {
+            self.pending += 1;
+        }
+    }
+    /// Take back the last typed byte of the current line.
+    fn erase_last(&mut self) -> bool {
+        if self.pending == 0 {
+            return false;
+        }
+        self.q.pop_back();
+        self.pending -= 1;
+        true
+    }
+    /// Drop the whole current line; returns how many bytes.
+    fn kill_line(&mut self) -> usize {
+        let n = self.pending;
+        for _ in 0..n {
+            self.q.pop_back();
+        }
+        self.pending = 0;
+        n
+    }
+    /// Drop the last word (and blanks before it) of the current line.
+    fn kill_word(&mut self) -> usize {
+        let mut n = 0;
+        while n < self.pending && self.q.iter().rev().nth(n) == Some(&b' ') {
+            n += 1;
+        }
+        while n < self.pending && self.q.iter().rev().nth(n).is_some_and(|&b| b != b' ') {
+            n += 1;
+        }
+        for _ in 0..n {
+            self.q.pop_back();
+        }
+        self.pending -= n;
+        n
+    }
+    /// Bytes a reader may take now.
+    fn committed(&self) -> usize {
+        self.q.len() - self.pending
+    }
+}
+
+static TTY: Mutex<Tty> = Mutex::new(Tty::new());
+/// Woken when a line is committed — a blocked `read` on fd 0 sleeps on it.
 static INPUT_WQ: WaitQueue = WaitQueue::new();
 static PREV: Mutex<[u8; 6]> = Mutex::new([0; 6]);
-/// Bytes on the current line not yet consumed by a reader — for backspace.
-static LINE_LEN: Mutex<usize> = Mutex::new(0);
 
 /// `true` while a secure-attention sequence is being typed: every key goes
-/// to [`SAK_BUF`] instead of [`QUEUE`], masked, until Enter.
+/// to [`SAK_BUF`] instead of [`TTY`], masked, until Enter.
 /// Set by Ctrl+D on an empty line: the next `read` on fd 0 reports EOF (0) once.
 static EOF: AtomicBool = AtomicBool::new(false);
 /// The clipboard: filled by `Ctrl+Shift+C` (copy selection), drained by
@@ -137,18 +199,11 @@ const KC_LEFT: u8 = 0x50;
 const KC_DOWN: u8 = 0x51;
 const KC_UP: u8 = 0x52;
 
-/// Queue one typed character exactly as a key press would: into the line queue,
-/// counted in the current line, and echoed (honouring the echo mode).
+/// Queue one typed character exactly as a key press would: into the line being
+/// edited (a newline commits it), and echoed (honouring the echo mode).
 fn push_typed(c: u8) {
-    let echo = ECHO.load(Ordering::Relaxed);
-    QUEUE.lock().push_back(c);
-    let mut ll = LINE_LEN.lock();
-    if c == b'\n' {
-        *ll = 0;
-    } else {
-        *ll += 1;
-    }
-    match echo {
+    TTY.lock().push(c);
+    match ECHO.load(Ordering::Relaxed) {
         1 if c != b'\n' => serial::write_bytes(b"*"),
         2 => {}
         _ => serial::write_bytes(&[c]),
@@ -164,37 +219,15 @@ fn echo_erase(n: usize) {
     }
 }
 
-/// Ctrl+U: discard the whole unread part of the current line.
+/// Ctrl+U: discard the whole line being edited.
 fn kill_line() {
-    let mut ll = LINE_LEN.lock();
-    let n = *ll;
-    let mut q = QUEUE.lock();
-    for _ in 0..n {
-        q.pop_back();
-    }
-    *ll = 0;
-    drop(q);
-    drop(ll);
+    let n = TTY.lock().kill_line();
     echo_erase(n);
 }
 
 /// Ctrl+W: discard the last word (and the blanks before it) of the current line.
 fn kill_word() {
-    let mut ll = LINE_LEN.lock();
-    let mut q = QUEUE.lock();
-    let mut n = 0;
-    while n < *ll && q.iter().rev().nth(n) == Some(&b' ') {
-        n += 1;
-    }
-    while n < *ll && q.iter().rev().nth(n).is_some_and(|&b| b != b' ') {
-        n += 1;
-    }
-    for _ in 0..n {
-        q.pop_back();
-    }
-    *ll -= n;
-    drop(q);
-    drop(ll);
+    let n = TTY.lock().kill_word();
     echo_erase(n);
 }
 
@@ -272,11 +305,17 @@ fn shortcut(k: u8, ctrl: bool, shift: bool) -> bool {
         (true, false, KC_U) => kill_line(),
         (true, false, KC_W) => kill_word(),
         (true, false, KC_L) => clear_screen(),
+        // Ctrl+D: on an empty line it is end-of-file; on a half-typed line it
+        // hands that line to the reader without a newline (POSIX canonical mode).
         (true, false, KC_D) => {
-            if *LINE_LEN.lock() == 0 {
+            let mut t = TTY.lock();
+            if t.pending == 0 {
                 EOF.store(true, Ordering::Release);
-                INPUT_WQ.wake_all();
+            } else {
+                t.pending = 0;
             }
+            drop(t);
+            INPUT_WQ.wake_all();
         }
         // Ctrl+C: THOS has no signals yet (roadmap B3), so this approximates the
         // prompt case — abandon the line, show ^C, and hand the shell an empty
@@ -285,7 +324,7 @@ fn shortcut(k: u8, ctrl: bool, shift: bool) -> bool {
         (true, false, KC_C) => {
             kill_line();
             serial::write_bytes(b"^C\r\n");
-            QUEUE.lock().push_back(b'\n');
+            TTY.lock().push(b'\n');
             INPUT_WQ.wake_all();
         }
         (true, _, _) => {} // any other Ctrl chord: swallow
@@ -342,31 +381,13 @@ pub fn feed_report(rpt: &[u8; 8]) {
         if c == 0 {
             continue;
         }
-        let echo = ECHO.load(Ordering::Relaxed);
         if c == 0x08 {
-            let mut ll = LINE_LEN.lock();
-            if *ll > 0 {
-                *ll -= 1;
-                let mut q = QUEUE.lock();
-                q.pop_back();
-                if echo != 2 {
-                    serial::write_bytes(b"\x08 \x08");
-                }
+            if TTY.lock().erase_last() {
+                echo_erase(1);
             }
         } else {
-            QUEUE.lock().push_back(c);
-            pushed = true;
-            let mut ll = LINE_LEN.lock();
-            if c == b'\n' {
-                *ll = 0;
-            } else {
-                *ll += 1;
-            }
-            match echo {
-                1 if c != b'\n' => serial::write_bytes(b"*"),
-                2 => {}
-                _ => serial::write_bytes(&[c]),
-            }
+            push_typed(c);
+            pushed |= c == b'\n'; // only a committed line can wake a reader
         }
     }
     *prev = keys;
@@ -390,7 +411,7 @@ fn sak_begin() {
 
 /// Decode one HID report's worth of keys while a SAK sequence is being
 /// typed: same layout decode as the normal path, but every character is
-/// masked and appended to [`SAK_BUF`] instead of [`QUEUE`] — it never
+/// masked and appended to [`SAK_BUF`] instead of [`TTY`] — it never
 /// becomes readable by any process, elevated or not.
 fn sak_feed(keys: &[u8; 6], prev: &mut [u8; 6], shift: bool, altgr: bool) {
     for &k in keys.iter() {
@@ -449,20 +470,21 @@ fn sak_finish() {
     SAK_ACTIVE.store(false, Ordering::Relaxed);
 }
 
-/// Non-blocking read into `buf`; returns bytes moved.
+/// Non-blocking read into `buf`; returns bytes moved. Only *committed* input is
+/// readable — the line still being typed stays with the line editor.
 pub fn read(buf: &mut [u8]) -> usize {
-    let mut q = QUEUE.lock();
-    let n = buf.len().min(q.len());
+    let mut t = TTY.lock();
+    let n = buf.len().min(t.committed());
     for b in buf.iter_mut().take(n) {
-        *b = q.pop_front().unwrap();
+        *b = t.q.pop_front().unwrap();
     }
     n
 }
 
-/// Block the current thread until at least one byte is available for `read`
-/// (or an EOF from Ctrl+D is pending).
+/// Block the current thread until a committed line (or an EOF from Ctrl+D) is
+/// available for `read`.
 pub fn wait_for_input() {
-    INPUT_WQ.wait_if(|| QUEUE.lock().is_empty() && !EOF.load(Ordering::Acquire));
+    INPUT_WQ.wait_if(|| TTY.lock().committed() == 0 && !EOF.load(Ordering::Acquire));
 }
 
 /// Consume a pending Ctrl+D EOF, if any.
@@ -472,5 +494,5 @@ pub fn take_eof() -> bool {
 
 #[allow(dead_code)] // used by an interactive line-reader
 pub fn has_input() -> bool {
-    !QUEUE.lock().is_empty()
+    TTY.lock().committed() > 0
 }

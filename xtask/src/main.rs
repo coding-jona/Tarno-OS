@@ -3667,22 +3667,22 @@ fn shortcuts_test(img: &Path) {
     settle(800);
     let mut fails: Vec<String> = Vec::new();
 
-    // 1. Ctrl+U discards the half-typed line: "abc" is gone, so `echo UOK42`
-    //    runs as itself and prints UOK42 at the start of a line.
+    // 1. Ctrl+U discards the half-typed line: "abc" is gone, so `echo uok42`
+    //    runs as itself and prints uok42 at the start of a line.
     for c in ["a", "b", "c"] { key(c); }
     key("ctrl-u");
     settle(300);
-    type_line(&sock, "echo UOK42");
-    if !wait_for(&log, "\nUOK42", 15) || text(&log).contains("abcecho") {
+    type_line(&sock, "echo uok42");
+    if !wait_for(&log, "\nuok42", 15) || text(&log).contains("abcecho") {
         fails.push("Ctrl+U did not discard the typed line".into());
     }
 
     // 2. Mark mode: start at the cursor (prompt row), Up to the output line,
     //    Home, Enter copies; then Ctrl+Shift+V types it back in.
-    type_line(&sock, "echo PASTEME");
-    wait_for(&log, "\nPASTEME", 15);
+    type_line(&sock, "echo pasteme");
+    wait_for(&log, "\npasteme", 15);
     settle(500);
-    let before = text(&log).matches("PASTEME").count();
+    let before = text(&log).matches("pasteme").count();
     key("ctrl-shift-spc");
     key("up");
     key("home");
@@ -3690,22 +3690,23 @@ fn shortcuts_test(img: &Path) {
     settle(300);
     key("ctrl-shift-v");
     settle(800);
-    let after = text(&log).matches("PASTEME").count();
+    let after = text(&log).matches("pasteme").count();
     if after <= before {
-        fails.push(format!("mark+copy+paste typed nothing back (PASTEME x{before} -> x{after})"));
+        fails.push(format!("mark+copy+paste typed nothing back (pasteme x{before} -> x{after})"));
     }
     key("ctrl-u");
     settle(300);
 
     // 3. Select all + copy + paste: the whole text model comes back as typed
-    //    input, which includes the very first boot line a second time.
-    let boots = text(&log).matches("THOS: kmain reached").count();
+    //    input, which includes an early boot line a second time. (The first two
+    //    boot lines predate the framebuffer console, so they are not in its model.)
+    let boots = text(&log).matches("THOS: GDT + IDT loaded").count();
     key("ctrl-shift-a");
     key("ctrl-shift-c");
     settle(300);
     key("ctrl-shift-v");
     settle(1500);
-    let boots2 = text(&log).matches("THOS: kmain reached").count();
+    let boots2 = text(&log).matches("THOS: GDT + IDT loaded").count();
     if boots2 <= boots {
         fails.push(format!("select-all+copy+paste did not reproduce the scrollback ({boots} -> {boots2})"));
     }
