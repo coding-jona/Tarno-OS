@@ -3945,8 +3945,8 @@ fn net_test(img: &Path) {
     let out = boot_and_run_args(
         img,
         "net",
-        &format!("nettest {tcp_port} {udp_port}; busybox wget -q -O - http://10.0.2.2:{tcp_port}/"),
-        "THOS-NET-OK-TCP",
+        &format!("nettest {tcp_port} {udp_port}; busybox wget -q -O - http://10.0.2.2:{tcp_port}/; cat /etc/resolv.conf"),
+        "nameserver",
         90,
         &["-cpu", "Westmere", "-nic", "user,model=virtio-net-pci"],
     );
@@ -3954,10 +3954,11 @@ fn net_test(img: &Path) {
     let sock = out.lines().find(|l| l.contains("net-sock ok")).map(str::trim);
     // The HTTP body must also appear as the *output* of BusyBox wget (a line of its own).
     let wget = out.lines().any(|l| l.trim() == "THOS-NET-OK-TCP");
-    if gw.is_some() && sock.is_some() && wget {
+    let dns = out.lines().any(|l| l.trim() == "nameserver 10.0.2.3");
+    if gw.is_some() && sock.is_some() && wget && dns {
         println!("net-test PASSED: {}", gw.unwrap());
         println!("                 {}", sock.unwrap());
-        println!("                 BusyBox wget fetched the page from the host");
+        println!("                 BusyBox wget fetched the page from the host; DHCP lease + resolv.conf (nameserver 10.0.2.3)");
     } else {
         for l in out.lines().filter(|l| l.contains("net")) {
             eprintln!("  {l}");

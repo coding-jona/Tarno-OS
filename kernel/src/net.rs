@@ -9,10 +9,10 @@ use alloc::vec::Vec;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
-use smoltcp::socket::icmp;
+use smoltcp::socket::{dhcpv4, icmp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
+    EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
 };
 use spin::Mutex;
 
@@ -78,6 +78,11 @@ pub struct Stack {
     nic: Nic,
     pub iface: Interface,
     pub sockets: SocketSet<'static>,
+    dhcp: SocketHandle,
+    /// DNS servers from the lease (or the static fallback).
+    pub dns: Vec<[u8; 4]>,
+    /// A lease (or the static fallback) has been applied.
+    pub configured: bool,
 }
 
 pub static NET: Mutex<Option<Stack>> = Mutex::new(None);
@@ -89,7 +94,78 @@ fn now() -> Instant {
 impl Stack {
     pub fn poll(&mut self) {
         self.iface.poll(now(), &mut self.nic, &mut self.sockets);
+        self.service_dhcp();
     }
+
+    fn set_address(&mut self, addr: Ipv4Cidr, router: Option<Ipv4Address>, dns: Vec<[u8; 4]>) {
+        self.iface.update_ip_addrs(|a| {
+            a.clear();
+            let _ = a.push(IpCidr::Ipv4(addr));
+        });
+        match router {
+            Some(r) => {
+                let _ = self.iface.routes_mut().add_default_ipv4_route(r);
+            }
+            None => self.iface.routes_mut().remove_default_ipv4_route().map(|_| ()).unwrap_or(()),
+        }
+        self.dns = dns;
+        self.configured = true;
+    }
+
+    /// Apply DHCP lease changes as they arrive.
+    fn service_dhcp(&mut self) {
+        // Copy the lease out of the socket before touching `self` again.
+        let lease = match self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).poll() {
+            Some(dhcpv4::Event::Configured(cfg)) => {
+                Some(Some((cfg.address, cfg.router, cfg.dns_servers.iter().map(|d| d.octets()).collect::<Vec<_>>())))
+            }
+            Some(dhcpv4::Event::Deconfigured) => Some(None),
+            None => None,
+        };
+        match lease {
+            Some(Some((addr, router, dns))) => {
+                kprintln!(
+                    "THOS: net dhcp         lease {} via {} dns {:?}",
+                    addr,
+                    router.map_or(alloc::string::String::from("-"), |r| alloc::format!("{r}")),
+                    dns
+                );
+                self.set_address(addr, router, dns);
+            }
+            Some(None) => {
+                self.iface.update_ip_addrs(|a| a.clear());
+                self.configured = false;
+            }
+            None => {}
+        }
+    }
+
+    /// No lease arrived: use the QEMU user-network defaults so the stack is still usable.
+    pub fn fallback_static(&mut self) {
+        if !self.configured {
+            kprintln!("THOS: net dhcp         no lease — static fallback 10.0.2.15/24");
+            self.set_address(
+                Ipv4Cidr::new(Ipv4Address::new(STATIC_IP[0], STATIC_IP[1], STATIC_IP[2], STATIC_IP[3]), 24),
+                Some(Ipv4Address::new(GATEWAY[0], GATEWAY[1], GATEWAY[2], GATEWAY[3])),
+                vec![[10, 0, 2, 3]],
+            );
+        }
+    }
+}
+
+/// `/etc/resolv.conf` as the resolver should see it: the lease's DNS servers. `None` while
+/// the stack is down or has no DNS server (the file on disk, if any, is used then).
+pub fn resolv_conf() -> Option<alloc::string::String> {
+    let g = NET.lock();
+    let st = g.as_ref()?;
+    if st.dns.is_empty() {
+        return None;
+    }
+    let mut out = alloc::string::String::new();
+    for d in &st.dns {
+        out.push_str(&alloc::format!("nameserver {}.{}.{}.{}\n", d[0], d[1], d[2], d[3]));
+    }
+    Some(out)
 }
 
 /// The interface's IPv4 address (0.0.0.0 before `init`).
@@ -107,18 +183,14 @@ pub fn init() -> Result<(), &'static str> {
     let mut dev = Nic(VirtioNet::probe()?);
     let mac = dev.0.mac;
     let cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-    let mut iface = Interface::new(cfg, &mut dev, now());
-    iface.update_ip_addrs(|a| {
-        let _ = a.push(IpCidr::new(IpAddress::v4(STATIC_IP[0], STATIC_IP[1], STATIC_IP[2], STATIC_IP[3]), 24));
-    });
-    let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(GATEWAY[0], GATEWAY[1], GATEWAY[2], GATEWAY[3]));
+    let iface = Interface::new(cfg, &mut dev, now());
     kprintln!(
-        "THOS: net nic          virtio-net {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, {}.{}.{}.{}/24 via {}.{}.{}.{}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-        STATIC_IP[0], STATIC_IP[1], STATIC_IP[2], STATIC_IP[3],
-        GATEWAY[0], GATEWAY[1], GATEWAY[2], GATEWAY[3]
+        "THOS: net nic          virtio-net {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
-    *NET.lock() = Some(Stack { nic: dev, iface, sockets: SocketSet::new(Vec::new()) });
+    let mut sockets = SocketSet::new(Vec::new());
+    let dhcp = sockets.add(dhcpv4::Socket::new());
+    *NET.lock() = Some(Stack { nic: dev, iface, sockets, dhcp, dns: Vec::new(), configured: false });
     Ok(())
 }
 
@@ -176,6 +248,21 @@ fn ping(dst: [u8; 4], tries: u32) -> Option<u64> {
 
 /// The network thread: boot-time gateway ping, then keep the stack serviced.
 pub extern "C" fn net_thread(_: usize) -> ! {
+    // Give DHCP a few seconds, then fall back to the static QEMU defaults.
+    for _ in 0..300 {
+        {
+            let mut g = NET.lock();
+            let Some(st) = g.as_mut() else { break };
+            st.poll();
+            if st.configured {
+                break;
+            }
+        }
+        crate::timer::sleep_ns(10_000_000);
+    }
+    if let Some(st) = NET.lock().as_mut() {
+        st.fallback_static();
+    }
     match ping(GATEWAY, 3) {
         Some(ms) => kprintln!(
             "THOS: net ok           ping {}.{}.{}.{} answered in {} ms (ARP + ICMP over virtio-net + smoltcp)",

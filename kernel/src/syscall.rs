@@ -564,6 +564,12 @@ pub fn open_resolved_access(path: &str, want_read: bool, want_write: bool) -> i6
     let Some(task) = sched::current().task() else {
         return EBADF;
     };
+    // The resolver configuration is generated from the DHCP lease (read-only, virtual).
+    if path == "/etc/resolv.conf" && !want_write {
+        if let Some(text) = crate::net::resolv_conf() {
+            return task.fd_alloc(crate::file::Ext2File::new(path.into(), text.into_bytes())) as i64;
+        }
+    }
     let Some(fs) = ext2::open().ok() else { return EIO };
     let Some(ino) = fs.path_lookup(path) else { return ENOENT };
     let node = fs.read_inode(ino);
