@@ -129,6 +129,7 @@ const SYS_PPOLL: u64 = 271;
 const SYS_READLINKAT: u64 = 267;
 
 const ENOSYS: i64 = -38;
+const ENOEXEC: i64 = -8;
 const EBADF: i64 = -9;
 const ECHILD: i64 = -10;
 #[allow(dead_code)]
@@ -986,6 +987,10 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             let argv = user_cstr_array(a2);
             let envp = user_cstr_array(a3);
             match ext2::open().ok().and_then(|fs| fs.read_path(&path)) {
+                // Not something we can run (a script, a text file, a truncated
+                // binary): ENOEXEC lets the shell fall back instead of the
+                // kernel dying inside `execve`'s own `expect`.
+                Some(bytes) if crate::elf::validate(&bytes).is_err() => ENOEXEC,
                 Some(bytes) => process::execve(&bytes, &argv, &envp), // -> ! on success
                 None => ENOENT,
             }

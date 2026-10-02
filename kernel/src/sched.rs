@@ -94,6 +94,36 @@ extern "C" fn thos_thread_exit() -> ! {
 
 const KSTACK_SIZE: usize = 16 * 1024;
 
+/// One thread's x87/SSE register file (`FXSAVE` area, 512 bytes, 16-aligned).
+///
+/// The kernel itself is built without SSE, so it never touches `xmm`/x87 — but
+/// user programs (musl, Rust, every Win64 binary) use them constantly, and the
+/// timer preempts between processes at arbitrary instructions. Without a
+/// per-thread save/restore at the context switch, every process would see
+/// another process's `xmm` registers (silent data corruption). Saved when a
+/// thread stops running, restored when it resumes — see `reschedule`/`exit`.
+#[repr(C, align(16))]
+struct FpuState([u8; 512]);
+
+impl FpuState {
+    /// A valid power-on image: x87 control word 0x037F, MXCSR 0x1F80 (all
+    /// exceptions masked), MXCSR_MASK 0xFFFF — what `fninit` + reset would give.
+    fn boxed() -> Box<UnsafeCell<FpuState>> {
+        let mut st = FpuState([0; 512]);
+        st.0[0..2].copy_from_slice(&0x037Fu16.to_le_bytes()); // FCW
+        st.0[24..28].copy_from_slice(&0x1F80u32.to_le_bytes()); // MXCSR
+        st.0[28..32].copy_from_slice(&0x0000_FFFFu32.to_le_bytes()); // MXCSR_MASK
+        Box::new(UnsafeCell::new(st))
+    }
+}
+
+unsafe fn fxsave(area: *mut u8) {
+    core::arch::asm!("fxsave64 [{0}]", in(reg) area, options(nostack, preserves_flags));
+}
+unsafe fn fxrstor(area: *const u8) {
+    core::arch::asm!("fxrstor64 [{0}]", in(reg) area, options(nostack, preserves_flags));
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
     Ready,
@@ -152,6 +182,8 @@ pub struct Thread {
     /// timed wait: `false` at rest, so the requeue is deduped by the ready-queue
     /// scan in `unblock` rather than a claim flag.
     wake_pending: AtomicBool,
+    /// x87/SSE state while this thread is *not* running (see [`FpuState`]).
+    fpu: Box<UnsafeCell<FpuState>>,
 }
 
 unsafe impl Send for Thread {}
@@ -186,6 +218,7 @@ impl Thread {
             fsbase: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
             wake_pending: AtomicBool::new(false),
+            fpu: FpuState::boxed(),
         })
     }
 
@@ -239,6 +272,7 @@ impl Thread {
             fsbase: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
             wake_pending: AtomicBool::new(false),
+            fpu: FpuState::boxed(),
         })
     }
 
@@ -274,6 +308,7 @@ impl Thread {
             fsbase: AtomicU64::new(0),
             gsbase: AtomicU64::new(gsbase),
             wake_pending: AtomicBool::new(false),
+            fpu: FpuState::boxed(),
         })
     }
 
@@ -309,6 +344,7 @@ impl Thread {
             fsbase: AtomicU64::new(fsbase),
             gsbase: AtomicU64::new(0),
             wake_pending: AtomicBool::new(false),
+            fpu: FpuState::boxed(),
         })
     }
 
@@ -596,6 +632,8 @@ pub fn exit() -> ! {
     while next.running.swap(true, Ordering::Acquire) {
         core::hint::spin_loop();
     }
+    // The exiting thread's registers are dead — only load the incoming set.
+    unsafe { fxrstor(next.fpu.get() as *const u8) };
     // `thos_ctx_switch` does not return for this call — this stack is dead
     // the instant it jumps away, so `next`'s Drop glue would otherwise never
     // run (the enclosing frame is never unwound to reach it). Drop it
@@ -642,7 +680,7 @@ pub fn phantoms_dropped() -> u64 {
 /// The core switch. `block` = don't return the current thread to the ready
 /// queue (it is going to sleep). Must run with interrupts disabled.
 fn reschedule(block: bool) {
-    let (save, load, next, cpu, cr3, kstack_top, fsbase, gsbase) = {
+    let (save, load, next, cpu, cr3, kstack_top, fsbase, gsbase, prev_fpu) = {
         let mut s = SCHED.lock();
         let cpu = smp::this_cpu() as usize;
 
@@ -686,6 +724,7 @@ fn reschedule(block: bool) {
             next.kstack_top,
             next.fsbase(),
             next.gsbase(),
+            prev.fpu.get() as *mut u8,
         );
         s.cpus[cpu].current = Some(next.clone());
         out
@@ -697,6 +736,16 @@ fn reschedule(block: bool) {
     // Claim `next`'s stack: wait out any CPU still unwinding off it.
     while next.running.swap(true, Ordering::Acquire) {
         core::hint::spin_loop();
+    }
+
+    // x87/SSE: park the outgoing thread's registers, load the incoming one's.
+    // `prev` is still ours (its `running` claim is released only in
+    // `finish_switch`, after the switch) and `next` was saved by whichever CPU
+    // last ran it *before* that CPU released it — so neither area can be
+    // touched concurrently.
+    unsafe {
+        fxsave(prev_fpu);
+        fxrstor(next.fpu.get() as *const u8);
     }
 
     unsafe { thos_ctx_switch(save, load) };

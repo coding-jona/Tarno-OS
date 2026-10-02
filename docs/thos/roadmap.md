@@ -1507,6 +1507,13 @@ Planned in [`network-plan.md`](network-plan.md) (*user, 2026-10-02*): virtio-net
 first, smoltcp-class stack, shared socket endpoints for POSIX + Winsock, then the
 real NICs. Not built yet.
 
+## Source review (2026-10-02)
+
+A full read of the kernel tree: bugs fixed (per-thread x87/SSE state, `execve`
+panic on non-ELF), open hazards (user-pointer trust, self-tests in the production
+boot, signals, CSPRNG, file I/O limits) and an honest map of the Linux/Windows
+compatibility coverage — [`source-review-2026-10.md`](source-review-2026-10.md).
+
 ## Installing software
 
 Planned in [`software-install-plan.md`](software-install-plan.md) (*user,

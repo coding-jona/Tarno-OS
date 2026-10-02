@@ -32,7 +32,8 @@ fn main() {
             run_qemu(&iso, gui);
         }
         "bios-image" => {
-            build_kernel(&[]);
+            // `--interactive`: the login/shell build (the plain one just halts).
+            build_kernel(if args.iter().any(|a| a == "--interactive") { &["interactive"] } else { &[] });
             bios_image();
         }
         "bios-test" => {
@@ -344,6 +345,8 @@ fn disk_image() -> PathBuf {
         // `poweroff`/`reboot`/`halt`: one binary, three names under /bin
         // (dispatch on argv[0]); BusyBox's versions need /proc.
         ("power.rs", "power"),
+        // Scheduler x87/SSE isolation test, typed in by `kbd-test`.
+        ("fputest.rs", "fputest"),
     ] {
         let rs = root.join("xtask/testdata").join(src);
         let bin = root.join("target").join(name);
@@ -3250,6 +3253,11 @@ fn kbd_test(iso: &Path) {
     // running CI can be slow enough that a 2 MiB BusyBox applet takes seconds.
     let _ = wait_for(&log, "hello a file read via open+lseek+read", 30);
 
+    // x87/SSE isolation: 12 forked children (more than the 4 vCPUs) each hold
+    // a private pattern in xmm0-7 while the timer preempts them.
+    type_line(&sock, "fputest");
+    let _ = wait_for(&log, "fpu ", 150);
+
     // Capability policy: the logged-in session is uid 1000 (`thos`, per
     // `drive_login`); `/etc/thos/admin.cred` is owned by uid 0 (the system
     // account — every file `write_path` creates is, today) at mode 644 —
@@ -3321,6 +3329,7 @@ fn kbd_test(iso: &Path) {
         let tail = after.rsplit("thos$ ls\n").next().unwrap_or("");
         tail.contains("newfile") && tail.contains("newdir")
     };
+    let fpu_ok = after.contains("fpu ok");
     let elevate_ok = after.contains("elevated-check uid=0");
     let sak_denied_ok = after.contains("THOS: SAK denied");
     let sak_accepted_ok = after.contains("THOS: SAK accepted");
@@ -3332,6 +3341,7 @@ fn kbd_test(iso: &Path) {
         && ls_ok
         && cwd_ok
         && cat_ok
+        && fpu_ok
         && perm_ok
         && create_ok
         && elevate_ok
@@ -3340,11 +3350,11 @@ fn kbd_test(iso: &Path) {
         && sak_spawn_ok
     {
         println!(
-            "kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), DAC write denial, O_CREAT/mkdir, elevate(), SAK trusted path"
+            "kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), private x87/SSE state across preemption, DAC write denial, O_CREAT/mkdir, elevate(), SAK trusted path"
         );
     } else {
         eprintln!(
-            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} perm_ok={perm_ok} create_ok={create_ok} elevate_ok={elevate_ok} sak_denied_ok={sak_denied_ok} sak_accepted_ok={sak_accepted_ok} sak_spawn_ok={sak_spawn_ok})\n---\n{after}\n---"
+            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} fpu_ok={fpu_ok} perm_ok={perm_ok} create_ok={create_ok} elevate_ok={elevate_ok} sak_denied_ok={sak_denied_ok} sak_accepted_ok={sak_accepted_ok} sak_spawn_ok={sak_spawn_ok})\n---\n{after}\n---"
         );
         exit(1);
     }

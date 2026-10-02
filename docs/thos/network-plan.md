@@ -4,6 +4,16 @@
 roadmap's Phase 5 already names a NIC driver + TCP/IP stack, this makes it concrete
 and pulls the first slice forward.*
 
+## Prerequisites found in the source review
+
+([`source-review-2026-10.md`](source-review-2026-10.md)) — not network code, but
+the network is unsafe or impossible without them: a real **CSPRNG** (B4: today
+`getrandom` is a fixed-seed xorshift), a **clock/RTC** (B8), **user-pointer
+validation** (B1: a socket syscall layer taking raw pointers is an RCE surface),
+**signals/`select`/`poll`** semantics (B3), **IO-APIC + MSI routing** for the NIC
+(B12), bus-0-only PCI scan (B13), and a kernel heap that can grow (B6: packet
+buffers).
+
 ## Goals
 Both personalities (POSIX sockets, Winsock) bind **the same kernel endpoint
 objects** (one object, many views). Shell-first: `ping`, DHCP, DNS, `wget`/`nc`

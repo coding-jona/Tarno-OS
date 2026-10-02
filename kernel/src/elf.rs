@@ -27,7 +27,74 @@ fn u64le(b: &[u8]) -> u64 {
     u64::from_le_bytes(b[..8].try_into().unwrap())
 }
 
+/// Largest memory footprint a single `PT_LOAD` may claim (user half only).
+const MAX_SEG_MEM: u64 = 1 << 30;
+const USER_TOP: u64 = 0x0000_8000_0000_0000;
+
+/// Parse and bounds-check every header `load` will touch, without mapping
+/// anything. A hostile or merely wrong file (a text file the shell tried to
+/// `exec`, a truncated binary) must be an `Err`, never a kernel panic — the
+/// PE loader has always been written that way, this brings the ELF side to the
+/// same bar. `load` runs it first, so the two can't drift.
+pub fn validate(image: &[u8]) -> Result<(), &'static str> {
+    if image.len() < 64 || &image[0..4] != b"\x7FELF" {
+        return Err("not an ELF");
+    }
+    if image[4] != 2 {
+        return Err("not ELF64");
+    }
+    if image[5] != 1 {
+        return Err("not little-endian");
+    }
+    if u16le(&image[16..]) != 2 {
+        return Err("not ET_EXEC");
+    }
+    if u16le(&image[18..]) != 0x3E {
+        return Err("not x86-64");
+    }
+    let e_phoff = u64le(&image[32..]);
+    let e_phentsize = u16le(&image[54..]) as u64;
+    let e_phnum = u16le(&image[56..]) as u64;
+    if e_phentsize < 56 || e_phnum == 0 || e_phnum > 128 {
+        return Err("bad program header table");
+    }
+    let tbl_end = e_phentsize
+        .checked_mul(e_phnum)
+        .and_then(|n| n.checked_add(e_phoff))
+        .ok_or("program header table overflows")?;
+    if tbl_end > image.len() as u64 {
+        return Err("program headers outside the file");
+    }
+    let mut loads = 0;
+    for i in 0..e_phnum {
+        let ph = &image[(e_phoff + i * e_phentsize) as usize..];
+        if u32le(&ph[0..]) != 1 {
+            continue;
+        }
+        loads += 1;
+        let (p_offset, p_vaddr) = (u64le(&ph[8..]), u64le(&ph[16..]));
+        let (p_filesz, p_memsz) = (u64le(&ph[32..]), u64le(&ph[40..]));
+        if p_filesz > p_memsz || p_memsz > MAX_SEG_MEM {
+            return Err("bad segment size");
+        }
+        if p_offset.checked_add(p_filesz).map_or(true, |e| e > image.len() as u64) {
+            return Err("segment data outside the file");
+        }
+        if p_vaddr == 0 || p_vaddr.checked_add(p_memsz).map_or(true, |e| e >= USER_TOP) {
+            return Err("segment outside the user address space");
+        }
+    }
+    if loads == 0 {
+        return Err("no PT_LOAD segments");
+    }
+    if u64le(&image[24..]) >= USER_TOP {
+        return Err("entry point outside the user address space");
+    }
+    Ok(())
+}
+
 pub fn load(proc: &Process, image: &[u8]) -> Result<Image, &'static str> {
+    validate(image)?;
     if image.len() < 64 || &image[0..4] != b"\x7FELF" {
         return Err("not an ELF");
     }

@@ -4,15 +4,23 @@
 run software from **both worlds** — Windows `.exe` / `.msi` installers and Linux
 packages — through one coherent, secure, customisable mechanism.*
 
-## 0. Honest starting point
+## 0. Ground truth (from the full source review — see [`source-review-2026-10.md`](source-review-2026-10.md))
 
-Today THOS runs **statically linked** Linux x86-64 ELFs (BusyBox, static musl Rust)
-and **statically linked** Win64 PEs through its own from-scratch loaders. Real-world
-installers and packages are mostly *dynamic*: Windows installers pull in dozens of
-system DLLs, COM, the registry and services; Linux packages need `ld.so`, glibc,
-`/proc`, `/sys`, `/dev`. So "install anything" is gated on **runtime coverage**, not on
-the installer UI. The plan therefore builds the package *mechanism* first and widens
-compatibility underneath it, stage by stage.
+The compatibility work already done is **deep in mechanism but narrow in API
+surface**, and several platform gaps sit between "THOS runs a test `.exe`" and
+"THOS installs real software":
+
+| Layer | What exists | What an installer/package needs and is missing |
+|---|---|---|
+| Linux ELF | static `ET_EXEC` only, 62 syscalls (many stubs), BusyBox + ~60 applets | **dynamic loader** (`PT_INTERP`, PIE, `dlopen`), file-backed `mmap`, **threads + futex**, real signals, sockets, `/proc` `/sys` `/dev`, symlinks, timestamps/clock |
+| Windows PE | PE32+ only; ~130 ANSI entry points (kernel32 31, ntdll 43, msvcrt 35, user32 14, gdi32 6); real objects, SEH, APC, registry, sections | **PE32 (32-bit) / WOW64** — most installers and all old `.msi` are 32-bit; wide-char APIs; `CreateFile` create/write, `FindFirstFile`, `CreateProcess`, `Reg*` (advapi32), shell32/ole32/COM, services, `HeapFree`/`free` that really free |
+| Filesystem | ext2: whole-file read on open, whole-file rewrite on write, **12-block directories**, 32 MiB kernel heap | streaming I/O + page cache + growable heap; large directories; symlinks; timestamps |
+| Boot | the *production* boot runs the whole self-test suite and `expect()`s on test files | a clean `selftest` feature split (otherwise an installed system panics at boot) |
+| Security | exec gate, isolated Security Service, quarantine, SAK, `elevate()` — **but syscalls trust user pointers** | pointer validation + SMEP/SMAP before any "scan then run untrusted installer" claim is true |
+
+So the package *mechanism* can be built early, but "install anything" is gated on
+runtime coverage. The plan below therefore builds the transaction machinery first
+and widens compatibility underneath it, in the order the review recommends.
 
 ## 1. One mechanism, many formats
 
@@ -22,8 +30,9 @@ package into a THOS **install transaction**.
 
 | Format | Handler | What it really needs |
 |---|---|---|
-| **`.exe` installer** (NSIS, Inno Setup, InstallShield, plain self-extractors) | run the installer *inside the NT personality* in a recording sandbox | enough Win32 (file/registry/shell/COM basics, `CreateProcess`, temp dirs, DLL loading) — Wine's DLLs are the open decision N-DLL in `roadmap.md` |
-| **`.msi`** | **msiexec** service: Windows Installer database (OLE compound file → tables), standard actions, registry/file/shortcut/service tables | MSI engine — reuse Wine's `msi.dll` (LGPL, see `licensing.md`) *or* a clean-room one; needs the registry, COM and a services manager |
+| **`.exe` installer** (NSIS, Inno Setup, InstallShield, plain self-extractors) | run the installer *inside the NT personality* in a recording sandbox | **WOW64 (32-bit PE32)** — the large majority are 32-bit — plus wide-char Win32, file create/write, registry front end, `CreateProcess`, temp dirs, shell/COM basics. The `ntdll` boundary is decided from-scratch; whether Wine's PE `kernel32`/`kernelbase` sit on top is still open |
+| **`.msi`** | **msiexec** service: Windows Installer database (OLE compound file → tables), standard actions, registry/file/shortcut/service tables | MSI engine — Wine's `msi.dll` (LGPL) would itself need Wine's `kernel32`/`ole32`/`advapi32` under it, which cuts against the from-scratch `ntdll` decision; a clean-room engine is the more consistent option (**P2**). Needs WOW64, the registry front end, COM and a services manager |
+| **`.apk`** (Android) | the roadmap's Android profile (Waydroid-class: `binder` + Bionic + ART on the Linux personality) — listed here so the package db is one place; far on the critical path | dynamic ELF, threads, `binder`, namespaces-lite — a long way off |
 | **Portable `.exe` / `.zip` / `.7z`** | unpack + register a launcher entry | archive formats only |
 | **Linux `.deb`** | unpack `ar`/`tar`, run maintainer scripts in the POSIX personality | dynamic ELF (`ld.so` + glibc) for scripts and most payloads |
 | **`.rpm`, `.apk`, Arch `.pkg.tar.*`** | same transaction model | as above |
@@ -64,20 +73,29 @@ audited code path, and makes every install reversible.
   [`desktop-plan.md`](desktop-plan.md)) so the shell, the launcher and the user's own
   tools all see the same application list.
 
-## 4. Compatibility work this depends on (the real critical path)
+## 4. What this depends on (the real critical path, ordered)
 
-| Need | Why | Status |
-|---|---|---|
-| **Dynamic ELF loader** (`ld.so`, `PT_INTERP`, `dlopen`) + glibc/musl policy | any distro package | not started — decide **glibc-compat vs musl-only** (**P1**) |
-| More Linux syscalls, `/proc`, `/sys`, `/dev`, `fork/exec` details, signals | maintainer scripts, package tools | partial |
-| Windows **DLL loading from System32**, registry, COM/OLE, services, shell APIs | installers | partial (own `ntdll`/`kernel32` subset) |
-| **Wine PE DLLs vs own** (open decision in `roadmap.md`) | breadth of Win32 | open |
-| Archive/compression libs (zlib, xz, zstd, bzip2, cab, 7z) | every format | not started |
-| **Networking** ([`network-plan.md`](network-plan.md)) | fetching packages | planned |
-| Signatures/hashing for repos | trust | partial (SHA-256 exists) |
+1. **Hardening prerequisites** — `selftest` feature split (B2), user-pointer
+   validation + SMEP/SMAP (B1), real signals/`kill` (B3), clock/RTC (B8), CSPRNG (B4).
+   Without these an "untrusted installer" sandbox is not a boundary and a real
+   install panics at boot.
+2. **Storage that can hold software** — streaming file I/O, page cache, growable
+   kernel heap (B6); ext2 directories beyond 12 blocks, symlinks, timestamps (B7).
+3. **Linux runtime** — dynamic ELF loader + `ld.so`/glibc-or-musl policy (**P1**),
+   file-backed `mmap`, threads (`CLONE_VM`) + real `futex`, sockets (network plan),
+   `/proc` `/sys` `/dev`.
+4. **Windows runtime** — **WOW64** (PE32 loader + 32-bit `ntdll` thunk layer),
+   wide-char APIs, `CreateFile` (all dispositions) / `FindFirstFile` / `CreateProcess`,
+   an `advapi32` registry front end over the existing hives, shell32/ole32/COM
+   basics, services, a heap that frees.
+5. Archive/compression libraries (zlib, xz, zstd, bzip2, cab, 7z) and signature
+   verification (SHA-256 exists; needs RSA/ECDSA/Ed25519).
+6. **Networking** ([`network-plan.md`](network-plan.md)) for fetching packages.
 
 ## 5. Stages
 
+- **S-1 — Prerequisites** (section 4, items 1–2): `selftest` split, pointer
+  validation, streaming I/O. Nothing below is honest without them.
 - **S0 — Static payloads**: `thos-pkg` core, package db, transactions, uninstall;
   formats = tar/zip of static binaries; Security Service scan hook. *Milestone:*
   install and remove a static ELF and a static `.exe` with a launcher entry.
@@ -104,17 +122,27 @@ audited code path, and makes every install reversible.
 4. Always reversible; the package db is the source of truth for "what is on my disk".
 5. CLI first (`thos-pkg install foo.msi`, from the shell), GUI later.
 
-## 7. Open decisions
+## 7. Product constraints already decided elsewhere
+
+- **"Download → it runs, zero setup"** (roadmap, *Product goal*): for simple cases the
+  installer must be invisible — opening a `.exe`/`.msi`/`.deb` shows one consent
+  screen, not a wizard of options. The recorded-plan view is the *detail* pane.
+- **Age/maturity gate** (roadmap, *Age declaration*): the package layer checks the
+  content rating at install time and consults the principal's `maturity`.
+- **No circumvention** of anti-cheat/DRM attestation; vendor-sanctioned runtimes only.
+- **ML/AI is paused** (*user, 2026-10-02*): no assistant-driven install features.
+
+## 8. Open decisions
 
 - **P1** glibc-compat vs musl-only for third-party Linux binaries (most distro `.deb`s
   assume glibc).
-- **P2** MSI engine: Wine's `msi.dll` vs clean-room.
+- **P2** MSI engine: clean-room (consistent with the from-scratch `ntdll`) vs Wine's `msi.dll` (needs Wine's DLL stack beneath it).
 - **P3** Recording sandbox mechanism: filesystem/registry overlay in the kernel vs a
   userspace shim in each personality.
 - **P4** Own repository format vs consuming Debian/Devuan repos directly.
 - **P5** Package-db format and location.
 
-## 8. Verification
+## 9. Verification
 
 `cargo xtask pkg-test`: install/remove a static ELF and a static PE, assert the
 package db, launcher entries, integrity baseline and that removal leaves the

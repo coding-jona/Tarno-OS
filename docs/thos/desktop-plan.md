@@ -85,10 +85,14 @@ Linux desktop allows — not just colours. Designing for that now:
 
 ## 3. Stages (each independently useful and testable)
 
-**Stage 0 — Shell-first (done / finishing).** Framebuffer console + PS/2 + BusyBox.
-Remaining: scrollback (Shift+PgUp), key repeat, IRQ-driven i8042 instead of
-polling (avoid lost scancodes), German layout switch, `reboot`/`poweroff`
-(ACPI), `help`/`man`-style built-ins, clean shutdown (flush ext2).
+**Stage 0 — Shell-first (mostly done).** Framebuffer console + PS/2 + BusyBox +
+`reboot`/`poweroff`/`halt` (ACPI) are in. Remaining, from the source review
+([`source-review-2026-10.md`](source-review-2026-10.md)): **umlauts / ß / dead keys / €**
+(the console layout table has none — B11), scrollback (Shift+PgUp), key repeat,
+**IRQ-driven i8042 via the IO-APIC** instead of polling (B10, B12), real
+`TIOCGWINSZ` from the framebuffer size, `Ctrl+C` → `SIGINT` (needs real signals, B3),
+clean shutdown (flush, stop other CPUs, B14), and the **`selftest` feature split
+(B2)** so the default boot is just *bring-up → mount → login → shell*.
 
 **Stage 1 — Input foundation.** PS/2 **mouse/touchpad** (the 5742G uses a PS/2
 Synaptics-class pad: start with plain relative mode, gestures later), a kernel
