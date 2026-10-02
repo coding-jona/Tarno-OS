@@ -96,19 +96,33 @@ pub unsafe fn parse(rsdp_virt: *const u8) -> AcpiInfo {
     };
 
     // Prefer the 64-bit XSDT (ACPI 2.0+); fall back to the 32-bit RSDT.
-    let madt = if revision >= 2 && rsdp.xsdt_addr != 0 {
-        find_table(rsdp.xsdt_addr, 8)
-    } else {
-        find_table(rsdp.rsdt_addr as u64, 4)
-    };
+    let madt = find_sdt(rsdp_virt, b"APIC");
     let madt = madt.expect("no MADT (APIC) table found");
 
     parse_madt(madt, &mut info);
     info
 }
 
-/// Walk an RSDT (`ptr_size == 4`) or XSDT (`ptr_size == 8`) for the `APIC` table.
-unsafe fn find_table(sdt_phys: u64, ptr_size: usize) -> Option<*const SdtHeader> {
+/// Find a static table by its 4-byte signature (`b"FACP"`, `b"APIC"`, ...) via
+/// the XSDT (ACPI 2.0+) or RSDT. Returns a pointer to its header and length.
+///
+/// # Safety
+/// `rsdp_virt` must be the (HHDM) virtual address Limine reported for the RSDP.
+pub unsafe fn find_table_ptr(rsdp_virt: *const u8, sig: &[u8; 4]) -> Option<(*const u8, usize)> {
+    find_sdt(rsdp_virt, sig).map(|h| (h as *const u8, (*h).length as usize))
+}
+
+unsafe fn find_sdt(rsdp_virt: *const u8, sig: &[u8; 4]) -> Option<*const SdtHeader> {
+    let rsdp = &*(rsdp_virt as *const Rsdp);
+    if rsdp.revision >= 2 && rsdp.xsdt_addr != 0 {
+        find_table(rsdp.xsdt_addr, 8, sig)
+    } else {
+        find_table(rsdp.rsdt_addr as u64, 4, sig)
+    }
+}
+
+/// Walk an RSDT (`ptr_size == 4`) or XSDT (`ptr_size == 8`) for table `sig`.
+unsafe fn find_table(sdt_phys: u64, ptr_size: usize, sig: &[u8; 4]) -> Option<*const SdtHeader> {
     let head = &*phys::<SdtHeader>(sdt_phys);
     let entries = (head.length as usize - core::mem::size_of::<SdtHeader>()) / ptr_size;
     let array = phys::<u8>(sdt_phys).add(core::mem::size_of::<SdtHeader>());
@@ -120,7 +134,7 @@ unsafe fn find_table(sdt_phys: u64, ptr_size: usize) -> Option<*const SdtHeader>
             core::ptr::read_unaligned(array.add(i * 4) as *const u32) as u64
         };
         let hdr = phys::<SdtHeader>(entry_phys);
-        if (*hdr).signature == *b"APIC" {
+        if (*hdr).signature == *sig {
             return Some(hdr);
         }
     }

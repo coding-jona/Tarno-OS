@@ -55,6 +55,18 @@ fn main() {
                 ])
                 .status();
         }
+        "bios-power-test" => {
+            build_kernel(&["interactive"]);
+            let img = bios_image();
+            for (cmd, needle) in [
+                ("reboot", "THOS: rebooting"),
+                ("poweroff", "THOS: powering off"),
+                ("poweroff -f", "THOS: powering off"),
+            ] {
+                bios_power_test(&img, cmd, needle);
+            }
+            println!("bios-power-test PASSED: reboot / poweroff / poweroff -f end the machine from the shell");
+        }
         "bios-kbd-test" => {
             build_kernel(&["interactive"]);
             let img = bios_image();
@@ -134,7 +146,7 @@ fn main() {
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|bios-image|bios-test|bios-run|bios-kbd-test|kbd-test|bootpick|bootpick-test|bootpick-tpm-test|ahci-test|ext2-test|integrity-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test|pe-test] [--gui]"
+                "usage: cargo xtask [build|iso|run|bios-image|bios-test|bios-power-test|bios-run|bios-kbd-test|kbd-test|bootpick|bootpick-test|bootpick-tpm-test|ahci-test|ext2-test|integrity-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test|pe-test] [--gui]"
             );
             exit(2);
         }
@@ -329,6 +341,9 @@ fn disk_image() -> PathBuf {
         // (`secsvc::spawn`) on every config, stdio wired to the
         // kernel<->service pipes instead of the console. Same recipe.
         ("secsvc.rs", "secsvc"),
+        // `poweroff`/`reboot`/`halt`: one binary, three names under /bin
+        // (dispatch on argv[0]); BusyBox's versions need /proc.
+        ("power.rs", "power"),
     ] {
         let rs = root.join("xtask/testdata").join(src);
         let bin = root.join("target").join(name);
@@ -437,6 +452,12 @@ fn disk_image() -> PathBuf {
         "busybox", "ls", "cat", "echo", "pwd", "mkdir", "rmdir", "rm", "cp", "mv",
         "ln", "touch", "head", "tail", "wc", "grep", "sort", "uniq", "true", "false",
         "env", "sleep", "clear", "sh",
+        // power + everyday tools (`reboot`/`poweroff`/`halt` are our own
+        // `power.rs` test binary below, not BusyBox's /proc-based ones)
+        "sync", "uname", "id", "whoami", "date", "ps",
+        "kill", "chmod", "chown", "df", "free", "find", "sed", "awk", "tr", "cut",
+        "basename", "dirname", "stat", "du", "od", "hexdump", "vi", "more", "less",
+        "which", "test", "expr", "tar", "reset", "hostname", "uptime", "xargs", "tee", "dd",
     ];
     run(Command::new("debugfs").args(["-w", "-R", "mkdir /bin", img.to_str().unwrap()]));
     for app in APPLETS {
@@ -451,6 +472,18 @@ fn disk_image() -> PathBuf {
         "-w", "-R", &format!("sif /busybox links_count {links}"),
         img.to_str().unwrap(),
     ]));
+    // Our own power tools (one binary, three names) — see `testdata/power.rs`.
+    let script = root.join("target/power-install.cmds");
+    let pbin = root.join("target/power");
+    std::fs::write(
+        &script,
+        format!(
+            "cd /bin\nwrite {p} reboot\nwrite {p} poweroff\nwrite {p} halt\n",
+            p = pbin.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    run(Command::new("debugfs").args(["-w", "-f", script.to_str().unwrap(), img.to_str().unwrap()]));
 
     // A self-contained GPT disk image — one EFI System Partition holding a
     // FAT32 volume with `/EFI/THOS/HELLO.TXT` — spliced into a hole past the
@@ -3462,6 +3495,66 @@ fn bios_test(img: &Path) {
         exit(1);
     }
     println!("bios-test PASSED: BIOS/MBR boot, root FS in a partition, PS/2 keyboard up");
+}
+
+/// Boot, log in over PS/2, run `cmd` in the shell and require that the machine
+/// goes away by itself (QEMU exits — `-no-reboot` turns a reset into an exit) and
+/// that the ACPI path was used, not the emulator-port fallback.
+fn bios_power_test(img: &Path, cmd: &str, needle: &str) {
+    let root = workspace_root();
+    let log = root.join("target/bios-power-serial.log");
+    let sock = root.join("target/bios-power-mon.sock");
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&sock);
+    // Each run starts from a pristine copy so first-run setup appears again.
+    let run_img = root.join("target/bios-power.img");
+    std::fs::copy(img, &run_img).expect("copy image");
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(["-M", "pc", "-m", "512M", "-smp", "2"])
+        .args([
+            "-drive", &format!("id=disk0,if=none,format=raw,file={}", run_img.to_str().unwrap()),
+            "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0,bootindex=0",
+            "-display", "none", "-no-reboot",
+            "-serial", &format!("file:{}", log.to_str().unwrap()),
+            "-monitor", &format!("unix:{},server,nowait", sock.to_str().unwrap()),
+        ])
+        .spawn()
+        .expect("spawn qemu");
+    if !wait_for(&log, "THOS first-run setup", 90) {
+        kill(&mut child, "bios-power-test", "kernel never reached first-run setup", &log);
+    }
+    drive_login(&sock, &log, &mut child, "bios-power-test");
+    if !wait_for(&log, "interactive hold", 90) {
+        kill(&mut child, "bios-power-test", "never reached the shell after login", &log);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    type_line(&sock, cmd);
+    if !wait_for(&log, needle, 20) {
+        kill(&mut child, "bios-power-test", &format!("`{cmd}` never reached the kernel"), &log);
+    }
+    let start = std::time::Instant::now();
+    let exited = loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            break true;
+        }
+        if start.elapsed().as_secs() > 15 {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let out = std::fs::read_to_string(&log).unwrap_or_default();
+    let fallback = out.contains("it is now safe to switch the machine off");
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!("bios-power-test FAILED: `{cmd}` did not end the machine; log: {}", log.display());
+        exit(1);
+    }
+    if cmd.starts_with("poweroff") && fallback {
+        eprintln!("bios-power-test FAILED: `{cmd}` worked only via the emulator-port fallback, ACPI S5 did not; log: {}", log.display());
+        exit(1);
+    }
+    println!("  ok   `{cmd}`");
 }
 
 /// BIOS/MBR boot with **only** a PS/2 keyboard (no USB controller at all, like

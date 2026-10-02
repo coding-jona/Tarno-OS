@@ -1492,7 +1492,7 @@ Still to do before the real laptop: write the image to a SATA SSD and boot it
 (`dd` of `target/thos-bios.img`, BIOS SATA mode **AHCI**); capture the real
 `lspci -nn`/`lscpu` into `hw-target.md`; verify the Westmere timer/APIC path on
 hardware; an EHCI (USB 2) driver for external keyboards; HM55 SATA is 3 Gb/s;
-a real installer (partitioning + `limine bios-install` on the target disk) rather
+`poweroff`/`reboot`/`halt` (`power.rs`: ACPI S5 from the DSDT, SMI_CMD enable, FADT/0xCF9/i8042 reset; verified by `cargo xtask bios-power-test`); a real installer (partitioning + `limine bios-install` on the target disk) rather
 than a prebuilt image; Evergreen KMS is far-future (VBE framebuffer until then).
 
 ## Desktop (side quest)
@@ -1500,6 +1500,12 @@ than a prebuilt image; Evergreen KMS is far-future (VBE framebuffer until then).
 Planned separately in [`desktop-plan.md`](desktop-plan.md) — a CPU-rendered,
 userspace compositor first (the Acer has no GPU driver), GPU later. Stage 0 (shell
 on the framebuffer console, `kernel/src/fbcon.rs`) is in; the rest is planning.
+
+## Networking
+
+Planned in [`network-plan.md`](network-plan.md) (*user, 2026-10-02*): virtio-net/e1000
+first, smoltcp-class stack, shared socket endpoints for POSIX + Winsock, then the
+real NICs. Not built yet.
 
 ## Open decisions
 

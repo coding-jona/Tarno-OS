@@ -64,6 +64,7 @@ mod vfs;
 mod vmm;
 mod window;
 mod fbcon;
+mod power;
 mod mbr;
 mod ps2;
 mod xhci;
@@ -254,6 +255,7 @@ fn acpi_apic_bringup() {
         .address as *const u8;
 
     let info = unsafe { acpi::parse(rsdp) };
+    unsafe { power::init(rsdp) };
     let enabled = info.cpus.iter().filter(|c| c.enabled).count();
 
     kprintln!(

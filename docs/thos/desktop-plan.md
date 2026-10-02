@@ -26,6 +26,33 @@ is built yet. It is a **side quest** — it must not block the kernel roadmap in
 | No ML/AI work for now (*user, 2026-10-02*) | No assistant panel in scope. |
 | Licensing ([`licensing.md`](licensing.md)) | Only permissive/GPL-compatible fonts, icons and toolkit code; record every third-party asset. |
 
+## 1b. Principle: everything is customisable (*user, 2026-10-02*)
+
+The user can change **the whole system and the whole shell, to 100 %**, the way a
+Linux desktop allows — not just colours. Designing for that now:
+
+- **Everything is data, not code**: theme, layout, panel contents, shortcuts,
+  window rules, launcher entries, icons and fonts live as plain files under
+  `/etc/thos/` (system) and `~/.config/thos/` (user), user overrides system.
+  Live-reload on change (the compositor watches them — same mechanism as the
+  registry change-notify).
+- **The shell is just a client.** Panel, launcher, file manager, lock screen are
+  ordinary programs speaking the public surface protocol; the user can replace or
+  kill any of them and run another (or none). Nothing in the compositor is
+  privileged except the secure-desktop pieces (login, elevate, AV prompts, SAK),
+  which stay fixed so customisation can never remove the security boundary.
+- **Scriptable compositor**: a documented control socket (list windows, move,
+  tile, bind keys, query/set config) and a small config/scripting language, so
+  tiling, hot corners, per-app rules etc. are user-level code.
+- **Swappable parts with stable interfaces**: shell, toolkit theme engine, input
+  method/keyboard layout, notification daemon, terminal — each behind a protocol.
+- **Source and rebuild on the machine**: the desktop ships with its sources and a
+  documented build, so a user can modify and rebuild it in place (the "live
+  developing" loop); safe-mode boot (stock shell, ignore user config) as the
+  recovery path.
+- **Reset is always one step away**: a broken user config must never lock the user
+  out (config validation, last-known-good copy, Safe-mode).
+
 ## 2. Architecture (target)
 
 ```

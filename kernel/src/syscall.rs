@@ -21,7 +21,7 @@ use x86_64::VirtAddr;
 
 #[cfg(feature = "interactive")]
 use crate::cred;
-use crate::{ext2, gdt, kprintln, process, sched, smp};
+use crate::{ext2, gdt, kprintln, power, process, sched, smp};
 
 static USER_EXITS: AtomicU64 = AtomicU64::new(0);
 
@@ -113,6 +113,7 @@ const SYS_MPROTECT: u64 = 10;
 const SYS_MADVISE: u64 = 28;
 const SYS_MUNMAP: u64 = 11;
 const SYS_KILL: u64 = 62;
+const SYS_REBOOT: u64 = 169;
 const SYS_UNAME: u64 = 63;
 const SYS_GETCWD: u64 = 79;
 const SYS_READLINK: u64 = 89;
@@ -905,6 +906,33 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             unsafe { core::ptr::copy_nonoverlapping(mask.as_ptr(), a3 as *mut u8, len) };
             len as i64
         }
+
+        // reboot(magic1, magic2, cmd, arg): the Linux numbers BusyBox uses for
+        // `poweroff -f` / `reboot -f` / `halt -f`. Any console user may do this
+        // (a single-seat machine, like logind's local-session rule).
+        SYS_REBOOT => {
+            if a1 != 0xfee1_dead {
+                EINVAL
+            } else {
+                match a3 {
+                    0x4321_FEDC => power::poweroff(),
+                    0x0123_4567 => power::reboot(),
+                    0xCDEF_0123 => power::halt(),
+                    0 | 0x89AB_CDEF => 0, // CAD off/on: accepted, no effect
+                    _ => EINVAL,
+                }
+            }
+        }
+
+        // BusyBox's plain `poweroff` / `reboot` / `halt` signal init (pid 1):
+        // SIGUSR2 = poweroff, SIGTERM = reboot, SIGUSR1 = halt. THOS has no
+        // userspace init, so the kernel plays that role for pid 1.
+        SYS_KILL if a1 == 1 => match a2 {
+            12 => power::poweroff(),
+            15 => power::reboot(),
+            10 => power::halt(),
+            _ => 0,
+        },
 
         SYS_KILL | SYS_TKILL | SYS_TGKILL => {
             // deliver only fatal signals; everything else is a no-op for now
