@@ -68,6 +68,16 @@ fn main() {
             }
             println!("bios-power-test PASSED: reboot / poweroff / poweroff -f end the machine from the shell");
         }
+        "shortcuts-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            shortcuts_test(&img);
+        }
+        "longcmd-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            longcmd_test(&img);
+        }
         "bios-kbd-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
@@ -502,6 +512,28 @@ fn disk_image() -> PathBuf {
     )
     .unwrap();
     run(Command::new("debugfs").args(["-w", "-f", script.to_str().unwrap(), img.to_str().unwrap()]));
+
+    // Long-command-line fixture for `longcmd-test`: builds a ~22 KB and a ~180 KB
+    // argument list by repeated doubling and hands each to an external `/bin/echo`
+    // (an execve). The first must work, the second must fail with E2BIG.
+    let longargs = root.join("target/longargs.sh");
+    std::fs::write(
+        &longargs,
+        "a=abcdefghij\n\
+         big=$a; i=0\n\
+         while [ $i -lt 11 ]; do big=\"$big $big\"; i=$((i+1)); done\n\
+         echo \"LONGARGS-SMALL $(/bin/echo $big | /bin/wc -c)\"\n\
+         big=$a; i=0\n\
+         while [ $i -lt 14 ]; do big=\"$big $big\"; i=$((i+1)); done\n\
+         /bin/echo $big | /bin/wc -c\n\
+         echo \"LONGARGS-BIG-RC $?\"\n\
+         echo LONGARGS-DONE\n",
+    )
+    .unwrap();
+    run(Command::new("debugfs").args([
+        "-w", "-R", &format!("write {} longargs.sh", longargs.to_str().unwrap()),
+        img.to_str().unwrap(),
+    ]));
 
     // A self-contained GPT disk image — one EFI System Partition holding a
     // FAT32 volume with `/EFI/THOS/HELLO.TXT` — spliced into a hole past the
@@ -3203,6 +3235,12 @@ fn type_line(sock: &Path, text: &str) {
             '$' => "shift-4",
             '(' => "shift-8",
             ')' => "shift-9",
+            // QWERTZ: the physical Y and Z keys are swapped relative to the US
+            // names QEMU's `sendkey` uses, so typing `y` needs the `z` key.
+            'y' => "z",
+            'z' => "y",
+            'Y' => "shift-z",
+            'Z' => "shift-y",
             _ => {
                 mon(sock, &format!("sendkey {c}"));
                 continue;
@@ -3452,6 +3490,10 @@ fn bios_image() -> PathBuf {
         run(Command::new("mcopy").args(["-i", b, src.to_str().unwrap(), dst]));
     }
 
+    // Always start from a pristine root FS: other tests (`kbd-test`, ...) boot
+    // `target/disk.img` itself and leave an admin account / hives behind, which
+    // would turn the next first-run setup into a login prompt.
+    let _ = std::fs::remove_file(root.join("target/disk.img"));
     let rootfs = std::fs::read(disk_image()).expect("read disk.img");
     let boot_bytes = std::fs::read(&boot).expect("read boot partition");
     let boot_secs = boot_bytes.len() as u64 / 512;
@@ -3585,6 +3627,175 @@ fn bios_power_test(img: &Path, cmd: &str, needle: &str) {
         exit(1);
     }
     println!("  ok   `{cmd}`");
+}
+
+/// Console keyboard shortcuts, end to end on the real boot path: PS/2 chords go
+/// through the i8042 decoder -> `console::feed_report` -> line discipline /
+/// framebuffer text model. Checks Ctrl+U (kill line), mark mode + copy + paste
+/// (Ctrl+Shift+Space / arrows / Enter / Ctrl+Shift+V), select-all + copy +
+/// paste, and Ctrl+D (end the session -> back to the login prompt).
+fn shortcuts_test(img: &Path) {
+    let root = workspace_root();
+    let log = root.join("target/shortcuts-serial.log");
+    let sock = root.join("target/shortcuts-mon.sock");
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&sock);
+    let run_img = root.join("target/shortcuts.img");
+    std::fs::copy(img, &run_img).expect("copy image");
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(["-M", "pc", "-m", "512M", "-smp", "2"])
+        .args([
+            "-drive", &format!("id=disk0,if=none,format=raw,file={}", run_img.to_str().unwrap()),
+            "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0,bootindex=0",
+            "-display", "none", "-no-reboot",
+            "-serial", &format!("file:{}", log.to_str().unwrap()),
+            "-monitor", &format!("unix:{},server,nowait", sock.to_str().unwrap()),
+        ])
+        .spawn()
+        .expect("spawn qemu");
+    let key = |k: &str| mon(&sock, &format!("sendkey {k}"));
+    let settle = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
+    let text = |l: &Path| std::fs::read_to_string(l).unwrap_or_default();
+
+    if !wait_for(&log, "THOS first-run setup", 90) {
+        kill(&mut child, "shortcuts-test", "no first-run setup", &log);
+    }
+    drive_login(&sock, &log, &mut child, "shortcuts-test");
+    if !wait_for(&log, "interactive hold", 90) {
+        kill(&mut child, "shortcuts-test", "no shell", &log);
+    }
+    settle(800);
+    let mut fails: Vec<String> = Vec::new();
+
+    // 1. Ctrl+U discards the half-typed line: "abc" is gone, so `echo UOK42`
+    //    runs as itself and prints UOK42 at the start of a line.
+    for c in ["a", "b", "c"] { key(c); }
+    key("ctrl-u");
+    settle(300);
+    type_line(&sock, "echo UOK42");
+    if !wait_for(&log, "\nUOK42", 15) || text(&log).contains("abcecho") {
+        fails.push("Ctrl+U did not discard the typed line".into());
+    }
+
+    // 2. Mark mode: start at the cursor (prompt row), Up to the output line,
+    //    Home, Enter copies; then Ctrl+Shift+V types it back in.
+    type_line(&sock, "echo PASTEME");
+    wait_for(&log, "\nPASTEME", 15);
+    settle(500);
+    let before = text(&log).matches("PASTEME").count();
+    key("ctrl-shift-spc");
+    key("up");
+    key("home");
+    key("ret");
+    settle(300);
+    key("ctrl-shift-v");
+    settle(800);
+    let after = text(&log).matches("PASTEME").count();
+    if after <= before {
+        fails.push(format!("mark+copy+paste typed nothing back (PASTEME x{before} -> x{after})"));
+    }
+    key("ctrl-u");
+    settle(300);
+
+    // 3. Select all + copy + paste: the whole text model comes back as typed
+    //    input, which includes the very first boot line a second time.
+    let boots = text(&log).matches("THOS: kmain reached").count();
+    key("ctrl-shift-a");
+    key("ctrl-shift-c");
+    settle(300);
+    key("ctrl-shift-v");
+    settle(1500);
+    let boots2 = text(&log).matches("THOS: kmain reached").count();
+    if boots2 <= boots {
+        fails.push(format!("select-all+copy+paste did not reproduce the scrollback ({boots} -> {boots2})"));
+    }
+    key("ctrl-u");
+    settle(500);
+
+    // 4. Ctrl+D on an empty line ends the shell; the session returns to login.
+    let logins = text(&log).matches("THOS login:").count();
+    key("ctrl-d");
+    if !wait_for(&log, "THOS: session ended", 20) || text(&log).matches("THOS login:").count() <= logins {
+        fails.push("Ctrl+D did not end the session / return to the login prompt".into());
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    if fails.is_empty() {
+        println!("shortcuts-test PASSED: Ctrl+U, mark/copy/paste, select-all/copy/paste, Ctrl+D -> login");
+    } else {
+        for f in &fails {
+            eprintln!("  FAIL {f}");
+        }
+        eprintln!("shortcuts-test FAILED; log: {}", log.display());
+        exit(1);
+    }
+}
+
+/// Very long command lines against the kernel's exec limits (real boot path):
+/// a ~22 KB argument list must be delivered intact, a ~180 KB one must be
+/// refused with E2BIG ("Argument list too long") — not truncated silently, not a
+/// kernel panic — and the system must still be alive afterwards.
+fn longcmd_test(img: &Path) {
+    let root = workspace_root();
+    let log = root.join("target/longcmd-serial.log");
+    let sock = root.join("target/longcmd-mon.sock");
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&sock);
+    let run_img = root.join("target/longcmd.img");
+    std::fs::copy(img, &run_img).expect("copy image");
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(["-M", "pc", "-m", "512M", "-smp", "2"])
+        .args([
+            "-drive", &format!("id=disk0,if=none,format=raw,file={}", run_img.to_str().unwrap()),
+            "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0,bootindex=0",
+            "-display", "none", "-no-reboot",
+            "-serial", &format!("file:{}", log.to_str().unwrap()),
+            "-monitor", &format!("unix:{},server,nowait", sock.to_str().unwrap()),
+        ])
+        .spawn()
+        .expect("spawn qemu");
+    if !wait_for(&log, "THOS first-run setup", 90) {
+        kill(&mut child, "longcmd-test", "no first-run setup", &log);
+    }
+    drive_login(&sock, &log, &mut child, "longcmd-test");
+    if !wait_for(&log, "interactive hold", 90) {
+        kill(&mut child, "longcmd-test", "no shell", &log);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    type_line(&sock, "/busybox sh /longargs.sh");
+    let done = wait_for(&log, "LONGARGS-DONE", 120);
+    let out = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let mut fails: Vec<String> = Vec::new();
+    if !done {
+        // (`THOS trap: #BP` is the benign breakpoint self-check at every boot.)
+        let crashed = out.contains("THOS PANIC")
+            || out.lines().any(|l| l.contains("THOS trap:") && !l.contains("#BP"));
+        fails.push(if crashed {
+            "the kernel crashed on a very long command line".into()
+        } else {
+            "the script never finished (hang)".into()
+        });
+    }
+    // 2048 words of 10 chars + 2047 blanks + newline = 22528 bytes, intact.
+    if !out.contains("LONGARGS-SMALL 22528") {
+        fails.push("the ~22 KB argument list was not delivered intact (truncated?)".into());
+    }
+    if !out.contains("Argument list too long") {
+        fails.push("the ~180 KB argument list was not refused with E2BIG".into());
+    }
+    if fails.is_empty() {
+        println!("longcmd-test PASSED: 22 KB argv intact, 180 KB argv refused with E2BIG, kernel alive");
+    } else {
+        for f in &fails {
+            eprintln!("  FAIL {f}");
+        }
+        eprintln!("longcmd-test FAILED; log: {}", log.display());
+        exit(1);
+    }
 }
 
 /// BIOS/MBR boot with **only** a PS/2 keyboard (no USB controller at all, like

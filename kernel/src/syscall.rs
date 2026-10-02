@@ -130,6 +130,7 @@ const SYS_READLINKAT: u64 = 267;
 
 const ENOSYS: i64 = -38;
 const ENOEXEC: i64 = -8;
+const E2BIG: i64 = -7;
 const EBADF: i64 = -9;
 const ECHILD: i64 = -10;
 #[allow(dead_code)]
@@ -568,8 +569,9 @@ fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
         },
         0x5402 | 0x5403 | 0x5404 => 0, // TCSETS / TCSETSW / TCSETSF
         0x5413 => unsafe {
-            // TIOCGWINSZ
-            *(arg as *mut [u16; 4]) = [25, 80, 0, 0];
+            // TIOCGWINSZ: rows, cols of the framebuffer console (25x80 without one)
+            let (cols, rows) = crate::fbcon::size();
+            *(arg as *mut [u16; 4]) = [rows as u16, cols as u16, 0, 0];
             0
         },
         0x540f => unsafe {
@@ -667,6 +669,81 @@ fn user_cstr(ptr: u64) -> alloc::string::String {
         p = unsafe { p.add(1) };
     }
     alloc::string::String::from_utf8_lossy(&s).into_owned()
+}
+
+/// Most bytes `execve` accepts for argv + envp together (strings, their NULs and
+/// the pointer arrays). The initial process stack is 64 KiB and also has to hold
+/// the auxiliary vector and leave the program room to run, so this is 48 KiB —
+/// Linux's equivalent is a quarter of the stack limit, up to `ARG_MAX`.
+const EXEC_ARG_LIMIT: usize = 48 * 1024;
+/// Most entries in argv or envp.
+const EXEC_ARGC_MAX: usize = 8192;
+/// Longest single argument string.
+const EXEC_STR_MAX: usize = 32 * 1024;
+
+/// Read a NULL-terminated array of user string pointers for `execve`, charging
+/// every string against `budget`. Unlike [`user_cstr_array`] this never truncates:
+/// a list that does not fit is `E2BIG`, so the new program can't silently see a
+/// shortened command line (and `init_stack` can never be asked to write past the
+/// stack it mapped).
+fn user_exec_args(ptr: u64, budget: &mut usize) -> Result<alloc::vec::Vec<alloc::string::String>, i64> {
+    let mut out = alloc::vec::Vec::new();
+    if ptr == 0 {
+        return Ok(out);
+    }
+    let mut p = ptr as *const u64;
+    for _ in 0..=EXEC_ARGC_MAX {
+        let sp = unsafe { *p };
+        if sp == 0 {
+            return Ok(out);
+        }
+        if out.len() == EXEC_ARGC_MAX {
+            return Err(E2BIG);
+        }
+        let mut bytes = alloc::vec::Vec::new();
+        let mut q = sp as *const u8;
+        loop {
+            let b = unsafe { *q };
+            if b == 0 {
+                break;
+            }
+            if bytes.len() >= EXEC_STR_MAX {
+                return Err(E2BIG);
+            }
+            bytes.push(b);
+            q = unsafe { q.add(1) };
+        }
+        let cost = bytes.len() + 1 + 8; // string + NUL + its pointer slot
+        if cost > *budget {
+            return Err(E2BIG);
+        }
+        *budget -= cost;
+        out.push(alloc::string::String::from_utf8_lossy(&bytes).into_owned());
+        p = unsafe { p.add(1) };
+    }
+    Err(E2BIG)
+}
+
+/// `execve(path, argv, envp)`. Does not return on success.
+fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
+    let path = process::resolve_path(&user_cstr(path_ptr));
+    let mut budget = EXEC_ARG_LIMIT;
+    let argv = match user_exec_args(argv_ptr, &mut budget) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let envp = match user_exec_args(envp_ptr, &mut budget) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match ext2::open().ok().and_then(|fs| fs.read_path(&path)) {
+        // Not something we can run (a script, a text file, a truncated
+        // binary): ENOEXEC lets the shell fall back instead of the kernel dying
+        // inside `execve`'s own `expect`.
+        Some(bytes) if crate::elf::validate(&bytes).is_err() => ENOEXEC,
+        Some(bytes) => process::execve(&bytes, &argv, &envp), // -> ! on success
+        None => ENOENT,
+    }
 }
 
 /// Read a NULL-terminated array of user string pointers.
@@ -982,19 +1059,7 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_NEWFSTATAT => sys_newfstatat(a1, a2, a3, a4),
         SYS_SETUID | SYS_SETGID => 0,
 
-        SYS_EXECVE => {
-            let path = process::resolve_path(&user_cstr(a1));
-            let argv = user_cstr_array(a2);
-            let envp = user_cstr_array(a3);
-            match ext2::open().ok().and_then(|fs| fs.read_path(&path)) {
-                // Not something we can run (a script, a text file, a truncated
-                // binary): ENOEXEC lets the shell fall back instead of the
-                // kernel dying inside `execve`'s own `expect`.
-                Some(bytes) if crate::elf::validate(&bytes).is_err() => ENOEXEC,
-                Some(bytes) => process::execve(&bytes, &argv, &envp), // -> ! on success
-                None => ENOENT,
-            }
-        }
+        SYS_EXECVE => sys_execve(a1, a2, a3),
 
         SYS_WAIT4 => process::wait4(a1 as i64, a2),
 

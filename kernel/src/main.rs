@@ -185,26 +185,30 @@ extern "C" fn kmain() -> ! {
     #[cfg(feature = "interactive")]
     {
         // Milestone 2: first-run setup / login, then launch the shell off ext2
-        // and hand it the USB keyboard.
-        let fs = ext2::open().unwrap_or_else(|e| fatal_boot("cannot mount the root filesystem", e));
-        let session = login::establish(&fs);
-        process::set_session(&session.name, session.uid);
-        kprintln!("THOS: session          {} (uid {})", session.name, session.uid);
-
-        // The interactive shell is stock BusyBox `sh` (ash).
-        let sh = fs
-            .read_path("/busybox")
-            .unwrap_or_else(|| fatal_boot("no login shell", "/busybox is missing from the root filesystem"));
-        kprintln!("THOS: shell            /busybox sh = {} bytes", sh.len());
-        process::spawn_init(
-            &sh,
-            &["sh"],
-            &["PATH=/bin:/", "HOME=/", "PWD=/", "TERM=dumb", "PS1=thos$ "],
-        );
-
-        kprintln!("THOS: interactive hold — type on the keyboard");
+        // and hand it the keyboard. When the shell ends (`exit`, Ctrl+D) the
+        // session is over: back to the login prompt, never a dead console.
         loop {
-            sched::yield_now();
+            let fs = ext2::open().unwrap_or_else(|e| fatal_boot("cannot mount the root filesystem", e));
+            let session = login::establish(&fs);
+            process::set_session(&session.name, session.uid);
+            kprintln!("THOS: session          {} (uid {})", session.name, session.uid);
+
+            // The interactive shell is stock BusyBox `sh` (ash).
+            let sh = fs
+                .read_path("/busybox")
+                .unwrap_or_else(|| fatal_boot("no login shell", "/busybox is missing from the root filesystem"));
+            kprintln!("THOS: shell            /busybox sh = {} bytes", sh.len());
+            let pid = process::spawn_init(
+                &sh,
+                &["sh"],
+                &["PATH=/bin:/", "HOME=/", "PWD=/", "TERM=dumb", "PS1=thos$ "],
+            );
+
+            kprintln!("THOS: interactive hold — type on the keyboard");
+            while !process::pid_exited(pid) {
+                sched::yield_now();
+            }
+            kprintln!("\nTHOS: session ended");
         }
     }
 

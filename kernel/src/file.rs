@@ -63,6 +63,9 @@ impl FileOps for KeyboardFile {
             if n > 0 {
                 return n as i64;
             }
+            if crate::console::take_eof() {
+                return 0; // Ctrl+D on an empty line
+            }
             crate::console::wait_for_input();
         }
     }

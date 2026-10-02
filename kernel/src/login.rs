@@ -28,6 +28,7 @@ fn prompt(label: &str, mask: bool) -> String {
     let mut b = [0u8; 1];
     loop {
         while console::read(&mut b) == 0 {
+            let _ = console::take_eof(); // a stray Ctrl+D must not leak into the shell
             sched::yield_now();
         }
         match b[0] {

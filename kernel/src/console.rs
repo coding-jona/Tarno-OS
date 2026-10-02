@@ -32,6 +32,14 @@ static LINE_LEN: Mutex<usize> = Mutex::new(0);
 
 /// `true` while a secure-attention sequence is being typed: every key goes
 /// to [`SAK_BUF`] instead of [`QUEUE`], masked, until Enter.
+/// Set by Ctrl+D on an empty line: the next `read` on fd 0 reports EOF (0) once.
+static EOF: AtomicBool = AtomicBool::new(false);
+/// The clipboard: filled by `Ctrl+Shift+C` (copy selection), drained by
+/// `Ctrl+Shift+V` (paste as typed input).
+static CLIPBOARD: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Longest paste accepted in one go.
+const PASTE_MAX: usize = 4096;
+
 static SAK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SAK_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
@@ -109,6 +117,183 @@ fn ascii(code: u8, shift: bool, altgr: bool) -> u8 {
 /// HID Usage ID for the Delete key.
 const KC_DELETE: u8 = 0x4C;
 
+// Non-character keys the shortcuts use (HID usage IDs).
+const KC_A: u8 = 0x04;
+const KC_C: u8 = 0x06;
+const KC_D: u8 = 0x07;
+const KC_L: u8 = 0x0F;
+const KC_U: u8 = 0x18;
+const KC_V: u8 = 0x19;
+const KC_W: u8 = 0x1A;
+const KC_ENTER: u8 = 0x28;
+const KC_ESC: u8 = 0x29;
+const KC_SPACE: u8 = 0x2C;
+const KC_PGUP: u8 = 0x4B;
+const KC_PGDN: u8 = 0x4E;
+const KC_HOME: u8 = 0x4A;
+const KC_END: u8 = 0x4D;
+const KC_RIGHT: u8 = 0x4F;
+const KC_LEFT: u8 = 0x50;
+const KC_DOWN: u8 = 0x51;
+const KC_UP: u8 = 0x52;
+
+/// Queue one typed character exactly as a key press would: into the line queue,
+/// counted in the current line, and echoed (honouring the echo mode).
+fn push_typed(c: u8) {
+    let echo = ECHO.load(Ordering::Relaxed);
+    QUEUE.lock().push_back(c);
+    let mut ll = LINE_LEN.lock();
+    if c == b'\n' {
+        *ll = 0;
+    } else {
+        *ll += 1;
+    }
+    match echo {
+        1 if c != b'\n' => serial::write_bytes(b"*"),
+        2 => {}
+        _ => serial::write_bytes(&[c]),
+    }
+}
+
+/// Erase `n` just-typed characters from the screen.
+fn echo_erase(n: usize) {
+    if ECHO.load(Ordering::Relaxed) != 2 {
+        for _ in 0..n {
+            serial::write_bytes(b"\x08 \x08");
+        }
+    }
+}
+
+/// Ctrl+U: discard the whole unread part of the current line.
+fn kill_line() {
+    let mut ll = LINE_LEN.lock();
+    let n = *ll;
+    let mut q = QUEUE.lock();
+    for _ in 0..n {
+        q.pop_back();
+    }
+    *ll = 0;
+    drop(q);
+    drop(ll);
+    echo_erase(n);
+}
+
+/// Ctrl+W: discard the last word (and the blanks before it) of the current line.
+fn kill_word() {
+    let mut ll = LINE_LEN.lock();
+    let mut q = QUEUE.lock();
+    let mut n = 0;
+    while n < *ll && q.iter().rev().nth(n) == Some(&b' ') {
+        n += 1;
+    }
+    while n < *ll && q.iter().rev().nth(n).is_some_and(|&b| b != b' ') {
+        n += 1;
+    }
+    for _ in 0..n {
+        q.pop_back();
+    }
+    *ll -= n;
+    drop(q);
+    drop(ll);
+    echo_erase(n);
+}
+
+/// Ctrl+Shift+C / Enter in mark mode: copy the selection, then drop it.
+fn copy_selection_to_clipboard() {
+    if let Some(t) = crate::fbcon::copy_selection() {
+        *CLIPBOARD.lock() = t;
+    }
+    crate::fbcon::clear_selection();
+}
+
+/// Ctrl+Shift+V: type the clipboard in. Anything that could act on its own is
+/// defused first — control characters (ESC in particular) are dropped and
+/// newlines become blanks, so a paste can never *execute* a command; the user
+/// reviews the line and presses Enter.
+fn paste() {
+    let text = CLIPBOARD.lock().clone();
+    for &b in text.iter().take(PASTE_MAX) {
+        match b {
+            b' '..=b'~' => push_typed(b),
+            b'\n' | b'\t' => push_typed(b' '),
+            _ => {}
+        }
+    }
+    INPUT_WQ.wake_all();
+}
+
+/// Keyboard-driven mark mode: arrows move the selection end, Enter or
+/// Ctrl+Shift+C copies, Esc cancels. Consumes every key while active.
+fn mark_key(k: u8, ctrl: bool, shift: bool) {
+    use crate::fbcon::*;
+    match k {
+        KC_LEFT => mark_move(-1, 0),
+        KC_RIGHT => mark_move(1, 0),
+        KC_UP => mark_move(0, -1),
+        KC_DOWN => mark_move(0, 1),
+        KC_PGUP => mark_move(0, -page_rows()),
+        KC_PGDN => mark_move(0, page_rows()),
+        KC_HOME => mark_line_edge(true),
+        KC_END => mark_line_edge(false),
+        KC_ENTER => copy_selection_to_clipboard(),
+        KC_C if ctrl && shift => copy_selection_to_clipboard(),
+        KC_A if ctrl && shift => select_all(),
+        KC_ESC => clear_selection(),
+        _ => {}
+    }
+}
+
+/// What a key press with Ctrl and/or Shift held does. Returns `true` if the key
+/// was a shortcut (consumed), `false` if it should be typed normally. A Ctrl
+/// chord that is *not* a known shortcut is also consumed — Ctrl+X must never
+/// type an `x`.
+fn shortcut(k: u8, ctrl: bool, shift: bool) -> bool {
+    use crate::fbcon::*;
+    if mark_active() {
+        mark_key(k, ctrl, shift);
+        return true;
+    }
+    match (ctrl, shift, k) {
+        // --- copy / paste / select (terminal convention: Ctrl+Shift+...) ---
+        (true, true, KC_A) => select_all(),
+        (true, true, KC_C) => copy_selection_to_clipboard(),
+        (true, true, KC_V) => paste(),
+        (true, true, KC_SPACE) => mark_begin(),
+
+        // --- scrollback (Shift+...) ---
+        (false, true, KC_PGUP) => scroll_view(page_rows()),
+        (false, true, KC_PGDN) => scroll_view(-page_rows()),
+        (false, true, KC_HOME) => scroll_to(true),
+        (false, true, KC_END) => scroll_to(false),
+        (false, true, KC_UP) => scroll_view(1),
+        (false, true, KC_DOWN) => scroll_view(-1),
+
+        // --- line editing / terminal control (Ctrl+...) ---
+        (true, false, KC_U) => kill_line(),
+        (true, false, KC_W) => kill_word(),
+        (true, false, KC_L) => clear_screen(),
+        (true, false, KC_D) => {
+            if *LINE_LEN.lock() == 0 {
+                EOF.store(true, Ordering::Release);
+                INPUT_WQ.wake_all();
+            }
+        }
+        // Ctrl+C: THOS has no signals yet (roadmap B3), so this approximates the
+        // prompt case — abandon the line, show ^C, and hand the shell an empty
+        // line so it prints a fresh prompt. A running foreground program is not
+        // interrupted (that needs real SIGINT delivery).
+        (true, false, KC_C) => {
+            kill_line();
+            serial::write_bytes(b"^C\r\n");
+            QUEUE.lock().push_back(b'\n');
+            INPUT_WQ.wake_all();
+        }
+        (true, _, _) => {} // any other Ctrl chord: swallow
+        _ => return false,
+    }
+    true
+}
+
 /// Feed one HID boot keyboard report (`[modifiers, reserved, k0..k5]`).
 pub fn feed_report(rpt: &[u8; 8]) {
     let shift = rpt[0] & 0b0010_0010 != 0; // L/R Shift
@@ -139,9 +324,19 @@ pub fn feed_report(rpt: &[u8; 8]) {
 
     let mut pushed = false;
 
+    let ctrl_only = ctrl && !altgr; // AltGr is reported as Ctrl+Alt on some keyboards
     for &k in &keys {
         if k == 0 || prev.contains(&k) {
             continue; // held or empty — only act on new key-down
+        }
+        // Keys that never type a character: handled while mark mode is on, or
+        // by a Ctrl/Shift chord. Plain navigation keys fall through to `ascii`
+        // (which ignores them).
+        let nav = matches!(k, KC_PGUP | KC_PGDN | KC_HOME | KC_END | KC_UP | KC_DOWN | KC_LEFT | KC_RIGHT);
+        if (ctrl_only || (shift && nav) || crate::fbcon::mark_active())
+            && shortcut(k, ctrl_only, shift)
+        {
+            continue;
         }
         let c = ascii(k, shift, altgr);
         if c == 0 {
@@ -264,9 +459,15 @@ pub fn read(buf: &mut [u8]) -> usize {
     n
 }
 
-/// Block the current thread until at least one byte is available for `read`.
+/// Block the current thread until at least one byte is available for `read`
+/// (or an EOF from Ctrl+D is pending).
 pub fn wait_for_input() {
-    INPUT_WQ.wait_if(|| QUEUE.lock().is_empty());
+    INPUT_WQ.wait_if(|| QUEUE.lock().is_empty() && !EOF.load(Ordering::Acquire));
+}
+
+/// Consume a pending Ctrl+D EOF, if any.
+pub fn take_eof() -> bool {
+    EOF.swap(false, Ordering::AcqRel)
 }
 
 #[allow(dead_code)] // used by an interactive line-reader
