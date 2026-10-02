@@ -12,10 +12,15 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ahci::{self, SECTOR};
 
 const SB_OFFSET: u64 = 1024;
+
+/// Disk LBA where the ext2 filesystem starts: 0 for a bare-image disk (the QEMU
+/// test disk), the partition's first sector on a real MBR disk.
+static PART_LBA: AtomicU64 = AtomicU64::new(0);
 const EXT2_MAGIC: u16 = 0xEF53;
 pub const ROOT_INO: u32 = 2;
 
@@ -83,11 +88,12 @@ fn disk_range(off: u64, len: usize) -> Vec<u8> {
     let start_lba = off / SECTOR as u64;
     let end_lba = (off + len as u64 + SECTOR as u64 - 1) / SECTOR as u64;
     let sectors = (end_lba - start_lba) as usize;
+    let part = PART_LBA.load(Ordering::Relaxed);
     let mut raw = vec![0u8; sectors * SECTOR];
     let mut done = 0;
     while done < sectors {
         let n = (sectors - done).min(64);
-        ahci::read(start_lba + done as u64, &mut raw[done * SECTOR..(done + n) * SECTOR])
+        ahci::read(part + start_lba + done as u64, &mut raw[done * SECTOR..(done + n) * SECTOR])
             .expect("ext2 disk read");
         done += n;
     }
@@ -102,10 +108,33 @@ fn le16(b: &[u8]) -> u16 {
     u16::from_le_bytes(b[..2].try_into().unwrap())
 }
 
+/// True when the root FS was found inside an MBR partition (a real disk), not a
+/// bare QEMU test image. Fixed-LBA scratch tests must not run on such a disk.
+pub fn on_partition() -> bool {
+    PART_LBA.load(Ordering::Relaxed) != 0
+}
+
 pub fn open() -> Result<Ext2, &'static str> {
-    let sb = disk_range(SB_OFFSET, 1024);
+    let mut sb = disk_range(SB_OFFSET, 1024);
     if le16(&sb[56..]) != EXT2_MAGIC {
-        return Err("ext2 magic not found");
+        // Not a bare-image disk: look for a Linux partition in the MBR.
+        let found = crate::mbr::entries()
+            .into_iter()
+            .filter(|e| e.ptype == crate::mbr::TYPE_LINUX)
+            .find(|e| {
+                PART_LBA.store(e.start_lba, Ordering::Relaxed);
+                le16(&disk_range(SB_OFFSET, 1024)[56..]) == EXT2_MAGIC
+            });
+        match found {
+            Some(e) => {
+                crate::kprintln!("THOS: ext2 part        root FS in MBR partition at LBA {} ({} MiB)", e.start_lba, e.sectors / 2048);
+                sb = disk_range(SB_OFFSET, 1024);
+            }
+            None => {
+                PART_LBA.store(0, Ordering::Relaxed);
+                return Err("ext2 magic not found");
+            }
+        }
     }
     let block_size = 1024u32 << le32(&sb[24..]);
     let rev = le32(&sb[76..]);
@@ -131,12 +160,13 @@ fn disk_write(off: u64, data: &[u8]) {
     let start_lba = off / SECTOR as u64;
     let end_lba = (off + data.len() as u64 + SECTOR as u64 - 1) / SECTOR as u64;
     let sectors = (end_lba - start_lba) as usize;
+    let part = PART_LBA.load(Ordering::Relaxed);
     let mut raw = vec![0u8; sectors * SECTOR];
 
     let mut done = 0;
     while done < sectors {
         let n = (sectors - done).min(64);
-        ahci::read(start_lba + done as u64, &mut raw[done * SECTOR..(done + n) * SECTOR])
+        ahci::read(part + start_lba + done as u64, &mut raw[done * SECTOR..(done + n) * SECTOR])
             .expect("ext2 rmw read");
         done += n;
     }
@@ -147,7 +177,7 @@ fn disk_write(off: u64, data: &[u8]) {
     let mut done = 0;
     while done < sectors {
         let n = (sectors - done).min(64);
-        ahci::write(start_lba + done as u64, &raw[done * SECTOR..(done + n) * SECTOR])
+        ahci::write(part + start_lba + done as u64, &raw[done * SECTOR..(done + n) * SECTOR])
             .expect("ext2 rmw write");
         done += n;
     }

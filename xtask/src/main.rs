@@ -31,6 +31,35 @@ fn main() {
             let iso = build_iso();
             run_qemu(&iso, gui);
         }
+        "bios-image" => {
+            build_kernel(&[]);
+            bios_image();
+        }
+        "bios-test" => {
+            build_kernel(&[]);
+            let img = bios_image();
+            bios_test(&img);
+        }
+        "bios-run" => {
+            build_kernel(&["interactive"]);
+            let img = bios_image();
+            let log = workspace_root().join("target/bios-run-serial.log");
+            println!("serial log: {}", log.display());
+            let _ = Command::new("qemu-system-x86_64")
+                .args(["-M", "pc", "-m", "512M", "-smp", "2", "-display", "gtk", "-vga", "std"])
+                .args([
+                    "-drive", &format!("id=disk0,if=none,format=raw,file={}", img.to_str().unwrap()),
+                    "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0,bootindex=0",
+                    "-serial", &format!("file:{}", log.to_str().unwrap()),
+                    "-monitor", &format!("unix:{},server,nowait", workspace_root().join("target/bios-run-mon.sock").to_str().unwrap()),
+                ])
+                .status();
+        }
+        "bios-kbd-test" => {
+            build_kernel(&["interactive"]);
+            let img = bios_image();
+            bios_kbd_test(&img);
+        }
         "kbd-test" => {
             build_kernel(&["interactive"]);
             let iso = build_iso();
@@ -105,7 +134,7 @@ fn main() {
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|kbd-test|bootpick|bootpick-test|bootpick-tpm-test|ahci-test|ext2-test|integrity-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test|pe-test] [--gui]"
+                "usage: cargo xtask [build|iso|run|bios-image|bios-test|bios-run|bios-kbd-test|kbd-test|bootpick|bootpick-test|bootpick-tpm-test|ahci-test|ext2-test|integrity-test|smp-test|ncq-error-test|busybox-test|pipe-test|fat-test|pe-test] [--gui]"
             );
             exit(2);
         }
@@ -3333,6 +3362,145 @@ fn login_test(iso: &Path) {
         eprintln!("login-test: FAIL — ok2={ok2}, setup_ran_again={}", full2.contains("first-run setup"));
         exit(1);
     }
+}
+
+/// A legacy-BIOS / MBR disk image — the Acer Aspire 5742G boot path (no UEFI,
+/// no CSM, MS-DOS partition table). Layout: 1 MiB gap (MBR + Limine stage 2 via
+/// `limine bios-install`), partition 1 = 64 MiB FAT32 `/boot` (active; Limine's
+/// stage 3 `limine-bios.sys`, `limine.conf`, the kernel — Limine does not read
+/// our ext2 here), partition 2 = type-0x83 ext2 root FS (same content as
+/// `disk.img`). Needs `mkfs.fat` (dosfstools), `mtools` and e2fsprogs on PATH.
+fn bios_image() -> PathBuf {
+    const GAP_SECTORS: u64 = 2048;
+    const BOOT_MIB: u64 = 64;
+    let root = workspace_root();
+    let limine = root.join("third_party/limine");
+    if !limine.join("limine-bios.sys").exists() {
+        eprintln!("Limine not vendored. Run:");
+        eprintln!("  git submodule update --init third_party/limine && make -C third_party/limine");
+        exit(1);
+    }
+    let boot = root.join("target/bios-boot.img");
+    let b = boot.to_str().unwrap();
+    let _ = std::fs::remove_file(&boot);
+    std::fs::write(&boot, vec![0u8; (BOOT_MIB << 20) as usize]).expect("create boot partition");
+    run(Command::new("mkfs.fat").args(["-F", "32", "-n", "THOSBOOT", b]));
+    run(Command::new("mmd").args(["-i", b, "::boot", "::boot/limine"]));
+    for (src, dst) in [
+        (limine.join("limine-bios.sys"), "::boot/"),
+        (kernel_elf(), "::boot/"),
+        (root.join("boot/limine.conf"), "::boot/limine/"),
+    ] {
+        run(Command::new("mcopy").args(["-i", b, src.to_str().unwrap(), dst]));
+    }
+
+    let rootfs = std::fs::read(disk_image()).expect("read disk.img");
+    let boot_bytes = std::fs::read(&boot).expect("read boot partition");
+    let boot_secs = boot_bytes.len() as u64 / 512;
+    let root_secs = rootfs.len() as u64 / 512;
+    let root_start = GAP_SECTORS + boot_secs;
+
+    let mut disk = vec![0u8; (GAP_SECTORS * 512) as usize];
+    // Entries: CHS left at the 0xFE 0xFF 0xFF "use LBA" sentinel.
+    for (i, (active, ptype, start, len)) in [
+        (0x80u8, 0x0Cu8, GAP_SECTORS, boot_secs),
+        (0x00, 0x83, root_start, root_secs),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let e = 0x1BE + i * 16;
+        disk[e] = active;
+        disk[e + 1..e + 4].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+        disk[e + 4] = ptype;
+        disk[e + 5..e + 8].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+        disk[e + 8..e + 12].copy_from_slice(&(start as u32).to_le_bytes());
+        disk[e + 12..e + 16].copy_from_slice(&(len as u32).to_le_bytes());
+    }
+    disk[510] = 0x55;
+    disk[511] = 0xAA;
+    disk.extend_from_slice(&boot_bytes);
+    disk.extend_from_slice(&rootfs);
+
+    let img = root.join("target/thos-bios.img");
+    std::fs::write(&img, &disk).expect("write bios image");
+    // Stage 1 into the MBR code area (partition table preserved), stage 2 into
+    // the gap.
+    run(Command::new(limine.join("limine")).arg("bios-install").arg(&img));
+    img
+}
+
+/// Boot the MBR image under SeaBIOS (no OVMF, no UEFI) on an AHCI disk with a
+/// PS/2 keyboard and assert the legacy path works end to end.
+fn bios_test(img: &Path) {
+    let root = workspace_root();
+    let log = root.join("target/bios-test.log");
+    let _ = std::fs::remove_file(&log);
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu.args(["-M", "pc", "-m", "512M", "-smp", "2"]);
+    qemu.args([
+        "-drive", &format!("id=disk0,if=none,format=raw,file={}", img.to_str().unwrap()),
+        "-device", "ahci,id=ahci0",
+        "-device", "ide-hd,drive=disk0,bus=ahci0.0,bootindex=0",
+        "-serial", &format!("file:{}", log.to_str().unwrap()),
+        "-display", "none", "-no-reboot",
+        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    ]);
+    let status = qemu.status().unwrap_or_else(|e| {
+        eprintln!("failed to spawn qemu: {e}");
+        exit(1);
+    });
+    let out = std::fs::read_to_string(&log).unwrap_or_default();
+    let mut ok = status.code() == Some(QEMU_SUCCESS);
+    for needle in ["THOS: ext2 part", "THOS: ps2 ok", "THOS: ahci ident"] {
+        let hit = out.contains(needle);
+        println!("  {} {needle}", if hit { "ok  " } else { "FAIL" });
+        ok &= hit;
+    }
+    if !ok {
+        eprintln!("bios-test FAILED (qemu status {status:?}); serial log: {}", log.display());
+        exit(1);
+    }
+    println!("bios-test PASSED: BIOS/MBR boot, root FS in a partition, PS/2 keyboard up");
+}
+
+/// BIOS/MBR boot with **only** a PS/2 keyboard (no USB controller at all, like
+/// the Acer): QEMU `sendkey` goes through the i8042, first-run setup + login +
+/// `init` are typed on it and must work.
+fn bios_kbd_test(img: &Path) {
+    let root = workspace_root();
+    let log = root.join("target/bios-kbd-serial.log");
+    let sock = root.join("target/bios-kbd-mon.sock");
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&sock);
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(["-M", "pc", "-m", "512M", "-smp", "2"])
+        .args([
+            "-drive", &format!("id=disk0,if=none,format=raw,file={}", img.to_str().unwrap()),
+            "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0,bootindex=0",
+            "-display", "none", "-no-reboot",
+            "-serial", &format!("file:{}", log.to_str().unwrap()),
+            "-monitor", &format!("unix:{},server,nowait", sock.to_str().unwrap()),
+        ])
+        .spawn()
+        .expect("spawn qemu");
+    if !wait_for(&log, "THOS first-run setup", 90) {
+        kill(&mut child, "bios-kbd-test", "kernel never reached first-run setup", &log);
+    }
+    drive_login(&sock, &log, &mut child, "bios-kbd-test");
+    if !wait_for(&log, "interactive hold", 90) {
+        kill(&mut child, "bios-kbd-test", "never reached the shell after login", &log);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    type_line(&sock, "cat /message");
+    let ok = wait_for(&log, "hello a file read via open+lseek+read", 30);
+    let _ = child.kill();
+    let _ = child.wait();
+    if !ok {
+        eprintln!("bios-kbd-test FAILED: typed command had no effect; log: {}", log.display());
+        exit(1);
+    }
+    println!("bios-kbd-test PASSED: BIOS/MBR boot, PS/2 typing -> login -> shell -> cat from the root partition");
 }
 
 fn run_qemu(iso: &Path, gui: bool) {

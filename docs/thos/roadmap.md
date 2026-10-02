@@ -1466,6 +1466,41 @@ ASRock board; and the risks below.
   different pre-boot environment can trigger a recovery-key prompt on the
   Windows side — needs testing before relying on it).
 
+## Acer Aspire 5742G: legacy BIOS / MBR / SATA target (*user, 2026-10-02*)
+
+A second target machine, see [`hw-target.md`](hw-target.md): **BIOS only (no
+UEFI, no CSM), MBR partition table, SATA SSDs, no NVMe**, Westmere i3-370M,
+Radeon HD 5470M, HM55 chipset, PS/2 internal keyboard, no xHCI.
+
+Status (verified in QEMU/SeaBIOS, **not yet on the real laptop**):
+
+- **Boot**: Limine BIOS (stage 1 in the MBR, stage 2 in the 1 MiB gap, stage 3 +
+  kernel + `limine.conf` on a 64 MiB FAT32 `/boot` partition — Limine did *not*
+  find `limine-bios.sys` on our ext2, FAT works). `cargo xtask bios-image`.
+- **Disk**: `kernel/src/mbr.rs` (primary entries, GPT-protective aware);
+  `ext2::open` falls back to the first type-0x83 partition holding an ext2
+  superblock and adds that LBA offset to every read/write.
+- **Keyboard**: `kernel/src/ps2.rs` — polled i8042, set-1 scancodes → HID boot
+  reports → the shared `console::feed_report` (SAK, line discipline unchanged).
+- **Safety**: the fixed-LBA AHCI write / NCQ scratch tests are skipped when the
+  root FS is in a partition (they would hit the user's data on a real disk).
+- **Tests**: `cargo xtask bios-test` (boot + partition + PS/2 + AHCI) and
+  `cargo xtask bios-kbd-test` (PS/2-only first-run setup → login → shell →
+  `cat` from the root partition). `ahci-test`, `ext2-test`, `kbd-test` still pass.
+
+Still to do before the real laptop: write the image to a SATA SSD and boot it
+(`dd` of `target/thos-bios.img`, BIOS SATA mode **AHCI**); capture the real
+`lspci -nn`/`lscpu` into `hw-target.md`; verify the Westmere timer/APIC path on
+hardware; an EHCI (USB 2) driver for external keyboards; HM55 SATA is 3 Gb/s;
+a real installer (partitioning + `limine bios-install` on the target disk) rather
+than a prebuilt image; Evergreen KMS is far-future (VBE framebuffer until then).
+
+## Desktop (side quest)
+
+Planned separately in [`desktop-plan.md`](desktop-plan.md) — a CPU-rendered,
+userspace compositor first (the Acer has no GPU driver), GPU later. Stage 0 (shell
+on the framebuffer console, `kernel/src/fbcon.rs`) is in; the rest is planning.
+
 ## Open decisions
 
 1. **GPU path A vs B** — decide after the Phase 4 spike.

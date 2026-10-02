@@ -63,6 +63,9 @@ mod timer;
 mod vfs;
 mod vmm;
 mod window;
+mod fbcon;
+mod mbr;
+mod ps2;
 mod xhci;
 mod wait;
 
@@ -131,6 +134,7 @@ extern "C" fn kmain() -> ! {
             Some(fb) => {
                 paint_smoke_test(fb);
                 kprintln!("THOS: framebuffer painted");
+                fbcon::init(fb); // from here on, kprintln! also lands on screen
             }
             None => kprintln!("THOS: no framebuffer in response"),
         },
@@ -146,8 +150,10 @@ extern "C" fn kmain() -> ! {
 
     memory_bringup();
     acpi_apic_bringup();
+    fbcon::suspend(); // the FB mapping changes under vmm_bringup
     vmm_bringup();
     gdi_bringup();
+    fbcon::resume();
     gdi_paint_check();
 
     let mp = MP_REQUEST.response().expect("Limine MP request unanswered");
@@ -177,7 +183,7 @@ extern "C" fn kmain() -> ! {
             &["PATH=/bin:/", "HOME=/", "PWD=/", "TERM=dumb", "PS1=thos$ "],
         );
 
-        kprintln!("THOS: interactive hold — type on the USB keyboard");
+        kprintln!("THOS: interactive hold — type on the keyboard");
         loop {
             sched::yield_now();
         }
@@ -1345,31 +1351,38 @@ fn storage_milestone() {
     // AHCI write: round-trip a known pattern through a scratch sector past the
     // ext2 image (LBA 50000 = ~25 MiB; the fs is the first 16 MiB). The host
     // side of `cargo xtask ahci-test` re-checks this landed in the disk file.
-    const SCRATCH_LBA: u64 = 50_000;
-    let mut wbuf = [0u8; ahci::SECTOR];
-    for (i, b) in wbuf.iter_mut().enumerate() {
-        *b = (i as u8) ^ 0xA5;
-    }
-    ahci::write(SCRATCH_LBA, &wbuf).expect("AHCI write");
-    let mut rbuf = [0u8; ahci::SECTOR];
-    ahci::read(SCRATCH_LBA, &mut rbuf).expect("AHCI read-back");
-    assert!(rbuf == wbuf, "AHCI write / read-back mismatch");
-    kprintln!("THOS: ahci write ok    LBA {} round-tripped (durable)", SCRATCH_LBA);
+    // Fixed-LBA scratch writes are test-image-only: on a real MBR disk those
+    // sectors lie inside the user's root partition.
+    if ext2::on_partition() {
+        kprintln!("THOS: ahci scratch skip real disk — destructive LBA tests not run");
+    } else {
+        const SCRATCH_LBA: u64 = 50_000;
+        let mut wbuf = [0u8; ahci::SECTOR];
+        for (i, b) in wbuf.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0xA5;
+        }
+        ahci::write(SCRATCH_LBA, &wbuf).expect("AHCI write");
+        let mut rbuf = [0u8; ahci::SECTOR];
+        ahci::read(SCRATCH_LBA, &mut rbuf).expect("AHCI read-back");
+        assert!(rbuf == wbuf, "AHCI write / read-back mismatch");
+        kprintln!("THOS: ahci write ok    LBA {} round-tripped (durable)", SCRATCH_LBA);
 
-    // Concurrent NCQ: 8 threads hammer distinct scratch regions at once, so
-    // several tags are outstanding and the drive reorders them.
-    for i in 0..8 {
-        sched::spawn("ncq-io", ncq_io_worker, i);
+        // Concurrent NCQ: 8 threads hammer distinct scratch regions at once, so
+        // several tags are outstanding and the drive reorders them.
+        for i in 0..8 {
+            sched::spawn("ncq-io", ncq_io_worker, i);
+        }
+        while NCQ_DONE.load(Ordering::Relaxed) < 8 {
+            sched::yield_now();
+        }
+        assert_eq!(NCQ_BAD.load(Ordering::Relaxed), 0, "concurrent NCQ I/O corrupted data");
+        kprintln!(
+            "THOS: ahci ncq ok      8 concurrent readers/writers verified (depth {}, {} completion IRQs)",
+            ahci::queue_depth(),
+            ahci::irq_count(),
+        );
+
     }
-    while NCQ_DONE.load(Ordering::Relaxed) < 8 {
-        sched::yield_now();
-    }
-    assert_eq!(NCQ_BAD.load(Ordering::Relaxed), 0, "concurrent NCQ I/O corrupted data");
-    kprintln!(
-        "THOS: ahci ncq ok      8 concurrent readers/writers verified (depth {}, {} completion IRQs)",
-        ahci::queue_depth(),
-        ahci::irq_count(),
-    );
 
     // ext2 write: create a file + a dir + a nested file, read them back through
     // our own read path. `cargo xtask ext2-test` then e2fsck's the image and
@@ -1430,6 +1443,15 @@ fn storage_milestone() {
         }
         Err(e) => kprintln!("THOS: xhci             {}", e),
     }
+
+    // PS/2 keyboard via the i8042 — the laptop target has no xHCI at all.
+    match ps2::init() {
+        Ok(()) => {
+            sched::spawn("ps2-poll", ps2_poll_thread, 0);
+            kprintln!("THOS: ps2 ok           i8042 keyboard attached (poll thread up)");
+        }
+        Err(e) => kprintln!("THOS: ps2              {}", e),
+    }
 }
 
 // --- concurrent NCQ I/O check (storage_milestone) ---
@@ -1472,6 +1494,18 @@ extern "C" fn xhci_poll_thread(_: usize) -> ! {
         }
         for r in &batch[..n] {
             console::feed_report(r);
+        }
+        sched::yield_now();
+    }
+}
+
+extern "C" fn ps2_poll_thread(_: usize) -> ! {
+    let mut dec = ps2::Decoder::new();
+    loop {
+        while let Some(b) = ps2::read_scancode() {
+            if let Some(r) = dec.feed(b) {
+                console::feed_report(&r);
+            }
         }
         sched::yield_now();
     }

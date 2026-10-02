@@ -1,5 +1,34 @@
 # THOS – Hardware target
 
+> ## Current target: Acer Aspire 5742G (legacy BIOS, MBR) — *user, 2026-10-02*
+>
+> THOS now also targets an **Acer Aspire 5742G** laptop. Its firmware is
+> **legacy BIOS only: no UEFI, no CSM switch, MBR / MS-DOS partition table.**
+> Targets are ordinary **SATA SSDs, no NVMe**. Figures below come from a
+> comparison sheet (user screenshot); re-capture with the `lspci`/`lscpu`
+> commands in *Raw inventory* before writing drivers against exact IDs.
+>
+> | Part | Acer Aspire 5742G | (HP EliteBook 840 G1, for comparison) |
+> |---|---|---|
+> | CPU | Core **i3-370M**, Westmere 2010, 3.5 GHz as listed | i5-4300U Haswell 2013 |
+> | GPU | **Radeon HD 5470M**, 512 MB GDDR3, 40 shader units (Evergreen / TeraScale 2) | Intel HD 4000 |
+> | Chipset | Intel **HM55** (Ibex Peak-M) — expected, to verify | — |
+> | Firmware | BIOS + MBR | — |
+>
+> What this changes versus the ASRock/Raptor Lake target below:
+>
+> | Area | Consequence |
+> |---|---|
+> | Boot | **Limine BIOS** (stage 1 in the MBR, stage 2 in the post-MBR gap) instead of UEFI. `cargo xtask bios-image` / `bios-test`. The UEFI boot picker (`loaders/thos-boot`) does **not** apply here. |
+> | Disk | **MBR partition table** — `kernel/src/mbr.rs`; the root ext2 lives in a type-`0x83` partition (`ext2::open` probes it). No GPT/ESP on this machine. |
+> | Keyboard | Internal keyboard is **PS/2 (i8042)**; HM55 has **no xHCI** (USB 2 EHCI only) — `kernel/src/ps2.rs`. External USB keyboards need an EHCI driver (not written). |
+> | Storage | HM55 SATA is **3 Gb/s (SATA II)**: a SATA III 6 Gb/s SSD works but is link-limited. The BIOS must have SATA mode = **AHCI** (the driver matches class `0106`; IDE/compat mode shows `0101` and is **not** supported). |
+> | CPU | Westmere: xAPIC only (no x2APIC), **no TSC-deadline**, no AVX/XSAVE, no RDRAND/SMEP — the kernel already uses xAPIC + PIT-calibrated periodic timer and an RDRAND-or-fallback salt, so nothing blocks. 2 cores / 4 threads: SMP code is generic. |
+> | GPU | Boot framebuffer comes from **VBE via Limine**; a native Evergreen KMS driver is a far-future item, replacing the RDNA2 plan. |
+> | Safety | Fixed-LBA scratch/stress tests are skipped when the root FS is found in a partition (`ext2::on_partition`). |
+>
+> The ASRock section below stays as the **secondary/original** target.
+
 THOS targets **exactly one machine**. Every driver is written for the chips below and
 nothing else. This is what keeps the project finite. Inventory captured 2026-08-29 from
 the running Devuan install on that machine.
