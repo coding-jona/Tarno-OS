@@ -1507,6 +1507,14 @@ Planned in [`network-plan.md`](network-plan.md) (*user, 2026-10-02*): virtio-net
 first, smoltcp-class stack, shared socket endpoints for POSIX + Winsock, then the
 real NICs. Not built yet.
 
+## Installing software
+
+Planned in [`software-install-plan.md`](software-install-plan.md) (*user,
+2026-10-02*): one package-manager service with handlers for Windows `.exe` / `.msi`
+and Linux `.deb` / `.rpm` / archives, scan-first + recorded-sandbox transactions.
+Critical path is runtime coverage (dynamic ELF loader, more Win32/registry/COM), not
+the installer UI. Not built yet.
+
 ## Open decisions
 
 1. **GPU path A vs B** — decide after the Phase 4 spike.

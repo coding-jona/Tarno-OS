@@ -112,7 +112,8 @@ can screenshot or inject input into the secure desktop.
 
 **Stage 5 — Shell UX ("professional").** Panel/taskbar, launcher, window
 switcher, notifications, file manager, terminal emulator (real VT in a window),
-text editor, settings (display, keyboard, accounts, network later). A
+text editor, settings (display, keyboard, accounts, network later), software installer / store front-end
+([`software-install-plan.md`](software-install-plan.md)). A
 consistent design language: spacing scale, one icon set, light/dark theme,
 keyboard-first navigation, 1366x768 as the *reference* resolution (and 1920x1080
 for the ASRock). Accessibility basics: scalable UI, high contrast, full keyboard
