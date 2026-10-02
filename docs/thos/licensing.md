@@ -32,7 +32,7 @@ worth a second licence in one tree).
 `tarno/mistral.go`, `tarno/provider.go`, `tarno/tarno.go`, `go.mod`, `go.sum`,
 `.gitignore`, a lint workflow) were made while the repository was AGPL-3.0. Relicensing
 those lines formally needs that contributor's consent; the lines are small and in the
-frozen part. **Open action:** ask for consent, or rewrite those files.
+frozen part. **Open action:** consent is being obtained (the contributor is a personal contact of the maintainer); the request text and the record of the answer are in [`relicensing-consent.md`](relicensing-consent.md). Until it says "agreed", rewrite is the fallback.
 
 **Copyright holder line.** `.reuse/dep5` currently says "THOS contributors (see the git
 history)"; replace it with the maintainer's chosen name if wanted.
