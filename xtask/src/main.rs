@@ -390,6 +390,8 @@ fn disk_image() -> PathBuf {
         ("sigtest.rs", "sigtest"),
         // /dev/null, /dev/zero, /dev/urandom, /dev/tty — typed in by `kbd-test`.
         ("devtest.rs", "devtest"),
+        // Socket test, run by `net-test` against host-side servers.
+        ("nettest.rs", "nettest"),
         // getrandom quality test, run by `random-test`.
         ("randtest.rs", "randtest"),
     ] {
@@ -3867,6 +3869,11 @@ fn longcmd_test(img: &Path) {
 /// Boot the real boot path, log in over PS/2, run `cmd`, and return the serial log once
 /// `needle` appears (or after `secs`). Each call is a fresh boot of a pristine copy.
 fn boot_and_run(img: &Path, tag: &str, cmd: &str, needle: &str, secs: u64) -> String {
+    boot_and_run_args(img, tag, cmd, needle, secs, &[])
+}
+
+/// [`boot_and_run`] with extra QEMU arguments (e.g. a NIC).
+fn boot_and_run_args(img: &Path, tag: &str, cmd: &str, needle: &str, secs: u64, extra: &[&str]) -> String {
     let root = workspace_root();
     let log = root.join(format!("target/{tag}-serial.log"));
     let sock = root.join(format!("target/{tag}-mon.sock"));
@@ -3883,6 +3890,7 @@ fn boot_and_run(img: &Path, tag: &str, cmd: &str, needle: &str, secs: u64) -> St
             "-serial", &format!("file:{}", log.to_str().unwrap()),
             "-monitor", &format!("unix:{},server,nowait", sock.to_str().unwrap()),
         ])
+        .args(extra)
         .spawn()
         .expect("spawn qemu");
     if !wait_for(&log, "THOS first-run setup", 90) {
@@ -3905,35 +3913,47 @@ fn boot_and_run(img: &Path, tag: &str, cmd: &str, needle: &str, secs: u64) -> St
 /// virtio-net + smoltcp: boot with QEMU user-mode networking; the kernel's net thread must
 /// find the NIC, resolve the gateway by ARP and get an ICMP echo reply from it.
 fn net_test(img: &Path) {
-    let root = workspace_root();
-    let log = root.join("target/net-serial.log");
-    let _ = std::fs::remove_file(&log);
-    let run_img = root.join("target/net.img");
-    std::fs::copy(img, &run_img).expect("copy image");
+    use std::io::{Read, Write};
+    // Host-side servers the guest reaches as 10.0.2.2 (QEMU user networking = host loopback).
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp bind");
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+    let (tcp_port, udp_port) = (tcp.local_addr().unwrap().port(), udp.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        for conn in tcp.incoming() {
+            if let Ok(mut c) = conn {
+                let mut buf = [0u8; 256];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(b"HTTP/1.0 200 OK\r\n\r\nTHOS-NET-OK-TCP\n");
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = udp.recv_from(&mut buf) {
+            let mut reply = b"echo:".to_vec();
+            reply.extend_from_slice(&buf[..n]);
+            let _ = udp.send_to(&reply, from);
+        }
+    });
     // Westmere-class CPU, small RAM: the reference machine is a 2010 laptop.
-    let mut child = Command::new("qemu-system-x86_64")
-        .args(["-M", "pc", "-cpu", "Westmere", "-m", "512M", "-smp", "2"])
-        .args([
-            "-drive", &format!("id=disk0,if=none,format=raw,file={}", run_img.to_str().unwrap()),
-            "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0,bootindex=0",
-            "-nic", "user,model=virtio-net-pci",
-            "-display", "none", "-no-reboot",
-            "-serial", &format!("file:{}", log.to_str().unwrap()),
-        ])
-        .spawn()
-        .expect("spawn qemu");
-    let ok = wait_for(&log, "THOS: net ok", 90);
-    let out = std::fs::read_to_string(&log).unwrap_or_default();
-    let _ = child.kill();
-    let _ = child.wait();
-    if ok {
-        let line = out.lines().find(|l| l.contains("THOS: net ok")).unwrap_or("");
-        println!("net-test PASSED: {}", line.trim());
+    let out = boot_and_run_args(
+        img,
+        "net",
+        &format!("nettest {tcp_port} {udp_port}"),
+        "net-sock ",
+        90,
+        &["-cpu", "Westmere", "-nic", "user,model=virtio-net-pci"],
+    );
+    let gw = out.lines().find(|l| l.contains("THOS: net ok")).map(str::trim);
+    let sock = out.lines().find(|l| l.contains("net-sock ok")).map(str::trim);
+    if gw.is_some() && sock.is_some() {
+        println!("net-test PASSED: {}", gw.unwrap());
+        println!("                 {}", sock.unwrap());
     } else {
         for l in out.lines().filter(|l| l.contains("net")) {
             eprintln!("  {l}");
         }
-        eprintln!("net-test FAILED: no ping reply from the gateway");
+        eprintln!("net-test FAILED (gateway ping: {}, sockets: {})", gw.is_some(), sock.is_some());
         exit(1);
     }
 }

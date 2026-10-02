@@ -22,7 +22,7 @@ use x86_64::VirtAddr;
 #[cfg(feature = "interactive")]
 use crate::cred;
 use crate::usercopy::{self, EFAULT};
-use crate::{ext2, gdt, kprintln, power, process, sched, signal, smp};
+use crate::{ext2, gdt, kprintln, power, process, sched, signal, smp, sock_sys};
 
 static USER_EXITS: AtomicU64 = AtomicU64::new(0);
 
@@ -121,6 +121,19 @@ const SYS_GETCWD: u64 = 79;
 const SYS_READLINK: u64 = 89;
 const SYS_RT_SIGRETURN: u64 = 15;
 const SYS_SIGALTSTACK: u64 = 131;
+const SYS_SOCKET: u64 = 41;
+const SYS_CONNECT: u64 = 42;
+const SYS_ACCEPT: u64 = 43;
+const SYS_SENDTO: u64 = 44;
+const SYS_RECVFROM: u64 = 45;
+const SYS_SHUTDOWN: u64 = 48;
+const SYS_BIND: u64 = 49;
+const SYS_LISTEN: u64 = 50;
+const SYS_GETSOCKNAME: u64 = 51;
+const SYS_GETPEERNAME: u64 = 52;
+const SYS_SETSOCKOPT: u64 = 54;
+const SYS_GETSOCKOPT: u64 = 55;
+const SYS_ACCEPT4: u64 = 288;
 const SYS_PAUSE: u64 = 34;
 const SYS_RT_SIGPENDING: u64 = 127;
 const SYS_RT_SIGSUSPEND: u64 = 130;
@@ -612,6 +625,7 @@ fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
     let need = match cmd {
         0x5401 => 36,
         0x5413 => 8,
+        0x5421 => 4,
         0x540f => 4,
         _ => 0,
     };
@@ -649,6 +663,14 @@ fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
             *(arg as *mut u32) = signal::FG_PGRP.load(Ordering::Relaxed) as u32;
             0
         },
+        0x5421 => {
+            // FIONBIO
+            let on = usercopy::read_u32(arg).unwrap_or(0) != 0;
+            if let Some(f) = cur_fd(fd) {
+                f.set_nonblock(on);
+            }
+            0
+        }
         0x5410 => match usercopy::read_u32(arg) {
             // TIOCSPGRP (job-control shells make a child's group the foreground one)
             Ok(g) => {
@@ -1098,8 +1120,14 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             }
             1 => process::current_fd_get_cloexec(a1 as i32) as i64,
             2 => process::current_fd_set_cloexec(a1 as i32, a3 & 1 != 0) as i64,
-            3 => 0o2, // F_GETFL -> O_RDWR
-            4 => 0,   // F_SETFL
+            3 => 0o2 | cur_fd(a1).map_or(0, |f| if f.is_nonblock() { 0o4000 } else { 0 }), // F_GETFL
+            4 => {
+                // F_SETFL: only O_NONBLOCK (0o4000) is honoured, and only by sockets
+                if let Some(f) = cur_fd(a1) {
+                    f.set_nonblock(a3 & 0o4000 != 0);
+                }
+                0
+            }
             _ => 0,
         },
 
@@ -1125,30 +1153,36 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
 
         SYS_WAITID => ECHILD,
 
-        // poll: mark valid fds as "no events", invalid as POLLNVAL.
-        SYS_POLL | SYS_PPOLL => {
-            let n = a2 as usize;
-            if n > 4096 {
-                frame.rax = EINVAL as u64;
-                return;
-            }
-            if !usercopy::user_ok(a1, n * 8, true) {
-                frame.rax = EFAULT as u64;
-                return;
-            }
-            let fds = unsafe { core::slice::from_raw_parts_mut(a1 as *mut [u8; 8], n) };
-            let mut ready = 0i64;
-            for pfd in fds.iter_mut() {
-                let fd = i32::from_le_bytes([pfd[0], pfd[1], pfd[2], pfd[3]]);
-                let revents: u16 = if cur_fd(fd as u64).is_some() { 0 } else { 0x20 /* POLLNVAL */ };
-                pfd[6] = revents as u8;
-                pfd[7] = (revents >> 8) as u8;
-                if revents != 0 {
-                    ready += 1;
+        SYS_POLL => sock_sys::sys_poll(a1, a2, if (a3 as i32) < 0 { -1 } else { (a3 as i64) * 1_000_000 }),
+        SYS_PPOLL => {
+            // a3 = *timespec or NULL (forever)
+            let ns = if a3 == 0 {
+                -1
+            } else {
+                match (usercopy::read_u64(a3), usercopy::read_u64(a3.wrapping_add(8))) {
+                    (Ok(s), Ok(n)) => (s as i64).saturating_mul(1_000_000_000).saturating_add(n as i64),
+                    _ => {
+                        frame.rax = EFAULT as u64;
+                        return;
+                    }
                 }
-            }
-            ready
+            };
+            sock_sys::sys_poll(a1, a2, ns)
         }
+
+        SYS_SOCKET => sock_sys::sys_socket(a1, a2, a3),
+        SYS_BIND => sock_sys::sys_bind(a1, a2, a3),
+        SYS_LISTEN => sock_sys::sys_listen(a1),
+        SYS_CONNECT => sock_sys::sys_connect(a1, a2, a3),
+        SYS_ACCEPT => sock_sys::sys_accept(a1, a2, a3, 0),
+        SYS_ACCEPT4 => sock_sys::sys_accept(a1, a2, a3, a4),
+        SYS_SENDTO => sock_sys::sys_sendto(a1, a2, a3, a5, frame.r9),
+        SYS_RECVFROM => sock_sys::sys_recvfrom(a1, a2, a3, a5, frame.r9),
+        SYS_SHUTDOWN => sock_sys::sys_shutdown(a1, a2),
+        SYS_GETSOCKNAME => sock_sys::sys_getsockname(a1, a2, a3),
+        SYS_GETPEERNAME => sock_sys::sys_getpeername(a1, a2, a3),
+        SYS_SETSOCKOPT => sock_sys::sys_setsockopt(a1),
+        SYS_GETSOCKOPT => sock_sys::sys_getsockopt(a1, a2, a3, a4, a5),
 
         SYS_CLOCK_GETTIME => match clock_ns(a1) {
             None => EINVAL,

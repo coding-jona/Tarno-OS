@@ -44,7 +44,26 @@ pub trait FileOps: Send + Sync {
     fn getdents64(&self, _buf: &mut [u8]) -> i64 {
         ENOTDIR
     }
+    /// `poll(2)` readiness for the events in `want` (`POLLIN`=1, `POLLOUT`=4, ...). Plain
+    /// files and devices are always ready.
+    fn poll_mask(&self, want: u16) -> u16 {
+        want & (POLLIN | POLLOUT)
+    }
+    /// The socket behind this file, if it is one.
+    fn as_socket(&self) -> Option<&crate::net_sock::SockFile> {
+        None
+    }
+    /// `O_NONBLOCK` via `fcntl(F_SETFL)` / `FIONBIO`; only sockets honour it for now.
+    fn set_nonblock(&self, _on: bool) {}
+    fn is_nonblock(&self) -> bool {
+        false
+    }
 }
+
+pub const POLLIN: u16 = 0x1;
+pub const POLLOUT: u16 = 0x4;
+pub const POLLERR: u16 = 0x8;
+pub const POLLHUP: u16 = 0x10;
 
 // --- /dev ---
 
@@ -164,6 +183,13 @@ impl FileOps for KeyboardFile {
     }
     fn stat(&self) -> (u32, u64) {
         (S_IFCHR | 0o620, 0)
+    }
+    fn poll_mask(&self, want: u16) -> u16 {
+        let mut r = want & POLLOUT;
+        if want & POLLIN != 0 && (crate::console::has_input() || crate::console::eof_pending()) {
+            r |= POLLIN;
+        }
+        r
     }
 }
 
@@ -469,6 +495,16 @@ impl FileOps for PipeReadEnd {
     }
     fn stat(&self) -> (u32, u64) {
         (S_IFIFO | 0o600, 0)
+    }
+    fn poll_mask(&self, want: u16) -> u16 {
+        let mut r = 0;
+        if want & POLLIN != 0 && !self.0.buf.lock().is_empty() {
+            r |= POLLIN;
+        }
+        if self.0.writers.load(Ordering::Acquire) == 0 {
+            r |= POLLHUP | (want & POLLIN); // EOF is "readable" (read returns 0)
+        }
+        r
     }
 }
 

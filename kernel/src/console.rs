@@ -492,6 +492,11 @@ pub fn wait_for_input() {
     INPUT_WQ.wait_if_intr(|| TTY.lock().committed() == 0 && !EOF.load(Ordering::Acquire));
 }
 
+/// Is a Ctrl+D end-of-file waiting to be read?
+pub fn eof_pending() -> bool {
+    EOF.load(Ordering::Acquire)
+}
+
 /// Consume a pending Ctrl+D EOF, if any.
 pub fn take_eof() -> bool {
     EOF.swap(false, Ordering::AcqRel)

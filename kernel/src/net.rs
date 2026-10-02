@@ -76,7 +76,7 @@ impl Device for Nic {
 
 pub struct Stack {
     nic: Nic,
-    iface: Interface,
+    pub iface: Interface,
     pub sockets: SocketSet<'static>,
 }
 
@@ -90,6 +90,15 @@ impl Stack {
     pub fn poll(&mut self) {
         self.iface.poll(now(), &mut self.nic, &mut self.sockets);
     }
+}
+
+/// The interface's IPv4 address (0.0.0.0 before `init`).
+pub fn local_ip() -> [u8; 4] {
+    NET.lock()
+        .as_ref()
+        .and_then(|st| st.iface.ipv4_addr())
+        .map(|a| a.octets())
+        .unwrap_or([0; 4])
 }
 
 /// Bring the NIC and the stack up. `Err` (no virtio-net device) is normal on real hardware
@@ -177,6 +186,7 @@ pub extern "C" fn net_thread(_: usize) -> ! {
     loop {
         if let Some(st) = NET.lock().as_mut() {
             st.poll();
+            crate::net_sock::reap(st);
         }
         crate::timer::sleep_ns(10_000_000);
     }
