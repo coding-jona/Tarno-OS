@@ -89,3 +89,65 @@ pub fn sleep_until(deadline: u64) {
     sched::block_current();
     disarm(&me); // woken (deadline or an unrelated wake) — drop any stale entry
 }
+
+// ===========================================================================
+//  Wall-clock and monotonic time (nanosecond resolution, TSC-based)
+// ===========================================================================
+
+/// TSC ticks per millisecond, measured against the PIT at boot (`apic`).
+static TSC_PER_MS: AtomicU64 = AtomicU64::new(0);
+/// TSC value when the clock was started.
+static TSC_BASE: AtomicU64 = AtomicU64::new(0);
+/// Unix time (ns) corresponding to `monotonic_ns() == 0`.
+static BOOT_UNIX_NS: AtomicU64 = AtomicU64::new(0);
+/// Last value handed out, so the clock never runs backwards even if two CPUs'
+/// TSCs are slightly out of step.
+static LAST_NS: AtomicU64 = AtomicU64::new(0);
+
+fn rdtsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Start the nanosecond clock: `tsc_per_ms` is the calibration, `unix_secs` the
+/// RTC reading at this instant (or `None`, then wall-clock time starts at 0).
+pub fn start_clock(tsc_per_ms: u64, unix_secs: Option<u64>) {
+    TSC_PER_MS.store(tsc_per_ms.max(1), Ordering::Relaxed);
+    TSC_BASE.store(rdtsc(), Ordering::Relaxed);
+    BOOT_UNIX_NS.store(unix_secs.unwrap_or(0).saturating_mul(1_000_000_000), Ordering::Relaxed);
+}
+
+/// Nanoseconds since the clock started. Falls back to the 100 Hz tick count if
+/// the TSC was never calibrated.
+pub fn monotonic_ns() -> u64 {
+    let per_ms = TSC_PER_MS.load(Ordering::Relaxed);
+    let ns = if per_ms == 0 {
+        now() * NS_PER_TICK
+    } else {
+        let d = rdtsc().saturating_sub(TSC_BASE.load(Ordering::Relaxed));
+        ((d as u128 * 1_000_000) / per_ms as u128) as u64
+    };
+    LAST_NS.fetch_max(ns, Ordering::Relaxed).max(ns)
+}
+
+/// Wall-clock time, nanoseconds since the Unix epoch (UTC).
+pub fn realtime_ns() -> u64 {
+    BOOT_UNIX_NS.load(Ordering::Relaxed).saturating_add(monotonic_ns())
+}
+
+/// Wall-clock time in whole seconds.
+pub fn unix_secs() -> u64 {
+    realtime_ns() / 1_000_000_000
+}
+
+/// Block the caller for at least `ns` nanoseconds (rounded up to whole 10 ms
+/// ticks, minimum one tick for any non-zero request).
+pub fn sleep_ns(ns: u64) {
+    if ns == 0 {
+        return;
+    }
+    let ticks = ns.div_ceil(NS_PER_TICK).max(1);
+    let deadline = now().saturating_add(ticks);
+    while now() < deadline {
+        sleep_until(deadline);
+    }
+}

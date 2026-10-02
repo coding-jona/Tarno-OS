@@ -374,6 +374,8 @@ fn disk_image() -> PathBuf {
         ("fputest.rs", "fputest"),
         // User-pointer validation test, typed in by `kbd-test`.
         ("ptrtest.rs", "ptrtest"),
+        // Clock / sleep / timestamp test, typed in by `kbd-test`.
+        ("clocktest.rs", "clocktest"),
     ] {
         let rs = root.join("xtask/testdata").join(src);
         let bin = root.join("target").join(name);
@@ -3318,6 +3320,11 @@ fn kbd_test(iso: &Path) {
     type_line(&sock, "ptrtest");
     let _ = wait_for(&log, "ptr ", 60);
 
+    // A real clock: RTC-backed wall time (compared with the host's), monotonic
+    // time that matches nanosleep, and file timestamps.
+    type_line(&sock, "clocktest");
+    let _ = wait_for(&log, "clock ", 90);
+
     // Capability policy: the logged-in session is uid 1000 (`thos`, per
     // `drive_login`); `/etc/thos/admin.cred` is owned by uid 0 (the system
     // account — every file `write_path` creates is, today) at mode 644 —
@@ -3391,6 +3398,20 @@ fn kbd_test(iso: &Path) {
     };
     let fpu_ok = after.contains("fpu ok");
     let ptr_ok = after.contains("ptr ok");
+    // The guest's wall clock must be within two minutes of the host's.
+    let clock_ok = after.contains("clock ok") && {
+        let guest = after
+            .split("clock ok: real=")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|n| n.parse::<i64>().ok())
+            .unwrap_or(0);
+        let host = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        (host - guest).abs() < 120
+    };
     let elevate_ok = after.contains("elevated-check uid=0");
     let sak_denied_ok = after.contains("THOS: SAK denied");
     let sak_accepted_ok = after.contains("THOS: SAK accepted");
@@ -3404,6 +3425,7 @@ fn kbd_test(iso: &Path) {
         && cat_ok
         && fpu_ok
         && ptr_ok
+        && clock_ok
         && perm_ok
         && create_ok
         && elevate_ok
@@ -3412,11 +3434,11 @@ fn kbd_test(iso: &Path) {
         && sak_spawn_ok
     {
         println!(
-            "kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), private x87/SSE state across preemption, user-pointer validation (EFAULT), DAC write denial, O_CREAT/mkdir, elevate(), SAK trusted path"
+            "kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), private x87/SSE state across preemption, user-pointer validation (EFAULT), RTC-backed clock + sleep + file mtimes, DAC write denial, O_CREAT/mkdir, elevate(), SAK trusted path"
         );
     } else {
         eprintln!(
-            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} fpu_ok={fpu_ok} ptr_ok={ptr_ok} perm_ok={perm_ok} create_ok={create_ok} elevate_ok={elevate_ok} sak_denied_ok={sak_denied_ok} sak_accepted_ok={sak_accepted_ok} sak_spawn_ok={sak_spawn_ok})\n---\n{after}\n---"
+            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} fpu_ok={fpu_ok} ptr_ok={ptr_ok} clock_ok={clock_ok} perm_ok={perm_ok} create_ok={create_ok} elevate_ok={elevate_ok} sak_denied_ok={sak_denied_ok} sak_accepted_ok={sak_accepted_ok} sak_spawn_ok={sak_spawn_ok})\n---\n{after}\n---"
         );
         exit(1);
     }

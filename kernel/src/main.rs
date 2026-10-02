@@ -71,6 +71,7 @@ mod fbcon;
 mod power;
 mod mbr;
 mod ps2;
+mod rtc;
 mod xhci;
 mod wait;
 
@@ -308,6 +309,18 @@ fn acpi_apic_bringup() {
         "THOS: LAPIC id {}       timer {} counts/ms",
         apic::bsp_apic_id(),
         apic::counts_per_ms()
+    );
+
+    // Start the wall clock: RTC reading + the TSC calibrated against the PIT.
+    let rtc = rtc::read_unix();
+    timer::start_clock(apic::tsc_per_ms(), rtc);
+    kprintln!(
+        "THOS: clock            TSC {} MHz; RTC {}",
+        apic::tsc_per_ms() / 1000,
+        match rtc {
+            Some(t) => alloc::format!("{} (unix)", t),
+            None => alloc::string::String::from("unreadable — wall clock starts at 0"),
+        }
     );
 
     x86_64::instructions::interrupts::enable();

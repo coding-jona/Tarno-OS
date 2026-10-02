@@ -34,6 +34,10 @@ pub trait FileOps: Send + Sync {
     fn seek(&self, offset: i64, whence: u32) -> i64;
     /// (mode bits for `st_mode`, size for `st_size`).
     fn stat(&self) -> (u32, u64);
+    /// `(atime, mtime, ctime)` in seconds since the epoch; zeros if unknown.
+    fn times(&self) -> (u32, u32, u32) {
+        (0, 0, 0)
+    }
     /// Fill `buf` with `struct linux_dirent64` records; `0` at end-of-dir,
     /// `-EINVAL` if `buf` is too small for even one record. Not a directory by
     /// default.
@@ -170,6 +174,16 @@ impl FileOps for Ext2File {
     }
     fn stat(&self) -> (u32, u64) {
         (S_IFREG | 0o644, self.buf.lock().len() as u64)
+    }
+    fn times(&self) -> (u32, u32, u32) {
+        let Some(fs) = crate::ext2::open().ok() else { return (0, 0, 0) };
+        match fs.path_lookup(&self.path) {
+            Some(ino) => {
+                let n = fs.read_inode(ino);
+                (n.atime, n.mtime, n.ctime)
+            }
+            None => (0, 0, 0),
+        }
     }
 }
 

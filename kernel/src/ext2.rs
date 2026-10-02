@@ -42,6 +42,10 @@ pub struct Inode {
     pub mode: u16,
     pub size: u64,
     pub block: [u32; 15],
+    /// `i_atime` / `i_ctime` / `i_mtime`, seconds since the epoch.
+    pub atime: u32,
+    pub ctime: u32,
+    pub mtime: u32,
     /// `i_uid`/`i_gid` — the classic 16-bit ext2 fields (not the Linux
     /// high-16-bits-in-`i_osd2` extension; THOS's own uid space is small
     /// enough that this doesn't matter yet). Every file THOS itself creates
@@ -216,6 +220,11 @@ fn set_inode(
     raw[24..26].copy_from_slice(&(gid as u16).to_le_bytes());
     raw[26..28].copy_from_slice(&links.to_le_bytes());
     raw[28..32].copy_from_slice(&blocks512.to_le_bytes()); // i_blocks (512-byte units)
+    // Timestamps: every inode write through here is a create or a content rewrite.
+    let now = (crate::timer::unix_secs() as u32).to_le_bytes();
+    raw[8..12].copy_from_slice(&now); // i_atime
+    raw[12..16].copy_from_slice(&now); // i_ctime
+    raw[16..20].copy_from_slice(&now); // i_mtime
     for (i, b) in block.iter().enumerate() {
         raw[40 + i * 4..44 + i * 4].copy_from_slice(&b.to_le_bytes());
     }
@@ -247,6 +256,9 @@ impl Ext2 {
             block,
             uid: le16(&raw[2..]) as u32,
             gid: le16(&raw[24..]) as u32,
+            atime: le32(&raw[8..]),
+            ctime: le32(&raw[12..]),
+            mtime: le32(&raw[16..]),
         }
     }
 

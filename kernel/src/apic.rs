@@ -44,6 +44,8 @@ static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 /// APIC-timer counts per millisecond, from PIT calibration.
 static COUNTS_PER_MS: AtomicU64 = AtomicU64::new(0);
+/// TSC ticks per millisecond, measured in the same PIT window.
+static TSC_PER_MS: AtomicU64 = AtomicU64::new(0);
 static BSP_APIC_ID: AtomicU8 = AtomicU8::new(0);
 
 fn base() -> *mut u8 {
@@ -117,6 +119,10 @@ pub unsafe fn init_bsp(local_apic_addr: u64) {
     start_periodic_timer();
 }
 
+pub fn tsc_per_ms() -> u64 {
+    TSC_PER_MS.load(Ordering::Relaxed)
+}
+
 pub fn counts_per_ms() -> u64 {
     COUNTS_PER_MS.load(Ordering::Relaxed)
 }
@@ -163,8 +169,12 @@ unsafe fn calibrate_against_pit() -> u64 {
     write(REG_LVT_TIMER, LVT_MASKED);
     write(REG_TIMER_INITCNT, u32::MAX);
 
-    // Wait for PIT OUT2 (bit 5) to go high == counter hit 0.
+    // Wait for PIT OUT2 (bit 5) to go high == counter hit 0 — and measure the TSC
+    // over the same window (the PIT is the only trustworthy reference this early).
+    let tsc0 = core::arch::x86_64::_rdtsc();
     while inb(PIT_CH2_GATE) & 0x20 == 0 {}
+    let tsc1 = core::arch::x86_64::_rdtsc();
+    TSC_PER_MS.store((tsc1 - tsc0) / CALIB_MS as u64, Ordering::Relaxed);
 
     let elapsed = u32::MAX - read(REG_TIMER_CURRCNT);
     write(REG_TIMER_INITCNT, 0); // stop

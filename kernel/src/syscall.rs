@@ -115,6 +115,7 @@ const SYS_MADVISE: u64 = 28;
 const SYS_MUNMAP: u64 = 11;
 const SYS_KILL: u64 = 62;
 const SYS_REBOOT: u64 = 169;
+const SYS_GETTIMEOFDAY: u64 = 96;
 const SYS_UNAME: u64 = 63;
 const SYS_GETCWD: u64 = 79;
 const SYS_READLINK: u64 = 89;
@@ -567,7 +568,19 @@ fn sys_fstat(fd: u64, buf: u64) -> i64 {
         *((buf + 56) as *mut i64) = 4096; // st_blksize
         *((buf + 64) as *mut i64) = ((size + 511) / 512) as i64;
     }
+    let (a, m, c) = f.times();
+    fill_stat_times(buf, a, m, c);
     0
+}
+
+/// `st_atim` / `st_mtim` / `st_ctim` of the x86-64 `struct stat` (each a
+/// `timespec`: seconds at +0, nanoseconds at +8) at offsets 72 / 88 / 104.
+fn fill_stat_times(buf: u64, atime: u32, mtime: u32, ctime: u32) {
+    unsafe {
+        *((buf + 72) as *mut i64) = atime as i64;
+        *((buf + 88) as *mut i64) = mtime as i64;
+        *((buf + 104) as *mut i64) = ctime as i64;
+    }
 }
 
 /// Minimal terminal `ioctl`: report a canonical-mode line discipline with the
@@ -701,6 +714,7 @@ fn sys_newfstatat(dirfd: u64, path_ptr: u64, buf: u64, flags: u64) -> i64 {
         *((buf + 56) as *mut i64) = 4096;
         *((buf + 64) as *mut i64) = ((node.size + 511) / 512) as i64;
     }
+    fill_stat_times(buf, node.atime, node.mtime, node.ctime);
     0
 }
 
@@ -759,6 +773,43 @@ fn user_exec_args(ptr: u64, budget: &mut usize) -> Result<alloc::vec::Vec<alloc:
         out.push(alloc::string::String::from_utf8_lossy(&bytes).into_owned());
     }
     Err(E2BIG)
+}
+
+/// Nanoseconds on Linux clock `id`, or `None` for an unknown clock. Realtime-like
+/// clocks (REALTIME, REALTIME_COARSE, REALTIME_ALARM, TAI) give wall-clock time; all
+/// the others (MONOTONIC*, BOOTTIME*, the CPU-time clocks — approximated) count from boot.
+fn clock_ns(id: u64) -> Option<u64> {
+    match id {
+        0 | 5 | 8 | 11 => Some(crate::timer::realtime_ns()),
+        1 | 2 | 3 | 4 | 6 | 7 | 9 => Some(crate::timer::monotonic_ns()),
+        _ => None,
+    }
+}
+
+/// `nanosleep` / `clock_nanosleep` (`flags & 1` = `TIMER_ABSTIME`).
+fn sys_nanosleep(clock: u64, flags: u64, req: u64, rem: u64) -> i64 {
+    let (Ok(sec), Ok(nsec)) = (usercopy::read_u64(req), usercopy::read_u64(req.wrapping_add(8))) else {
+        return EFAULT;
+    };
+    let (sec, nsec) = (sec as i64, nsec as i64);
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return EINVAL;
+    }
+    let want = (sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64);
+    let ns = if flags & 1 != 0 {
+        let Some(now) = clock_ns(clock) else { return EINVAL };
+        want.saturating_sub(now) // absolute deadline
+    } else {
+        if clock_ns(clock).is_none() {
+            return EINVAL;
+        }
+        want
+    };
+    crate::timer::sleep_ns(ns);
+    if rem != 0 {
+        let _ = usercopy::slice_mut(rem, 16).map(|b| b.fill(0)); // slept it all
+    }
+    0
 }
 
 /// `execve(path, argv, envp)`. Does not return on success.
@@ -877,19 +928,34 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         }
         SYS_LSEEK => cur_fd(a1).map(|f| f.seek(a2 as i64, a3 as u32)).unwrap_or(EBADF),
 
-        // time(2): seconds since the epoch. No RTC yet — a fixed plausible value
-        // keeps `ls` and friends from tripping the unhandled-syscall path.
+        // time(2): seconds since the epoch, from the RTC + the TSC clock.
         SYS_TIME => {
-            let t: i64 = 1_735_689_600; // 2025-01-01
-            if a1 != 0 {
-                if usercopy::write_u64(a1, t as u64).is_err() {
-                    EFAULT
-                } else {
-                    t
-                }
+            let t = crate::timer::unix_secs() as i64;
+            if a1 != 0 && usercopy::write_u64(a1, t as u64).is_err() {
+                EFAULT
             } else {
                 t
             }
+        }
+
+        SYS_GETTIMEOFDAY => {
+            let ns = crate::timer::realtime_ns();
+            if a1 != 0 {
+                match usercopy::slice_mut(a1, 16) {
+                    Ok(b) => {
+                        b[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+                        b[8..].copy_from_slice(&((ns % 1_000_000_000) / 1000).to_le_bytes());
+                    }
+                    Err(e) => {
+                        frame.rax = e as u64;
+                        return;
+                    }
+                }
+            }
+            if a2 != 0 {
+                let _ = usercopy::slice_mut(a2, 8).map(|b| b.fill(0)); // struct timezone: UTC
+            }
+            0
         }
 
         // sendfile(out, in, *offset, count): plain copy loop through a bounce
@@ -1006,16 +1072,21 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             _ => 0,
         },
 
-        SYS_NANOSLEEP | SYS_CLOCK_NANOSLEEP => {
-            for _ in 0..1000 {
-                sched::yield_now();
-            }
-            0
-        }
+        // nanosleep(req, rem) / clock_nanosleep(clock, flags, req, rem): a real timed
+        // block on the timer wheel (10 ms resolution, never shorter than asked).
+        SYS_NANOSLEEP => sys_nanosleep(0, 0, a1, a2),
+        SYS_CLOCK_NANOSLEEP => sys_nanosleep(a1, a2, a3, a4),
 
         SYS_SYSINFO => match usercopy::slice_mut(a1, 112) {
             Ok(b) => {
                 b.fill(0);
+                let free = crate::mm::FRAME_ALLOC.lock().free_frames() * 4096;
+                let total = crate::mm::total_frames() * 4096;
+                b[0..8].copy_from_slice(&(crate::timer::monotonic_ns() / 1_000_000_000).to_le_bytes()); // uptime
+                b[32..40].copy_from_slice(&total.to_le_bytes()); // totalram
+                b[40..48].copy_from_slice(&free.to_le_bytes()); // freeram
+                b[80..82].copy_from_slice(&1u16.to_le_bytes()); // procs (not tracked)
+                b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
                 0
             }
             Err(e) => e,
@@ -1048,12 +1119,16 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             ready
         }
 
-        SYS_CLOCK_GETTIME => match usercopy::slice_mut(a2, 16) {
-            Ok(b) => {
-                b.fill(0);
-                0
-            }
-            Err(e) => e,
+        SYS_CLOCK_GETTIME => match clock_ns(a1) {
+            None => EINVAL,
+            Some(ns) => match usercopy::slice_mut(a2, 16) {
+                Ok(b) => {
+                    b[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+                    b[8..].copy_from_slice(&(ns % 1_000_000_000).to_le_bytes());
+                    0
+                }
+                Err(e) => e,
+            },
         },
 
         SYS_SCHED_GETAFFINITY => {

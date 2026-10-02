@@ -49,6 +49,12 @@ pub static FRAME_ALLOC: Mutex<FrameAllocator> = Mutex::new(FrameAllocator::new()
 /// Carved off the largest usable region and never handed to `FRAME_ALLOC`.
 const DMA_ARENA_BYTES: u64 = 1024 * 1024;
 static DMA_ARENA: AtomicU64 = AtomicU64::new(0);
+/// Frames handed to the allocator at boot (for `sysinfo`).
+static TOTAL_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+pub fn total_frames() -> u64 {
+    TOTAL_FRAMES.load(Ordering::Relaxed)
+}
 
 /// `(phys_base, len)` of the contiguous DMA bounce arena.
 pub fn dma_arena() -> (u64, u64) {
@@ -108,6 +114,7 @@ pub unsafe fn init(hhdm: u64, entries: &[&Entry]) -> MemStats {
         }
     }
     drop(alloc);
+    TOTAL_FRAMES.store(stats.usable_frames, Ordering::Relaxed);
 
     // Bring the heap up on the static arena.
     HEAP.lock().init(core::ptr::addr_of_mut!(HEAP_ARENA) as *mut u8, HEAP_SIZE);
