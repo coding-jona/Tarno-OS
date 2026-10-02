@@ -3255,6 +3255,8 @@ fn type_line(sock: &Path, text: &str) {
             '|' => "altgr-less", // DE: AltGr + the key left of Y
             '>' => "shift-less", // DE: Shift + the key left of Y (plain = `<`)
             '$' => "shift-4",
+            ';' => "shift-comma",
+            ':' => "shift-dot",
             '(' => "shift-8",
             ')' => "shift-9",
             // QWERTZ: the physical Y and Z keys are swapped relative to the US
@@ -3263,6 +3265,10 @@ fn type_line(sock: &Path, text: &str) {
             'z' => "y",
             'Y' => "shift-z",
             'Z' => "shift-y",
+            c if c.is_ascii_uppercase() => {
+                mon(sock, &format!("sendkey shift-{}", c.to_ascii_lowercase()));
+                continue;
+            }
             _ => {
                 mon(sock, &format!("sendkey {c}"));
                 continue;
@@ -3939,21 +3945,24 @@ fn net_test(img: &Path) {
     let out = boot_and_run_args(
         img,
         "net",
-        &format!("nettest {tcp_port} {udp_port}"),
-        "net-sock ",
+        &format!("nettest {tcp_port} {udp_port}; busybox wget -q -O - http://10.0.2.2:{tcp_port}/"),
+        "THOS-NET-OK-TCP",
         90,
         &["-cpu", "Westmere", "-nic", "user,model=virtio-net-pci"],
     );
     let gw = out.lines().find(|l| l.contains("THOS: net ok")).map(str::trim);
     let sock = out.lines().find(|l| l.contains("net-sock ok")).map(str::trim);
-    if gw.is_some() && sock.is_some() {
+    // The HTTP body must also appear as the *output* of BusyBox wget (a line of its own).
+    let wget = out.lines().any(|l| l.trim() == "THOS-NET-OK-TCP");
+    if gw.is_some() && sock.is_some() && wget {
         println!("net-test PASSED: {}", gw.unwrap());
         println!("                 {}", sock.unwrap());
+        println!("                 BusyBox wget fetched the page from the host");
     } else {
         for l in out.lines().filter(|l| l.contains("net")) {
             eprintln!("  {l}");
         }
-        eprintln!("net-test FAILED (gateway ping: {}, sockets: {})", gw.is_some(), sock.is_some());
+        eprintln!("net-test FAILED (gateway ping: {}, sockets: {}, wget: {})", gw.is_some(), sock.is_some(), wget);
         exit(1);
     }
 }
