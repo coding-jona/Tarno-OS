@@ -85,6 +85,9 @@ pub fn sleep_until(deadline: u64) {
     }
     let me = sched::current();
     sched::mark_blocking(&me);
+    if crate::signal::interrupted() {
+        return; // a signal ends the sleep (`sleep_ns` reports the rest)
+    }
     arm(deadline, me.clone());
     sched::block_current();
     disarm(&me); // woken (deadline or an unrelated wake) — drop any stale entry
@@ -141,13 +144,20 @@ pub fn unix_secs() -> u64 {
 
 /// Block the caller for at least `ns` nanoseconds (rounded up to whole 10 ms
 /// ticks, minimum one tick for any non-zero request).
-pub fn sleep_ns(ns: u64) {
+/// Sleep `ns` nanoseconds; returns the nanoseconds left if a signal cut it short.
+pub fn sleep_ns(ns: u64) -> u64 {
     if ns == 0 {
-        return;
+        return 0;
     }
-    let ticks = ns.div_ceil(NS_PER_TICK).max(1);
+    // +1: `now()` is somewhere inside the current tick, so without it the sleep could end
+    // up to a whole tick short of what was asked (POSIX: at least the requested time).
+    let ticks = ns.div_ceil(NS_PER_TICK).max(1) + 1;
     let deadline = now().saturating_add(ticks);
     while now() < deadline {
+        if crate::signal::interrupted() {
+            return (deadline - now()).saturating_mul(NS_PER_TICK).min(ns);
+        }
         sleep_until(deadline);
     }
+    0
 }

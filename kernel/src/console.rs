@@ -182,6 +182,7 @@ const KC_DELETE: u8 = 0x4C;
 // Non-character keys the shortcuts use (HID usage IDs).
 const KC_A: u8 = 0x04;
 const KC_C: u8 = 0x06;
+const KC_BACKSLASH: u8 = 0x31;
 const KC_D: u8 = 0x07;
 const KC_L: u8 = 0x0F;
 const KC_U: u8 = 0x18;
@@ -317,14 +318,17 @@ fn shortcut(k: u8, ctrl: bool, shift: bool) -> bool {
             drop(t);
             INPUT_WQ.wake_all();
         }
-        // Ctrl+C: THOS has no signals yet (roadmap B3), so this approximates the
-        // prompt case — abandon the line, show ^C, and hand the shell an empty
-        // line so it prints a fresh prompt. A running foreground program is not
-        // interrupted (that needs real SIGINT delivery).
-        (true, false, KC_C) => {
+        // Ctrl+C / Ctrl+\ (ISIG): drop the half-typed line, echo ^C, and send
+        // SIGINT / SIGQUIT to the foreground process group.
+        (true, false, KC_C) | (true, false, KC_BACKSLASH) => {
             kill_line();
-            serial::write_bytes(b"^C\r\n");
-            TTY.lock().push(b'\n');
+            let (name, sig): (&[u8], u32) = if k == KC_C {
+                (b"^C\r\n", crate::signal::SIGINT)
+            } else {
+                (b"^\\\r\n", crate::signal::SIGQUIT)
+            };
+            serial::write_bytes(name);
+            crate::signal::send_pgrp(crate::signal::FG_PGRP.load(Ordering::Relaxed), sig);
             INPUT_WQ.wake_all();
         }
         (true, _, _) => {} // any other Ctrl chord: swallow
@@ -485,7 +489,7 @@ pub fn read(buf: &mut [u8]) -> usize {
 /// Block the current thread until a committed line (or an EOF from Ctrl+D) is
 /// available for `read`.
 pub fn wait_for_input() {
-    INPUT_WQ.wait_if(|| TTY.lock().committed() == 0 && !EOF.load(Ordering::Acquire));
+    INPUT_WQ.wait_if_intr(|| TTY.lock().committed() == 0 && !EOF.load(Ordering::Acquire));
 }
 
 /// Consume a pending Ctrl+D EOF, if any.

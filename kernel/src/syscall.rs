@@ -22,7 +22,7 @@ use x86_64::VirtAddr;
 #[cfg(feature = "interactive")]
 use crate::cred;
 use crate::usercopy::{self, EFAULT};
-use crate::{ext2, gdt, kprintln, power, process, sched, smp};
+use crate::{ext2, gdt, kprintln, power, process, sched, signal, smp};
 
 static USER_EXITS: AtomicU64 = AtomicU64::new(0);
 
@@ -121,6 +121,10 @@ const SYS_GETCWD: u64 = 79;
 const SYS_READLINK: u64 = 89;
 const SYS_RT_SIGRETURN: u64 = 15;
 const SYS_SIGALTSTACK: u64 = 131;
+const SYS_PAUSE: u64 = 34;
+const SYS_RT_SIGPENDING: u64 = 127;
+const SYS_RT_SIGSUSPEND: u64 = 130;
+const SYS_GETSID: u64 = 124;
 const SYS_GETTID: u64 = 186;
 const SYS_FUTEX: u64 = 202;
 const SYS_SCHED_GETAFFINITY: u64 = 204;
@@ -598,6 +602,7 @@ fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
         0x540f => 4,
         _ => 0,
     };
+    let need = if cmd == 0x5410 { 0 } else { need };
     if need > 0 && !usercopy::user_ok(arg, need, true) {
         return EFAULT;
     }
@@ -627,11 +632,18 @@ fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
             0
         },
         0x540f => unsafe {
-            // TIOCGPGRP
-            *(arg as *mut u32) = process::current_pid() as u32;
+            // TIOCGPGRP: the foreground process group of the console
+            *(arg as *mut u32) = signal::FG_PGRP.load(Ordering::Relaxed) as u32;
             0
         },
-        0x5410 => 0, // TIOCSPGRP
+        0x5410 => match usercopy::read_u32(arg) {
+            // TIOCSPGRP (job-control shells make a child's group the foreground one)
+            Ok(g) => {
+                signal::FG_PGRP.store(g as u64, Ordering::Relaxed);
+                0
+            }
+            Err(e) => e,
+        },
         _ => ENOTTY,
     }
 }
@@ -805,11 +817,12 @@ fn sys_nanosleep(clock: u64, flags: u64, req: u64, rem: u64) -> i64 {
         }
         want
     };
-    crate::timer::sleep_ns(ns);
-    if rem != 0 {
-        let _ = usercopy::slice_mut(rem, 16).map(|b| b.fill(0)); // slept it all
+    let left = crate::timer::sleep_ns(ns);
+    if rem != 0 && flags & 1 == 0 {
+        let _ = usercopy::write_u64(rem, left / 1_000_000_000);
+        let _ = usercopy::write_u64(rem.wrapping_add(8), left % 1_000_000_000);
     }
-    0
+    if left > 0 { signal::EINTR } else { 0 }
 }
 
 /// `execve(path, argv, envp)`. Does not return on success.
@@ -1001,9 +1014,20 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_GETGID | SYS_GETEGID => process::current_gid() as i64,
         SYS_SET_TID_ADDRESS => process::current_pid() as i64,
         SYS_IOCTL => sys_ioctl(a1, a2, a3),
-        SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_RT_SIGRETURN | SYS_SET_ROBUST_LIST
-        | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MPROTECT | SYS_MADVISE | SYS_MUNMAP | SYS_FUTEX
-        | SYS_PRCTL | SYS_FCHDIR | SYS_SETPGID | SYS_SETSID => 0,
+        SYS_RT_SIGACTION => signal::sys_sigaction(a1, a2, a3, a4),
+        SYS_RT_SIGPROCMASK => signal::sys_sigprocmask(a1, a2, a3, a4),
+        SYS_RT_SIGRETURN => signal::sys_sigreturn(frame),
+        SYS_RT_SIGPENDING => signal::sys_sigpending(a1, a2),
+        SYS_RT_SIGSUSPEND => signal::sys_sigsuspend(a1, a2),
+        SYS_PAUSE => signal::sys_pause(),
+        SYS_SETPGID => sys_setpgid(a1, a2),
+        SYS_SETSID => sys_setsid(),
+        SYS_GETSID => match if a1 == 0 { sched::current().task() } else { process::find_task(a1) } {
+            Some(t) => t.sid() as i64,
+            None => -3, // ESRCH
+        },
+        SYS_SET_ROBUST_LIST | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MPROTECT | SYS_MADVISE
+        | SYS_MUNMAP | SYS_FUTEX | SYS_PRCTL | SYS_FCHDIR => 0,
         SYS_RSEQ => ENOSYS,
 
         // chdir: normalise against the cwd, verify it names a directory in ext2.
@@ -1028,7 +1052,11 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         }
 
         // No process groups; job-control shells just want a plausible answer.
-        SYS_GETPGRP | SYS_GETPGID => process::current_pid() as i64,
+        SYS_GETPGRP => sched::current().task().map_or(0, |t| t.pgid() as i64),
+        SYS_GETPGID => match if a1 == 0 { sched::current().task() } else { process::find_task(a1) } {
+            Some(t) => t.pgid() as i64,
+            None => -3,
+        },
 
         SYS_PIPE => sys_pipe(a1, 0),
         SYS_PIPE2 => sys_pipe(a1, a2),
@@ -1161,16 +1189,10 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             _ => 0,
         },
 
-        SYS_KILL | SYS_TKILL | SYS_TGKILL => {
-            // deliver only fatal signals; everything else is a no-op for now
-            let sig = if nr == SYS_TGKILL { a3 } else { a2 };
-            if sig == 6 || sig == 9 || sig == 15 {
-                process::set_exit_status(128 + sig as i32);
-                USER_EXITS.fetch_add(1, Ordering::Release);
-                sched::exit()
-            }
-            0
-        }
+        SYS_KILL => signal::sys_kill(a1 as i64, a2),
+        // THOS has one thread per task, so a tid is a pid.
+        SYS_TKILL => signal::sys_kill(a1 as i64, a2),
+        SYS_TGKILL => signal::sys_kill(a2 as i64, a3),
 
         // getcwd(buf, size): write the path + NUL, return its length incl. NUL.
         SYS_GETCWD => {
@@ -1242,6 +1264,40 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         }
     };
 
+    let mut ret = ret;
+    // A write to a pipe nobody reads raises SIGPIPE — here, in the syscall layer, so
+    // the kernel's own pipe writes (the security service) never kill their caller.
+    if ret == -32 && matches!(nr, SYS_WRITE | SYS_WRITEV) {
+        signal::send_current(signal::SIGPIPE);
+    }
+    signal::deliver_at_syscall_exit(frame, nr, &mut ret);
     frame.rax = ret as u64;
+}
+
+/// `setpgid(pid, pgid)`: 0 means "the caller" for both arguments. Only the caller
+/// itself or a child of the same session may be moved.
+fn sys_setpgid(pid: u64, pgid: u64) -> i64 {
+    let Some(me) = sched::current().task() else { return -3 };
+    let target = if pid == 0 || pid == me.pid { me.clone() } else {
+        match process::find_task(pid) {
+            Some(t) if t.ppid == me.pid && t.sid() == me.sid() => t,
+            Some(_) => return -1, // EPERM
+            None => return -3,
+        }
+    };
+    let g = if pgid == 0 { target.pid } else { pgid };
+    target.set_pgid(g);
+    0
+}
+
+/// `setsid()`: a new session and process group led by the caller.
+fn sys_setsid() -> i64 {
+    let Some(me) = sched::current().task() else { return -3 };
+    if me.pgid() == me.pid && me.sid() == me.pid {
+        return -1; // already a group leader (EPERM)
+    }
+    me.set_sid(me.pid);
+    me.set_pgid(me.pid);
+    me.pid as i64
 }
 

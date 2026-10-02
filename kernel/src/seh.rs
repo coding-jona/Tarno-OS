@@ -200,7 +200,7 @@ extern "C" fn thos_fault_dispatch(frame: &mut ExcFrame, vector: u64, error_code:
     // thread). Kill that process — never the machine.
     if !from_user && vector == 14 && cr2 < crate::usercopy::USER_TOP && crate::process::current_pid() != 0 {
         kprintln!("THOS trap: kernel #PF on user address {:#x} rip={:#x} — process killed", cr2, frame.rip);
-        crate::process::set_exit_status(139);
+        crate::process::set_term_signal(11);
         crate::syscall::note_user_exit();
         sched::exit();
     }

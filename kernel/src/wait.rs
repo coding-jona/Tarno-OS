@@ -57,6 +57,28 @@ impl WaitQueue {
         });
     }
 
+    /// Like [`wait_if`], but a pending signal ends the wait too (the caller then
+    /// reports EINTR). The signal check comes *after* `mark_blocking`, so a signal
+    /// sent between the predicate and the block cannot be lost: `send` sets
+    /// `wake_pending`, and `reschedule` aborts the block.
+    pub fn wait_if_intr<F: FnOnce() -> bool>(&self, should_block: F) {
+        interrupts::without_interrupts(|| {
+            let mut w = self.waiters.lock();
+            if !should_block() {
+                return;
+            }
+            let me = sched::current();
+            sched::mark_blocking(&me);
+            if crate::signal::interrupted() {
+                return;
+            }
+            w.push_back(me.clone());
+            drop(w);
+            sched::block_current();
+            self.remove(&me); // a signal wake leaves the queue entry behind
+        });
+    }
+
     /// Condition-variable wait with a timer-wheel deadline: the thread is
     /// enqueued here **and** armed on the timer wheel, so it wakes on whichever
     /// happens first — the object being signalled (`wake_*`) or `deadline`

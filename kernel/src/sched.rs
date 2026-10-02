@@ -487,7 +487,9 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize) -> !, arg: usize) -
 pub fn spawn_user(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     task.thread_spawned();
+    let tk = task.clone();
     let t = Thread::spawned_user(id, name, task, entry, user_rsp, 0);
+    tk.set_thread(Arc::downgrade(&t));
     SCHED.lock().ready.push_back(t);
     id
 }
@@ -498,7 +500,9 @@ pub fn spawn_user(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64
 pub fn spawn_user_pe(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: u64, teb: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     task.thread_spawned();
+    let tk = task.clone();
     let t = Thread::spawned_user(id, name, task, entry, user_rsp, teb);
+    tk.set_thread(Arc::downgrade(&t));
     SCHED.lock().ready.push_back(t);
     id
 }
@@ -508,7 +512,9 @@ pub fn spawn_user_pe(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: 
 pub fn spawn_user_frame(name: &'static str, task: Arc<Task>, frame: UserFrame, fsbase: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     task.thread_spawned();
+    let tk = task.clone();
     let t = Thread::spawned_user_frame(id, name, task, frame, fsbase);
+    tk.set_thread(Arc::downgrade(&t));
     SCHED.lock().ready.push_back(t);
     id
 }

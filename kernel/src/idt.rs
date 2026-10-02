@@ -62,6 +62,7 @@ core::arch::global_asm!(
     push r14
     push r15
     mov  rbp, rsp
+    mov  rdi, rbp                   // arg 0: the saved register frame (rip at +120, cs at +128)
     and  rsp, -16                   // dynamic 16-byte align for the SysV call
     call \body
     mov  rsp, rbp
@@ -100,17 +101,22 @@ extern "C" {
 /// (compiler-stub) form. Runs with `IF=0` and `%gs` guaranteed to be the
 /// per-CPU base by the `thos_irq_timer` shim.
 #[no_mangle]
-extern "C" fn thos_irq_timer_body() {
+extern "C" fn thos_irq_timer_body(frame: *const u64) {
     apic::on_timer_tick();
     crate::random::add_event(apic::ticks());
     apic::eoi();
     crate::ahci::poll_wake(); // safety net for a dropped AHCI completion IRQ
     crate::timer::tick(); // advance the monotonic clock + wake timed sleepers
+    // Interrupted ring 3 (saved CS.RPL == 3, 16th slot after the 15 pushed GPRs)?
+    // Then a fatal signal ends the process even if it never makes a syscall.
+    if unsafe { *frame.add(16) } & 3 == 3 {
+        crate::signal::irq_check_fatal();
+    }
     crate::sched::on_tick();
 }
 
 #[no_mangle]
-extern "C" fn thos_irq_ahci_body() {
+extern "C" fn thos_irq_ahci_body(_frame: *const u64) {
     crate::ahci::on_irq();
     apic::eoi();
 }
@@ -196,7 +202,7 @@ fn fatal(name: &str, frame: &InterruptStackFrame, code: Option<u64>) -> ! {
     }
     if from_user {
         kprintln!("  killed user rip={:#x}", frame.instruction_pointer.as_u64());
-        crate::process::set_exit_status(139); // 128 + SIGSEGV
+        crate::process::set_term_signal(11); // SIGSEGV
         crate::syscall::note_user_exit();
         crate::sched::exit();
     }

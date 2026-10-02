@@ -70,6 +70,9 @@ impl FileOps for KeyboardFile {
             if crate::console::take_eof() {
                 return 0; // Ctrl+D on an empty line
             }
+            if crate::signal::interrupted() {
+                return -4; // EINTR
+            }
             crate::console::wait_for_input();
         }
     }
@@ -370,7 +373,10 @@ impl FileOps for PipeReadEnd {
                     return 0; // EOF — no writers left
                 }
             }
-            self.0.wq.wait_if(|| {
+            if crate::signal::interrupted() {
+                return -4; // EINTR
+            }
+            self.0.wq.wait_if_intr(|| {
                 self.0.buf.lock().is_empty() && self.0.writers.load(Ordering::Acquire) != 0
             });
         }
@@ -396,6 +402,9 @@ impl FileOps for PipeWriteEnd {
             if self.0.readers.load(Ordering::Acquire) == 0 {
                 return if done == 0 { EPIPE } else { done as i64 };
             }
+            if crate::signal::interrupted() {
+                return if done == 0 { -4 } else { done as i64 };
+            }
             {
                 let mut q = self.0.buf.lock();
                 let space = PIPE_CAP - q.len();
@@ -408,7 +417,7 @@ impl FileOps for PipeWriteEnd {
                     continue;
                 }
             }
-            self.0.wq.wait_if(|| {
+            self.0.wq.wait_if_intr(|| {
                 self.0.buf.lock().len() == PIPE_CAP && self.0.readers.load(Ordering::Acquire) != 0
             });
         }

@@ -14,7 +14,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use spin::Mutex;
 use x86_64::registers::control::{Cr3, Cr3Flags};
@@ -654,6 +654,16 @@ pub struct Task {
     cwd: Mutex<String>,
     /// Pending user-mode APCs, delivered when the thread next goes alertable.
     apcs: Mutex<VecDeque<ApcEntry>>,
+    /// Process group and session ids (a new task leads its own group until it joins
+    /// another; `fork` inherits both).
+    pgid: AtomicU64,
+    sid: AtomicU64,
+    /// POSIX signal state: handlers, blocked mask, pending set (see `signal.rs`).
+    pub sig: Mutex<crate::signal::SigState>,
+    /// The task's (first) thread, so a signal can wake it out of a blocking wait.
+    thread: Mutex<Option<alloc::sync::Weak<crate::sched::Thread>>>,
+    /// Non-zero if the task ended because of that signal (`wait4` reports it).
+    term_sig: AtomicU32,
     /// `true` for a native PE image, `false` for an ELF — for a `ps` view.
     is_pe: AtomicBool,
     /// How many of this task's threads are still alive — *not* the same
@@ -688,8 +698,9 @@ impl Task {
     /// in-place token upgrade — a fresh process is the only way a task ever
     /// becomes uid 0).
     fn new_with_ids(ppid: u64, space: Arc<Process>, uid: u32, gid: u32) -> Arc<Self> {
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
         let t = Arc::new(Self {
-            pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
+            pid,
             ppid,
             uid,
             gid,
@@ -699,11 +710,42 @@ impl Task {
             fds: Mutex::new(seed_fds()),
             cwd: Mutex::new(String::from("/")),
             apcs: Mutex::new(VecDeque::new()),
+            pgid: AtomicU64::new(pid),
+            sid: AtomicU64::new(pid),
+            sig: Mutex::new(crate::signal::SigState::new()),
+            thread: Mutex::new(None),
+            term_sig: AtomicU32::new(0),
             is_pe: AtomicBool::new(false),
             active_threads: AtomicU64::new(0),
         });
         TASKS.lock().insert(t.pid, t.clone());
         t
+    }
+
+    pub fn pgid(&self) -> u64 {
+        self.pgid.load(Ordering::Relaxed)
+    }
+    pub fn sid(&self) -> u64 {
+        self.sid.load(Ordering::Relaxed)
+    }
+    pub fn set_pgid(&self, v: u64) {
+        self.pgid.store(v, Ordering::Relaxed);
+    }
+    pub fn set_sid(&self, v: u64) {
+        self.sid.store(v, Ordering::Relaxed);
+    }
+    /// Remember the task's thread (weakly: the thread owns an `Arc<Task>`).
+    pub fn set_thread(&self, t: alloc::sync::Weak<crate::sched::Thread>) {
+        *self.thread.lock() = Some(t);
+    }
+    pub fn thread(&self) -> Option<Arc<crate::sched::Thread>> {
+        self.thread.lock().as_ref().and_then(|w| w.upgrade())
+    }
+    pub fn term_sig(&self) -> u32 {
+        self.term_sig.load(Ordering::Relaxed)
+    }
+    pub fn is_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
     }
 
     pub fn mark_pe(&self) {
@@ -1156,8 +1198,44 @@ pub fn set_exit_status(code: i32) {
         *t.exit_status.lock() = Some(code);
         t.fds.lock().clear();
         t.exited.store(true, Ordering::Release);
+        notify_parent(&t);
     }
     CHILD_EXIT.wake_all(); // an interested parent may be blocked in wait4
+}
+
+/// End the current task because of fatal signal `sig` (`wait4` reports
+/// `WIFSIGNALED` / `WTERMSIG`, which shells print as "Terminated" etc.).
+pub fn set_term_signal(sig: u32) {
+    if let Some(t) = sched::current().task() {
+        t.term_sig.store(sig, Ordering::Relaxed);
+        crate::kprintln!("THOS: pid {} killed by signal {}", t.pid, sig);
+    }
+    set_exit_status(128 + sig as i32);
+}
+
+/// `SIGCHLD` to the parent when a child ends (default action: ignore, but a
+/// handler — or an interruptible `wait4` — sees it).
+fn notify_parent(t: &Task) {
+    if t.ppid != 0 {
+        if let Some(p) = find_task(t.ppid) {
+            crate::signal::send(&p, crate::signal::SIGCHLD);
+        }
+    }
+}
+
+/// The live task with this pid.
+pub fn find_task(pid: u64) -> Option<Arc<Task>> {
+    TASKS.lock().get(&pid).filter(|t| !t.is_exited()).cloned()
+}
+
+/// Every live task of process group `pgid`.
+pub fn tasks_in_pgrp(pgid: u64) -> Vec<Arc<Task>> {
+    TASKS.lock().values().filter(|t| !t.is_exited() && t.pgid() == pgid).cloned().collect()
+}
+
+/// Every task that has not exited.
+pub fn all_live_tasks() -> Vec<Arc<Task>> {
+    TASKS.lock().values().filter(|t| !t.is_exited()).cloned().collect()
 }
 
 /// Predicate for `wait4` to sleep on: this task has a matching live child and
@@ -1287,6 +1365,15 @@ pub fn fork(frame: &UserFrame) -> i64 {
     let child = Task::new(parent.pid, cspace);
     *child.fds.lock() = parent.clone_fds();
     child.set_cwd(parent.cwd());
+    child.set_pgid(parent.pgid());
+    child.set_sid(parent.sid());
+    {
+        // Handlers and the blocked mask are inherited; pending signals are not.
+        let p = parent.sig.lock();
+        let mut c = child.sig.lock();
+        c.actions = p.actions;
+        c.blocked = p.blocked;
+    }
     let (cs, ss) = user_selectors();
     let mut cf = *frame;
     cf.rax = 0;
@@ -1326,6 +1413,7 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
     let rsp = space.init_stack(stack_top, &av, &ev, &img);
 
     task.close_on_exec(); // drop O_CLOEXEC fds before the new image sees them
+    task.sig.lock().reset_for_exec(); // caught signals go back to default; ignored stay ignored
 
     let new_cr3 = space.pml4_phys();
     // `swap_space`, not `set_space`: this thread is still running on the
@@ -1385,14 +1473,16 @@ pub fn wait4(pid: i64, status_ptr: u64) -> i64 {
                         && t.exited.load(Ordering::Acquire)
                         && (pid == -1 || t.pid == pid as u64)
                 })
-                .map(|t| (t.pid, t.exit_status.lock().unwrap_or(0)));
-            if let Some((cpid, status)) = hit {
+                .map(|t| (t.pid, t.exit_status.lock().unwrap_or(0), t.term_sig()));
+            if let Some((cpid, status, tsig)) = hit {
                 tasks.remove(&cpid);
                 drop(tasks);
                 if status_ptr != 0 {
                     // The child is already reaped; a bad pointer only costs the
-                    // caller its status word, never kernel memory.
-                    let _ = crate::usercopy::write_u32(status_ptr, ((status & 0xFF) << 8) as u32);
+                    // caller its status word, never kernel memory. Killed by a
+                    // signal: the signal number in the low bits; else exit code << 8.
+                    let word = if tsig != 0 { tsig } else { ((status & 0xFF) << 8) as u32 };
+                    let _ = crate::usercopy::write_u32(status_ptr, word);
                 }
                 return cpid as i64;
             }
@@ -1403,6 +1493,9 @@ pub fn wait4(pid: i64, status_ptr: u64) -> i64 {
                 return -10; // ECHILD
             }
         }
-        CHILD_EXIT.wait_if(|| should_block_in_wait4(me, pid));
+        if crate::signal::interrupted() {
+            return -4; // EINTR
+        }
+        CHILD_EXIT.wait_if_intr(|| should_block_in_wait4(me, pid));
     }
 }

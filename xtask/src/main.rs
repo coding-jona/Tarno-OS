@@ -381,6 +381,8 @@ fn disk_image() -> PathBuf {
         ("ptrtest.rs", "ptrtest"),
         // Clock / sleep / timestamp test, typed in by `kbd-test`.
         ("clocktest.rs", "clocktest"),
+        // POSIX signals test, typed in by `kbd-test`.
+        ("sigtest.rs", "sigtest"),
         // getrandom quality test, run by `random-test`.
         ("randtest.rs", "randtest"),
     ] {
@@ -3331,6 +3333,18 @@ fn kbd_test(iso: &Path) {
     // time that matches nanosleep, and file timestamps.
     type_line(&sock, "clocktest");
     let _ = wait_for(&log, "clock ", 90);
+
+    // POSIX signals: handlers, masks, SIGKILL on a busy loop, EINTR, SA_RESTART, SIGPIPE.
+    type_line(&sock, "sigtest");
+    let _ = wait_for(&log, "sig ", 90);
+
+    // Ctrl+C reaches the foreground process: `sleep 100` is interrupted, the shell lives on.
+    type_line(&sock, "sleep 100");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    mon(&sock, "sendkey ctrl-c");
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    type_line(&sock, "echo ctrlc-$((1+1))");
+    let _ = wait_for(&log, "ctrlc-2", 20);
 
     // Capability policy: the logged-in session is uid 1000 (`thos`, per
     // `drive_login`); `/etc/thos/admin.cred` is owned by uid 0 (the system

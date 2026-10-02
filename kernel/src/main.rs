@@ -59,6 +59,7 @@ mod registry;
 mod sched;
 mod secsvc;
 mod seh;
+mod signal;
 mod serial;
 mod smp;
 mod syscall;
@@ -209,6 +210,7 @@ extern "C" fn kmain() -> ! {
                 &["PATH=/bin:/", "HOME=/", "PWD=/", "TERM=dumb", "PS1=thos$ "],
             );
 
+            signal::FG_PGRP.store(pid, core::sync::atomic::Ordering::Relaxed);
             kprintln!("THOS: interactive hold — type on the keyboard");
             while !process::pid_exited(pid) {
                 sched::yield_now();
