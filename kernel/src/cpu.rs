@@ -18,3 +18,22 @@ pub fn enable_sse() {
         });
     }
 }
+
+/// Turn on SMEP (supervisor-mode execution prevention) where the CPU has it
+/// (Ivy Bridge and later; the Acer's Westmere does not): the kernel can then
+/// never execute a user page, which removes the classic "return to a user
+/// payload" step from any kernel exploit. Returns whether it was enabled.
+/// SMAP (no kernel *reads/writes* of user pages outside `stac`/`clac`) would
+/// need every user access to be bracketed; `usercopy` is the place to add that.
+pub fn enable_smep() -> bool {
+    let max = core::arch::x86_64::__cpuid(0).eax;
+    if max < 7 {
+        return false;
+    }
+    let ebx = core::arch::x86_64::__cpuid_count(7, 0).ebx;
+    if ebx & (1 << 7) == 0 {
+        return false;
+    }
+    unsafe { Cr4::update(|f| f.insert(Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION)) };
+    true
+}

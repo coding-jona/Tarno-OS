@@ -81,10 +81,14 @@ unsafe fn write_context(dst: u64, r: &Regs) {
 /// parameters in its `P1Home..P4Home` area, the layout the `KiUserApcDispatcher`
 /// stub reads) to the user stack and return `(new_rsp, new_rip)` — `new_rip`
 /// being `KiUserApcDispatcher`.
-pub fn stage(r: &Regs, e: &ApcEntry) -> (u64, u64) {
-    let mut sp = r.rsp - 128; // skip the red zone
-    sp = (sp - CTX_SIZE) & !0xF; // 16-aligned CONTEXT == dispatcher entry rsp
+pub fn stage(r: &Regs, e: &ApcEntry) -> Option<(u64, u64)> {
+    let mut sp = r.rsp.wrapping_sub(128); // skip the red zone
+    sp = sp.wrapping_sub(CTX_SIZE) & !0xF; // 16-aligned CONTEXT == dispatcher entry rsp
     let ctx = sp;
+    // `rsp` is user-controlled: the whole CONTEXT must be user-writable memory.
+    if !crate::usercopy::user_ok(ctx, CTX_SIZE as usize, true) {
+        return None;
+    }
     unsafe {
         write_context(ctx, r);
         *((ctx + 0x00) as *mut u64) = e.arg1; // P1Home = NormalContext (ApcArgument1)
@@ -92,12 +96,12 @@ pub fn stage(r: &Regs, e: &ApcEntry) -> (u64, u64) {
         *((ctx + 0x10) as *mut u64) = e.arg3; // P3Home = SystemArgument2 (ApcArgument3)
         *((ctx + 0x18) as *mut u64) = e.routine; // P4Home = NormalRoutine (ApcRoutine)
     }
-    (ctx, PE_KIUSERAPC_ADDR)
+    Some((ctx, PE_KIUSERAPC_ADDR))
 }
 
 /// If the current thread has a pending user APC, dequeue it and stage it over
 /// `r`, returning the redirected `(rsp, rip)`. `None` if the queue is empty.
 pub fn take_and_stage(r: &Regs) -> Option<(u64, u64)> {
     let e = process::current_take_apc()?;
-    Some(stage(r, &e))
+    stage(r, &e)
 }

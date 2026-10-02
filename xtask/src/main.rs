@@ -372,6 +372,8 @@ fn disk_image() -> PathBuf {
         ("power.rs", "power"),
         // Scheduler x87/SSE isolation test, typed in by `kbd-test`.
         ("fputest.rs", "fputest"),
+        // User-pointer validation test, typed in by `kbd-test`.
+        ("ptrtest.rs", "ptrtest"),
     ] {
         let rs = root.join("xtask/testdata").join(src);
         let bin = root.join("target").join(name);
@@ -3311,6 +3313,11 @@ fn kbd_test(iso: &Path) {
     type_line(&sock, "fputest");
     let _ = wait_for(&log, "fpu ", 150);
 
+    // User-pointer validation: kernel / unmapped addresses as buffers, paths,
+    // argv, out-parameters must all be refused with EFAULT, never dereferenced.
+    type_line(&sock, "ptrtest");
+    let _ = wait_for(&log, "ptr ", 60);
+
     // Capability policy: the logged-in session is uid 1000 (`thos`, per
     // `drive_login`); `/etc/thos/admin.cred` is owned by uid 0 (the system
     // account — every file `write_path` creates is, today) at mode 644 —
@@ -3383,6 +3390,7 @@ fn kbd_test(iso: &Path) {
         tail.contains("newfile") && tail.contains("newdir")
     };
     let fpu_ok = after.contains("fpu ok");
+    let ptr_ok = after.contains("ptr ok");
     let elevate_ok = after.contains("elevated-check uid=0");
     let sak_denied_ok = after.contains("THOS: SAK denied");
     let sak_accepted_ok = after.contains("THOS: SAK accepted");
@@ -3395,6 +3403,7 @@ fn kbd_test(iso: &Path) {
         && cwd_ok
         && cat_ok
         && fpu_ok
+        && ptr_ok
         && perm_ok
         && create_ok
         && elevate_ok
@@ -3403,11 +3412,11 @@ fn kbd_test(iso: &Path) {
         && sak_spawn_ok
     {
         println!(
-            "kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), private x87/SSE state across preemption, DAC write denial, O_CREAT/mkdir, elevate(), SAK trusted path"
+            "kbd-test: OK — `init`, BusyBox applets, per-process cwd (cd/pwd/ls), private x87/SSE state across preemption, user-pointer validation (EFAULT), DAC write denial, O_CREAT/mkdir, elevate(), SAK trusted path"
         );
     } else {
         eprintln!(
-            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} fpu_ok={fpu_ok} perm_ok={perm_ok} create_ok={create_ok} elevate_ok={elevate_ok} sak_denied_ok={sak_denied_ok} sak_accepted_ok={sak_accepted_ok} sak_spawn_ok={sak_spawn_ok})\n---\n{after}\n---"
+            "kbd-test: FAIL (shell_ok={shell_ok} ls_ok={ls_ok} cwd_ok={cwd_ok} cat_ok={cat_ok} fpu_ok={fpu_ok} ptr_ok={ptr_ok} perm_ok={perm_ok} create_ok={create_ok} elevate_ok={elevate_ok} sak_denied_ok={sak_denied_ok} sak_accepted_ok={sak_accepted_ok} sak_spawn_ok={sak_spawn_ok})\n---\n{after}\n---"
         );
         exit(1);
     }
@@ -3537,7 +3546,9 @@ fn bios_test(img: &Path) {
     let log = root.join("target/bios-test.log");
     let _ = std::fs::remove_file(&log);
     let mut qemu = Command::new("qemu-system-x86_64");
-    qemu.args(["-M", "pc", "-m", "512M", "-smp", "2"]);
+    // `-cpu max`: the richest TCG model (SMEP, SMAP, RDRAND, ...), so the feature
+    // paths the default qemu64 model skips (SMEP enabled, RDRAND salts) also boot.
+    qemu.args(["-M", "pc", "-cpu", "max", "-m", "512M", "-smp", "2"]);
     qemu.args([
         "-drive", &format!("id=disk0,if=none,format=raw,file={}", img.to_str().unwrap()),
         "-device", "ahci,id=ahci0",
@@ -3552,7 +3563,7 @@ fn bios_test(img: &Path) {
     });
     let out = std::fs::read_to_string(&log).unwrap_or_default();
     let mut ok = status.code() == Some(QEMU_SUCCESS);
-    for needle in ["THOS: ext2 part", "THOS: ps2 ok", "THOS: ahci ident"] {
+    for needle in ["THOS: ext2 part", "THOS: ps2 ok", "THOS: ahci ident", "THOS: SMEP             enabled"] {
         let hit = out.contains(needle);
         println!("  {} {needle}", if hit { "ok  " } else { "FAIL" });
         ok &= hit;

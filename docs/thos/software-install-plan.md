@@ -16,7 +16,7 @@ surface**, and several platform gaps sit between "THOS runs a test `.exe`" and
 | Windows PE | PE32+ only; ~130 ANSI entry points (kernel32 31, ntdll 43, msvcrt 35, user32 14, gdi32 6); real objects, SEH, APC, registry, sections | **PE32 (32-bit) / WOW64** — most installers and all old `.msi` are 32-bit; wide-char APIs; `CreateFile` create/write, `FindFirstFile`, `CreateProcess`, `Reg*` (advapi32), shell32/ole32/COM, services, `HeapFree`/`free` that really free |
 | Filesystem | ext2: whole-file read on open, whole-file rewrite on write, **12-block directories**, 32 MiB kernel heap | streaming I/O + page cache + growable heap; large directories; symlinks; timestamps |
 | Boot | ~~the production boot ran the whole self-test suite~~ — **fixed** (`selftest` feature; see source review F5) | an **installer** that lays down partitions + Limine + the root FS on a real disk |
-| Security | exec gate, isolated Security Service, quarantine, SAK, `elevate()` — **but syscalls trust user pointers** | pointer validation + SMEP/SMAP before any "scan then run untrusted installer" claim is true |
+| Security | exec gate, isolated Security Service, quarantine, SAK, `elevate()`; **user pointers are now validated (F7)** | SMAP and per-site NT checks (B1b) before "scan then run untrusted installer" is fully true |
 
 So the package *mechanism* can be built early, but "install anything" is gated on
 runtime coverage. The plan below therefore builds the transaction machinery first
@@ -75,8 +75,8 @@ audited code path, and makes every install reversible.
 
 ## 4. What this depends on (the real critical path, ordered)
 
-1. **Hardening prerequisites** — (`selftest` split done, F5), user-pointer
-   validation + SMEP/SMAP (B1), real signals/`kill` (B3), clock/RTC (B8), CSPRNG (B4).
+1. **Hardening prerequisites** — (`selftest` split done F5, user-pointer
+   validation done F7; SMAP remains), real signals/`kill` (B3), clock/RTC (B8), CSPRNG (B4).
    Without these an "untrusted installer" sandbox is not a boundary and a real
    install panics at boot.
 2. **Storage that can hold software** — streaming file I/O, page cache, growable

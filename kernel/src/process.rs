@@ -1390,7 +1390,9 @@ pub fn wait4(pid: i64, status_ptr: u64) -> i64 {
                 tasks.remove(&cpid);
                 drop(tasks);
                 if status_ptr != 0 {
-                    unsafe { *(status_ptr as *mut i32) = (status & 0xFF) << 8 };
+                    // The child is already reaped; a bad pointer only costs the
+                    // caller its status word, never kernel memory.
+                    let _ = crate::usercopy::write_u32(status_ptr, ((status & 0xFF) << 8) as u32);
                 }
                 return cpid as i64;
             }

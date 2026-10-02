@@ -288,6 +288,7 @@ const STATUS_PROCEDURE_NOT_FOUND: u32 = 0xC000_007A;
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_NOT_MAPPED_VIEW: u32 = 0xC000_0019;
 const STATUS_MUTANT_NOT_OWNED: u32 = 0xC000_0046;
 const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = 0xC000_005F;
@@ -300,11 +301,11 @@ fn teb() -> Option<*mut u8> {
 }
 fn set_last_error(err: u32) {
     if let Some(t) = teb() {
-        unsafe { *(t.add(0x68) as *mut u32) = err };
+        unsafe { crate::usercopy::put::<u32>(t.add(0x68), (err) as u32); }
     }
 }
 fn get_last_error() -> u32 {
-    teb().map_or(0, |t| unsafe { *(t.add(0x68) as *const u32) })
+    teb().map_or(0, |t| unsafe { crate::usercopy::get::<u32>(t.add(0x68)) })
 }
 
 /// Handle a `syscall` from an NT stub. `sel` is the stub's index; the
@@ -432,7 +433,7 @@ fn dispatch_gdi32(idx: u16, frame: &mut UserFrame) -> i64 {
     let a1 = frame.rdx;
     let a2 = frame.r8;
     let a3 = frame.r9;
-    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
+    let stack = |i: u64| crate::usercopy::win64_stack_arg(frame.rsp, i);
     match idx {
         GDI_GETSTOCKOBJECT => crate::gdi::get_stock_object(a0 as i64) as i64,
         GDI_CREATESOLIDBRUSH => crate::gdi::create_solid_brush(a0 as u32) as i64,
@@ -456,7 +457,7 @@ fn dispatch_user32(idx: u16, frame: &mut UserFrame) -> i64 {
     let a1 = frame.rdx;
     let a2 = frame.r8;
     let a3 = frame.r9;
-    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
+    let stack = |i: u64| crate::usercopy::win64_stack_arg(frame.rsp, i);
     match idx {
         USER_GETSYSTEMMETRICS => {
             let (w, h) = crate::gdi::screen_size();
@@ -486,7 +487,7 @@ fn dispatch_user32(idx: u16, frame: &mut UserFrame) -> i64 {
         // (hWnd/Msg/wParam here, lParam on the stack) and hand its LRESULT
         // back as this syscall's own return value.
         USER_CALLWINDOWPROCA => {
-            let lparam = unsafe { *((frame.rsp + 0x28) as *const u64) };
+            let lparam = crate::usercopy::win64_stack_arg(frame.rsp, 0);
             invoke_ring3_callback(a0, [frame.rdx, frame.r8, frame.r9, lparam], frame)
         }
 
@@ -496,8 +497,8 @@ fn dispatch_user32(idx: u16, frame: &mut UserFrame) -> i64 {
         // fields there after the leading `UINT style`). `0` (real
         // `ATOM` failure value) if the class name is empty.
         USER_REGISTERCLASSA => {
-            let wndproc = unsafe { *((a0 + 0x08) as *const u64) };
-            let name_ptr = unsafe { *((a0 + 0x40) as *const u64) };
+            let wndproc = unsafe { crate::usercopy::get::<u64>((a0 + 0x08)) };
+            let name_ptr = unsafe { crate::usercopy::get::<u64>((a0 + 0x40)) };
             let name = user_cstr(name_ptr);
             if name.is_empty() {
                 0
@@ -550,10 +551,10 @@ fn dispatch_user32(idx: u16, frame: &mut UserFrame) -> i64 {
         USER_GETMESSAGEA => {
             let m = crate::window::get_message(process::current_tid());
             unsafe {
-                *(a0 as *mut u64) = m.hwnd as u64; // MSG.hwnd
-                *((a0 + 0x08) as *mut u32) = m.message; // MSG.message
-                *((a0 + 0x10) as *mut u64) = m.wparam; // MSG.wParam
-                *((a0 + 0x18) as *mut u64) = m.lparam; // MSG.lParam
+                crate::usercopy::put::<u64>(a0, (m.hwnd as u64) as u64); // MSG.hwnd
+                crate::usercopy::put::<u32>((a0 + 0x08), (m.message) as u32); // MSG.message
+                crate::usercopy::put::<u64>((a0 + 0x10), (m.wparam) as u64); // MSG.wParam
+                crate::usercopy::put::<u64>((a0 + 0x18), (m.lparam) as u64); // MSG.lParam
             }
             (m.message != crate::window::WM_QUIT) as i64
         }
@@ -562,10 +563,10 @@ fn dispatch_user32(idx: u16, frame: &mut UserFrame) -> i64 {
         // window's WndProc in ring 3 (`invoke_ring3_callback`, the same
         // mechanism `CallWindowProcA` uses) and hands its result back.
         USER_DISPATCHMESSAGEA => {
-            let hwnd = unsafe { *(a0 as *const u64) } as u32;
-            let message = unsafe { *((a0 + 0x08) as *const u32) };
-            let wparam = unsafe { *((a0 + 0x10) as *const u64) };
-            let lparam = unsafe { *((a0 + 0x18) as *const u64) };
+            let hwnd = unsafe { crate::usercopy::get::<u64>(a0) } as u32;
+            let message = unsafe { crate::usercopy::get::<u32>((a0 + 0x08)) };
+            let wparam = unsafe { crate::usercopy::get::<u64>((a0 + 0x10)) };
+            let lparam = unsafe { crate::usercopy::get::<u64>((a0 + 0x18)) };
             match crate::window::wndproc_of(hwnd) {
                 Some(wndproc) => invoke_ring3_callback(wndproc, [hwnd as u64, message as u64, wparam, lparam], frame),
                 None => 0,
@@ -611,8 +612,12 @@ fn invoke_ring3_callback(target: u64, args: [u64; 4], frame: &UserFrame) -> i64 
     // A fresh call frame below the caller's own stack: a return address
     // (the trampoline) plus the Win64 shadow space the callback may
     // scribble into, 16-aligned as if a real `call` had just landed here.
-    let ret_rsp = ((frame.rsp - 0x100) & !0xF) - 8;
-    unsafe { *(ret_rsp as *mut u64) = crate::pe::PE_CALLBACK_RETURN_ADDR };
+    let ret_rsp = ((frame.rsp.wrapping_sub(0x100)) & !0xF).wrapping_sub(8);
+    if crate::usercopy::write_u64(ret_rsp, crate::pe::PE_CALLBACK_RETURN_ADDR).is_err() {
+        // The thread's own stack is unusable: nothing sane to call back into.
+        process::pop_callback_frame(process::current_tid());
+        proc_terminate(0xC000_0005u32 as i32);
+    }
 
     let (cs, ss) = process::user_selectors();
     let f = crate::seh::ExcFrame {
@@ -672,15 +677,28 @@ fn proc_terminate(code: i32) -> ! {
     sched::exit();
 }
 
+/// Write a *kernel-owned* buffer (a formatted string) to a descriptor.
+fn file_write_kernel(fd: i32, buf: &[u8]) -> i64 {
+    match process::current_fd(fd) {
+        Some(f) => f.write(buf),
+        None => -1,
+    }
+}
 /// `write(2)` against the current process's fd table. Bytes written, or -1.
 fn file_write_core(fd: i32, buf: u64, len: usize) -> i64 {
     let Some(f) = process::current_fd(fd) else { return -1 };
-    f.write(unsafe { core::slice::from_raw_parts(buf as *const u8, len) })
+    match crate::usercopy::slice(buf, len) {
+        Ok(b) => f.write(b),
+        Err(_) => -1,
+    }
 }
 /// `read(2)` against the current process's fd table. Bytes read (0 = EOF), or -1.
 fn file_read_core(fd: i32, buf: u64, len: usize) -> i64 {
     let Some(f) = process::current_fd(fd) else { return -1 };
-    f.read(unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) })
+    match crate::usercopy::slice_mut(buf, len) {
+        Ok(b) => f.read(b),
+        Err(_) => -1,
+    }
 }
 fn handle_close_core(h: i32) -> bool {
     matches!(sched::current().task(), Some(t) if t.fd_close(h))
@@ -703,7 +721,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
     let a3 = frame.r9;
     // 5th Win64 arg at [rsp+0x28] (0x20 shadow + the call's return address);
     // `stack(i)` walks further stack args.
-    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
+    let stack = |i: u64| crate::usercopy::win64_stack_arg(frame.rsp, i);
 
     match idx {
         // NtTerminateProcess(ProcessHandle, ExitStatus)
@@ -743,14 +761,14 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             if base_pp == 0 || size_pp == 0 {
                 return STATUS_INVALID_PARAMETER as i64;
             }
-            let size = unsafe { *(size_pp as *const u64) };
+            let size = unsafe { crate::usercopy::get::<u64>(size_pp) };
             let base = mem_alloc_core(size);
             if base == 0 {
                 return STATUS_NO_MEMORY as i64;
             }
             unsafe {
-                *(base_pp as *mut u64) = base;
-                *(size_pp as *mut u64) = (size + 0xFFF) & !0xFFF;
+                crate::usercopy::put::<u64>(base_pp, (base) as u64);
+                crate::usercopy::put::<u64>(size_pp, ((size + 0xFFF) & !0xFFF) as u64);
             }
             STATUS_SUCCESS as i64
         }
@@ -771,8 +789,8 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             if base_pp == 0 || size_pp == 0 {
                 return STATUS_INVALID_PARAMETER as i64;
             }
-            let base = unsafe { *(base_pp as *const u64) };
-            let size = unsafe { *(size_pp as *const u64) };
+            let base = unsafe { crate::usercopy::get::<u64>(base_pp) };
+            let size = unsafe { crate::usercopy::get::<u64>(size_pp) };
             let Some((w, x)) = win32_protect_to_wx(a3 as u32) else {
                 return STATUS_INVALID_PARAMETER as i64;
             };
@@ -783,7 +801,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 Some((old_w, old_x)) => {
                     let old_pp = stack(0);
                     if old_pp != 0 {
-                        unsafe { *(old_pp as *mut u32) = wx_to_win32_protect(old_w, old_x) };
+                        unsafe { crate::usercopy::put::<u32>(old_pp, (wx_to_win32_protect(old_w, old_x)) as u32); }
                     }
                     STATUS_SUCCESS as i64
                 }
@@ -803,7 +821,10 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             if len < 0x30 {
                 return STATUS_INFO_LENGTH_MISMATCH as i64;
             }
-            let peb = teb().map_or(0, |t| unsafe { *(t.add(0x60) as *const u64) });
+            let peb = teb().map_or(0, |t| unsafe { crate::usercopy::get::<u64>(t.add(0x60)) });
+            if !crate::usercopy::user_ok(buf, 0x30, true) {
+                return STATUS_ACCESS_VIOLATION as i64;
+            }
             unsafe {
                 let b = buf as *mut u64;
                 *b.add(0) = 0; // ExitStatus
@@ -814,7 +835,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 *b.add(5) = 0; // InheritedFromUniqueProcessId
             }
             if ret_len != 0 {
-                unsafe { *(ret_len as *mut u32) = 0x30 }; // ReturnLength is ULONG
+                unsafe { crate::usercopy::put::<u32>(ret_len, (0x30) as u32); } // ReturnLength is ULONG
             }
             STATUS_SUCCESS as i64
         }
@@ -833,18 +854,21 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 return STATUS_INFO_LENGTH_MISMATCH as i64;
             }
             let page = addr & !0xFFF;
+            if !crate::usercopy::user_ok(buf, 0x30, true) {
+                return STATUS_ACCESS_VIOLATION as i64;
+            }
             unsafe {
                 let b = buf as *mut u64;
                 *b.add(0) = page; // BaseAddress
                 *b.add(1) = page; // AllocationBase
-                *(b.add(2) as *mut u32) = 0x40; // AllocationProtect = PAGE_EXECUTE_READWRITE
+                crate::usercopy::put::<u32>(b.add(2), (0x40) as u32); // AllocationProtect = PAGE_EXECUTE_READWRITE
                 *b.add(3) = 0x1000; // RegionSize
-                *(b.add(4) as *mut u32) = 0x1000; // State = MEM_COMMIT
+                crate::usercopy::put::<u32>(b.add(4), (0x1000) as u32); // State = MEM_COMMIT
                 *(b.add(4) as *mut u32).add(1) = 0x40; // Protect
-                *(b.add(5) as *mut u32) = 0x2_0000; // Type = MEM_PRIVATE
+                crate::usercopy::put::<u32>(b.add(5), (0x2_0000) as u32); // Type = MEM_PRIVATE
             }
             if ret_len != 0 {
-                unsafe { *(ret_len as *mut u64) = 0x30 }; // ReturnLength is SIZE_T
+                unsafe { crate::usercopy::put::<u64>(ret_len, (0x30) as u64); } // ReturnLength is SIZE_T
             }
             STATUS_SUCCESS as i64
         }
@@ -871,7 +895,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             if h < 0 {
                 return STATUS_NO_MEMORY as i64;
             }
-            unsafe { *(a0 as *mut u64) = h as u64 };
+            unsafe { crate::usercopy::put::<u64>(a0, (h as u64) as u64); }
             STATUS_SUCCESS as i64
         }
 
@@ -907,7 +931,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 w.wait(tid);
                 return STATUS_SUCCESS as i64;
             }
-            let timeout = unsafe { *(a2 as *const i64) };
+            let timeout = unsafe { crate::usercopy::get::<i64>(a2) };
             if timeout >= 0 {
                 return if w.try_take(tid) { STATUS_SUCCESS as i64 } else { STATUS_TIMEOUT as i64 };
             }
@@ -926,7 +950,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             if h < 0 {
                 return STATUS_NO_MEMORY as i64;
             }
-            unsafe { *(a0 as *mut u64) = h as u64 };
+            unsafe { crate::usercopy::put::<u64>(a0, (h as u64) as u64); }
             STATUS_SUCCESS as i64
         }
 
@@ -938,7 +962,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             match m.release(process::current_tid()) {
                 Ok(prev) => {
                     if a1 != 0 {
-                        unsafe { *(a1 as *mut u32) = prev };
+                        unsafe { crate::usercopy::put::<u32>(a1, (prev) as u32); }
                     }
                     STATUS_SUCCESS as i64
                 }
@@ -957,7 +981,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             if h < 0 {
                 return STATUS_NO_MEMORY as i64;
             }
-            unsafe { *(a0 as *mut u64) = h as u64 };
+            unsafe { crate::usercopy::put::<u64>(a0, (h as u64) as u64); }
             STATUS_SUCCESS as i64
         }
 
@@ -969,7 +993,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             match s.release(a1 as i32) {
                 Some(prev) => {
                     if a2 != 0 {
-                        unsafe { *(a2 as *mut u32) = prev as u32 };
+                        unsafe { crate::usercopy::put::<u32>(a2, (prev as u32) as u32); }
                     }
                     STATUS_SUCCESS as i64
                 }
@@ -994,7 +1018,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let tid = process::current_tid();
             let mut objs: alloc::vec::Vec<process::Waitable> = alloc::vec::Vec::with_capacity(count);
             for i in 0..count {
-                let h = unsafe { *((a1 + (i * 8) as u64) as *const u64) } as i32;
+                let h = unsafe { crate::usercopy::get::<u64>((a1 + (i * 8) as u64)) } as i32;
                 match process::current_waitable(h) {
                     Some(w) => objs.push(w),
                     None => return STATUS_INVALID_HANDLE as i64,
@@ -1003,7 +1027,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let tptr = stack(0);
             // NULL timeout = wait forever; `*t == 0` = poll once; `*t < 0` =
             // relative wall-clock deadline off the timer wheel.
-            let timeout = if tptr == 0 { -1 } else { unsafe { *(tptr as *const i64) } };
+            let timeout = if tptr == 0 { -1 } else { unsafe { crate::usercopy::get::<i64>(tptr) } };
             let deadline = if tptr != 0 && timeout < 0 {
                 Some(crate::timer::deadline_from_relative_100ns(timeout))
             } else {
@@ -1047,7 +1071,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // 100 ns units — a real executive block on the timer wheel. 0 or
         // positive (absolute) = just yield.
         NT_NTDELAYEXECUTION => {
-            let interval = if a1 == 0 { 0 } else { unsafe { *(a1 as *const i64) } };
+            let interval = if a1 == 0 { 0 } else { unsafe { crate::usercopy::get::<i64>(a1) } };
             if interval < 0 {
                 crate::timer::sleep_until(crate::timer::deadline_from_relative_100ns(interval));
             } else {
@@ -1072,7 +1096,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                     if h < 0 {
                         return STATUS_NO_MEMORY as i64;
                     }
-                    unsafe { *(a0 as *mut u64) = h as u64 };
+                    unsafe { crate::usercopy::put::<u64>(a0, (h as u64) as u64); }
                     STATUS_SUCCESS as i64
                 }
                 Err(_) => STATUS_NO_MEMORY as i64,
@@ -1116,7 +1140,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             } else if file_h != 0 {
                 return STATUS_INVALID_HANDLE as i64; // a handle was given but didn't resolve
             } else {
-                let max = if a3 != 0 { (unsafe { *(a3 as *const i64) }) as usize } else { 0 };
+                let max = if a3 != 0 { (unsafe { crate::usercopy::get::<i64>(a3) }) as usize } else { 0 };
                 if max == 0 || max > CAP {
                     return STATUS_INVALID_PARAMETER as i64;
                 }
@@ -1127,7 +1151,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             if h < 0 {
                 return STATUS_NO_MEMORY as i64;
             }
-            unsafe { *(a0 as *mut u64) = h as u64 };
+            unsafe { crate::usercopy::put::<u64>(a0, (h as u64) as u64); }
             STATUS_SUCCESS as i64
         }
 
@@ -1145,20 +1169,20 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 return STATUS_INVALID_PARAMETER as i64;
             }
             let (off_pp, vsize_pp) = (stack(1), stack(2));
-            let offset = if off_pp != 0 { (unsafe { *(off_pp as *const i64) }) as usize } else { 0 };
+            let offset = if off_pp != 0 { (unsafe { crate::usercopy::get::<i64>(off_pp) }) as usize } else { 0 };
             if offset >= sec.size {
                 return STATUS_INVALID_PARAMETER as i64;
             }
-            let want = if vsize_pp != 0 { (unsafe { *(vsize_pp as *const u64) }) as usize } else { 0 };
+            let want = if vsize_pp != 0 { (unsafe { crate::usercopy::get::<u64>(vsize_pp) }) as usize } else { 0 };
             let view = if want != 0 { want.min(sec.size - offset) } else { sec.size - offset };
             let Some(proc) = sched::current_proc() else {
                 return STATUS_INVALID_PARAMETER as i64; // not a user task
             };
             let base = proc.map_section_view(&sec, offset, view);
             unsafe {
-                *(a2 as *mut u64) = base;
+                crate::usercopy::put::<u64>(a2, (base) as u64);
                 if vsize_pp != 0 {
-                    *(vsize_pp as *mut u64) = view as u64;
+                    crate::usercopy::put::<u64>(vsize_pp, (view as u64) as u64);
                 }
             }
             STATUS_SUCCESS as i64
@@ -1185,7 +1209,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let Some(proc) = sched::current_proc() else {
                 return STATUS_INVALID_PARAMETER as i64;
             };
-            let base = unsafe { *(a1 as *const u64) };
+            let base = unsafe { crate::usercopy::get::<u64>(a1) };
             status(proc.flush_view(base), STATUS_NOT_MAPPED_VIEW)
         }
 
@@ -1221,7 +1245,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         NT_NTCONTINUE => {
             let c = a0;
             let (cs, ss) = process::user_selectors();
-            let rd = |off: u64| unsafe { *((c + off) as *const u64) };
+            let rd = |off: u64| unsafe { crate::usercopy::get::<u64>((c + off)) };
             let mut f = crate::seh::ExcFrame {
                 rax: rd(0x78),
                 rcx: rd(0x80),
@@ -1242,7 +1266,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 rip: rd(0xF8),
                 // keep the saved IF (0 for a cooperative PE thread); bit 1 is
                 // the reserved always-set flag.
-                rflags: unsafe { *((c + 0x44) as *const u32) } as u64 | 0x2,
+                rflags: unsafe { crate::usercopy::get::<u32>((c + 0x44)) } as u64 | 0x2,
                 cs,
                 ss,
             };
@@ -1305,7 +1329,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 ev.reset();
             }
             if a1 != 0 {
-                unsafe { *(a1 as *mut u32) = prev };
+                unsafe { crate::usercopy::put::<u32>(a1, (prev) as u32); }
             }
             STATUS_SUCCESS as i64
         }
@@ -1332,10 +1356,10 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             if h < 0 {
                 return STATUS_NO_MEMORY as i64;
             }
-            unsafe { *(a0 as *mut u64) = h as u64 };
+            unsafe { crate::usercopy::put::<u64>(a0, (h as u64) as u64); }
             let disp = stack(2);
             if disp != 0 {
-                unsafe { *(disp as *mut u32) = if existed { 2 } else { 1 } }; // OPENED_EXISTING / CREATED_NEW
+                unsafe { crate::usercopy::put::<u32>(disp, (if existed { 2 } else { 1 }) as u32); } // OPENED_EXISTING / CREATED_NEW
             }
             STATUS_SUCCESS as i64
         }
@@ -1352,7 +1376,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             if h < 0 {
                 return STATUS_NO_MEMORY as i64;
             }
-            unsafe { *(a0 as *mut u64) = h as u64 };
+            unsafe { crate::usercopy::put::<u64>(a0, (h as u64) as u64); }
             STATUS_SUCCESS as i64
         }
 
@@ -1367,7 +1391,9 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             }
             let name = unsafe { unicode_string_ascii(a1) };
             let (data_ptr, size) = (stack(0), stack(1) as usize);
-            let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, size) };
+            let Ok(data) = crate::usercopy::slice(data_ptr, size) else {
+                return STATUS_ACCESS_VIOLATION as i64;
+            };
             status(
                 crate::registry::set_value(&path, &name, a3 as u32, data),
                 STATUS_OBJECT_NAME_NOT_FOUND,
@@ -1391,16 +1417,19 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let need = 12 + data.len();
             let ret_len = stack(1);
             if ret_len != 0 {
-                unsafe { *(ret_len as *mut u32) = need as u32 };
+                unsafe { crate::usercopy::put::<u32>(ret_len, (need as u32) as u32); }
             }
             if (stack(0) as usize) < need {
                 return STATUS_INFO_LENGTH_MISMATCH as i64;
             }
+            if !crate::usercopy::user_ok(a3, need, true) {
+                return STATUS_ACCESS_VIOLATION as i64;
+            }
             unsafe {
                 let b = a3 as *mut u8;
-                *(b as *mut u32) = 0; // TitleIndex
-                *(b.add(4) as *mut u32) = ty; // Type
-                *(b.add(8) as *mut u32) = data.len() as u32; // DataLength
+                crate::usercopy::put::<u32>(b, (0) as u32); // TitleIndex
+                crate::usercopy::put::<u32>(b.add(4), (ty) as u32); // Type
+                crate::usercopy::put::<u32>(b.add(8), (data.len() as u32) as u32); // DataLength
                 core::ptr::copy_nonoverlapping(data.as_ptr(), b.add(12), data.len());
             }
             STATUS_SUCCESS as i64
@@ -1462,18 +1491,21 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let need = 16 + name_len;
             let ret_len = stack(1);
             if ret_len != 0 {
-                unsafe { *(ret_len as *mut u32) = need as u32 };
+                unsafe { crate::usercopy::put::<u32>(ret_len, (need as u32) as u32); }
             }
             if (stack(0) as usize) < need {
                 return STATUS_BUFFER_TOO_SMALL as i64;
             }
+            if !crate::usercopy::user_ok(a3, need, true) {
+                return STATUS_ACCESS_VIOLATION as i64;
+            }
             unsafe {
                 let b = a3 as *mut u8;
-                *(b as *mut i64) = 0; // LastWriteTime
-                *(b.add(8) as *mut u32) = 0; // TitleIndex
-                *(b.add(12) as *mut u32) = name_len as u32;
+                crate::usercopy::put::<i64>(b, (0) as i64); // LastWriteTime
+                crate::usercopy::put::<u32>(b.add(8), (0) as u32); // TitleIndex
+                crate::usercopy::put::<u32>(b.add(12), (name_len as u32) as u32);
                 for (i, c) in name.encode_utf16().enumerate() {
-                    *(b.add(16 + i * 2) as *mut u16) = c;
+                    crate::usercopy::put::<u16>(b.add(16 + i * 2), (c) as u16);
                 }
             }
             STATUS_SUCCESS as i64
@@ -1500,18 +1532,21 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
             let need = 12 + name_len;
             let ret_len = stack(1);
             if ret_len != 0 {
-                unsafe { *(ret_len as *mut u32) = need as u32 };
+                unsafe { crate::usercopy::put::<u32>(ret_len, (need as u32) as u32); }
             }
             if (stack(0) as usize) < need {
                 return STATUS_BUFFER_TOO_SMALL as i64;
             }
+            if !crate::usercopy::user_ok(a3, need, true) {
+                return STATUS_ACCESS_VIOLATION as i64;
+            }
             unsafe {
                 let b = a3 as *mut u8;
-                *(b as *mut u32) = 0; // TitleIndex
-                *(b.add(4) as *mut u32) = ty;
-                *(b.add(8) as *mut u32) = name_len as u32;
+                crate::usercopy::put::<u32>(b, (0) as u32); // TitleIndex
+                crate::usercopy::put::<u32>(b.add(4), (ty) as u32);
+                crate::usercopy::put::<u32>(b.add(8), (name_len as u32) as u32);
                 for (i, c) in name.encode_utf16().enumerate() {
-                    *(b.add(12 + i * 2) as *mut u16) = c;
+                    crate::usercopy::put::<u16>(b.add(12 + i * 2), (c) as u16);
                 }
             }
             STATUS_SUCCESS as i64
@@ -1520,7 +1555,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
         // LdrGetProcedureAddress(DllHandle, *AnsiName(STRING), Ordinal, *Address)
         NT_LDRGETPROCEDUREADDRESS => {
             let addr = if a1 != 0 {
-                let namebuf = unsafe { *((a1 + 8) as *const u64) }; // STRING.Buffer
+                let namebuf = unsafe { crate::usercopy::get::<u64>((a1 + 8)) }; // STRING.Buffer
                 export_by_name(a0, &user_cstr(namebuf), 0)
             } else {
                 export_by_ordinal(a0, a2 as u16, 0)
@@ -1529,7 +1564,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 return STATUS_PROCEDURE_NOT_FOUND as i64;
             }
             if a3 != 0 {
-                unsafe { *(a3 as *mut u64) = addr as u64 };
+                unsafe { crate::usercopy::put::<u64>(a3, (addr as u64) as u64); }
             }
             STATUS_SUCCESS as i64
         }
@@ -1542,7 +1577,7 @@ fn dispatch_ntdll(idx: u16, frame: &mut UserFrame) -> i64 {
                 return STATUS_DLL_NOT_FOUND as i64;
             }
             if a3 != 0 {
-                unsafe { *(a3 as *mut u64) = base };
+                unsafe { crate::usercopy::put::<u64>(a3, (base) as u64); }
             }
             STATUS_SUCCESS as i64
         }
@@ -1587,9 +1622,9 @@ fn exc_frame_regs(f: &crate::seh::ExcFrame) -> crate::apc::Regs {
 
 /// Fill an `IO_STATUS_BLOCK` (`{ NTSTATUS Status; ULONG_PTR Information; }`).
 unsafe fn write_iosb(iosb: u64, status: u32, information: u64) {
-    if iosb != 0 {
-        *(iosb as *mut u32) = status;
-        *((iosb + 8) as *mut u64) = information;
+    if iosb != 0 && crate::usercopy::user_ok(iosb, 16, true) {
+        crate::usercopy::put::<u32>(iosb, (status) as u32);
+        crate::usercopy::put::<u64>((iosb + 8), (information) as u64);
     }
 }
 
@@ -1628,11 +1663,11 @@ fn frame_regs(frame: &UserFrame, status_ax: u32) -> crate::apc::Regs {
 /// (`+0x10`, a `PUNICODE_STRING`), prefixed with the `RootDirectory` (`+0x08`)
 /// key's path when that handle is set.
 unsafe fn oa_path(oa: u64) -> Option<alloc::string::String> {
-    if oa == 0 {
+    if oa == 0 || !crate::usercopy::user_ok(oa, 0x18, false) {
         return None;
     }
-    let root = *((oa + 0x08) as *const u64);
-    let name = unicode_string_ascii(*((oa + 0x10) as *const u64));
+    let root = crate::usercopy::get::<u64>((oa + 0x08));
+    let name = unicode_string_ascii(crate::usercopy::get::<u64>((oa + 0x10)));
     if name.is_empty() && root == 0 {
         return None;
     }
@@ -1647,14 +1682,17 @@ unsafe fn oa_path(oa: u64) -> Option<alloc::string::String> {
 /// Decode a `UNICODE_STRING` (`{ u16 Length; u16 Max; u64 Buffer; }`, `Length`
 /// in bytes) to an ASCII `String`, non-ASCII code units becoming `?`.
 unsafe fn unicode_string_ascii(us: u64) -> alloc::string::String {
-    if us == 0 {
+    if us == 0 || !crate::usercopy::user_ok(us, 16, false) {
         return alloc::string::String::new();
     }
-    let n = (*(us as *const u16) as usize / 2).min(260);
-    let buf = *((us + 8) as *const u64);
+    let n = (crate::usercopy::get::<u16>(us) as usize / 2).min(260);
+    let buf = crate::usercopy::get::<u64>((us + 8));
+    if !crate::usercopy::user_ok(buf, n * 2, false) {
+        return alloc::string::String::new();
+    }
     let mut s = alloc::string::String::with_capacity(n);
     for i in 0..n {
-        let c = *((buf + (i * 2) as u64) as *const u16);
+        let c = crate::usercopy::get::<u16>((buf + (i * 2) as u64));
         s.push(if c < 0x80 { c as u8 as char } else { '?' });
     }
     s
@@ -1667,7 +1705,7 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
     let a1 = frame.rdx;
     let a2 = frame.r8;
     let a3 = frame.r9;
-    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
+    let stack = |i: u64| crate::usercopy::win64_stack_arg(frame.rsp, i);
 
     match idx {
         // ExitProcess(UINT uExitCode)
@@ -1688,7 +1726,7 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
                 return 0; // FALSE
             }
             if a3 != 0 {
-                unsafe { *(a3 as *mut u32) = n as u32 };
+                unsafe { crate::usercopy::put::<u32>(a3, (n as u32) as u32); }
             }
             1 // TRUE
         }
@@ -1701,7 +1739,7 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
                 return 0;
             }
             if a3 != 0 {
-                unsafe { *(a3 as *mut u32) = n as u32 };
+                unsafe { crate::usercopy::put::<u32>(a3, (n as u32) as u32); }
             }
             1
         }
@@ -1712,7 +1750,7 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
             // at [rsp+0x28] from the stub's frame (0x20 shadow + the `call`'s
             // 8-byte return address).
             let name = user_cstr(a0);
-            let disposition = unsafe { *((frame.rsp + 0x28) as *const u32) };
+            let disposition = crate::usercopy::win64_stack_arg(frame.rsp, 0) as u32;
             const OPEN_EXISTING: u32 = 3;
             if disposition != OPEN_EXISTING {
                 set_last_error(ERROR_FILE_NOT_FOUND);
@@ -1796,8 +1834,8 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
         NT_GETMODULEHANDLEA => {
             if a0 == 0 {
                 teb().map_or(0, |t| unsafe {
-                    let peb = *(t.add(0x60) as *const u64);
-                    *((peb + 0x10) as *const u64) as i64
+                    let peb = crate::usercopy::get::<u64>(t.add(0x60));
+                    crate::usercopy::get::<u64>((peb + 0x10)) as i64
                 })
             } else {
                 match ldr_find(&normalize_mod(&user_cstr(a0))) {
@@ -1864,7 +1902,7 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
             match proc.protect(a0, a1.max(1), w, x) {
                 Some((old_w, old_x)) => {
                     if a3 != 0 {
-                        unsafe { *(a3 as *mut u32) = wx_to_win32_protect(old_w, old_x) };
+                        unsafe { crate::usercopy::put::<u32>(a3, (wx_to_win32_protect(old_w, old_x)) as u32); }
                     }
                     1
                 }
@@ -1949,7 +1987,7 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
             }
             let m = n.min(dstlen);
             for k in 0..m {
-                unsafe { *((dst + (k * 2) as u64) as *mut u16) = *((src + k as u64) as *const u8) as u16 };
+                unsafe { crate::usercopy::put::<u16>((dst + (k * 2) as u64), (crate::usercopy::get::<u8>((src + k as u64)) as u16) as u16); }
             }
             m as i64
         }
@@ -1959,7 +1997,7 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
             let (dst, dstlen) = (stack(0), stack(1) as usize);
             let mut n = 0usize;
             if srclen < 0 {
-                while unsafe { *((src + (n * 2) as u64) as *const u16) } != 0 {
+                while unsafe { crate::usercopy::get::<u16>((src + (n * 2) as u64)) } != 0 {
                     n += 1;
                 }
                 n += 1;
@@ -1971,8 +2009,8 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
             }
             let m = n.min(dstlen);
             for k in 0..m {
-                let wc = unsafe { *((src + (k * 2) as u64) as *const u16) };
-                unsafe { *((dst + k as u64) as *mut u8) = if wc < 0x100 { wc as u8 } else { b'?' } };
+                let wc = unsafe { crate::usercopy::get::<u16>((src + (k * 2) as u64)) };
+                unsafe { crate::usercopy::put::<u8>((dst + k as u64), (if wc < 0x100 { wc as u8 } else { b'?' }) as u8); }
             }
             m as i64
         }
@@ -1984,15 +2022,18 @@ fn dispatch_kernel32(idx: u16, frame: &mut UserFrame) -> i64 {
                 return 0;
             }
             let page = addr & !0xFFF;
+            if !crate::usercopy::user_ok(buf, 0x30, true) {
+                return 0;
+            }
             unsafe {
                 let b = buf as *mut u64;
                 *b.add(0) = page;
                 *b.add(1) = page;
-                *(b.add(2) as *mut u32) = 0x40;
+                crate::usercopy::put::<u32>(b.add(2), (0x40) as u32);
                 *b.add(3) = 0x1000;
-                *(b.add(4) as *mut u32) = 0x1000;
+                crate::usercopy::put::<u32>(b.add(4), (0x1000) as u32);
                 *(b.add(4) as *mut u32).add(1) = 0x40;
-                *(b.add(5) as *mut u32) = 0x2_0000;
+                crate::usercopy::put::<u32>(b.add(5), (0x2_0000) as u32);
             }
             0x30
         }
@@ -2019,18 +2060,14 @@ fn crt(off: u64) -> u64 {
 
 /// Length of a NUL-terminated user string, capped.
 fn user_cstr_len(p: u64) -> usize {
-    let mut n = 0usize;
-    while n < 1 << 20 && unsafe { *((p + n as u64) as *const u8) } != 0 {
-        n += 1;
-    }
-    n
+    crate::usercopy::cstr_bytes(p, 1 << 20).map_or(0, |b| b.len())
 }
 
 /// Minimal `printf`-family formatter. Writes into `out`, returns the byte count.
 /// `ap` points at the first vararg (Win64: consecutive 8-byte slots). No
 /// closures — plain procedural code to keep the borrow checker happy.
 fn cfmt(fmt: u64, ap: *const u64, out: &mut [u8]) -> usize {
-    let rb = |p: u64| unsafe { *(p as *const u8) };
+    let rb = |p: u64| unsafe { crate::usercopy::get::<u8>(p) };
     let mut o = 0usize;
     let mut w = |b: u8, o: &mut usize| {
         if *o < out.len() {
@@ -2195,7 +2232,7 @@ fn file_fd(file_ptr: u64) -> i32 {
     if file_ptr == 0 {
         return 1;
     }
-    unsafe { *((file_ptr + 28) as *const i32) }
+    unsafe { crate::usercopy::get::<i32>((file_ptr + 28)) }
 }
 
 fn dispatch_msvcrt(idx: u16, frame: &mut UserFrame) -> i64 {
@@ -2203,21 +2240,27 @@ fn dispatch_msvcrt(idx: u16, frame: &mut UserFrame) -> i64 {
     let a1 = frame.rdx;
     let a2 = frame.r8;
     let a3 = frame.r9;
-    let stack = |i: u64| unsafe { *((frame.rsp + 0x28 + i * 8) as *const u64) };
+    let stack = |i: u64| crate::usercopy::win64_stack_arg(frame.rsp, i);
 
     match idx {
         MSV_MEMCPY => {
+            if !crate::usercopy::user_ok(a1, a2 as usize, false) || !crate::usercopy::user_ok(a0, a2 as usize, true) {
+                return 0;
+            }
             unsafe { core::ptr::copy(a1 as *const u8, a0 as *mut u8, a2 as usize) };
             a0 as i64
         }
         MSV_MEMSET => {
+            if !crate::usercopy::user_ok(a0, a2 as usize, true) {
+                return 0;
+            }
             unsafe { core::ptr::write_bytes(a0 as *mut u8, a1 as u8, a2 as usize) };
             a0 as i64
         }
         MSV_STRLEN => user_cstr_len(a0) as i64,
         MSV_WCSLEN => {
             let mut n = 0u64;
-            while unsafe { *((a0 + n * 2) as *const u16) } != 0 {
+            while unsafe { crate::usercopy::get::<u16>((a0 + n * 2)) } != 0 {
                 n += 1;
             }
             n as i64
@@ -2225,7 +2268,7 @@ fn dispatch_msvcrt(idx: u16, frame: &mut UserFrame) -> i64 {
         MSV_STRNCMP => {
             for k in 0..a2 {
                 let (x, y) = unsafe {
-                    (*((a0 + k) as *const u8) as i32, *((a1 + k) as *const u8) as i32)
+                    (crate::usercopy::get::<u8>((a0 + k)) as i32, crate::usercopy::get::<u8>((a1 + k)) as i32)
                 };
                 if x != y {
                     return (x - y) as i64;
@@ -2279,27 +2322,27 @@ fn dispatch_msvcrt(idx: u16, frame: &mut UserFrame) -> i64 {
             let mut p = cmdline;
             unsafe {
                 loop {
-                    while *(p as *const u8) == b' ' {
+                    while crate::usercopy::get::<u8>(p) == b' ' {
                         p += 1;
                     }
-                    if *(p as *const u8) == 0 || argc >= 32 {
+                    if crate::usercopy::get::<u8>(p) == 0 || argc >= 32 {
                         break;
                     }
-                    *((argv_base + argc * 8) as *mut u64) = sp;
+                    crate::usercopy::put::<u64>((argv_base + argc * 8), (sp) as u64);
                     argc += 1;
-                    while *(p as *const u8) != 0 && *(p as *const u8) != b' ' {
-                        *(sp as *mut u8) = *(p as *const u8);
+                    while crate::usercopy::get::<u8>(p) != 0 && crate::usercopy::get::<u8>(p) != b' ' {
+                        crate::usercopy::put::<u8>(sp, (crate::usercopy::get::<u8>(p)) as u8);
                         sp += 1;
                         p += 1;
                     }
-                    *(sp as *mut u8) = 0;
+                    crate::usercopy::put::<u8>(sp, (0) as u8);
                     sp += 1;
                 }
-                *((argv_base + argc * 8) as *mut u64) = 0; // argv[argc] = NULL
-                *(a0 as *mut i32) = argc as i32;
-                *(a1 as *mut u64) = argv_base;
+                crate::usercopy::put::<u64>((argv_base + argc * 8), (0) as u64); // argv[argc] = NULL
+                crate::usercopy::put::<i32>(a0, (argc as i32) as i32);
+                crate::usercopy::put::<u64>(a1, (argv_base) as u64);
                 if a2 != 0 {
-                    *(a2 as *mut u64) = argv_base + argc * 8; // env -> the NULL slot
+                    crate::usercopy::put::<u64>(a2, (argv_base + argc * 8) as u64); // env -> the NULL slot
                 }
             }
             0
@@ -2322,7 +2365,7 @@ fn dispatch_msvcrt(idx: u16, frame: &mut UserFrame) -> i64 {
         MSV_FPUTC => {
             let ch = a0 as u8;
             let fd = file_fd(a1);
-            let _ = file_write_core(fd, &ch as *const u8 as u64, 1);
+            let _ = file_write_kernel(fd, &[ch]);
             a0 as i64
         }
         MSV_FFLUSH => 0,
@@ -2334,15 +2377,18 @@ fn dispatch_msvcrt(idx: u16, frame: &mut UserFrame) -> i64 {
                 [a2, a3, stack(0), stack(1), stack(2), stack(3), stack(4), stack(5)];
             let mut buf = [0u8; 1024];
             let n = cfmt(a1, args.as_ptr(), &mut buf);
-            file_write_core(fd, buf.as_ptr() as u64, n);
+            file_write_kernel(fd, &buf[..n]);
             n as i64
         }
         MSV_VFPRINTF => {
             // vfprintf(FILE*, fmt, va_list) — a2 is the va_list pointer.
             let fd = file_fd(a0);
             let mut buf = [0u8; 1024];
-            let n = cfmt(a1, a2 as *const u64, &mut buf);
-            file_write_core(fd, buf.as_ptr() as u64, n);
+            // The va_list lives in user memory: snapshot a bounded number of
+            // argument words through checked reads, never walk it raw.
+            let va: [u64; 16] = core::array::from_fn(|i| crate::usercopy::get::<u64>(a2.wrapping_add(i as u64 * 8)));
+            let n = cfmt(a1, va.as_ptr(), &mut buf);
+            file_write_kernel(fd, &buf[..n]);
             n as i64
         }
 
@@ -2372,7 +2418,7 @@ unsafe fn utf16_eq_ci(buf: u64, n: usize, want: &str) -> bool {
         return false;
     }
     for (i, &w) in wb.iter().enumerate() {
-        let c = *((buf + (i * 2) as u64) as *const u16);
+        let c = crate::usercopy::get::<u16>((buf + (i * 2) as u64));
         if c > 0x7F || (c as u8).to_ascii_lowercase() != w {
             return false;
         }
@@ -2385,27 +2431,27 @@ unsafe fn utf16_eq_ci(buf: u64, n: usize, want: &str) -> bool {
 fn ldr_find(want: &str) -> u64 {
     let Some(t) = teb() else { return 0 };
     unsafe {
-        let peb = *(t.add(0x60) as *const u64);
+        let peb = crate::usercopy::get::<u64>(t.add(0x60));
         if peb == 0 {
             return 0;
         }
-        let ldr = *((peb + 0x18) as *const u64);
+        let ldr = crate::usercopy::get::<u64>((peb + 0x18));
         if ldr == 0 {
             return 0;
         }
         let head = ldr + 0x10; // InLoadOrderModuleList
-        let mut cur = *(head as *const u64); // first Flink
+        let mut cur = crate::usercopy::get::<u64>(head); // first Flink
         // InLoadOrderLinks sits at offset 0 of LDR_DATA_TABLE_ENTRY.
         for _ in 0..64 {
             if cur == head || cur == 0 {
                 break;
             }
-            let len = *((cur + 0x58) as *const u16) as usize; // BaseDllName.Length
-            let bufp = *((cur + 0x60) as *const u64); // BaseDllName.Buffer
+            let len = crate::usercopy::get::<u16>((cur + 0x58)) as usize; // BaseDllName.Length
+            let bufp = crate::usercopy::get::<u64>((cur + 0x60)); // BaseDllName.Buffer
             if bufp != 0 && len >= 2 && utf16_eq_ci(bufp, len / 2, want) {
-                return *((cur + 0x30) as *const u64); // DllBase
+                return crate::usercopy::get::<u64>((cur + 0x30)); // DllBase
             }
-            cur = *(cur as *const u64); // next Flink
+            cur = crate::usercopy::get::<u64>(cur); // next Flink
         }
     }
     0
@@ -2430,28 +2476,28 @@ impl ExportDir {
         if base == 0 {
             return None;
         }
-        let pe = base + *((base + 0x3C) as *const u32) as u64;
-        if *(pe as *const u32) != 0x0000_4550 {
+        let pe = base + crate::usercopy::get::<u32>((base + 0x3C)) as u64;
+        if crate::usercopy::get::<u32>(pe) != 0x0000_4550 {
             return None; // "PE\0\0"
         }
         let opt = pe + 4 + 20;
-        if *(opt as *const u16) != 0x20B || *((opt + 108) as *const u32) < 1 {
+        if crate::usercopy::get::<u16>(opt) != 0x20B || crate::usercopy::get::<u32>((opt + 108)) < 1 {
             return None; // not PE32+, or no export data dir slot
         }
-        let dir_rva = *((opt + 112) as *const u32) as u64;
-        let dir_size = *((opt + 116) as *const u32) as u64;
+        let dir_rva = crate::usercopy::get::<u32>((opt + 112)) as u64;
+        let dir_size = crate::usercopy::get::<u32>((opt + 116)) as u64;
         if dir_rva == 0 {
             return None;
         }
         let ed = base + dir_rva;
         Some(ExportDir {
             base,
-            eat: base + *((ed + 0x1C) as *const u32) as u64,
-            enpt: base + *((ed + 0x20) as *const u32) as u64,
-            ords: base + *((ed + 0x24) as *const u32) as u64,
-            n_names: *((ed + 0x18) as *const u32) as usize,
-            n_funcs: *((ed + 0x14) as *const u32) as u64,
-            ord_base: *((ed + 0x10) as *const u32) as u64,
+            eat: base + crate::usercopy::get::<u32>((ed + 0x1C)) as u64,
+            enpt: base + crate::usercopy::get::<u32>((ed + 0x20)) as u64,
+            ords: base + crate::usercopy::get::<u32>((ed + 0x24)) as u64,
+            n_names: crate::usercopy::get::<u32>((ed + 0x18)) as usize,
+            n_funcs: crate::usercopy::get::<u32>((ed + 0x14)) as u64,
+            ord_base: crate::usercopy::get::<u32>((ed + 0x10)) as u64,
             dir_rva,
             dir_size,
         })
@@ -2464,7 +2510,7 @@ impl ExportDir {
         if idx >= self.n_funcs {
             return 0;
         }
-        let frva = *((self.eat + idx * 4) as *const u32) as u64;
+        let frva = crate::usercopy::get::<u32>((self.eat + idx * 4)) as u64;
         if frva == 0 {
             return 0;
         }
@@ -2495,9 +2541,9 @@ fn export_by_name(base: u64, name: &str, depth: u32) -> i64 {
     unsafe {
         let Some(ed) = ExportDir::parse(base) else { return 0 };
         for i in 0..ed.n_names {
-            let nrva = *((ed.enpt + (i * 4) as u64) as *const u32) as u64;
+            let nrva = crate::usercopy::get::<u32>((ed.enpt + (i * 4) as u64)) as u64;
             if user_cstr(base + nrva) == name {
-                let ord = *((ed.ords + (i * 2) as u64) as *const u16) as u64;
+                let ord = crate::usercopy::get::<u16>((ed.ords + (i * 2) as u64)) as u64;
                 return ed.resolve_slot(ord, depth);
             }
         }
@@ -2513,15 +2559,8 @@ fn export_by_ordinal(base: u64, ordinal: u16, depth: u32) -> i64 {
 }
 
 fn user_cstr(ptr: u64) -> alloc::string::String {
-    let mut s = alloc::string::String::new();
-    let mut p = ptr;
-    for _ in 0..4096 {
-        let b = unsafe { *(p as *const u8) };
-        if b == 0 {
-            break;
-        }
-        s.push(b as char);
-        p += 1;
-    }
-    s
+    // Bytes map 1:1 to chars (the NT layer is ANSI/Latin-1); a bad pointer is "".
+    crate::usercopy::cstr_bytes(ptr, 4096)
+        .map(|b| b.into_iter().map(|c| c as char).collect())
+        .unwrap_or_default()
 }

@@ -21,6 +21,7 @@ use x86_64::VirtAddr;
 
 #[cfg(feature = "interactive")]
 use crate::cred;
+use crate::usercopy::{self, EFAULT};
 use crate::{ext2, gdt, kprintln, power, process, sched, smp};
 
 static USER_EXITS: AtomicU64 = AtomicU64::new(0);
@@ -294,8 +295,10 @@ fn cur_fd(fd: u64) -> Option<alloc::sync::Arc<dyn crate::file::FileOps>> {
 fn sys_write(fd: u64, ptr: u64, len: u64) -> i64 {
     match cur_fd(fd) {
         Some(f) => {
-            let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-            f.write(bytes)
+            match usercopy::slice(ptr, len as usize) {
+                Ok(bytes) => f.write(bytes),
+                Err(e) => e,
+            }
         }
         None => EBADF,
     }
@@ -304,8 +307,10 @@ fn sys_write(fd: u64, ptr: u64, len: u64) -> i64 {
 fn sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
     match cur_fd(fd) {
         Some(f) => {
-            let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
-            f.read(buf)
+            match usercopy::slice_mut(ptr, len as usize) {
+                Ok(buf) => f.read(buf),
+                Err(e) => e,
+            }
         }
         None => EBADF,
     }
@@ -316,6 +321,9 @@ fn sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
 /// `flags` marks both fds close-on-exec.
 fn sys_pipe(fds_ptr: u64, flags: u64) -> i64 {
     let Some(task) = sched::current().task() else { return EBADF };
+    if !usercopy::user_ok(fds_ptr, 8, true) {
+        return EFAULT;
+    }
     let cloexec = flags & 0o2000000 != 0;
     let (r, w) = crate::file::pipe();
     let rf: alloc::sync::Arc<dyn crate::file::FileOps> = r;
@@ -330,7 +338,10 @@ fn sys_pipe(fds_ptr: u64, flags: u64) -> i64 {
 }
 
 fn sys_unlink(path_ptr: u64, dir: bool) -> i64 {
-    let path = process::resolve_path(&user_cstr(path_ptr));
+    let path = match user_path(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     let Some(fs) = ext2::open().ok() else { return EIO };
     let r = if dir { fs.rmdir_path(&path) } else { fs.unlink_path(&path) };
     match r {
@@ -344,7 +355,10 @@ fn sys_unlink(path_ptr: u64, dir: bool) -> i64 {
 }
 
 fn sys_open(path_ptr: u64, flags: u64) -> i64 {
-    open_resolved(&process::resolve_path(&user_cstr(path_ptr)), flags)
+    match user_path(path_ptr) {
+        Ok(p) => open_resolved(&p, flags),
+        Err(e) => e,
+    }
 }
 
 /// `mkdir(path, mode)` — `mode` isn't honoured yet (new directories are
@@ -352,7 +366,10 @@ fn sys_open(path_ptr: u64, flags: u64) -> i64 {
 /// what's new here is a real owner (the calling task's uid) instead of the
 /// permanent system uid every directory got before this increment.
 fn sys_mkdir(path_ptr: u64) -> i64 {
-    let path = process::resolve_path(&user_cstr(path_ptr));
+    let path = match user_path(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     let Some(task) = sched::current().task() else { return EBADF };
     let Some(fs) = ext2::open().ok() else { return EIO };
     // Same rule as O_CREAT in `open_resolved`: creating an entry is a write
@@ -377,7 +394,10 @@ fn sys_mkdir(path_ptr: u64) -> i64 {
 /// permission bits, checked here (`ext2::chmod_path` itself does no check —
 /// see its doc comment).
 fn sys_chmod(path_ptr: u64, mode: u64) -> i64 {
-    let path = process::resolve_path(&user_cstr(path_ptr));
+    let path = match user_path(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     let Some(task) = sched::current().task() else { return EBADF };
     let Some(fs) = ext2::open().ok() else { return EIO };
     let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
@@ -393,7 +413,10 @@ fn sys_chmod(path_ptr: u64, mode: u64) -> i64 {
 /// `chown(path, uid, gid)` — root-only (matches modern Unix: even the owner
 /// can't give a file away), stricter than `chmod`'s owner-or-root.
 fn sys_chown(path_ptr: u64, uid: u64, gid: u64) -> i64 {
-    let path = process::resolve_path(&user_cstr(path_ptr));
+    let path = match user_path(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     let Some(task) = sched::current().task() else { return EBADF };
     if task.uid != 0 {
         return EPERM;
@@ -439,7 +462,10 @@ fn sys_elevate(path_ptr: u64, argv_ptr: u64, password_ptr: u64) -> i64 {
     if !stored.verify(&stored.name, &password) {
         return EACCES;
     }
-    let path = process::resolve_path(&user_cstr(path_ptr));
+    let path = match user_path(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     let Some(bytes) = fs.read_path(&path) else { return ENOENT };
     let argv = user_cstr_array(argv_ptr);
     let argv_refs: alloc::vec::Vec<&str> = argv.iter().map(alloc::string::String::as_str).collect();
@@ -529,6 +555,9 @@ pub fn open_resolved_access(path: &str, want_read: bool, want_write: bool) -> i6
 /// blksize @56, blocks @64. Everything else zero.
 fn sys_fstat(fd: u64, buf: u64) -> i64 {
     let Some(f) = cur_fd(fd) else { return EBADF };
+    if !usercopy::user_ok(buf, 144, true) {
+        return EFAULT;
+    }
     let (mode, size) = f.stat();
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, 144);
@@ -548,6 +577,16 @@ fn sys_fstat(fd: u64, buf: u64) -> i64 {
 fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
     if cur_fd(fd).is_none() {
         return EBADF;
+    }
+    // Every command below writes a fixed-size struct through `arg`.
+    let need = match cmd {
+        0x5401 => 36,
+        0x5413 => 8,
+        0x540f => 4,
+        _ => 0,
+    };
+    if need > 0 && !usercopy::user_ok(arg, need, true) {
+        return EFAULT;
     }
     match cmd {
         0x5401 => unsafe {
@@ -592,6 +631,9 @@ fn sys_sendfile(out_fd: u64, in_fd: u64, off_ptr: u64, count: u64) -> i64 {
     let (Some(src), Some(dst)) = (cur_fd(in_fd), cur_fd(out_fd)) else {
         return EBADF;
     };
+    if off_ptr != 0 && !usercopy::user_ok(off_ptr, 8, true) {
+        return EFAULT;
+    }
     if off_ptr != 0 {
         let start = unsafe { *(off_ptr as *const i64) };
         if src.seek(start, crate::file::SEEK_SET) < 0 {
@@ -637,11 +679,17 @@ fn sys_sendfile(out_fd: u64, in_fd: u64, off_ptr: u64, count: u64) -> i64 {
 /// cwd (a real `dirfd` other than `AT_FDCWD` is not honoured), plus
 /// `AT_EMPTY_PATH` fstat.
 fn sys_newfstatat(dirfd: u64, path_ptr: u64, buf: u64, flags: u64) -> i64 {
-    let raw = user_cstr(path_ptr);
+    let raw = match usercopy::cstr(path_ptr, 4096) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
     if raw.is_empty() && flags & 0x1000 != 0 {
         return sys_fstat(dirfd, buf);
     }
     let path = process::resolve_path(&raw);
+    if !usercopy::user_ok(buf, 144, true) {
+        return EFAULT;
+    }
     let Some(fs) = ext2::open().ok() else { return -5 /* EIO */ };
     let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
     let node = fs.read_inode(ino);
@@ -656,19 +704,18 @@ fn sys_newfstatat(dirfd: u64, path_ptr: u64, buf: u64, flags: u64) -> i64 {
     0
 }
 
-/// Read a NUL-terminated string from user memory (we're under the caller's CR3).
+/// A path argument, resolved against the cwd. A pointer that is not valid user
+/// memory is `EFAULT` — **not** the empty string, which would silently mean "the
+/// current directory".
+fn user_path(ptr: u64) -> Result<alloc::string::String, i64> {
+    Ok(process::resolve_path(&usercopy::cstr(ptr, 4096)?))
+}
+
+/// Read a NUL-terminated string from user memory (at most 4 KiB; a bad pointer
+/// reads as the empty string, which every caller already treats as "no such
+/// file" — nothing outside the user half is ever touched).
 fn user_cstr(ptr: u64) -> alloc::string::String {
-    let mut s = alloc::vec::Vec::new();
-    let mut p = ptr as *const u8;
-    for _ in 0..4096 {
-        let b = unsafe { *p };
-        if b == 0 {
-            break;
-        }
-        s.push(b);
-        p = unsafe { p.add(1) };
-    }
-    alloc::string::String::from_utf8_lossy(&s).into_owned()
+    usercopy::cstr(ptr, 4096).unwrap_or_default()
 }
 
 /// Most bytes `execve` accepts for argv + envp together (strings, their NULs and
@@ -691,42 +738,35 @@ fn user_exec_args(ptr: u64, budget: &mut usize) -> Result<alloc::vec::Vec<alloc:
     if ptr == 0 {
         return Ok(out);
     }
-    let mut p = ptr as *const u64;
-    for _ in 0..=EXEC_ARGC_MAX {
-        let sp = unsafe { *p };
+    for i in 0..=EXEC_ARGC_MAX as u64 {
+        let sp = usercopy::read_u64(ptr.checked_add(i * 8).ok_or(EFAULT)?)?;
         if sp == 0 {
             return Ok(out);
         }
         if out.len() == EXEC_ARGC_MAX {
             return Err(E2BIG);
         }
-        let mut bytes = alloc::vec::Vec::new();
-        let mut q = sp as *const u8;
-        loop {
-            let b = unsafe { *q };
-            if b == 0 {
-                break;
-            }
-            if bytes.len() >= EXEC_STR_MAX {
-                return Err(E2BIG);
-            }
-            bytes.push(b);
-            q = unsafe { q.add(1) };
-        }
+        let bytes = match usercopy::cstr_bytes(sp, EXEC_STR_MAX) {
+            Ok(b) => b,
+            Err(-36) => return Err(E2BIG), // longer than EXEC_STR_MAX
+            Err(e) => return Err(e),
+        };
         let cost = bytes.len() + 1 + 8; // string + NUL + its pointer slot
         if cost > *budget {
             return Err(E2BIG);
         }
         *budget -= cost;
         out.push(alloc::string::String::from_utf8_lossy(&bytes).into_owned());
-        p = unsafe { p.add(1) };
     }
     Err(E2BIG)
 }
 
 /// `execve(path, argv, envp)`. Does not return on success.
 fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
-    let path = process::resolve_path(&user_cstr(path_ptr));
+    let path = match user_path(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     let mut budget = EXEC_ARG_LIMIT;
     let argv = match user_exec_args(argv_ptr, &mut budget) {
         Ok(v) => v,
@@ -746,20 +786,18 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     }
 }
 
-/// Read a NULL-terminated array of user string pointers.
+/// Read a NULL-terminated array of user string pointers (at most 256 entries;
+/// used by `elevate`, whose argv is tiny).
 fn user_cstr_array(ptr: u64) -> alloc::vec::Vec<alloc::string::String> {
     let mut out = alloc::vec::Vec::new();
     if ptr == 0 {
         return out;
     }
-    let mut p = ptr as *const u64;
-    for _ in 0..256 {
-        let sp = unsafe { *p };
-        if sp == 0 {
-            break;
+    for i in 0..256u64 {
+        match usercopy::read_u64(ptr + i * 8) {
+            Ok(0) | Err(_) => break,
+            Ok(sp) => out.push(user_cstr(sp)),
         }
-        out.push(user_cstr(sp));
-        p = unsafe { p.add(1) };
     }
     out
 }
@@ -775,6 +813,14 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_READ => sys_read(a1, a2, a3),
 
         SYS_WRITEV => {
+            if a3 > 1024 {
+                frame.rax = EINVAL as u64;
+                return;
+            }
+            if !usercopy::user_ok(a2, a3 as usize * 16, false) {
+                frame.rax = EFAULT as u64;
+                return;
+            }
             let iov = unsafe { core::slice::from_raw_parts(a2 as *const [u64; 2], a3 as usize) };
             let mut total = 0i64;
             for &[base, len] in iov {
@@ -813,10 +859,12 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             if a2 == 0 {
                 0
             } else {
-                let path = process::resolve_path(&user_cstr(a2));
-                match ext2::open().ok().and_then(|fs| fs.path_lookup(&path)) {
-                    Some(_) => 0,
-                    None => ENOENT,
+                match user_path(a2) {
+                    Err(e) => e,
+                    Ok(path) => match ext2::open().ok().and_then(|fs| fs.path_lookup(&path)) {
+                        Some(_) => 0,
+                        None => ENOENT,
+                    },
                 }
             }
         }
@@ -834,9 +882,14 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_TIME => {
             let t: i64 = 1_735_689_600; // 2025-01-01
             if a1 != 0 {
-                unsafe { *(a1 as *mut i64) = t };
+                if usercopy::write_u64(a1, t as u64).is_err() {
+                    EFAULT
+                } else {
+                    t
+                }
+            } else {
+                t
             }
-            t
         }
 
         // sendfile(out, in, *offset, count): plain copy loop through a bounce
@@ -844,10 +897,10 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_SENDFILE => sys_sendfile(a1, a2, a3, a4),
 
         SYS_GETDENTS64 => match cur_fd(a1) {
-            Some(f) => {
-                let buf = unsafe { core::slice::from_raw_parts_mut(a2 as *mut u8, a3 as usize) };
-                f.getdents64(buf)
-            }
+            Some(f) => match usercopy::slice_mut(a2, a3 as usize) {
+                Ok(buf) => f.getdents64(buf),
+                Err(e) => e,
+            },
             None => EBADF,
         },
         SYS_FSTAT => sys_fstat(a1, a2),
@@ -858,10 +911,10 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
                 sched::current().set_fsbase(a2); // survive context switches
                 0
             }
-            ARCH_GET_FS => {
-                unsafe { *(a2 as *mut u64) = FsBase::read().as_u64() };
-                0
-            }
+            ARCH_GET_FS => match usercopy::write_u64(a2, FsBase::read().as_u64()) {
+                Ok(()) => 0,
+                Err(e) => e,
+            },
             _ => EINVAL,
         },
 
@@ -869,7 +922,13 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_MMAP => sched::current_proc().map(|p| p.mmap_anon(a2) as i64).unwrap_or(EINVAL),
 
         SYS_GETRANDOM => {
-            let buf = unsafe { core::slice::from_raw_parts_mut(a1 as *mut u8, a2 as usize) };
+            let buf = match usercopy::slice_mut(a1, a2 as usize) {
+                Ok(b) => b,
+                Err(e) => {
+                    frame.rax = e as u64;
+                    return;
+                }
+            };
             let mut x = RNG.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
             for b in buf.iter_mut() {
                 x ^= x << 13;
@@ -893,7 +952,13 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
 
         // chdir: normalise against the cwd, verify it names a directory in ext2.
         SYS_CHDIR => {
-            let path = process::resolve_path(&user_cstr(a1));
+            let path = match user_path(a1) {
+                Ok(p) => p,
+                Err(e) => {
+                    frame.rax = e as u64;
+                    return;
+                }
+            };
             match ext2::open().ok().and_then(|fs| {
                 fs.path_lookup(&path).map(|ino| fs.read_inode(ino).mode)
             }) {
@@ -948,16 +1013,27 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             0
         }
 
-        SYS_SYSINFO => {
-            unsafe { core::ptr::write_bytes(a1 as *mut u8, 0, 112) };
-            0
-        }
+        SYS_SYSINFO => match usercopy::slice_mut(a1, 112) {
+            Ok(b) => {
+                b.fill(0);
+                0
+            }
+            Err(e) => e,
+        },
 
         SYS_WAITID => ECHILD,
 
         // poll: mark valid fds as "no events", invalid as POLLNVAL.
         SYS_POLL | SYS_PPOLL => {
             let n = a2 as usize;
+            if n > 4096 {
+                frame.rax = EINVAL as u64;
+                return;
+            }
+            if !usercopy::user_ok(a1, n * 8, true) {
+                frame.rax = EFAULT as u64;
+                return;
+            }
             let fds = unsafe { core::slice::from_raw_parts_mut(a1 as *mut [u8; 8], n) };
             let mut ready = 0i64;
             for pfd in fds.iter_mut() {
@@ -972,17 +1048,25 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             ready
         }
 
-        SYS_CLOCK_GETTIME => {
-            unsafe { core::ptr::write_bytes(a2 as *mut u8, 0, 16) };
-            0
-        }
+        SYS_CLOCK_GETTIME => match usercopy::slice_mut(a2, 16) {
+            Ok(b) => {
+                b.fill(0);
+                0
+            }
+            Err(e) => e,
+        },
 
         SYS_SCHED_GETAFFINITY => {
             // report the online CPUs as a bitmask
             let len = (a2 as usize).min(8);
             let mask = ((1u64 << smp::cpu_count().min(64)) - 1).to_le_bytes();
-            unsafe { core::ptr::copy_nonoverlapping(mask.as_ptr(), a3 as *mut u8, len) };
-            len as i64
+            match usercopy::slice_mut(a3, len) {
+                Ok(b) => {
+                    b.copy_from_slice(&mask[..len]);
+                    len as i64
+                }
+                Err(e) => e,
+            }
         }
 
         // reboot(magic1, magic2, cmd, arg): the Linux numbers BusyBox uses for
@@ -1030,18 +1114,24 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             if a1 == 0 || (a2 as usize) < need {
                 -34 // ERANGE
             } else {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(cwd.as_ptr(), a1 as *mut u8, cwd.len());
-                    *((a1 + cwd.len() as u64) as *mut u8) = 0;
+                match usercopy::slice_mut(a1, need) {
+                    Ok(b) => {
+                        b[..cwd.len()].copy_from_slice(cwd.as_bytes());
+                        b[cwd.len()] = 0;
+                        need as i64
+                    }
+                    Err(e) => e,
                 }
-                need as i64
             }
         }
         SYS_READLINK | SYS_READLINKAT => EINVAL,
-        SYS_UNAME => {
-            unsafe { core::ptr::write_bytes(a1 as *mut u8, 0, 6 * 65) };
-            0
-        }
+        SYS_UNAME => match usercopy::slice_mut(a1, 6 * 65) {
+            Ok(b) => {
+                b.fill(0);
+                0
+            }
+            Err(e) => e,
+        },
 
         SYS_FORK => process::fork(frame),
 

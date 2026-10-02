@@ -286,3 +286,22 @@ pub fn hhdm_gib(entries: &[&Entry]) -> u64 {
     }
     ((max_phys + GIB - 1) / GIB).clamp(4, HHDM_MAX_GIB)
 }
+
+/// Access a user page grants in `pml4_phys`: `None` if unmapped or not
+/// user-accessible, otherwise `Some(writable)`. Used by `usercopy` to validate a
+/// pointer a process handed the kernel.
+pub fn user_page_access(pml4_phys: u64, virt: u64) -> Option<bool> {
+    let hhdm = crate::mm::hhdm_offset();
+    let pml4: &mut PageTable = unsafe {
+        &mut *crate::mm::phys_to_virt(x86_64::PhysAddr::new(pml4_phys)).as_mut_ptr::<PageTable>()
+    };
+    let m = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(hhdm)) };
+    match m.translate(VirtAddr::new(virt)) {
+        x86_64::structures::paging::mapper::TranslateResult::Mapped { flags, .. }
+            if flags.contains(F::USER_ACCESSIBLE) =>
+        {
+            Some(flags.contains(F::WRITABLE))
+        }
+        _ => None,
+    }
+}

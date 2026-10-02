@@ -63,6 +63,7 @@ mod serial;
 mod smp;
 mod syscall;
 mod timer;
+mod usercopy;
 mod vfs;
 mod vmm;
 mod window;
@@ -146,9 +147,11 @@ extern "C" fn kmain() -> ! {
     }
 
     cpu::enable_sse();
+    let smep = cpu::enable_smep();
     gdt::init(0);
     idt::init();
     kprintln!("THOS: GDT + IDT loaded");
+    kprintln!("THOS: SMEP             {}", if smep { "enabled" } else { "not available on this CPU" });
     x86_64::instructions::interrupts::int3();
     kprintln!("THOS: traps ok (returned from #BP)");
 

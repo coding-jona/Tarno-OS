@@ -195,10 +195,22 @@ extern "C" fn thos_fault_dispatch(frame: &mut ExcFrame, vector: u64, error_code:
         _ => ("#PF page fault", STATUS_ACCESS_VIOLATION, 139),
     };
 
+    // A *kernel-mode* fault on a user address is a syscall that dereferenced a
+    // pointer the process supplied (unmapped, or unmapped meanwhile by another
+    // thread). Kill that process — never the machine.
+    if !from_user && vector == 14 && cr2 < crate::usercopy::USER_TOP && crate::process::current_pid() != 0 {
+        kprintln!("THOS trap: kernel #PF on user address {:#x} rip={:#x} — process killed", cr2, frame.rip);
+        crate::process::set_exit_status(139);
+        crate::syscall::note_user_exit();
+        sched::exit();
+    }
+
     if from_user && handler != 0 {
         let pf = (vector == 14).then_some((error_code, cr2));
-        deliver(frame, code, pf);
-        return;
+        if deliver(frame, code, pf) {
+            return;
+        }
+        // The user stack can't hold the exception record: fall through and kill.
     }
 
     if vector == 14 {
@@ -229,13 +241,18 @@ extern "C" fn thos_fault_dispatch(frame: &mut ExcFrame, vector: u64, error_code:
 
 /// Push an `EXCEPTION_RECORD` + `CONTEXT` onto the user stack and re-point
 /// `frame` at `KiUserExceptionDispatcher` (`rcx` = record, `rdx` = context).
-fn deliver(frame: &mut ExcFrame, code: u32, pf: Option<(u64, u64)>) {
-    let mut sp = frame.rsp - 128; // skip the red zone
-    sp = (sp - CTX_SIZE) & !0xF;
+fn deliver(frame: &mut ExcFrame, code: u32, pf: Option<(u64, u64)>) -> bool {
+    // `rsp` is whatever the faulting program left there — validate the whole
+    // region we are about to write before touching it.
+    let mut sp = frame.rsp.wrapping_sub(128); // skip the red zone
+    sp = sp.wrapping_sub(CTX_SIZE) & !0xF;
     let ctx = sp;
-    sp = (sp - EXR_SIZE) & !0xF;
+    sp = sp.wrapping_sub(EXR_SIZE) & !0xF;
     let exr = sp;
-    let new_rsp = (sp - 8) & !0xF;
+    let new_rsp = sp.wrapping_sub(8) & !0xF;
+    if !crate::usercopy::user_ok(new_rsp, (frame.rsp.wrapping_sub(new_rsp)) as usize, true) {
+        return false;
+    }
 
     unsafe {
         core::ptr::write_bytes(exr as *mut u8, 0, EXR_SIZE as usize);
@@ -286,4 +303,5 @@ fn deliver(frame: &mut ExcFrame, code: u32, pf: Option<(u64, u64)>) {
     frame.rdx = ctx;
     frame.rsp = new_rsp;
     frame.rip = PE_KIUSER_ADDR;
+    true
 }
