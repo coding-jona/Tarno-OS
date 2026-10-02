@@ -71,6 +71,7 @@ mod fbcon;
 mod power;
 mod mbr;
 mod ps2;
+mod random;
 mod rtc;
 mod xhci;
 mod wait;
@@ -322,6 +323,8 @@ fn acpi_apic_bringup() {
             None => alloc::string::String::from("unreadable — wall clock starts at 0"),
         }
     );
+
+    random::init(); // after the clock: the RTC and TSC are inputs to the pool
 
     x86_64::instructions::interrupts::enable();
     let start = apic::ticks();

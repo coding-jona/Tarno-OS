@@ -10,8 +10,6 @@
 //! store behind the `Principal` / token model. There is deliberately no root
 //! password — see `docs/thos/roadmap.md` "Identity, privilege & login".
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -120,29 +118,9 @@ pub fn save(fs: &Ext2, cred: &Cred) -> Result<(), &'static str> {
 
 // --- primitives ---------------------------------------------------------
 
-/// 64 bits of salt entropy. Prefers `RDRAND` (real hardware has it); falls back
-/// to a `RDTSC`-seeded xorshift where the CPU lacks it (QEMU's default model)
-/// so a missing optional instruction can't `#UD` the kernel.
+/// 64 bits of salt entropy, from the kernel CSPRNG.
 fn rand64() -> u64 {
-    let has_rdrand = unsafe { core::arch::x86_64::__cpuid(1).ecx } & (1 << 30) != 0;
-    if has_rdrand {
-        for _ in 0..32 {
-            let mut x = 0u64;
-            if unsafe { core::arch::x86_64::_rdrand64_step(&mut x) } == 1 {
-                return x;
-            }
-        }
-    }
-    static S: AtomicU64 = AtomicU64::new(0);
-    let mut x = S.load(Ordering::Relaxed) ^ unsafe { core::arch::x86_64::_rdtsc() };
-    if x == 0 {
-        x = 0x9E37_79B9_7F4A_7C15;
-    }
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    S.store(x, Ordering::Relaxed);
-    x
+    crate::random::u64()
 }
 
 fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {

@@ -78,6 +78,11 @@ fn main() {
             let img = bios_image();
             longcmd_test(&img);
         }
+        "random-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            random_test(&img);
+        }
         "bios-kbd-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
@@ -376,6 +381,8 @@ fn disk_image() -> PathBuf {
         ("ptrtest.rs", "ptrtest"),
         // Clock / sleep / timestamp test, typed in by `kbd-test`.
         ("clocktest.rs", "clocktest"),
+        // getrandom quality test, run by `random-test`.
+        ("randtest.rs", "randtest"),
     ] {
         let rs = root.join("xtask/testdata").join(src);
         let bin = root.join("target").join(name);
@@ -3828,6 +3835,74 @@ fn longcmd_test(img: &Path) {
             eprintln!("  FAIL {f}");
         }
         eprintln!("longcmd-test FAILED; log: {}", log.display());
+        exit(1);
+    }
+}
+
+/// Boot the real boot path, log in over PS/2, run `cmd`, and return the serial log once
+/// `needle` appears (or after `secs`). Each call is a fresh boot of a pristine copy.
+fn boot_and_run(img: &Path, tag: &str, cmd: &str, needle: &str, secs: u64) -> String {
+    let root = workspace_root();
+    let log = root.join(format!("target/{tag}-serial.log"));
+    let sock = root.join(format!("target/{tag}-mon.sock"));
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&sock);
+    let run_img = root.join(format!("target/{tag}.img"));
+    std::fs::copy(img, &run_img).expect("copy image");
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(["-M", "pc", "-m", "512M", "-smp", "2"])
+        .args([
+            "-drive", &format!("id=disk0,if=none,format=raw,file={}", run_img.to_str().unwrap()),
+            "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0,bootindex=0",
+            "-display", "none", "-no-reboot",
+            "-serial", &format!("file:{}", log.to_str().unwrap()),
+            "-monitor", &format!("unix:{},server,nowait", sock.to_str().unwrap()),
+        ])
+        .spawn()
+        .expect("spawn qemu");
+    if !wait_for(&log, "THOS first-run setup", 90) {
+        kill(&mut child, tag, "no first-run setup", &log);
+    }
+    drive_login(&sock, &log, &mut child, tag);
+    if !wait_for(&log, "interactive hold", 90) {
+        kill(&mut child, tag, "no shell", &log);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    type_line(&sock, cmd);
+    let _ = wait_for(&log, needle, secs);
+    let out = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = child.kill();
+    let _ = child.wait();
+    out
+}
+
+/// `getrandom` quality, and that two boots do not produce the same stream.
+fn random_test(img: &Path) {
+    let first = |out: &str| {
+        out.split("first=").nth(1).and_then(|r| r.split_whitespace().next()).map(String::from)
+    };
+    let a = boot_and_run(img, "rand-a", "randtest", "rand ", 60);
+    let b = boot_and_run(img, "rand-b", "randtest", "rand ", 60);
+    let (fa, fb) = (first(&a), first(&b));
+    let mut fails: Vec<String> = Vec::new();
+    for (n, out) in [("boot A", &a), ("boot B", &b)] {
+        if !out.contains("rand ok") {
+            fails.push(format!("{n}: statistical checks failed or randtest did not run"));
+        }
+        if !out.contains("ChaCha20 CSPRNG seeded") {
+            fails.push(format!("{n}: kernel did not report seeding the CSPRNG"));
+        }
+    }
+    if fa.is_none() || fa == fb {
+        fails.push(format!("the two boots produced the same random stream ({fa:?} vs {fb:?})"));
+    }
+    if fails.is_empty() {
+        println!("random-test PASSED: CSPRNG seeded, statistics sane, boots differ ({} vs {})", fa.unwrap(), fb.unwrap());
+    } else {
+        for f in &fails {
+            eprintln!("  FAIL {f}");
+        }
+        eprintln!("random-test FAILED");
         exit(1);
     }
 }

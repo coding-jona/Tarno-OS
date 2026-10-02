@@ -987,23 +987,13 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_BRK => sched::current_proc().map(|p| p.brk(a1) as i64).unwrap_or(EINVAL),
         SYS_MMAP => sched::current_proc().map(|p| p.mmap_anon(a2) as i64).unwrap_or(EINVAL),
 
-        SYS_GETRANDOM => {
-            let buf = match usercopy::slice_mut(a1, a2 as usize) {
-                Ok(b) => b,
-                Err(e) => {
-                    frame.rax = e as u64;
-                    return;
-                }
-            };
-            let mut x = RNG.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
-            for b in buf.iter_mut() {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                *b = x as u8;
+        SYS_GETRANDOM => match usercopy::slice_mut(a1, a2 as usize) {
+            Ok(buf) => {
+                crate::random::fill(buf);
+                a2 as i64
             }
-            a2 as i64
-        }
+            Err(e) => e,
+        },
 
         SYS_GETPID | SYS_GETTID => process::current_pid() as i64,
         SYS_GETPPID => process::current_ppid() as i64,
@@ -1255,4 +1245,3 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
     frame.rax = ret as u64;
 }
 
-static RNG: AtomicU64 = AtomicU64::new(0x1234_5678_9abc_def0);

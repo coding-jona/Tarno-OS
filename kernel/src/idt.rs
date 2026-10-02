@@ -102,6 +102,7 @@ extern "C" {
 #[no_mangle]
 extern "C" fn thos_irq_timer_body() {
     apic::on_timer_tick();
+    crate::random::add_event(apic::ticks());
     apic::eoi();
     crate::ahci::poll_wake(); // safety net for a dropped AHCI completion IRQ
     crate::timer::tick(); // advance the monotonic clock + wake timed sleepers

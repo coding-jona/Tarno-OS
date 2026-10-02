@@ -335,6 +335,7 @@ fn shortcut(k: u8, ctrl: bool, shift: bool) -> bool {
 
 /// Feed one HID boot keyboard report (`[modifiers, reserved, k0..k5]`).
 pub fn feed_report(rpt: &[u8; 8]) {
+    crate::random::add_event(u64::from_le_bytes(*rpt)); // keystroke timing is entropy
     let shift = rpt[0] & 0b0010_0010 != 0; // L/R Shift
     let altgr = rpt[0] & 0b0100_0000 != 0; // Right Alt (AltGr)
     let ctrl = rpt[0] & 0b0001_0001 != 0; // L/R Ctrl
