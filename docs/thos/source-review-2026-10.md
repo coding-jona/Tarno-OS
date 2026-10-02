@@ -15,13 +15,14 @@ expected "not yet" of a young kernel — but several are real bugs.*
 | F2 | **`execve` of a non-ELF file panicked the kernel** (`elf::load(..).expect(..)`) — typing `./message` or any text file at the shell prompt. The ELF loader also indexed the file with unchecked offsets (the PE loader never did). | `elf::validate` bounds-checks every header/segment first; `execve` returns `ENOEXEC`. | Code path; `kbd-test` unchanged. |
 | F3 | Fixed-LBA AHCI write tests ran on any disk — on a real partitioned disk they would overwrite user data. | Skipped when the root FS is in an MBR partition (`ext2::on_partition`). | `bios-test` log. |
 | F4 | `0xAA` (Left-Shift release) was dropped by the new PS/2 decoder → stuck Shift. | Removed from the filter. | `bios-kbd-test`. |
+| F5 | **B2 — the production boot ran the whole self-test suite** (and `expect()`ed on test files; a real install would panic at boot and its disk would get test junk). | New cargo feature **`selftest`** (kernel `Cargo.toml`): all milestones/checks/scratch tests compile only with it. A normal boot is now `sched init → ahci → mount root → registry hives → Security Service → input devices → login → shell`, with `fatal_boot()` giving readable errors (no SATA disk / no root FS / no `/busybox`) instead of bare panics. `cargo xtask *-test` still build with `selftest`; the `bios-*` commands build the real boot path (18 s vs. > 60 s to a prompt in QEMU). | `bios-test`, `bios-kbd-test`, `bios-power-test` run the production boot; all legacy tests run with `selftest`. |
+| F6 | **ACPI S5 poweroff was silently disabled on ACPI-1.0 firmware** (FADT 116 bytes; QEMU's `-M pc` builds one) — the code required ≥ 132 bytes and returned without a word. Also: `bios-power-test` could not tell ACPI from the emulator fallback (a timing race on a log line), so the earlier "verified via the real ACPI S5 path" was **not actually proven**. | `power::init` accepts ≥ 116-byte FADTs (reset register / X_DSDT stay guarded) and logs every abort path; the test now requires the kernel's `THOS: power ok … SLP_TYP` line. | `bios-power-test` 3/3 runs, log shows `ACPI S5 (PM1a 0x604, SLP_TYP 0/0)`. |
 
 ## 2. Open — real bugs / hazards (not fixed yet)
 
 | # | Finding | Why it matters |
 |---|---|---|
 | B1 | **Syscalls trust user pointers completely** (`sys_write`, `sys_read`, `user_cstr`, `getdents64`, NT `*(a as *mut ..)` …): no range check, no SMAP/SMEP. A process can read/write kernel memory via `write()`/`read()` or crash the kernel with a bad pointer. | The security story (AV, W^X, capability policy) is moot while any process can poke ring 0. Highest-priority hardening item. |
-| B2 | **The production boot runs the whole self-test suite.** `storage_milestone` & co. `expect()` on test files (`/init`, `/pe-hello.exe`, `/crt.exe`, …), write `/thos-created.txt`, hives, quarantine log, and spawn dozens of processes — on every boot, including the interactive one. A real install without those files **panics at boot**; a real user's disk gets test junk. | Blocks any real installer. Needs a `selftest` cargo feature; the default boot must be: bring-up → mount root → login → shell. |
 | B3 | `kill(pid, sig)` ignores `pid` and, for SIGTERM/KILL/ABRT, **kills the caller**. Signals (`rt_sigaction`, `sigprocmask`, `sigreturn`) are accepted and ignored; no handlers ever run, no `SIGINT` on Ctrl+C, no `SIGCHLD`. | Job control, `Ctrl+C`, daemons, almost every real program. |
 | B4 | `getrandom` is a fixed-seed xorshift (predictable). `cred::rand64` falls back to TSC xorshift (the Acer's Westmere has no RDRAND). | Needs a real CSPRNG (entropy pool + ChaCha20) before TLS / network / package signatures. |
 | B5 | `execve` does **no execute-permission check** (`x` bits ignored) and no setuid semantics. | DAC is incomplete for exec. |
@@ -57,11 +58,11 @@ expected "not yet" of a young kernel — but several are real bugs.*
 - Memory: free-list frame allocator, no zones/NUMA, 1 MiB DMA arena (32 tags x 32 KiB), kernel heap 32 MiB static.
 - Boot/BIOS: now Limine BIOS + MBR (Acer) or UEFI + GPT (ASRock); the UEFI boot picker (`loaders/thos-boot`) is not part of the BIOS path.
 - Drivers present: AHCI (NCQ, MSI/MSI-X, error recovery), xHCI (keyboard only, no descriptor parsing), PS/2 keyboard, 16550 serial, LAPIC/PIT. **Absent:** EHCI, mouse/touchpad, NIC, audio, GPU, RTC, HPET, IO-APIC, CSPRNG.
-- Security core is further along than the platform under it: SAK trusted path, `elevate()`, exec gate + isolated Security Service, integrity baselines, per-key registry DAC — but see B1 (pointer trust) and B2 (self-tests in prod).
+- Security core is further along than the platform under it: SAK trusted path, `elevate()`, exec gate + isolated Security Service, integrity baselines, per-key registry DAC — but see B1 (pointer trust).
 
 ## 4. Recommended order (hardening first, then the plans)
 
-1. **B2** gate self-tests behind a `selftest` feature (unblocks real installs).
+1. ~~B2 `selftest` feature~~ — done (F5).
 2. **B1** user-pointer validation + SMEP/SMAP (unblocks any security claim).
 3. **B3** real signals + `kill`; **B8** RTC/clock; **B4** CSPRNG.
 4. Streaming file I/O + page cache + growable heap (**B6**), ext2 directories past 12 blocks (**B7**).

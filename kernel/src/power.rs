@@ -55,7 +55,11 @@ pub unsafe fn init(rsdp: *const u8) {
         crate::kprintln!("THOS: power            no FADT — only emulator shutdown ports available");
         return;
     };
-    if len < 132 {
+    // ACPI 1.0 FADTs are 116 bytes and already carry SMI_CMD / PM1a_CNT / DSDT /
+    // flags — everything S5 needs. The reset register (129+) and X_DSDT (148+)
+    // only exist in later revisions and are guarded separately below.
+    if len < 116 {
+        crate::kprintln!("THOS: power            FADT is only {len} bytes — emulator ports only");
         return;
     }
     let smi_cmd = rd32(fadt, 48);
@@ -98,11 +102,13 @@ pub unsafe fn init(rsdp: *const u8) {
         }
     }
     if dsdt_pa == 0 {
+        crate::kprintln!("THOS: power            FADT has no DSDT pointer — emulator ports only");
         return;
     }
     let dsdt = (dsdt_pa + hhdm_offset()) as *const u8;
     let dlen = rd32(dsdt, 4) as usize;
     if !(36..=0x400000).contains(&dlen) {
+        crate::kprintln!("THOS: power            DSDT length {dlen:#x} implausible — emulator ports only");
         return;
     }
     let body = core::slice::from_raw_parts(dsdt, dlen);

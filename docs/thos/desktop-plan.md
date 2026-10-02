@@ -91,8 +91,8 @@ Linux desktop allows — not just colours. Designing for that now:
 (the console layout table has none — B11), scrollback (Shift+PgUp), key repeat,
 **IRQ-driven i8042 via the IO-APIC** instead of polling (B10, B12), real
 `TIOCGWINSZ` from the framebuffer size, `Ctrl+C` → `SIGINT` (needs real signals, B3),
-clean shutdown (flush, stop other CPUs, B14), and the **`selftest` feature split
-(B2)** so the default boot is just *bring-up → mount → login → shell*.
+and clean shutdown (flush, stop other CPUs, B14). (The default boot is now just
+*bring-up → mount → login → shell*; self-tests are behind the `selftest` feature.)
 
 **Stage 1 — Input foundation.** PS/2 **mouse/touchpad** (the 5742G uses a PS/2
 Synaptics-class pad: start with plain relative mode, gestures later), a kernel

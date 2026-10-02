@@ -22,6 +22,9 @@
 #![no_main]
 #![feature(alloc_error_handler)]
 #![feature(abi_x86_interrupt)]
+// The self-test suite (cargo feature `selftest`) is most of this file. A normal
+// boot compiles it out entirely, leaving the helpers it used unreferenced.
+#![cfg_attr(not(feature = "selftest"), allow(dead_code, unused_imports, unused_variables))]
 
 extern crate alloc;
 
@@ -155,6 +158,7 @@ extern "C" fn kmain() -> ! {
     vmm_bringup();
     gdi_bringup();
     fbcon::resume();
+    #[cfg(feature = "selftest")]
     gdi_paint_check();
 
     let mp = MP_REQUEST.response().expect("Limine MP request unanswered");
@@ -162,21 +166,35 @@ extern "C" fn kmain() -> ! {
 
     syscall::init_cpu(0);
 
-    scheduler_milestone();
-    multi_wait_milestone();
-    storage_milestone();
+    // `selftest` = the full in-kernel verification suite `cargo xtask *-test`
+    // drives (it needs the test binaries on the disk, writes scratch files,
+    // spawns dozens of processes). A normal boot is just: bring up the
+    // scheduler, find the disk + root filesystem, start the input devices.
+    #[cfg(feature = "selftest")]
+    {
+        scheduler_milestone();
+        multi_wait_milestone();
+        storage_milestone();
+    }
+    #[cfg(not(feature = "selftest"))]
+    {
+        sched::init_bsp();
+        boot_system();
+    }
 
     #[cfg(feature = "interactive")]
     {
         // Milestone 2: first-run setup / login, then launch the shell off ext2
         // and hand it the USB keyboard.
-        let fs = ext2::open().expect("mount ext2 for the shell");
+        let fs = ext2::open().unwrap_or_else(|e| fatal_boot("cannot mount the root filesystem", e));
         let session = login::establish(&fs);
         process::set_session(&session.name, session.uid);
         kprintln!("THOS: session          {} (uid {})", session.name, session.uid);
 
         // The interactive shell is stock BusyBox `sh` (ash).
-        let sh = fs.read_path("/busybox").expect("read /busybox from ext2");
+        let sh = fs
+            .read_path("/busybox")
+            .unwrap_or_else(|| fatal_boot("no login shell", "/busybox is missing from the root filesystem"));
         kprintln!("THOS: shell            /busybox sh = {} bytes", sh.len());
         process::spawn_init(
             &sh,
@@ -1436,7 +1454,13 @@ fn storage_milestone() {
         );
     }
 
-    // USB keyboard via xHCI -> the line-disciplined console -> fd 0.
+    start_input_devices();
+}
+
+/// Bring up every input device that can feed the console: USB keyboard via
+/// xHCI (if the machine has one) and the i8042 PS/2 keyboard (the laptop
+/// path). Each runs a polling thread that feeds `console::feed_report`.
+fn start_input_devices() {
     match xhci::init() {
         Ok(x) => {
             *XHCI.lock() = Some(x);
@@ -1454,6 +1478,32 @@ fn storage_milestone() {
         }
         Err(e) => kprintln!("THOS: ps2              {}", e),
     }
+}
+
+/// Normal (non-`selftest`) boot after the scheduler is up: disk, root
+/// filesystem, registry hives, the Security Service, input devices.
+#[cfg(not(feature = "selftest"))]
+fn boot_system() {
+    if let Err(e) = ahci::init() {
+        fatal_boot("no usable SATA disk (BIOS SATA mode must be AHCI)", e);
+    }
+    let fs = ext2::open().unwrap_or_else(|e| fatal_boot("cannot mount the root filesystem", e));
+    let hives = registry::load_hives(&fs);
+    kprintln!("THOS: registry ok      {}/3 hives loaded from disk", hives);
+    secsvc::spawn(&fs); // logs and degrades gracefully if /secsvc is absent
+    start_input_devices();
+}
+
+/// A boot failure the user can act on: say what is wrong, then stop. (This is
+/// the screen the user sees on a real machine now that the framebuffer console
+/// mirrors the kernel log — so it must not be a bare `expect` panic.)
+#[allow(dead_code)] // only the normal boot path and the interactive login use it
+fn fatal_boot(what: &str, why: &str) -> ! {
+    kprintln!("");
+    kprintln!("THOS: cannot continue — {what}");
+    kprintln!("THOS:   {why}");
+    exit_qemu(ExitCode::Failed);
+    hcf();
 }
 
 // --- concurrent NCQ I/O check (storage_milestone) ---

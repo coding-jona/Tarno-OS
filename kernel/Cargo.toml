@@ -24,27 +24,33 @@ x86_64 = "0.15"
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
 [features]
+# `selftest`: compile in the full in-kernel verification suite (milestones,
+# registry/exec-gate/section/integrity/DAC checks, the scratch-sector AHCI
+# tests, ...). A normal boot is just bring-up -> mount -> login -> shell.
+# Every `cargo xtask *-test` builds with it; the test-specific features below
+# imply it.
+selftest = []
 # `interactive`: kmain holds after the milestones instead of halting, so a
 # human (or `cargo xtask kbd-test`) can type on the USB keyboard.
 interactive = []
 # `stress`: run the SMP scheduler stress milestone (many threads churning
 # yield / block / wake / fork across every CPU). Driven by `cargo xtask smp-test`.
-stress = []
+stress = ["selftest"]
 # `faulttest`: read an LBA that `cargo xtask ncq-error-test` poisons via QEMU
 # blkdebug, to exercise AHCI NCQ error recovery.
-faulttest = []
+faulttest = ["selftest"]
 # `bbtest`: run a stock static BusyBox in storage_milestone. Driven by
 # `cargo xtask busybox-test`. Off by default — reading the 2 MiB binary a
 # block at a time slows every boot.
-bbtest = []
+bbtest = ["selftest"]
 # `pipetest`: run a BusyBox `sh -c` line with `|` and `$(…)` in
 # storage_milestone. Driven by `cargo xtask pipe-test`.
-pipetest = []
+pipetest = ["selftest"]
 # `petest`: load and run a statically linked Win64 `.exe` via the native PE
 # loader. Driven by `cargo xtask pe-test`.
-petest = []
+petest = ["selftest"]
 # `regcrashtest`: deliberately "crash" (a controlled QEMU exit) partway
 # through `ext2::write_path_owned`'s overwrite path — right after the new
 # content's inode commit, before the old blocks are freed — to prove that
 # ordering is really crash-safe. Driven by `cargo xtask registry-crash-test`.
-regcrashtest = []
+regcrashtest = ["selftest"]

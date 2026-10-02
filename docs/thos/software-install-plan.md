@@ -15,7 +15,7 @@ surface**, and several platform gaps sit between "THOS runs a test `.exe`" and
 | Linux ELF | static `ET_EXEC` only, 62 syscalls (many stubs), BusyBox + ~60 applets | **dynamic loader** (`PT_INTERP`, PIE, `dlopen`), file-backed `mmap`, **threads + futex**, real signals, sockets, `/proc` `/sys` `/dev`, symlinks, timestamps/clock |
 | Windows PE | PE32+ only; ~130 ANSI entry points (kernel32 31, ntdll 43, msvcrt 35, user32 14, gdi32 6); real objects, SEH, APC, registry, sections | **PE32 (32-bit) / WOW64** — most installers and all old `.msi` are 32-bit; wide-char APIs; `CreateFile` create/write, `FindFirstFile`, `CreateProcess`, `Reg*` (advapi32), shell32/ole32/COM, services, `HeapFree`/`free` that really free |
 | Filesystem | ext2: whole-file read on open, whole-file rewrite on write, **12-block directories**, 32 MiB kernel heap | streaming I/O + page cache + growable heap; large directories; symlinks; timestamps |
-| Boot | the *production* boot runs the whole self-test suite and `expect()`s on test files | a clean `selftest` feature split (otherwise an installed system panics at boot) |
+| Boot | ~~the production boot ran the whole self-test suite~~ — **fixed** (`selftest` feature; see source review F5) | an **installer** that lays down partitions + Limine + the root FS on a real disk |
 | Security | exec gate, isolated Security Service, quarantine, SAK, `elevate()` — **but syscalls trust user pointers** | pointer validation + SMEP/SMAP before any "scan then run untrusted installer" claim is true |
 
 So the package *mechanism* can be built early, but "install anything" is gated on
@@ -75,7 +75,7 @@ audited code path, and makes every install reversible.
 
 ## 4. What this depends on (the real critical path, ordered)
 
-1. **Hardening prerequisites** — `selftest` feature split (B2), user-pointer
+1. **Hardening prerequisites** — (`selftest` split done, F5), user-pointer
    validation + SMEP/SMAP (B1), real signals/`kill` (B3), clock/RTC (B8), CSPRNG (B4).
    Without these an "untrusted installer" sandbox is not a boundary and a real
    install panics at boot.
@@ -94,8 +94,7 @@ audited code path, and makes every install reversible.
 
 ## 5. Stages
 
-- **S-1 — Prerequisites** (section 4, items 1–2): `selftest` split, pointer
-  validation, streaming I/O. Nothing below is honest without them.
+- **S-1 — Prerequisites** (section 4, items 1–2): pointer validation, signals, streaming I/O. Nothing below is honest without them.
 - **S0 — Static payloads**: `thos-pkg` core, package db, transactions, uninstall;
   formats = tar/zip of static binaries; Security Service scan hook. *Milestone:*
   install and remove a static ELF and a static `.exe` with a launcher entry.

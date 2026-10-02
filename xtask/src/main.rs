@@ -33,16 +33,16 @@ fn main() {
         }
         "bios-image" => {
             // `--interactive`: the login/shell build (the plain one just halts).
-            build_kernel(if args.iter().any(|a| a == "--interactive") { &["interactive"] } else { &[] });
+            build_kernel_prod(if args.iter().any(|a| a == "--interactive") { &["interactive"] } else { &[] });
             bios_image();
         }
         "bios-test" => {
-            build_kernel(&[]);
+            build_kernel_prod(&[]);
             let img = bios_image();
             bios_test(&img);
         }
         "bios-run" => {
-            build_kernel(&["interactive"]);
+            build_kernel_prod(&["interactive"]);
             let img = bios_image();
             let log = workspace_root().join("target/bios-run-serial.log");
             println!("serial log: {}", log.display());
@@ -57,7 +57,7 @@ fn main() {
                 .status();
         }
         "bios-power-test" => {
-            build_kernel(&["interactive"]);
+            build_kernel_prod(&["interactive"]);
             let img = bios_image();
             for (cmd, needle) in [
                 ("reboot", "THOS: rebooting"),
@@ -69,7 +69,7 @@ fn main() {
             println!("bios-power-test PASSED: reboot / poweroff / poweroff -f end the machine from the shell");
         }
         "bios-kbd-test" => {
-            build_kernel(&["interactive"]);
+            build_kernel_prod(&["interactive"]);
             let img = bios_image();
             bios_kbd_test(&img);
         }
@@ -172,7 +172,22 @@ fn run(cmd: &mut Command) {
     }
 }
 
+/// The kernel *with* the in-kernel self-test suite (`selftest`): what every
+/// legacy `cargo xtask *-test` boots. Needs the test binaries on the disk.
 fn build_kernel(features: &[&str]) {
+    let mut all = vec!["selftest"];
+    all.extend_from_slice(features);
+    build_kernel_raw(&all);
+}
+
+/// The kernel as a user boots it: no self-tests, just bring-up -> mount ->
+/// login -> shell. The `bios-*` commands use this so they exercise the real
+/// boot path.
+fn build_kernel_prod(features: &[&str]) {
+    build_kernel_raw(features);
+}
+
+fn build_kernel_raw(features: &[&str]) {
     let mut c = Command::new(env!("CARGO"));
     c.current_dir(workspace_root())
         .args(["build", "--package", "thos-kernel", "--release"]);
@@ -3553,15 +3568,20 @@ fn bios_power_test(img: &Path, cmd: &str, needle: &str) {
         std::thread::sleep(std::time::Duration::from_millis(200));
     };
     let out = std::fs::read_to_string(&log).unwrap_or_default();
-    let fallback = out.contains("it is now safe to switch the machine off");
+    // The *only* reliable evidence that the ACPI S5 path (FADT PM1 control block
+    // + `\_S5_` from the DSDT) was used is the kernel having found it at boot.
+    // (Checking for the "safe to switch off" fallback message is a race: QEMU
+    // stops the guest asynchronously, so it may or may not get printed. Also,
+    // under QEMU's PIIX4 the emulator fallback port *is* the PM1a control port.)
+    let acpi = out.contains("THOS: power ok");
     if !exited {
         let _ = child.kill();
         let _ = child.wait();
         eprintln!("bios-power-test FAILED: `{cmd}` did not end the machine; log: {}", log.display());
         exit(1);
     }
-    if cmd.starts_with("poweroff") && fallback {
-        eprintln!("bios-power-test FAILED: `{cmd}` worked only via the emulator-port fallback, ACPI S5 did not; log: {}", log.display());
+    if cmd.starts_with("poweroff") && !acpi {
+        eprintln!("bios-power-test FAILED: the kernel found no ACPI S5 data, `{cmd}` can only have used an emulator port; log: {}", log.display());
         exit(1);
     }
     println!("  ok   `{cmd}`");
