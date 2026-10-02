@@ -27,7 +27,8 @@ Fill in once received (keep the original message / screenshot somewhere safe):
 
 | Date | Contributor | Medium (chat / e-mail / in person) | Answer |
 |---|---|---|---|
-| _pending_ | kirby | | |
+| 2026-10-02 | kirby | chat message in the maintainer's session; the maintainer (`coding-jona`) confirmed in the same session that it came from kirby, who was present | "mach was nötig ist, die lizens ist nicht von belang" ("do whatever is necessary, the licence doesn't matter to me") |
 
-Until a row above says "agreed", the licence of those 68 lines is formally still
-AGPL-3.0; if consent cannot be obtained they should be rewritten.
+Status: **consent given informally** (the wording above, confirmed by the maintainer).
+It is not the explicit sentence suggested in the message template; if a stricter record
+is ever wanted, ask for a one-line written "I agree to GPL-2.0-or-later" and add a row.
