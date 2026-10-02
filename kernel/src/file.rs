@@ -46,6 +46,86 @@ pub trait FileOps: Send + Sync {
     }
 }
 
+// --- /dev ---
+
+/// The few character devices every Unix program expects under `/dev`. They are virtual:
+/// `open` recognises the paths before it looks at the filesystem, so they exist even on
+/// a root image that has no `/dev` directory.
+pub enum DevKind {
+    Null,
+    Zero,
+    /// `/dev/random` and `/dev/urandom` — both the CSPRNG (never blocks once seeded).
+    Random,
+}
+
+pub struct DevFile(pub DevKind);
+
+impl FileOps for DevFile {
+    fn read(&self, buf: &mut [u8]) -> i64 {
+        match self.0 {
+            DevKind::Null => 0, // always EOF
+            DevKind::Zero => {
+                buf.fill(0);
+                buf.len() as i64
+            }
+            DevKind::Random => {
+                crate::random::fill(buf);
+                buf.len() as i64
+            }
+        }
+    }
+    fn write(&self, buf: &[u8]) -> i64 {
+        // Everything is accepted. Writes to the random devices would only stir the pool;
+        // THOS ignores them rather than trusting user-supplied "entropy".
+        buf.len() as i64
+    }
+    fn seek(&self, _o: i64, _w: u32) -> i64 {
+        0
+    }
+    fn stat(&self) -> (u32, u64) {
+        (S_IFCHR | 0o666, 0)
+    }
+}
+
+/// A character device by absolute path, if `path` names one. `/dev/tty` and
+/// `/dev/console` are the console: read = the keyboard line discipline, write = the
+/// screen (the same objects fds 0/1 are made of).
+pub fn open_device(path: &str, want_read: bool, want_write: bool) -> Option<Arc<dyn FileOps>> {
+    Some(match path {
+        "/dev/null" => Arc::new(DevFile(DevKind::Null)),
+        "/dev/zero" => Arc::new(DevFile(DevKind::Zero)),
+        "/dev/urandom" | "/dev/random" => Arc::new(DevFile(DevKind::Random)),
+        "/dev/tty" | "/dev/console" => {
+            if want_read && !want_write {
+                Arc::new(KeyboardFile)
+            } else if want_write && !want_read {
+                Arc::new(ConsoleFile { writable: true })
+            } else {
+                Arc::new(TtyFile)
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// `/dev/tty` opened read-write: keyboard in, screen out.
+pub struct TtyFile;
+
+impl FileOps for TtyFile {
+    fn read(&self, buf: &mut [u8]) -> i64 {
+        KeyboardFile.read(buf)
+    }
+    fn write(&self, buf: &[u8]) -> i64 {
+        ConsoleFile { writable: true }.write(buf)
+    }
+    fn seek(&self, _o: i64, _w: u32) -> i64 {
+        ESPIPE
+    }
+    fn stat(&self) -> (u32, u64) {
+        (S_IFCHR | 0o666, 0)
+    }
+}
+
 // --- console ---
 
 pub struct ConsoleFile {

@@ -495,6 +495,9 @@ const O_EXCL: u64 = 0o200;
 /// path is `EEXIST`, same as Linux. `O_CREAT` against an existing path with
 /// no `O_EXCL` is a no-op (POSIX: the flag is ignored).
 pub fn open_resolved(path: &str, flags: u64) -> i64 {
+    if let Some(r) = open_dev(path, flags & 0x3 != 1, flags & 0x3 != 0) {
+        return r;
+    }
     if flags & O_CREAT != 0 {
         let Some(task) = sched::current().task() else {
             return EBADF;
@@ -521,6 +524,13 @@ pub fn open_resolved(path: &str, flags: u64) -> i64 {
     open_resolved_access(path, accmode != 1, accmode != 0)
 }
 
+/// `/dev/null` & co: `Some(fd)` if `path` is a virtual device node.
+fn open_dev(path: &str, want_read: bool, want_write: bool) -> Option<i64> {
+    let dev = crate::file::open_device(path, want_read, want_write)?;
+    let task = sched::current().task()?;
+    Some(task.fd_alloc(dev) as i64)
+}
+
 /// The directory component of an absolute path (`"/"` for a top-level name).
 fn parent_of(path: &str) -> Option<&str> {
     let idx = path.rfind('/')?;
@@ -535,6 +545,9 @@ fn parent_of(path: &str) -> Option<&str> {
 /// (`Inode::access_ok`) — the DAC check every file open goes through now,
 /// not just a mode-bits-ignored lookup.
 pub fn open_resolved_access(path: &str, want_read: bool, want_write: bool) -> i64 {
+    if let Some(r) = open_dev(path, want_read, want_write) {
+        return r;
+    }
     let Some(task) = sched::current().task() else {
         return EBADF;
     };

@@ -383,6 +383,8 @@ fn disk_image() -> PathBuf {
         ("clocktest.rs", "clocktest"),
         // POSIX signals test, typed in by `kbd-test`.
         ("sigtest.rs", "sigtest"),
+        // /dev/null, /dev/zero, /dev/urandom, /dev/tty — typed in by `kbd-test`.
+        ("devtest.rs", "devtest"),
         // getrandom quality test, run by `random-test`.
         ("randtest.rs", "randtest"),
     ] {
@@ -3337,6 +3339,10 @@ fn kbd_test(iso: &Path) {
     // POSIX signals: handlers, masks, SIGKILL on a busy loop, EINTR, SA_RESTART, SIGPIPE.
     type_line(&sock, "sigtest");
     let _ = wait_for(&log, "sig ", 90);
+
+    // Character devices under /dev.
+    type_line(&sock, "devtest");
+    let _ = wait_for(&log, "dev ", 60);
 
     // Ctrl+C reaches the foreground process: `sleep 100` is interrupted, the shell lives on.
     type_line(&sock, "sleep 100");
