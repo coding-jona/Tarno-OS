@@ -78,6 +78,11 @@ fn main() {
             let img = bios_image();
             longcmd_test(&img);
         }
+        "net-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            net_test(&img);
+        }
         "random-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
@@ -3897,6 +3902,42 @@ fn boot_and_run(img: &Path, tag: &str, cmd: &str, needle: &str, secs: u64) -> St
 }
 
 /// `getrandom` quality, and that two boots do not produce the same stream.
+/// virtio-net + smoltcp: boot with QEMU user-mode networking; the kernel's net thread must
+/// find the NIC, resolve the gateway by ARP and get an ICMP echo reply from it.
+fn net_test(img: &Path) {
+    let root = workspace_root();
+    let log = root.join("target/net-serial.log");
+    let _ = std::fs::remove_file(&log);
+    let run_img = root.join("target/net.img");
+    std::fs::copy(img, &run_img).expect("copy image");
+    // Westmere-class CPU, small RAM: the reference machine is a 2010 laptop.
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(["-M", "pc", "-cpu", "Westmere", "-m", "512M", "-smp", "2"])
+        .args([
+            "-drive", &format!("id=disk0,if=none,format=raw,file={}", run_img.to_str().unwrap()),
+            "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=disk0,bus=ahci0.0,bootindex=0",
+            "-nic", "user,model=virtio-net-pci",
+            "-display", "none", "-no-reboot",
+            "-serial", &format!("file:{}", log.to_str().unwrap()),
+        ])
+        .spawn()
+        .expect("spawn qemu");
+    let ok = wait_for(&log, "THOS: net ok", 90);
+    let out = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = child.kill();
+    let _ = child.wait();
+    if ok {
+        let line = out.lines().find(|l| l.contains("THOS: net ok")).unwrap_or("");
+        println!("net-test PASSED: {}", line.trim());
+    } else {
+        for l in out.lines().filter(|l| l.contains("net")) {
+            eprintln!("  {l}");
+        }
+        eprintln!("net-test FAILED: no ping reply from the gateway");
+        exit(1);
+    }
+}
+
 fn random_test(img: &Path) {
     let first = |out: &str| {
         out.split("first=").nth(1).and_then(|r| r.split_whitespace().next()).map(String::from)

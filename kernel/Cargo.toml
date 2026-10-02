@@ -23,6 +23,9 @@ x86_64 = "0.15"
 # runtime CPU dispatch into an unsupported path faults with #UD.
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
+# TCP/IP stack (BSD-0). `alloc` + only the protocols we use; no std, no Wi-Fi.
+smoltcp = { version = "0.12", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "socket-dns"] }
+
 [features]
 # `selftest`: compile in the full in-kernel verification suite (milestones,
 # registry/exec-gate/section/integrity/DAC checks, the scratch-sector AHCI

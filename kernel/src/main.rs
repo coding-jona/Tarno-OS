@@ -58,6 +58,7 @@ mod process;
 mod registry;
 mod sched;
 mod secsvc;
+mod net;
 mod seh;
 mod signal;
 mod serial;
@@ -65,6 +66,7 @@ mod smp;
 mod syscall;
 mod timer;
 mod usercopy;
+mod virtio_net;
 mod vfs;
 mod vmm;
 mod window;
@@ -1493,6 +1495,14 @@ fn start_input_devices() {
             kprintln!("THOS: xhci ok          USB keyboard attached (poll thread up)");
         }
         Err(e) => kprintln!("THOS: xhci             {}", e),
+    }
+
+    // Network: virtio-net under QEMU (real NICs get their own drivers; none yet).
+    match net::init() {
+        Ok(()) => {
+            sched::spawn("net", net::net_thread, 0);
+        }
+        Err(e) => kprintln!("THOS: net              {}", e),
     }
 
     // PS/2 keyboard via the i8042 — the laptop target has no xHCI at all.
