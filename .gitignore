@@ -19,3 +19,6 @@ __pycache__/
 /boot.log
 **/*.rs.bk
 /third_party/limine/*.o
+
+# Claude Code: per-user permission settings must never be committed
+.claude/settings.local.json

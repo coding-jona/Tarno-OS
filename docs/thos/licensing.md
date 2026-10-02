@@ -1,31 +1,49 @@
-# THOS – Licensing strategy (DECIDED 2026-08-29)
+# THOS – Licensing strategy (DECIDED 2026-08-29, confirmed 2026-10-02)
 
-**Decision:** the THOS kernel tree is **GPL-2.0-or-later**. The frozen Linux-distro
-components keep **AGPL-3.0**. Vendored code under `third_party/` keeps its upstream
-license. Every source file carries an `SPDX-License-Identifier` header.
+**Decision: the whole project is GPL-2.0-or-later.** Every source file carries
+`SPDX-License-Identifier: GPL-2.0-or-later`; the full text is in
+[`LICENSES/GPL-2.0-or-later.txt`](../../LICENSES/GPL-2.0-or-later.txt) and the root
+[`LICENSE`](../../LICENSE) (GPL-2.0). `.reuse/dep5` covers files that cannot carry a
+header (docs, configuration, data, binaries).
 
-- `kernel/ hal/ personalities/ loaders/ drivers/ boot/ xtask/` + THOS build files
-  → `GPL-2.0-or-later` (keeps the door open for a future `amdgpu` port without a second
-  relicensing round, and stays GPL-3 compatible).
-- `tarnod/ tarno-guard-ebpf/ tarno-desktop/ tarno-installer/ tarno-ui-theme/
-  tarno-br2-external/ scripts/` → unchanged **AGPL-3.0** (see `FROZEN.md`).
-- `third_party/*` → upstream licenses, vendored unmodified.
-- Root `LICENSE` (AGPL-3.0 full text) stays as the repo default for the frozen parts.
-- `LICENSES/GPL-2.0-or-later.txt` (full text) added 2026-10-02. **Still open:** a `.reuse/dep5` map, and the licence of the frozen Devuan/Go parts — see *Open licensing questions* below.
+**Why GPL-2.0 and not AGPL-3.0** (the project was AGPL-3.0 until 2026-08-29): the
+Linux `amdgpu` GPU driver is **GPL-2.0-only**, which is *incompatible* with AGPL-3.0
+and GPL-3.0. Choosing GPL-2.0-or-later keeps the door open to port `amdgpu` (GPU
+path A, see below) without a second relicensing round — and `-or-later` still lets
+the code be used under GPL-3. The licence of the root `LICENSE` file was switched
+from AGPL-3.0 to GPL-2.0 on 2026-08-29 (commit `4830a08`, made through the GitHub web
+UI) as part of this decision.
 
-### Open licensing questions (found 2026-10-02, before making the repository public)
+**Exceptions**
+- `third_party/*` keeps its upstream licence, vendored unmodified.
+- `kernel/font/Lat15-Terminus16.psf` is the Terminus Font under the **SIL OFL 1.1**
+  (`LICENSES/OFL-1.1.txt`, attribution in `kernel/font/README.md`).
 
-1. The root `LICENSE` file is the **GPL-2.0** text, not the AGPL-3.0 text this document says it is.
-2. The frozen components (`main.go`, `cmd/`, `tarno/`, `scripts/`, `tarno-devuan-live/`) carry **no SPDX header at all**, so their licence is currently undefined in the files themselves.
-3. A copyright-holder line / `AUTHORS` has not been decided (the history has three committer identities).
+**History / the frozen Devuan parts.** Before 2026-08-29 the whole repository was
+AGPL-3.0 (`LICENSE`, commit `a68ffef`, 2026-08-22). An earlier version of this document
+said the frozen Devuan/Go components "keep AGPL-3.0" and that the root `LICENSE` was
+AGPL; that was wrong — the `LICENSE` file had already been changed to GPL-2.0 45 minutes
+before this document was written, and the frozen components had no SPDX headers. As of
+2026-10-02 they carry `GPL-2.0-or-later` like everything else (the earlier AGPL
+reasoning — its network clause only matters for network-facing services — was not
+worth a second licence in one tree).
 
-One licence for everything (GPL-2.0-or-later) would be the simplest open-source setup; keeping AGPL-3.0 for the frozen network-facing daemon is the alternative. Needs the maintainer's decision.
+**Contributors.** Two commits by a third contributor (`kirby`, 2026-08-22, 68 lines:
+`tarno/mistral.go`, `tarno/provider.go`, `tarno/tarno.go`, `go.mod`, `go.sum`,
+`.gitignore`, a lint workflow) were made while the repository was AGPL-3.0. Relicensing
+those lines formally needs that contributor's consent; the lines are small and in the
+frozen part. **Open action:** ask for consent, or rewrite those files.
+
+**Copyright holder line.** `.reuse/dep5` currently says "THOS contributors (see the git
+history)"; replace it with the maintainer's chosen name if wanted.
+
+---
 
 ### Does hosting on GitHub complicate this?
 
 No. Pushing a public repo grants other GitHub users a view/fork right (GitHub ToS D.4);
 your chosen open-source license governs everything else. A public repo with a
-GPL-2.0-or-later kernel tree and AGPL-3.0 frozen dirs is a normal, valid setup. The only
+GPL-2.0-or-later tree (with a vendored OFL font and upstream-licensed `third_party/`) is a normal, valid setup. The only
 real constraint is **license compatibility between files that get linked together** —
 handled by the per-directory split above and by keeping `amdgpu` (GPL-2.0-only) out
 unless/until Path A is chosen.

@@ -1,0 +1,20 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: THOS (Tarno Hybrid OS)
+Upstream-Contact: see the repository
+Source: https://github.com/condingmaaster/Tarno-OS
+Comment: One licence for the whole project: GPL-2.0-or-later (decided 2026-08-29,
+ so that GPL-2.0-only code such as Linux `amdgpu` can be combined later without
+ another relicensing round). Source files carry an SPDX header; this file covers
+ everything that cannot (docs, configuration, data, binaries). The only
+ exceptions are listed explicitly below. See docs/thos/licensing.md.
+
+Files: *
+Copyright: 2026 THOS contributors (see the git history)
+License: GPL-2.0-or-later
+
+Files: kernel/font/Lat15-Terminus16.psf
+Copyright: 2010 Dimitar Toshkov Zhekov
+Comment: Terminus Font (Reserved Font Name "Terminus Font"), converted to the
+ PSF1 console format and ISO-8859-15 order by Debian's console-setup package.
+ Embedded unmodified in the kernel image by kernel/src/fbcon.rs.
+License: OFL-1.1

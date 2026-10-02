@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Boot the built Tarno OS ISO in QEMU and check it actually reaches a
 working desktop - an automated stand-in for the manual real-hardware
 testing this project has relied on so far.

@@ -76,4 +76,4 @@ events) — never by one personality calling the other's syscall table.
 
 See [`roadmap.md`](roadmap.md) for the phased build order, [`feasibility.md`](feasibility.md)
 for the honest cost/blocker analysis, and [`licensing.md`](licensing.md) for the
-AGPL-3.0 ↔ LGPL/GPL reuse question.
+GPL-2.0 ↔ LGPL/GPL reuse question (the project was AGPL-3.0 until 2026-08-29).

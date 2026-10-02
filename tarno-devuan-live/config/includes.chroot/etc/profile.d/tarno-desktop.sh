@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # start labwc on login - same "startx from .profile" trick used for X
 # for decades, just launching a wayland compositor instead.
 #

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Builds a flat APT repo from .deb files. Signs Release if APT_REPO_GPG_KEY
 # (armored private key) and APT_REPO_GPG_KEY_ID are set; otherwise the repo
 # is left unsigned and needs [trusted=yes] in sources.list.

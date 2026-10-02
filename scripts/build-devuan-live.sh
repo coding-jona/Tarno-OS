@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Builds the Devuan live ISO locally. Run this on a real Devuan machine
 # (Devuan 13/excalibur) - native debootstrap already knows devuan suite
 # names, so unlike the CI workflow this needs no debootstrap package swap.

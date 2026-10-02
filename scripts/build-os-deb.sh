@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Builds tarno-os.deb - the whole OS layer (tarnod, the labwc/waybar
 # desktop, tarno-settings/tarno-store/tarno-assistant, all the OpenRC
 # service wiring) as one installable/upgradable apt package.

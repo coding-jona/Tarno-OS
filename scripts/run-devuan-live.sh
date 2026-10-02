@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Boots the built live ISO in QEMU, for testing without a spare machine
 # or USB stick. Needs qemu-system-x86_64.
 set -eu

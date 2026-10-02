@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Builds tarno-tools.deb (tarno-install + tarno-disk-install) from source.
 # VERSION defaults to a git-sha dev version if not set.
 set -eu

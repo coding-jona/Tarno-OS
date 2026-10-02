@@ -268,11 +268,14 @@ Full inventory and driver implications: [`docs/thos/hw-target.md`](docs/thos/hw-
 
 ## Licensing
 
-The THOS kernel tree (`kernel/ loaders/ xtask/` + build files) is
-**GPL-2.0-or-later**. The frozen Devuan components keep **AGPL-3.0**. Vendored code
-under `third_party/` keeps its upstream license. Every source file carries an
-`SPDX-License-Identifier`. Rationale, the compatibility matrix, and the `amdgpu`
-(GPL-2.0-only) question: [`docs/thos/licensing.md`](docs/thos/licensing.md).
+THOS is **GPL-2.0-or-later** — the whole repository, including the frozen Devuan
+components (full text: [`LICENSE`](LICENSE) and [`LICENSES/`](LICENSES/)). It was
+AGPL-3.0 until 2026-08-29; GPL-2.0 was chosen so that GPL-2.0-only code such as the
+Linux `amdgpu` driver can be combined later. Exceptions: vendored code under
+`third_party/` keeps its upstream licence, and the console font is the Terminus Font
+under the SIL OFL 1.1. Every source file carries an `SPDX-License-Identifier`; files
+that cannot are mapped in [`.reuse/dep5`](.reuse/dep5). Rationale, the compatibility
+matrix and the `amdgpu` question: [`docs/thos/licensing.md`](docs/thos/licensing.md).
 
 ## Contributing & legal boundaries
 
