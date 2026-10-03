@@ -62,17 +62,20 @@ fn write_sockaddr(ptr: u64, lenp: u64, addr: ([u8; 4], u16)) -> i64 {
     }
 }
 
-pub fn sys_socket(domain: u64, ty: u64, _proto: u64) -> i64 {
+pub fn sys_socket(domain: u64, ty: u64, proto: u64) -> i64 {
     if domain != AF_INET {
         return EAFNOSUPPORT;
     }
     let kind = match ty & 0xF {
         SOCK_STREAM => Kind::Tcp,
+        SOCK_DGRAM if proto == 1 => Kind::Icmp, // IPPROTO_ICMP: an unprivileged ping socket
         SOCK_DGRAM => Kind::Udp,
+        3 if proto == 1 => Kind::Icmp, // SOCK_RAW + ICMP: what BusyBox `ping` opens
+        3 => return -1,                // other raw sockets: EPERM
         _ => return ESOCKTNOSUPPORT,
     };
     let _ = EPROTONOSUPPORT;
-    let sock = match SockFile::create(kind) {
+    let sock = match SockFile::create_icmp_aware(kind, ty & 0xF == 3) {
         Ok(s) => s,
         Err(e) => return e,
     };

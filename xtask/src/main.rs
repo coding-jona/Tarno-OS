@@ -116,6 +116,28 @@ fn main() {
                 }
             }
         }
+        "ping-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            let out = boot_and_run_args(
+                &img,
+                "ping",
+                "ping -c 3 10.0.2.2; echo ping-after-$((11))",
+                "ping-after-11",
+                90,
+                &["-cpu", "Westmere", "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"],
+            );
+            let replies = out.lines().filter(|l| l.contains("bytes from 10.0.2.2")).count();
+            if replies >= 2 {
+                println!("ping-test PASSED: BusyBox ping got {replies} of 3 echo replies from the gateway (raw ICMP socket)");
+            } else {
+                for l in out.lines().filter(|l| l.contains("ping") || l.contains("PING") || l.contains("bytes") || l.contains("unhandled") || l.contains("packet")) {
+                    eprintln!("  {l}");
+                }
+                eprintln!("ping-test FAILED ({replies} replies)");
+                exit(1);
+            }
+        }
         "dns-test" => {
             // Needs the host to be online: QEMU's resolver (10.0.2.3) forwards to the host's.
             use std::net::ToSocketAddrs;
@@ -677,6 +699,9 @@ fn disk_image() -> PathBuf {
         "kill", "chmod", "chown", "df", "free", "find", "sed", "awk", "tr", "cut",
         "basename", "dirname", "stat", "du", "od", "hexdump", "vi", "more", "less",
         "which", "test", "expr", "tar", "reset", "hostname", "uptime", "xargs", "tee", "dd",
+        // network + archive tools
+        "wget", "nc", "nslookup", "ping", "telnet", "gzip", "gunzip", "zcat", "unzip", "bzip2", "xz",
+        "diff", "patch", "top",
     ];
     run(Command::new("debugfs").args(["-w", "-R", "mkdir /bin", img.to_str().unwrap()]));
     for app in APPLETS {

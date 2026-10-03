@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use smoltcp::iface::SocketHandle;
-use smoltcp::socket::{tcp, udp};
+use smoltcp::socket::{icmp, tcp, udp};
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 use spin::Mutex;
 
@@ -40,6 +40,9 @@ const CONNECT_TIMEOUT_NS: u64 = 15_000_000_000;
 pub enum Kind {
     Tcp,
     Udp,
+    /// `SOCK_DGRAM` + `IPPROTO_ICMP`: Linux's unprivileged "ping socket". The kernel owns the
+    /// echo identifier (the socket's "port"), so replies find their way back to the right socket.
+    Icmp,
 }
 
 struct Sock {
@@ -51,6 +54,9 @@ struct Sock {
 
 pub struct SockFile {
     kind: Kind,
+    /// A raw ICMP socket (`SOCK_RAW`): the program sets the echo identifier itself and receives
+    /// replies with their IP header. (`false`: the Linux-style ping socket, kernel-owned id.)
+    raw: bool,
     st: Mutex<Sock>,
     nonblock: AtomicBool,
 }
@@ -88,6 +94,30 @@ pub fn reap(st: &mut Stack) {
 
 fn new_tcp() -> tcp::Socket<'static> {
     tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; TCP_BUF]), tcp::SocketBuffer::new(vec![0u8; TCP_BUF]))
+}
+
+fn new_icmp() -> icmp::Socket<'static> {
+    icmp::Socket::new(
+        icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 8], vec![0u8; 8 * 1024]),
+        icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 8], vec![0u8; 8 * 1024]),
+    )
+}
+
+/// The Internet checksum of an ICMP message (checksum field already zeroed).
+fn icmp_checksum(msg: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut i = 0;
+    while i + 1 < msg.len() {
+        sum += u16::from_be_bytes([msg[i], msg[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < msg.len() {
+        sum += (msg[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 fn new_udp() -> udp::Socket<'static> {
@@ -139,15 +169,29 @@ fn v4(ep: &IpEndpoint) -> ([u8; 4], u16) {
 
 impl SockFile {
     pub fn create(kind: Kind) -> Result<Arc<SockFile>, i64> {
+        Self::create_icmp_aware(kind, false)
+    }
+
+    pub fn create_icmp_aware(kind: Kind, raw: bool) -> Result<Arc<SockFile>, i64> {
         let mut g = NET.lock();
         let st = g.as_mut().ok_or(ENETDOWN)?;
+        let mut local_port = 0;
         let handle = match kind {
             Kind::Tcp => st.sockets.add(new_tcp()),
             Kind::Udp => st.sockets.add(new_udp()),
+            Kind::Icmp => {
+                let mut s = new_icmp();
+                if !raw {
+                    local_port = ephemeral();
+                    let _ = s.bind(icmp::Endpoint::Ident(local_port));
+                } // a raw socket binds to the identifier of its first echo request
+                st.sockets.add(s)
+            }
         };
         Ok(Arc::new(SockFile {
             kind,
-            st: Mutex::new(Sock { handle, local_port: 0, peer: None, listening: false }),
+            raw,
+            st: Mutex::new(Sock { handle, local_port, peer: None, listening: false }),
             nonblock: AtomicBool::new(false),
         }))
     }
@@ -155,6 +199,9 @@ impl SockFile {
     pub fn bind(&self, port: u16) -> i64 {
         let mut s = self.st.lock();
         let port = if port == 0 { ephemeral() } else { port };
+        if self.kind == Kind::Icmp {
+            return 0; // the identifier is fixed at creation
+        }
         if self.kind == Kind::Udp {
             let mut g = NET.lock();
             let Some(st) = g.as_mut() else { return ENETDOWN };
@@ -194,6 +241,7 @@ impl SockFile {
         };
         let nb = self.is_nonblock();
         match self.kind {
+            Kind::Icmp => 0, // remember the peer (done above); sending needs nothing else
             Kind::Udp => {
                 // "Connected" UDP: just remember the peer, and make sure we are bound.
                 let mut g = NET.lock();
@@ -264,6 +312,7 @@ impl SockFile {
                 kind: Kind::Tcp,
                 st: Mutex::new(Sock { handle: conn, local_port: port, peer: remote, listening: false }),
                 nonblock: AtomicBool::new(false),
+                raw: false,
             }),
             peer,
         ))
@@ -296,6 +345,43 @@ impl SockFile {
                 None
             })
             .unwrap_or_else(|e| e),
+            Kind::Icmp => {
+                let Some(dst) = to.map(|(ip, p)| endpoint(ip, p)).or(peer) else { return -89 };
+                if data.len() < 8 {
+                    return EINVAL;
+                }
+                let mut msg = data.to_vec();
+                if self.raw {
+                    // Raw: the program's identifier stays; bind the socket to it on first use so
+                    // the matching replies come back here.
+                    let id = u16::from_be_bytes([msg[4], msg[5]]);
+                    let mut g = NET.lock();
+                    if let Some(st) = g.as_mut() {
+                        let s = st.sockets.get_mut::<icmp::Socket>(handle);
+                        if !s.is_open() {
+                            let _ = s.bind(icmp::Endpoint::Ident(id));
+                        }
+                    }
+                } else {
+                    // Ping socket: stamp our identifier into the echo header, fix the checksum.
+                    msg[4..6].copy_from_slice(&lport.to_be_bytes());
+                    msg[2] = 0;
+                    msg[3] = 0;
+                    let ck = icmp_checksum(&msg);
+                    msg[2..4].copy_from_slice(&ck.to_be_bytes());
+                }
+                wait_until(nb, None, |st| {
+                    let s = st.sockets.get_mut::<icmp::Socket>(handle);
+                    match s.send(msg.len(), dst.addr) {
+                        Ok(buf) => {
+                            buf.copy_from_slice(&msg);
+                            Some(Ok(data.len() as i64))
+                        }
+                        Err(_) => None,
+                    }
+                })
+                .unwrap_or_else(|e| e)
+            }
             Kind::Udp => {
                 let Some(dst) = to.map(|(ip, p)| endpoint(ip, p)).or(peer) else { return -89 /* EDESTADDRREQ */ };
                 wait_until(nb, None, |st| {
@@ -317,6 +403,7 @@ impl SockFile {
     /// Receive into `buf`; for UDP also the sender.
     pub fn recv_from(&self, buf: &mut [u8]) -> (i64, Option<([u8; 4], u16)>) {
         let (handle, kind) = (self.st.lock().handle, self.kind);
+        let raw = self.raw;
         let nb = self.is_nonblock();
         let r = wait_until(nb, None, |st| match kind {
             Kind::Tcp => {
@@ -330,6 +417,45 @@ impl SockFile {
                     Some(Ok((0, None))) // peer closed: EOF
                 } else {
                     None
+                }
+            }
+            Kind::Icmp => {
+                let my_ip = crate::net::local_ip_of(st);
+                let s = st.sockets.get_mut::<icmp::Socket>(handle);
+                match s.recv() {
+                    Ok((payload, addr)) => {
+                        let ip = match addr {
+                            IpAddress::Ipv4(a) => a.octets(),
+                        };
+                        if raw {
+                            // Raw sockets hand over the IP header too: build one for the reply.
+                            let total = 20 + payload.len();
+                            let mut pkt = vec![0u8; total];
+                            pkt[0] = 0x45;
+                            pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+                            pkt[8] = 64; // ttl
+                            pkt[9] = 1; // ICMP
+                            pkt[12..16].copy_from_slice(&ip);
+                            pkt[16..20].copy_from_slice(&my_ip);
+                            let mut sum = 0u32;
+                            for i in (0..20).step_by(2) {
+                                sum += u16::from_be_bytes([pkt[i], pkt[i + 1]]) as u32;
+                            }
+                            while sum >> 16 != 0 {
+                                sum = (sum & 0xFFFF) + (sum >> 16);
+                            }
+                            pkt[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+                            pkt[20..].copy_from_slice(payload);
+                            let n = pkt.len().min(buf.len());
+                            buf[..n].copy_from_slice(&pkt[..n]);
+                            Some(Ok((n as i64, Some((ip, 0)))))
+                        } else {
+                            let n = payload.len().min(buf.len());
+                            buf[..n].copy_from_slice(&payload[..n]);
+                            Some(Ok((n as i64, Some((ip, 0)))))
+                        }
+                    }
+                    Err(_) => None,
                 }
             }
             Kind::Udp => {
@@ -383,6 +509,9 @@ impl Drop for SockFile {
         let Some(st) = g.as_mut() else { return };
         match self.kind {
             Kind::Udp => {
+                st.sockets.remove(h);
+            }
+            Kind::Icmp => {
                 st.sockets.remove(h);
             }
             Kind::Tcp => {
@@ -447,6 +576,15 @@ impl FileOps for SockFile {
                     if matches!(s.state(), tcp::State::Closed | tcp::State::TimeWait) {
                         r |= POLLHUP;
                     }
+                }
+            }
+            Kind::Icmp => {
+                let s = st.sockets.get_mut::<icmp::Socket>(h);
+                if s.can_recv() {
+                    r |= POLLIN;
+                }
+                if s.can_send() {
+                    r |= POLLOUT;
                 }
             }
             Kind::Udp => {

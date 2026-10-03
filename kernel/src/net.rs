@@ -168,6 +168,11 @@ pub fn resolv_conf() -> Option<alloc::string::String> {
     Some(out)
 }
 
+/// The interface address of an already-locked stack.
+pub fn local_ip_of(st: &Stack) -> [u8; 4] {
+    st.iface.ipv4_addr().map(|a| a.octets()).unwrap_or([0; 4])
+}
+
 /// The interface's IPv4 address (0.0.0.0 before `init`).
 pub fn local_ip() -> [u8; 4] {
     NET.lock()
