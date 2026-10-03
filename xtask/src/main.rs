@@ -3931,6 +3931,14 @@ fn net_test(img: &Path) {
     let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp bind");
     let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp bind");
     let (tcp_port, udp_port) = (tcp.local_addr().unwrap().port(), udp.local_addr().unwrap().port());
+    // QEMU's user networking reaches the host through its loopback interface. If `lo` is
+    // down (it happens: some network tools take it down) every host-bound connection times
+    // out, which looks like a guest bug. Say so instead.
+    if std::net::TcpStream::connect_timeout(&tcp.local_addr().unwrap(), std::time::Duration::from_secs(2)).is_err() {
+        eprintln!("net-test SKIPPED: the host's loopback interface cannot reach its own listener (is `lo` down?).");
+        eprintln!("                  Fix with: sudo ip link set lo up    (QEMU user networking needs it)");
+        exit(0);
+    }
     std::thread::spawn(move || {
         for conn in tcp.incoming() {
             if let Ok(mut c) = conn {
@@ -3955,7 +3963,13 @@ fn net_test(img: &Path) {
         &format!("nettest {tcp_port} {udp_port}; busybox wget -q -O - http://10.0.2.2:{tcp_port}/; cat /etc/resolv.conf"),
         "nameserver",
         90,
-        &["-cpu", "Westmere", "-nic", "user,model=virtio-net-pci"],
+        &[
+            "-cpu", "Westmere",
+            "-netdev", "user,id=n0",
+            "-device", "virtio-net-pci,netdev=n0",
+            // Keep a capture of the guest's traffic: the first thing to look at when a socket test fails.
+            "-object", "filter-dump,id=cap,netdev=n0,file=target/net.pcap",
+        ],
     );
     let gw = out.lines().find(|l| l.contains("THOS: net ok")).map(str::trim);
     let sock = out.lines().find(|l| l.contains("net-sock ok")).map(str::trim);

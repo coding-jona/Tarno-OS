@@ -662,18 +662,47 @@ fn smp_stress_milestone(init_bytes: &[u8]) {
         // Only let a wave half-drain before piling on the next, so create and
         // destroy overlap across all CPUs the whole time.
         let mark = EXITED.load(Ordering::Relaxed) + (PER_WAVE as u64 / 2);
+        let mut wave_report = timer::monotonic_ns();
         while EXITED.load(Ordering::Relaxed) < mark {
             sched::yield_now();
+            if timer::monotonic_ns() - wave_report > 10_000_000_000 {
+                wave_report = timer::monotonic_ns();
+                kprintln!(
+                    "THOS: smp stress waiting in a wave: churn {}/{} (mark {}) parkers {}/{} user exits {}/{} ctx {}",
+                    EXITED.load(Ordering::Relaxed),
+                    SPAWNED.load(Ordering::Relaxed),
+                    mark,
+                    PARK_EXITED.load(Ordering::Relaxed),
+                    PARKERS,
+                    syscall::user_exits() - user_base,
+                    USER_INITS * 2,
+                    sched::ctx_switches()
+                );
+            }
         }
         sched::reap(); // free exited stacks — the bootstrap heap is small
     }
 
+    let mut last_report = timer::monotonic_ns();
     while EXITED.load(Ordering::Relaxed) < SPAWNED.load(Ordering::Relaxed)
         || PARK_EXITED.load(Ordering::Relaxed) < PARKERS as u64
         || syscall::user_exits() < user_base + USER_INITS * 2
     {
         sched::yield_now();
         sched::reap();
+        // Watchdog: say what the drain is still waiting for (a hang here is a scheduler bug).
+        if timer::monotonic_ns() - last_report > 10_000_000_000 {
+            last_report = timer::monotonic_ns();
+            kprintln!(
+                "THOS: smp stress waiting: churn {}/{} parkers {}/{} user exits {}/{}",
+                EXITED.load(Ordering::Relaxed),
+                SPAWNED.load(Ordering::Relaxed),
+                PARK_EXITED.load(Ordering::Relaxed),
+                PARKERS,
+                syscall::user_exits() - user_base,
+                USER_INITS * 2
+            );
+        }
     }
     sched::reap();
 
