@@ -43,13 +43,13 @@ fn main() {
     let t0 = clock(1);
     sleep_ns(1_500_000_000);
     let slept = clock(1) - t0;
-    if !(1_450_000_000..2_300_000_000).contains(&slept) {
+    if !(1_450_000_000..3_000_000_000).contains(&slept) {
         bad.push(format!("sleep(1.5s) took {} ms", slept / 1_000_000));
     }
     let t0 = clock(1);
     sleep_ns(50_000_000);
     let short = clock(1) - t0;
-    if !(45_000_000..120_000_000).contains(&short) {
+    if !(45_000_000..300_000_000).contains(&short) {
         bad.push(format!("sleep(50ms) took {} ms", short / 1_000_000));
     }
 

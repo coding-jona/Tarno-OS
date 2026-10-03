@@ -11,6 +11,7 @@
 //! journalling, timestamps, hard links.
 
 use alloc::vec;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -335,6 +336,49 @@ impl Ext2 {
         out
     }
 
+    /// The block numbers of a file (0 = hole), for [`Ext2::read_at`].
+    pub fn file_blocks(&self, inode: &Inode) -> Vec<u32> {
+        self.block_map(inode)
+    }
+
+    /// Read up to `out.len()` bytes at byte offset `off` of a file of `size` bytes whose
+    /// block map is `blocks` — only the blocks that are needed, in runs of consecutive disk
+    /// blocks (at most 64 per disk read). Returns the number of bytes read (0 at EOF).
+    pub fn read_at(&self, blocks: &[u32], size: u64, off: u64, out: &mut [u8]) -> usize {
+        if off >= size {
+            return 0;
+        }
+        let n = out.len().min((size - off) as usize);
+        let bs = self.block_size as u64;
+        let mut done = 0usize;
+        while done < n {
+            let pos = off + done as u64;
+            let bi = (pos / bs) as usize;
+            let in_off = (pos % bs) as usize;
+            let remaining = n - done;
+            if bi >= blocks.len() || blocks[bi] == 0 {
+                // a hole (or past the map): reads as zeros up to the end of this block
+                let take = (bs as usize - in_off).min(remaining);
+                out[done..done + take].fill(0);
+                done += take;
+                continue;
+            }
+            let mut j = bi + 1;
+            while j < blocks.len()
+                && j - bi < 64
+                && blocks[j] == blocks[j - 1] + 1
+                && (j - bi) * (bs as usize) < in_off + remaining
+            {
+                j += 1;
+            }
+            let take = ((j - bi) * bs as usize - in_off).min(remaining);
+            let data = disk_range(blocks[bi] as u64 * bs + in_off as u64, take);
+            out[done..done + take].copy_from_slice(&data);
+            done += take;
+        }
+        n
+    }
+
     fn lookup(&self, dir_ino: u32, name: &str) -> Option<u32> {
         let data = self.read_file(&self.read_inode(dir_ino));
         let mut off = 0;
@@ -443,6 +487,11 @@ impl Ext2 {
         None
     }
 
+    /// Start a batched block-allocation transaction (see [`BlockTx`]).
+    fn tx(&self) -> BlockTx<'_> {
+        BlockTx { fs: self, bitmaps: BTreeMap::new(), free: BTreeMap::new(), delta: BTreeMap::new() }
+    }
+
     /// Allocate one zeroed data block; updates the group + superblock counts.
     fn alloc_block(&self) -> Option<u32> {
         let groups = self.group_count();
@@ -527,18 +576,19 @@ impl Ext2 {
 
     /// Free every data / indirect / double-indirect block an inode owns.
     fn free_all_blocks(&self, node: &Inode) {
+        let mut tx = self.tx();
         for &b in &node.block[..12] {
             if b != 0 {
-                self.free_block(b);
+                tx.release(b);
             }
         }
         if node.block[12] != 0 {
             for c in self.block(node.block[12]).chunks_exact(4) {
                 if le32(c) != 0 {
-                    self.free_block(le32(c));
+                    tx.release(le32(c));
                 }
             }
-            self.free_block(node.block[12]);
+            tx.release(node.block[12]);
         }
         if node.block[13] != 0 {
             for c in self.block(node.block[13]).chunks_exact(4) {
@@ -548,13 +598,14 @@ impl Ext2 {
                 }
                 for d in self.block(sib).chunks_exact(4) {
                     if le32(d) != 0 {
-                        self.free_block(le32(d));
+                        tx.release(le32(d));
                     }
                 }
-                self.free_block(sib);
+                tx.release(sib);
             }
-            self.free_block(node.block[13]);
+            tx.release(node.block[13]);
         }
+        tx.commit();
     }
 
     /// Allocate + fill data blocks for `data`. Returns `(block[15], i_blocks)`
@@ -563,6 +614,7 @@ impl Ext2 {
         let bs = self.block_size as usize;
         let per = bs / 4; // pointers per indirect block
         let nblocks = data.len().div_ceil(bs);
+        let mut tx = self.tx();
         let mut block = [0u32; 15];
         let mut meta = 0u32;
         let mut bi = 0usize;
@@ -575,19 +627,19 @@ impl Ext2 {
         };
 
         while bi < nblocks && bi < 12 {
-            let b = self.alloc_block()?;
+            let b = tx.alloc()?;
             self.write_block(b, &chunk(bi));
             block[bi] = b;
             bi += 1;
         }
 
         if bi < nblocks {
-            let ind = self.alloc_block()?;
+            let ind = tx.alloc()?;
             meta += 1;
             let mut buf = vec![0u8; bs];
             let mut k = 0;
             while bi < nblocks && k < per {
-                let b = self.alloc_block()?;
+                let b = tx.alloc()?;
                 self.write_block(b, &chunk(bi));
                 buf[k * 4..k * 4 + 4].copy_from_slice(&b.to_le_bytes());
                 bi += 1;
@@ -598,17 +650,17 @@ impl Ext2 {
         }
 
         if bi < nblocks {
-            let dind = self.alloc_block()?;
+            let dind = tx.alloc()?;
             meta += 1;
             let mut dbuf = vec![0u8; bs];
             let mut j = 0;
             while bi < nblocks && j < per {
-                let ind = self.alloc_block()?;
+                let ind = tx.alloc()?;
                 meta += 1;
                 let mut buf = vec![0u8; bs];
                 let mut k = 0;
                 while bi < nblocks && k < per {
-                    let b = self.alloc_block()?;
+                    let b = tx.alloc()?;
                     self.write_block(b, &chunk(bi));
                     buf[k * 4..k * 4 + 4].copy_from_slice(&b.to_le_bytes());
                     bi += 1;
@@ -625,6 +677,7 @@ impl Ext2 {
         if bi < nblocks {
             return None; // would need triple-indirect
         }
+        tx.commit();
         Some((block, (nblocks as u32 + meta) * (self.block_size / 512)))
     }
 
@@ -991,6 +1044,93 @@ impl Ext2 {
             sbc[90..92].copy_from_slice(&(g as u16).to_le_bytes()); // s_block_group_nr
             disk_write(sb_blk as u64 * self.block_size as u64, &sbc);
             disk_write((sb_blk + 1) as u64 * self.block_size as u64, &gdt);
+        }
+    }
+}
+
+
+/// A batch of block allocations / frees. The bitmaps and free counters each group needs are
+/// read **once**, edited in memory and written **once** at [`BlockTx::commit`] — instead of
+/// a read-modify-write of the bitmap, the group descriptor and the superblock for every single
+/// block, which made writing a megabyte take dozens of seconds. Dropping the transaction
+/// without committing leaves the disk's bitmaps untouched (blocks a failed allocation had
+/// picked simply stay free).
+struct BlockTx<'a> {
+    fs: &'a Ext2,
+    /// group -> (bitmap block number, bitmap bytes, modified)
+    bitmaps: BTreeMap<u32, (u32, Vec<u8>, bool)>,
+    /// group -> free-block count as read from its descriptor
+    free: BTreeMap<u32, i64>,
+    /// group -> change in free blocks to write back
+    delta: BTreeMap<u32, i64>,
+}
+
+impl BlockTx<'_> {
+    fn load(&mut self, g: u32) {
+        if !self.bitmaps.contains_key(&g) {
+            let bgd = self.fs.read_bgd(g);
+            let bmb = le32(&bgd[0..]);
+            self.free.insert(g, le16(&bgd[12..]) as i64);
+            self.bitmaps.insert(g, (bmb, self.fs.block(bmb), false));
+        }
+    }
+
+    /// The first free block (first-fit over the groups), marked used in the cached bitmap.
+    fn alloc(&mut self) -> Option<u32> {
+        let fs = self.fs;
+        let groups = fs.group_count();
+        for g in 0..groups {
+            self.load(g);
+            if self.free[&g] + self.delta.get(&g).copied().unwrap_or(0) <= 0 {
+                continue;
+            }
+            let in_group = if g == groups - 1 {
+                fs.block_count - fs.first_data_block - g * fs.blocks_per_group
+            } else {
+                fs.blocks_per_group
+            };
+            let bm = self.bitmaps.get_mut(&g).unwrap();
+            for i in 0..in_group as usize {
+                if bm.1[i / 8] & (1 << (i % 8)) == 0 {
+                    bm.1[i / 8] |= 1 << (i % 8);
+                    bm.2 = true;
+                    *self.delta.entry(g).or_insert(0) -= 1;
+                    return Some(fs.first_data_block + g * fs.blocks_per_group + i as u32);
+                }
+            }
+        }
+        None
+    }
+
+    /// Mark a block free (a no-op if its bit is already clear).
+    fn release(&mut self, bno: u32) {
+        let rel = bno - self.fs.first_data_block;
+        let g = rel / self.fs.blocks_per_group;
+        let i = (rel % self.fs.blocks_per_group) as usize;
+        self.load(g);
+        let bm = self.bitmaps.get_mut(&g).unwrap();
+        if bm.1[i / 8] & (1 << (i % 8)) != 0 {
+            bm.1[i / 8] &= !(1 << (i % 8));
+            bm.2 = true;
+            *self.delta.entry(g).or_insert(0) += 1;
+        }
+    }
+
+    /// Write the changed bitmaps and counters.
+    fn commit(self) {
+        let mut total = 0i64;
+        for (g, (bmb, bytes, dirty)) in &self.bitmaps {
+            if *dirty {
+                self.fs.write_block(*bmb, bytes);
+            }
+            let d = self.delta.get(g).copied().unwrap_or(0);
+            if d != 0 {
+                self.fs.bgd_add16(*g, 12, d);
+                total += d;
+            }
+        }
+        if total != 0 {
+            self.fs.sb_add32(12, total);
         }
     }
 }

@@ -637,7 +637,7 @@ impl Section {
             }
             remaining -= n;
         }
-        true
+        f.sync() >= 0 // write-back files only reach the disk now
     }
 }
 
@@ -1332,7 +1332,9 @@ pub fn current_fd_set_cloexec(fd: i32, on: bool) -> i32 {
 pub fn set_exit_status(code: i32) {
     if let Some(t) = sched::current().task() {
         *t.exit_status.lock() = Some(code);
-        t.fds.lock().clear();
+        // Take the table out before dropping it: closing the files can write to disk.
+        let old = core::mem::take(&mut *t.fds.lock());
+        drop(old);
         t.exited.store(true, Ordering::Release);
         notify_parent(&t);
         t.wake_all_threads(); // the other threads see `exited` and die

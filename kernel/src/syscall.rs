@@ -135,6 +135,8 @@ const SYS_SETSOCKOPT: u64 = 54;
 const SYS_GETSOCKOPT: u64 = 55;
 const SYS_ACCEPT4: u64 = 288;
 const SYS_PAUSE: u64 = 34;
+const SYS_FSYNC: u64 = 74;
+const SYS_FDATASYNC: u64 = 75;
 const SYS_SELECT: u64 = 23;
 const SYS_PSELECT6: u64 = 270;
 const SYS_ALARM: u64 = 37;
@@ -735,6 +737,10 @@ pub fn open_resolved_access(path: &str, want_read: bool, want_write: bool) -> i6
             fs.read_dir(ino).into_iter().map(|(i, t, n)| (i as u64, t, n)).collect();
         task.fd_alloc(crate::file::DirFile::new(&entries)) as i64
     } else {
+        if !want_write && node.size > crate::file::STREAM_THRESHOLD {
+            // big and read-only: stream it instead of loading it all
+            return task.fd_alloc(crate::file::Ext2Stream::new(fs, ino, &node)) as i64;
+        }
         task.fd_alloc(crate::file::Ext2File::new(path.into(), fs.read_file(&node)).with_ino(ino as u64)) as i64
     }
 }
@@ -1239,6 +1245,7 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_RT_SIGPENDING => signal::sys_sigpending(a1, a2),
         SYS_RT_SIGSUSPEND => signal::sys_sigsuspend(a1, a2),
         SYS_PAUSE => signal::sys_pause(),
+        SYS_FSYNC | SYS_FDATASYNC => cur_fd(a1).map_or(EBADF, |f| f.sync()),
         SYS_ALARM => crate::itimer::sys_alarm(a1),
         SYS_SETITIMER => crate::itimer::sys_setitimer(a1, a2, a3),
         SYS_GETITIMER => crate::itimer::sys_getitimer(a1, a2),

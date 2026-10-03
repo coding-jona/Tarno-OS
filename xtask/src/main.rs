@@ -461,6 +461,8 @@ fn disk_image() -> PathBuf {
         ("sigtest.rs", "sigtest"),
         // /dev/null, /dev/zero, /dev/urandom, /dev/tty — typed in by `kbd-test`.
         ("devtest.rs", "devtest"),
+        // Streaming file I/O test, typed in by `kbd-test`.
+        ("streamtest.rs", "streamtest"),
         // Socket test, run by `net-test` against host-side servers.
         ("nettest.rs", "nettest"),
         // PS/2 mouse test, run by `mouse-test`.
@@ -3485,6 +3487,10 @@ fn kbd_test(iso: &Path) {
     // Character devices under /dev.
     type_line(&sock, "devtest");
     let _ = wait_for(&log, "dev ", 60);
+
+    // Streaming file I/O: a 1 MiB file written in 4 KiB steps and read back piecewise.
+    type_line(&sock, "streamtest");
+    let _ = wait_for(&log, "stream ", 120);
 
     // Ctrl+C reaches the foreground process: `sleep 100` is interrupted, the shell lives on.
     type_line(&sock, "sleep 100");

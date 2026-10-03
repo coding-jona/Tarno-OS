@@ -10,7 +10,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -52,6 +52,10 @@ pub trait FileOps: Send + Sync {
     /// `st_ino`: the inode number for files on the root filesystem (0 elsewhere). Programs —
     /// `ld.so` above all — use (dev, ino) to tell whether two paths are the same file.
     fn ino(&self) -> u64 {
+        0
+    }
+    /// `fsync`: make sure everything written reached the disk.
+    fn sync(&self) -> i64 {
         0
     }
     /// The socket behind this file, if it is one.
@@ -233,10 +237,9 @@ impl FileOps for ConsoleFile {
 
 /// A real ext2 file, opened by path. Like `MemFile`, the whole file is
 /// slurped into memory on open — but `write()` mutates that buffer *and*
-/// re-persists the whole thing back to ext2 immediately via `write_path`
-/// (the same "rewrite it all, synchronously, on every mutation" pattern
-/// [`crate::registry`]'s hives use). No partial/streaming writeback, no
-/// dirty-range tracking — simple and correct, not the fastest.
+/// persists the whole thing back to ext2 via `write_path` — **write-back**: on `fsync`, on
+/// close, and every 64 KiB written, not on every `write` call (the old rewrite-everything-per-
+/// call was quadratic for big files). No dirty-range tracking — simple and correct.
 ///
 /// This is what makes a file-backed [`crate::process::Section`] able to
 /// actually flush to disk: `Section::flush` writes through whatever
@@ -247,20 +250,147 @@ pub struct Ext2File {
     buf: Mutex<Vec<u8>>,
     pos: AtomicUsize,
     ino: core::sync::atomic::AtomicU64,
+    /// Write-back state: bytes written since the last flush, and whether the file on disk
+    /// is behind the buffer. Writes go to the buffer; the disk is written on close, `fsync`
+    /// and every 64 KiB — not on every `write` call.
+    unflushed: AtomicUsize,
+    dirty: AtomicBool,
 }
 
+/// Bytes of writes after which the buffer is written to disk without waiting for a close.
+const FLUSH_EVERY: usize = 64 * 1024;
+
 impl Ext2File {
+    /// Write the buffer to disk if it is behind (the caller holds the buffer lock).
+    fn flush_locked(&self, data: &[u8]) -> i64 {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return 0;
+        }
+        self.unflushed.store(0, Ordering::Relaxed);
+        let Some(fs) = crate::ext2::open().ok() else { return EIO };
+        if fs.write_path(&self.path, data).is_err() {
+            self.dirty.store(true, Ordering::Release);
+            return EIO;
+        }
+        0
+    }
+
     pub fn new(path: String, data: Vec<u8>) -> Arc<Self> {
         Arc::new(Self {
             path,
             buf: Mutex::new(data),
             pos: AtomicUsize::new(0),
             ino: core::sync::atomic::AtomicU64::new(0),
+            unflushed: AtomicUsize::new(0),
+            dirty: AtomicBool::new(false),
         })
     }
     pub fn with_ino(self: Arc<Self>, ino: u64) -> Arc<Self> {
         self.ino.store(ino, Ordering::Relaxed);
         self
+    }
+}
+
+impl Drop for Ext2File {
+    fn drop(&mut self) {
+        // The last close: whatever was written but not yet flushed goes to disk now.
+        let data = self.buf.lock();
+        let _ = self.flush_locked(&data);
+    }
+}
+
+/// A large read-only file on the root filesystem, read on demand in 64 KiB chunks — opening
+/// a multi-gigabyte file costs its block map (4 bytes per 4 KiB), not its size.
+pub struct Ext2Stream {
+    ino: u64,
+    fs: crate::ext2::Ext2,
+    blocks: Vec<u32>,
+    size: u64,
+    pos: AtomicU64,
+    /// The last chunk read: `(file offset, bytes)`.
+    cache: Mutex<(u64, Vec<u8>)>,
+}
+
+const STREAM_CHUNK: usize = 64 * 1024;
+/// Files larger than this are streamed when opened read-only.
+pub const STREAM_THRESHOLD: u64 = 256 * 1024;
+
+impl Ext2Stream {
+    pub fn new(fs: crate::ext2::Ext2, ino: u32, inode: &crate::ext2::Inode) -> Arc<Self> {
+        let blocks = fs.file_blocks(inode);
+        Arc::new(Self {
+            ino: ino as u64,
+            fs,
+            blocks,
+            size: inode.size,
+            pos: AtomicU64::new(0),
+            cache: Mutex::new((0, Vec::new())),
+        })
+    }
+}
+
+impl FileOps for Ext2Stream {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn read(&self, buf: &mut [u8]) -> i64 {
+        let pos = self.pos.load(Ordering::Relaxed);
+        if pos >= self.size || buf.is_empty() {
+            return 0;
+        }
+        let n = buf.len().min((self.size - pos) as usize);
+        if n >= STREAM_CHUNK {
+            // big read: straight into the caller's buffer, no copy through the cache
+            let got = self.fs.read_at(&self.blocks, self.size, pos, &mut buf[..n]);
+            self.pos.store(pos + got as u64, Ordering::Relaxed);
+            return got as i64;
+        }
+        let mut done = 0usize;
+        let mut cache = self.cache.lock();
+        while done < n {
+            let p = pos + done as u64;
+            let (start, ref data) = *cache;
+            if !(p >= start && p < start + data.len() as u64) {
+                let aligned = p & !(STREAM_CHUNK as u64 - 1);
+                let want = STREAM_CHUNK.min((self.size - aligned) as usize);
+                let mut chunk = alloc::vec![0u8; want];
+                let got = self.fs.read_at(&self.blocks, self.size, aligned, &mut chunk);
+                chunk.truncate(got);
+                *cache = (aligned, chunk);
+                continue;
+            }
+            let off = (p - start) as usize;
+            let take = (data.len() - off).min(n - done);
+            buf[done..done + take].copy_from_slice(&data[off..off + take]);
+            done += take;
+        }
+        self.pos.store(pos + done as u64, Ordering::Relaxed);
+        done as i64
+    }
+    fn write(&self, _buf: &[u8]) -> i64 {
+        EBADF // opened read-only
+    }
+    fn seek(&self, offset: i64, whence: u32) -> i64 {
+        let pos = self.pos.load(Ordering::Relaxed) as i64;
+        let base = match whence {
+            SEEK_SET => 0i64,
+            SEEK_CUR => pos,
+            SEEK_END => self.size as i64,
+            _ => return EINVAL,
+        };
+        let np = base + offset;
+        if np < 0 {
+            return EINVAL;
+        }
+        self.pos.store(np as u64, Ordering::Relaxed);
+        np
+    }
+    fn stat(&self) -> (u32, u64) {
+        (S_IFREG | 0o644, self.size)
+    }
+    fn times(&self) -> (u32, u32, u32) {
+        let n = self.fs.read_inode(self.ino as u32);
+        (n.atime, n.mtime, n.ctime)
     }
 }
 
@@ -287,13 +417,18 @@ impl FileOps for Ext2File {
         }
         data[pos..pos + src.len()].copy_from_slice(src);
         self.pos.store(pos + src.len(), Ordering::Relaxed);
-        let Some(fs) = crate::ext2::open().ok() else {
-            return EIO;
-        };
-        if fs.write_path(&self.path, &data).is_err() {
+        self.dirty.store(true, Ordering::Release);
+        let total = self.unflushed.fetch_add(src.len(), Ordering::Relaxed) + src.len();
+        // Flush after 64 KiB, or after half the file's size once it is bigger — so the number
+        // of whole-file rewrites grows with log(size), not with size.
+        if total >= FLUSH_EVERY.max(data.len() / 2) && self.flush_locked(&data) < 0 {
             return EIO;
         }
         src.len() as i64
+    }
+    fn sync(&self) -> i64 {
+        let data = self.buf.lock();
+        self.flush_locked(&data)
     }
     fn seek(&self, offset: i64, whence: u32) -> i64 {
         let len = self.buf.lock().len() as i64;
