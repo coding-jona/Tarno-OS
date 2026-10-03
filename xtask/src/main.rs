@@ -116,6 +116,44 @@ fn main() {
                 }
             }
         }
+        "dns-test" => {
+            // Needs the host to be online: QEMU's resolver (10.0.2.3) forwards to the host's.
+            use std::net::ToSocketAddrs;
+            if "example.com:80".to_socket_addrs().is_err() {
+                eprintln!("dns-test SKIPPED: the host cannot resolve example.com (offline?)");
+                exit(0);
+            }
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            let out = boot_and_run_args(
+                &img,
+                "dns",
+                "busybox nslookup example.com 10.0.2.3; busybox wget -q -T 15 -O - http://example.com/; echo dns-after-$((11))",
+                "dns-after-11",
+                120,
+                &[
+                    "-cpu", "Westmere", "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0",
+                    "-object", "filter-dump,id=cap,netdev=n0,file=target/dns.pcap",
+                ],
+            );
+            let fetched = out.lines().any(|l| l.contains("Example Domain"));
+            if fetched {
+                println!("dns-test: BusyBox wget fetched http://example.com/ by name over the internet");
+            }
+            let answered = out.lines().any(|l| l.trim_start().starts_with("Address") && l.contains('.') && !l.contains("10.0.2.3"));
+            if answered {
+                println!("dns-test PASSED: BusyBox nslookup resolved example.com through THOS's UDP stack");
+                for l in out.lines().filter(|l| l.contains("Address") || l.contains("Name")) {
+                    println!("    {}", l.trim());
+                }
+            } else {
+                for l in out.lines().filter(|l| l.contains("nslookup") || l.contains("Address") || l.contains("Name") || l.contains("error") || l.contains("unhandled")) {
+                    eprintln!("  {l}");
+                }
+                eprintln!("dns-test FAILED");
+                exit(1);
+            }
+        }
         "thr-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();

@@ -252,6 +252,133 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout_ns: i64) -> i64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+//  sendmsg / recvmsg / sendmmsg / recvmmsg (glibc's resolver sends its A and AAAA queries with
+//  one sendmmsg). `struct msghdr`: name @0, namelen @8, iov @16, iovlen @24, control @32,
+//  controllen @40, flags @48 (56 bytes); `struct mmsghdr` = msghdr + u32 msg_len (64 bytes).
+// ---------------------------------------------------------------------------
+
+const MSG_MAX: usize = 64 * 1024;
+
+/// Gather the iovec array of a msghdr into one buffer.
+fn gather_iov(msg: u64) -> Result<alloc::vec::Vec<u8>, i64> {
+    let iov = usercopy::read_u64(msg + 16)?;
+    let n = usercopy::read_u64(msg + 24)?;
+    if n > 1024 {
+        return Err(EINVAL);
+    }
+    let mut out = alloc::vec::Vec::new();
+    for i in 0..n {
+        let base = usercopy::read_u64(iov + 16 * i)?;
+        let len = usercopy::read_u64(iov + 16 * i + 8)? as usize;
+        if out.len() + len > MSG_MAX {
+            return Err(-90); // EMSGSIZE
+        }
+        out.extend_from_slice(usercopy::slice(base, len)?);
+    }
+    Ok(out)
+}
+
+pub fn sys_sendmsg(fd: u64, msg: u64) -> i64 {
+    let f = match sock_of(fd) { Ok(f) => f, Err(e) => return e };
+    let name = usercopy::read_u64(msg).unwrap_or(0);
+    let namelen = usercopy::read_u32(msg + 8).unwrap_or(0) as u64;
+    let to = if name != 0 {
+        match read_sockaddr(name, namelen) { Ok(a) => Some(a), Err(e) => return e }
+    } else {
+        None
+    };
+    match gather_iov(msg) {
+        Ok(data) => f.as_socket().unwrap().send_to(&data, to),
+        Err(e) => e,
+    }
+}
+
+pub fn sys_recvmsg(fd: u64, msg: u64) -> i64 {
+    let f = match sock_of(fd) { Ok(f) => f, Err(e) => return e };
+    let iov = match usercopy::read_u64(msg + 16) { Ok(v) => v, Err(e) => return e };
+    let n = match usercopy::read_u64(msg + 24) { Ok(v) => v, Err(e) => return e };
+    if n > 1024 {
+        return EINVAL;
+    }
+    let mut total = 0usize;
+    for i in 0..n {
+        match usercopy::read_u64(iov + 16 * i + 8) {
+            Ok(l) => total += l as usize,
+            Err(e) => return e,
+        }
+    }
+    let mut buf = alloc::vec![0u8; total.min(MSG_MAX)];
+    let (got, from) = f.as_socket().unwrap().recv_from(&mut buf);
+    if got < 0 {
+        return got;
+    }
+    // scatter
+    let mut off = 0usize;
+    for i in 0..n {
+        if off >= got as usize {
+            break;
+        }
+        let (Ok(base), Ok(len)) = (usercopy::read_u64(iov + 16 * i), usercopy::read_u64(iov + 16 * i + 8)) else { return EFAULT };
+        let take = (len as usize).min(got as usize - off);
+        match usercopy::slice_mut(base, take) {
+            Ok(b) => b.copy_from_slice(&buf[off..off + take]),
+            Err(e) => return e,
+        }
+        off += take;
+    }
+    // sender address, if the caller asked for one
+    if let (Some(a), Ok(name)) = (from, usercopy::read_u64(msg)) {
+        if name != 0 {
+            let lenp = msg + 8; // msg_namelen is a u32 in place
+            let r = write_sockaddr(name, lenp, a);
+            if r < 0 {
+                return r;
+            }
+        }
+    }
+    let _ = usercopy::write_u64(msg + 40, 0); // no control data
+    let _ = usercopy::write_u32(msg + 48, 0); // msg_flags
+    got
+}
+
+pub fn sys_sendmmsg(fd: u64, vec: u64, vlen: u64) -> i64 {
+    let mut sent = 0i64;
+    for i in 0..vlen.min(1024) {
+        let m = vec + 64 * i;
+        let r = sys_sendmsg(fd, m);
+        if r < 0 {
+            return if sent > 0 { sent } else { r };
+        }
+        if usercopy::write_u32(m + 56, r as u32).is_err() {
+            return EFAULT;
+        }
+        sent += 1;
+    }
+    sent
+}
+
+pub fn sys_recvmmsg(fd: u64, vec: u64, vlen: u64) -> i64 {
+    let f = match sock_of(fd) { Ok(f) => f, Err(e) => return e };
+    let mut got = 0i64;
+    for i in 0..vlen.min(1024) {
+        // the first message may block; later ones only if something is already waiting
+        if i > 0 && f.poll_mask(POLLIN) & POLLIN == 0 {
+            break;
+        }
+        let m = vec + 64 * i;
+        let r = sys_recvmsg(fd, m);
+        if r < 0 {
+            return if got > 0 { got } else { r };
+        }
+        if usercopy::write_u32(m + 56, r as u32).is_err() {
+            return EFAULT;
+        }
+        got += 1;
+    }
+    got
+}
+
 /// `select` / `pselect6`: the `fd_set` flavour of [`sys_poll`]. `timeout_ns < 0` = forever.
 pub fn sys_select(nfds: u64, rd: u64, wr: u64, ex: u64, timeout_ns: i64) -> i64 {
     if nfds > 1024 {
