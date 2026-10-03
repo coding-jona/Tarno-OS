@@ -102,8 +102,9 @@ fn main() {
         "fork-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
-            let out = boot_and_run(&img, "fork", "forktest; echo fk-after-$((11))", "fk-after-11", 90);
-            let ok = out.lines().find(|l| l.contains("fork ok:")).map(str::trim);
+            let out = boot_and_run(&img, "fork", "forktest; forktest-static; echo fk-after-$((11))", "fk-after-11", 90);
+            let oks = out.lines().filter(|l| l.contains("fork ok:")).count();
+            let ok = (oks == 2).then(|| "dynamic and static glibc: fork, atexit in the child, exit status");
             match ok {
                 Some(l) => println!("fork-test PASSED: {l}"),
                 None => {
@@ -514,6 +515,16 @@ fn disk_image() -> PathBuf {
                 .unwrap_or(false);
             if fk_ok {
                 run(Command::new("debugfs").args(["-w", "-R", &format!("write {} forktest", fk.to_str().unwrap()), img.to_str().unwrap()]));
+            }
+            // The same program linked statically (like BusyBox): no ld.so, glibc's own startup.
+            let fks = root.join("target/forktest-static");
+            let fks_ok = Command::new("gcc")
+                .args(["-O1", "-static", "-o", fks.to_str().unwrap(), root.join("xtask/testdata/forktest.c").to_str().unwrap()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if fks_ok {
+                run(Command::new("debugfs").args(["-w", "-R", &format!("write {} forktest-static", fks.to_str().unwrap()), img.to_str().unwrap()]));
             }
             if thr_ok {
                 run(Command::new("debugfs").args(["-w", "-R", &format!("write {} thrtest", thr.to_str().unwrap()), img.to_str().unwrap()]));

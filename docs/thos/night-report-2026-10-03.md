@@ -54,7 +54,7 @@ proc, busybox, pipe, pe, bios, bios-kbd, shortcuts, longcmd, bios-power, random,
 
 ## Offen / Risiken
 - **B17 — BusyBox `ps` als geforkter Shell-Kindprozess stürzt beim Beenden ab** (`call *%rax` mit rax=1 in `__run_exit_handlers`).
-  Direkt per exec (`/busybox ps`) und mit glibc-`fork`+`atexit` (fork-test) tritt es nicht auf. Ausgabe/Shell nicht betroffen. Nicht gelöst.
+  Direkt per exec (`/busybox ps`) und mit glibc-`fork`+`atexit` (fork-test, dynamisch **und** statisch gelinkt) tritt es nicht auf — es ist also BusyBox-spezifisch, kein allgemeines Fork-Problem. Ausgabe/Shell nicht betroffen. Nicht gelöst.
 - **B16 — Scheduler-Heisenbug im `smp-test`** (24 CPUs, TCG): nicht ursächlich geklärt, nur der zeitabhängige Frame-Zähler-Test gehärtet.
 - `munmap` gibt Frames frei, aber `MAP_SHARED` schreibt nicht zurück; Signalzustand ist pro Prozess (kein thread-gerichtetes Signal); keine robust-/PI-Futexe; `clone3` fehlt (glibc fällt auf `clone` zurück).
 - Netzwerk pollt noch (10 ms bzw. 2 ms in blockierenden Aufrufen) statt IRQ-getrieben; keine echten NIC-Treiber (Acer: `lspci -nn` fehlt); DNS Ende-zu-Ende ungetestet; `sendmsg/recvmsg/sendmmsg`, AF_UNIX fehlen.
