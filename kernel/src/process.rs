@@ -757,6 +757,8 @@ pub struct Task {
     thread: Mutex<Option<alloc::sync::Weak<crate::sched::Thread>>>,
     /// Non-zero if the task ended because of that signal (`wait4` reports it).
     term_sig: AtomicU32,
+    /// argv of the running image, NUL-separated (for `/proc/<pid>/cmdline`).
+    cmdline: Mutex<Vec<u8>>,
     /// Debug: log this task's system calls (set for dynamically linked programs for now).
     pub trace: AtomicBool,
     /// `true` for a native PE image, `false` for an ELF — for a `ps` view.
@@ -815,6 +817,7 @@ impl Task {
             sig: Mutex::new(crate::signal::SigState::new()),
             thread: Mutex::new(None),
             term_sig: AtomicU32::new(0),
+            cmdline: Mutex::new(Vec::new()),
             trace: AtomicBool::new(false),
             is_pe: AtomicBool::new(false),
             active_threads: AtomicU64::new(0),
@@ -825,6 +828,17 @@ impl Task {
         t
     }
 
+    pub fn cmdline(&self) -> Vec<u8> {
+        self.cmdline.lock().clone()
+    }
+    pub fn set_cmdline<S: AsRef<str>>(&self, argv: &[S]) {
+        let mut v = Vec::new();
+        for a in argv {
+            v.extend_from_slice(a.as_ref().as_bytes());
+            v.push(0);
+        }
+        *self.cmdline.lock() = v;
+    }
     pub fn pgid(&self) -> u64 {
         self.pgid.load(Ordering::Relaxed)
     }
@@ -1396,6 +1410,7 @@ pub fn spawn_elevated(ppid: u64, bytes: &[u8], argv: &[&str], envp: &[&str], uid
     let stack_top = space.new_user_stack();
     let rsp = space.init_stack(stack_top, argv, envp, &img);
     let task = Task::new_with_ids(ppid, space, uid, gid);
+    task.set_cmdline(argv);
     sched::spawn_user("elevated", task.clone(), img.entry, rsp);
     Ok(task.pid)
 }
@@ -1436,6 +1451,7 @@ pub fn spawn_init(bytes: &[u8], argv: &[&str], envp: &[&str]) -> u64 {
     let stack_top = space.new_user_stack();
     let rsp = space.init_stack(stack_top, argv, envp, &img);
     let task = Task::new(0, space);
+    task.set_cmdline(argv);
     sched::spawn_user("init", task.clone(), img.entry, rsp);
     task.pid
 }
@@ -1488,6 +1504,7 @@ pub fn fork(frame: &UserFrame) -> i64 {
     let child = Task::new(parent.pid, cspace);
     *child.fds.lock() = parent.clone_fds();
     child.set_cwd(parent.cwd());
+    *child.cmdline.lock() = parent.cmdline();
     child.set_pgid(parent.pgid());
     child.set_sid(parent.sid());
     {
@@ -1537,6 +1554,7 @@ pub fn execve(bytes: &[u8], argv: &[String], envp: &[String]) -> ! {
 
     task.close_on_exec(); // drop O_CLOEXEC fds before the new image sees them
     task.sig.lock().reset_for_exec(); // caught signals go back to default; ignored stay ignored
+    task.set_cmdline(&av);
 
     let new_cr3 = space.pml4_phys();
     // `swap_space`, not `set_space`: this thread is still running on the

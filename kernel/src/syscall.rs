@@ -396,6 +396,28 @@ fn sys_prlimit(resource: u64, _new: u64, old: u64) -> i64 {
     0
 }
 
+/// `readlink(path, buf, size)`: only `/proc/<pid>/exe` is a symlink here.
+fn sys_readlink(path_ptr: u64, buf: u64, size: u64) -> i64 {
+    let raw = match usercopy::cstr(path_ptr, 4096) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let path = process::resolve_path(&raw);
+    match crate::procfs::readlink(&path) {
+        Some(target) => {
+            let n = target.len().min(size as usize);
+            match usercopy::slice_mut(buf, n) {
+                Ok(b) => {
+                    b.copy_from_slice(&target.as_bytes()[..n]);
+                    n as i64
+                }
+                Err(e) => e,
+            }
+        }
+        None => EINVAL,
+    }
+}
+
 /// `access(path, mode)` / `faccessat`: does the path exist, and may the caller use it so?
 fn sys_access(path_ptr: u64, mode: u64) -> i64 {
     let path = match user_path(path_ptr) {
@@ -617,6 +639,9 @@ const O_EXCL: u64 = 0o200;
 /// path is `EEXIST`, same as Linux. `O_CREAT` against an existing path with
 /// no `O_EXCL` is a no-op (POSIX: the flag is ignored).
 pub fn open_resolved(path: &str, flags: u64) -> i64 {
+    if crate::procfs::is_proc(path) && flags & 0x3 == 0 {
+        return open_proc(path);
+    }
     if let Some(r) = open_dev(path, flags & 0x3 != 1, flags & 0x3 != 0) {
         return r;
     }
@@ -646,6 +671,15 @@ pub fn open_resolved(path: &str, flags: u64) -> i64 {
     open_resolved_access(path, accmode != 1, accmode != 0)
 }
 
+/// A path under `/proc`: a generated file or directory.
+fn open_proc(path: &str) -> i64 {
+    let Some(task) = sched::current().task() else { return EBADF };
+    match crate::procfs::open(path) {
+        Some(f) => task.fd_alloc(f) as i64,
+        None => ENOENT,
+    }
+}
+
 /// `/dev/null` & co: `Some(fd)` if `path` is a virtual device node.
 fn open_dev(path: &str, want_read: bool, want_write: bool) -> Option<i64> {
     let dev = crate::file::open_device(path, want_read, want_write)?;
@@ -667,6 +701,9 @@ fn parent_of(path: &str) -> Option<&str> {
 /// (`Inode::access_ok`) — the DAC check every file open goes through now,
 /// not just a mode-bits-ignored lookup.
 pub fn open_resolved_access(path: &str, want_read: bool, want_write: bool) -> i64 {
+    if crate::procfs::is_proc(path) && !want_write {
+        return open_proc(path);
+    }
     if let Some(r) = open_dev(path, want_read, want_write) {
         return r;
     }
@@ -701,6 +738,10 @@ pub fn open_resolved_access(path: &str, want_read: bool, want_write: bool) -> i6
 /// blksize @56, blocks @64. Everything else zero.
 fn sys_fstat(fd: u64, buf: u64) -> i64 {
     let Some(f) = cur_fd(fd) else { return EBADF };
+    fstat_into(&*f, buf)
+}
+
+fn fstat_into(f: &dyn crate::file::FileOps, buf: u64) -> i64 {
     if !usercopy::user_ok(buf, 144, true) {
         return EFAULT;
     }
@@ -866,6 +907,10 @@ fn sys_newfstatat(dirfd: u64, path_ptr: u64, buf: u64, flags: u64) -> i64 {
     let path = process::resolve_path(&raw);
     if !usercopy::user_ok(buf, 144, true) {
         return EFAULT;
+    }
+    if crate::procfs::is_proc(&path) {
+        let Some(f) = crate::procfs::open(&path) else { return ENOENT };
+        return fstat_into(&*f, buf);
     }
     let Some(fs) = ext2::open().ok() else { return -5 /* EIO */ };
     let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
@@ -1395,7 +1440,8 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
                 }
             }
         }
-        SYS_READLINK | SYS_READLINKAT => EINVAL,
+        SYS_READLINK => sys_readlink(a1, a2, a3),
+        SYS_READLINKAT => sys_readlink(a2, a3, a4),
         SYS_UNAME => match usercopy::slice_mut(a1, 6 * 65) {
             Ok(b) => {
                 b.fill(0);

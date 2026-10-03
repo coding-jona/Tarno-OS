@@ -55,6 +55,7 @@ mod object;
 mod pci;
 mod pe;
 mod process;
+mod procfs;
 mod registry;
 mod sched;
 mod secsvc;

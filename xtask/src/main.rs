@@ -116,6 +116,22 @@ fn main() {
                 }
             }
         }
+        "proc-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            let out = boot_and_run(&img, "proc", "cat /proc/version; free; /busybox ps; echo zzz-$((11))", "zzz-11", 90);
+            let has = |needle: &str| out.lines().any(|l| l.contains(needle));
+            let (ver, mem, ps_sh) = (has("Linux version"), has("Mem:"), out.lines().any(|l| l.contains("sh") && l.contains("/proc") == false && l.trim_start().starts_with(|c: char| c.is_ascii_digit())));
+            if ver && mem && ps_sh {
+                println!("proc-test PASSED: /proc/version, `free` (reads /proc/meminfo) and `ps` (walks /proc/<pid>) work");
+            } else {
+                for l in out.lines().filter(|l| l.contains("Linux") || l.contains("Mem") || l.contains("PID") || l.contains("COMMAND") || l.contains("proc") || l.contains("unhandled")) {
+                    eprintln!("  {l}");
+                }
+                eprintln!("proc-test FAILED (version: {ver}, free: {mem}, ps lists the shell: {ps_sh})");
+                exit(1);
+            }
+        }
         "net-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
