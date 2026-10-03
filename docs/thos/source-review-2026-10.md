@@ -86,7 +86,7 @@ Resolved or substantially advanced since the review (see `night-report-2026-10-0
 | **B8** clock | **done** (RTC + TSC clock, real `nanosleep`, `sysinfo`, ext2 timestamps) |
 | **B10/B12** input IRQs | **done for PS/2**: the I/O APIC is programmed, keyboard (IRQ 1) and mouse (IRQ 12) are interrupt-driven with a polling safety net; HPET and a TSC-deadline timer still open |
 | **B15** AHCI hang | open (`ncq-error-test` still flaky) |
-| new **B16** | scheduler heisenbug in `smp-test` (24 CPUs under TCG) — only the timing-dependent frame-count check was hardened |
+| new **B16** | `smp-test` hang — **resolved (2026-10-03): a race in the test, not the scheduler**: the wave `mark` was computed after spawning, so when churn threads finished during the spawn loop it ended up above the number of threads that exist; it is now taken before the spawn (5/5 green). The frame-count baseline was hardened separately |
 | new **B17** | BusyBox `ps` forked from the shell crashes in `__run_exit_handlers` at exit (BusyBox-specific; plain glibc fork/atexit works) |
 
 New capabilities worth recording: dynamically linked PIE programs with `ld.so` (glibc 2.41 runs), POSIX threads

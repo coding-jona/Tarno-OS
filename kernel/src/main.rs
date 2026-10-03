@@ -660,13 +660,17 @@ fn smp_stress_milestone(init_bytes: &[u8]) {
     }
 
     for _ in 0..WAVES {
+        // Taken BEFORE the wave is spawned: on many CPUs the first churn threads can finish while the
+        // spawn loop is still running, and a mark computed afterwards would count them as
+        // "already exited" and end up beyond the number of threads that exist — a wait for ever.
+        let exited_before_wave = EXITED.load(Ordering::Relaxed);
         for i in 0..PER_WAVE {
             SPAWNED.fetch_add(1, Ordering::Relaxed);
             sched::spawn("stress-churn", churn_worker, i);
         }
         // Only let a wave half-drain before piling on the next, so create and
         // destroy overlap across all CPUs the whole time.
-        let mark = EXITED.load(Ordering::Relaxed) + (PER_WAVE as u64 / 2);
+        let mark = exited_before_wave + (PER_WAVE as u64 / 2);
         let mut wave_report = timer::monotonic_ns();
         while EXITED.load(Ordering::Relaxed) < mark {
             sched::yield_now();
