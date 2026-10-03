@@ -25,6 +25,11 @@ static PART_LBA: AtomicU64 = AtomicU64::new(0);
 const EXT2_MAGIC: u16 = 0xEF53;
 pub const ROOT_INO: u32 = 2;
 
+/// Serialises every operation that changes the filesystem (allocation bitmaps, directories,
+/// inodes are read-modify-write with no other protection). Threads and several CPUs can now
+/// write at once; without this two of them could be handed the same free block.
+static FS_WRITE: spin::Mutex<()> = spin::Mutex::new(());
+
 pub struct Ext2 {
     block_size: u32,
     inode_size: u32,
@@ -768,6 +773,7 @@ impl Ext2 {
     /// never changes its owner — matches real Unix: truncating a file you
     /// have write access to doesn't let you take it over.
     pub fn write_path_owned(&self, path: &str, data: &[u8], uid: u32, gid: u32) -> Result<(), &'static str> {
+        let _fs = FS_WRITE.lock();
         let (parent, name) = split_parent(path).ok_or("bad path")?;
         let parent_ino = self.path_lookup(parent).ok_or("parent dir missing")?;
         if name.len() > 255 {
@@ -828,6 +834,7 @@ impl Ext2 {
     /// Create directory `path`, owned by `uid`/`gid`. The parent must
     /// exist; `path` must not.
     pub fn mkdir_path_owned(&self, path: &str, uid: u32, gid: u32) -> Result<(), &'static str> {
+        let _fs = FS_WRITE.lock();
         let (parent, name) = split_parent(path).ok_or("bad path")?;
         let parent_ino = self.path_lookup(parent).ok_or("parent dir missing")?;
         if self.lookup(parent_ino, name).is_some() {
@@ -869,6 +876,7 @@ impl Ext2 {
     /// The caller (`syscall::sys_chmod`) is responsible for the "only the
     /// owner or root may do this" check — this just writes the bits.
     pub fn chmod_path(&self, path: &str, perm: u16) -> Result<(), &'static str> {
+        let _fs = FS_WRITE.lock();
         let ino = self.path_lookup(path).ok_or("no such file")?;
         let file_type = self.read_inode(ino).mode & 0xF000;
         self.patch_inode(ino, |raw| {
@@ -882,6 +890,7 @@ impl Ext2 {
     /// — the permission check (real `chown` is stricter: owner alone isn't
     /// enough, it's root-only, matching modern Unix) lives in the caller.
     pub fn chown_path(&self, path: &str, uid: u32, gid: u32) -> Result<(), &'static str> {
+        let _fs = FS_WRITE.lock();
         let ino = self.path_lookup(path).ok_or("no such file")?;
         self.patch_inode(ino, |raw| {
             raw[2..4].copy_from_slice(&(uid as u16).to_le_bytes());
@@ -958,6 +967,7 @@ impl Ext2 {
 
     /// Unlink a regular file: drop its last link and free it.
     pub fn unlink_path(&self, path: &str) -> Result<(), &'static str> {
+        let _fs = FS_WRITE.lock();
         let (parent, name) = split_parent(path).ok_or("bad path")?;
         let parent_ino = self.path_lookup(parent).ok_or("parent dir missing")?;
         let ino = self.lookup(parent_ino, name).ok_or("no such file")?;
@@ -979,6 +989,7 @@ impl Ext2 {
 
     /// Remove an empty directory.
     pub fn rmdir_path(&self, path: &str) -> Result<(), &'static str> {
+        let _fs = FS_WRITE.lock();
         let (parent, name) = split_parent(path).ok_or("bad path")?;
         let parent_ino = self.path_lookup(parent).ok_or("parent dir missing")?;
         let ino = self.lookup(parent_ino, name).ok_or("no such directory")?;
