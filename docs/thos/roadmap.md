@@ -8,6 +8,11 @@ SMP, scheduler + wait primitive + handle table) · own page tables ✔ (W^X kern
 low identity, every CPU switched). Next: Phase 2 — VFS, AHCI, the POSIX personality.
 The `syscall` fast path moved into Phase 2 (it needs the personality layer).
 
+**Status 2026-10-03 (Acer/BIOS track):** the POSIX personality now runs real dynamically linked Linux
+programs (glibc `ld.so`, pthreads, signals, sockets, `/proc`, `/dev`) — see
+[`night-report-2026-10-03.md`](night-report-2026-10-03.md) and the status update at the end of
+[`source-review-2026-10.md`](source-review-2026-10.md).
+
 Honest scale: from "boots to a framebuffer" to "a Windows game runs" is multiple
 person-decades for a small team. The phasing front-loads the finite, well-understood
 work (executive core, personalities) and hits the GPU driver mountain deliberately and

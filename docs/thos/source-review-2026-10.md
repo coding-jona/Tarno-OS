@@ -69,3 +69,26 @@ expected "not yet" of a young kernel — but several are real bugs.*
 3. **B3** real signals + `kill`; **B8** RTC/clock; **B4** CSPRNG.
 4. Streaming file I/O + page cache + growable heap (**B6**), ext2 directories past 12 blocks (**B7**).
 5. Then the product features: network stack, dynamic ELF loader + threads + futex, wide-char Win32 + 32-bit WOW64, the package manager, the desktop.
+
+
+---
+
+## Status update — 2026-10-03
+
+Resolved or substantially advanced since the review (see `night-report-2026-10-03.md` for the evidence):
+
+| Finding | State |
+|---|---|
+| **B1** user pointers | done (`usercopy.rs`); per-site NT checks and SMAP (B1b) still open |
+| **B3** signals | **done**: handlers on a Linux `rt_sigframe`, masks, `SA_RESTART`, EINTR, Ctrl+C → SIGINT, process groups, `alarm`/`setitimer`; per-thread signal state still open |
+| **B4** CSPRNG | **done** (entropy pool + ChaCha20, fast key erasure); AT_RANDOM now random |
+| **B6** big files | **partly**: read-only files > 256 KiB are streamed (`Ext2Stream`), writes are write-back with `fsync`, ext2 allocation is batched (1 MiB write 28 s → 1.7 s). Still open: a growable kernel heap, truly incremental ext2 writes (each flush still rewrites the whole file), files > 64 MiB on 1 KiB-block images (no triple-indirect) |
+| **B8** clock | **done** (RTC + TSC clock, real `nanosleep`, `sysinfo`, ext2 timestamps) |
+| **B10/B12** input IRQs | **done for PS/2**: the I/O APIC is programmed, keyboard (IRQ 1) and mouse (IRQ 12) are interrupt-driven with a polling safety net; HPET and a TSC-deadline timer still open |
+| **B15** AHCI hang | open (`ncq-error-test` still flaky) |
+| new **B16** | scheduler heisenbug in `smp-test` (24 CPUs under TCG) — only the timing-dependent frame-count check was hardened |
+| new **B17** | BusyBox `ps` forked from the shell crashes in `__run_exit_handlers` at exit (BusyBox-specific; plain glibc fork/atexit works) |
+
+New capabilities worth recording: dynamically linked PIE programs with `ld.so` (glibc 2.41 runs), POSIX threads
+(`clone(CLONE_THREAD)` + futex), BSD sockets over virtio-net + smoltcp with DHCP, virtual `/dev` and `/proc`,
+PS/2 mouse (`/dev/input/mice`).
