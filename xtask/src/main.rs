@@ -99,6 +99,22 @@ fn main() {
                 }
             }
         }
+        "mem-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            let out = boot_and_run(&img, "mem", "memtest; echo mem-after-$((11))", "mem-after-11", 180);
+            let ok = out.lines().find(|l| l.contains("mem ok:")).map(str::trim);
+            match ok {
+                Some(l) => println!("mem-test PASSED: {l}"),
+                None => {
+                    for l in out.lines().filter(|l| l.contains("mem ") || l.contains("page fault") || l.contains("unhandled") || l.contains("PANIC")) {
+                        eprintln!("  {l}");
+                    }
+                    eprintln!("mem-test FAILED");
+                    exit(1);
+                }
+            }
+        }
         "fork-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
@@ -569,6 +585,15 @@ fn disk_image() -> PathBuf {
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
+            let mt = root.join("target/memtest");
+            let mt_ok = Command::new("gcc")
+                .args(["-O1", "-o", mt.to_str().unwrap(), root.join("xtask/testdata/memtest.c").to_str().unwrap()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if mt_ok {
+                run(Command::new("debugfs").args(["-w", "-R", &format!("write {} memtest", mt.to_str().unwrap()), img.to_str().unwrap()]));
+            }
             let fk = root.join("target/forktest");
             let fk_ok = Command::new("gcc")
                 .args(["-O1", "-o", fk.to_str().unwrap(), root.join("xtask/testdata/forktest.c").to_str().unwrap()])
