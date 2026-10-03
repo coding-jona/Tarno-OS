@@ -796,6 +796,7 @@ fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
     }
     // Every command below writes a fixed-size struct through `arg`.
     let need = match cmd {
+        0x4600 | 0x4602 => 0, // checked by the device
         0x5401 => 36,
         0x5413 => 8,
         0x5421 => 4,
@@ -836,6 +837,7 @@ fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
             *(arg as *mut u32) = signal::FG_PGRP.load(Ordering::Relaxed) as u32;
             0
         },
+        0x4600 | 0x4602 => cur_fd(fd).map_or(EBADF, |f| f.ioctl(cmd, arg)), // fbdev geometry
         0x5421 => {
             // FIONBIO
             let on = usercopy::read_u32(arg).unwrap_or(0) != 0;

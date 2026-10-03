@@ -62,6 +62,10 @@ pub trait FileOps: Send + Sync {
     fn as_socket(&self) -> Option<&crate::net_sock::SockFile> {
         None
     }
+    /// A device-specific `ioctl`; `ENOTTY` for devices that have none.
+    fn ioctl(&self, _cmd: u64, _arg: u64) -> i64 {
+        -25
+    }
     /// `O_NONBLOCK` via `fcntl(F_SETFL)` / `FIONBIO`; only sockets honour it for now.
     fn set_nonblock(&self, _on: bool) {}
     fn is_nonblock(&self) -> bool {
@@ -135,6 +139,12 @@ pub fn open_device(path: &str, want_read: bool, want_write: bool) -> Option<Arc<
         "/dev/zero" => Arc::new(DevFile(DevKind::Zero)),
         "/dev/urandom" | "/dev/random" => Arc::new(DevFile(DevKind::Random)),
         "/dev/input/mice" | "/dev/input/mouse0" => Arc::new(DevFile(DevKind::Mice)),
+        "/dev/fb0" => {
+            if crate::gdi::fb_geometry().is_none() {
+                return None;
+            }
+            Arc::new(FbFile { pos: AtomicU64::new(0) })
+        }
         "/dev/tty" | "/dev/console" => {
             if want_read && !want_write {
                 Arc::new(KeyboardFile)
@@ -146,6 +156,82 @@ pub fn open_device(path: &str, want_read: bool, want_write: bool) -> Option<Arc<
         }
         _ => return None,
     })
+}
+
+/// `/dev/fb0`: the boot framebuffer as a Linux-style fbdev — `read`/`write`/`lseek` at byte
+/// offsets, `FBIOGET_VSCREENINFO` / `FBIOGET_FSCREENINFO` for its geometry. (No `mmap` yet.)
+pub struct FbFile {
+    pos: AtomicU64,
+}
+
+impl FileOps for FbFile {
+    fn read(&self, buf: &mut [u8]) -> i64 {
+        let pos = self.pos.load(Ordering::Relaxed) as usize;
+        let n = crate::gdi::fb_read(pos, buf);
+        self.pos.store((pos + n) as u64, Ordering::Relaxed);
+        n as i64
+    }
+    fn write(&self, buf: &[u8]) -> i64 {
+        let pos = self.pos.load(Ordering::Relaxed) as usize;
+        let n = crate::gdi::fb_write(pos, buf);
+        self.pos.store((pos + n) as u64, Ordering::Relaxed);
+        if n == 0 && !buf.is_empty() { -28 } else { n as i64 } // ENOSPC past the end
+    }
+    fn seek(&self, offset: i64, whence: u32) -> i64 {
+        let size = crate::gdi::fb_geometry().map_or(0, |g| g.2 as i64 * g.1 as i64);
+        let base = match whence {
+            SEEK_SET => 0,
+            SEEK_CUR => self.pos.load(Ordering::Relaxed) as i64,
+            SEEK_END => size,
+            _ => return EINVAL,
+        };
+        let np = base + offset;
+        if np < 0 {
+            return EINVAL;
+        }
+        self.pos.store(np as u64, Ordering::Relaxed);
+        np
+    }
+    fn stat(&self) -> (u32, u64) {
+        let size = crate::gdi::fb_geometry().map_or(0, |g| g.2 as u64 * g.1 as u64);
+        (S_IFCHR | 0o666, size)
+    }
+    fn ioctl(&self, cmd: u64, arg: u64) -> i64 {
+        let Some((w, h, pitch, rs, gs, bs)) = crate::gdi::fb_geometry() else { return -19 };
+        match cmd {
+            0x4600 => {
+                // FBIOGET_VSCREENINFO (struct fb_var_screeninfo, 160 bytes)
+                let Ok(b) = crate::usercopy::slice_mut(arg, 160) else { return crate::usercopy::EFAULT };
+                b.fill(0);
+                let put = |b: &mut [u8], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                put(b, 0, w);
+                put(b, 4, h);
+                put(b, 8, w);
+                put(b, 12, h);
+                put(b, 24, 32); // bits_per_pixel
+                put(b, 32, rs as u32);
+                put(b, 36, 8);
+                put(b, 44, gs as u32);
+                put(b, 48, 8);
+                put(b, 56, bs as u32);
+                put(b, 60, 8);
+                put(b, 88, 0xFFFF_FFFF); // height / width in mm: unknown
+                put(b, 92, 0xFFFF_FFFF);
+                0
+            }
+            0x4602 => {
+                // FBIOGET_FSCREENINFO (struct fb_fix_screeninfo, 80 bytes)
+                let Ok(b) = crate::usercopy::slice_mut(arg, 80) else { return crate::usercopy::EFAULT };
+                b.fill(0);
+                b[..7].copy_from_slice(b"THOS FB");
+                b[24..28].copy_from_slice(&(pitch * h).to_le_bytes()); // smem_len
+                b[36..40].copy_from_slice(&2u32.to_le_bytes()); // visual = TRUECOLOR
+                b[48..52].copy_from_slice(&pitch.to_le_bytes()); // line_length
+                0
+            }
+            _ => -25,
+        }
+    }
 }
 
 /// `/dev/tty` opened read-write: keyboard in, screen out.

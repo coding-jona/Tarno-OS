@@ -99,6 +99,11 @@ fn main() {
                 }
             }
         }
+        "fb-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            fb_test(&img);
+        }
         "mem-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
@@ -585,6 +590,15 @@ fn disk_image() -> PathBuf {
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
+            let fbd = root.join("target/fbdemo");
+            let fbd_ok = Command::new("gcc")
+                .args(["-O1", "-o", fbd.to_str().unwrap(), root.join("xtask/testdata/fbdemo.c").to_str().unwrap()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if fbd_ok {
+                run(Command::new("debugfs").args(["-w", "-R", &format!("write {} fbdemo", fbd.to_str().unwrap()), img.to_str().unwrap()]));
+            }
             let mt = root.join("target/memtest");
             let mt_ok = Command::new("gcc")
                 .args(["-O1", "-o", mt.to_str().unwrap(), root.join("xtask/testdata/memtest.c").to_str().unwrap()])
@@ -4237,6 +4251,72 @@ fn mouse_test(img: &Path) {
             eprintln!("  {l}");
         }
         eprintln!("mouse-test FAILED");
+        exit(1);
+    }
+}
+
+/// Desktop stage 2: a userspace program draws on /dev/fb0 and a cursor follows the PS/2 mouse.
+/// The host moves the pointer through the QEMU monitor, takes a screendump and checks the pixels.
+fn fb_test(img: &Path) {
+    let root = workspace_root();
+    let log = root.join("target/fb-serial.log");
+    let sock = root.join("target/fb-mon.sock");
+    let shot = root.join("target/fb-screen.ppm");
+    let _ = std::fs::remove_file(&shot);
+    let (tlog, tsock, tshot) = (log.clone(), sock.clone(), shot.clone());
+    std::thread::spawn(move || {
+        if wait_for(&tlog, "fb ready", 200) {
+            std::thread::sleep(std::time::Duration::from_millis(2500)); // the demo draws after a second
+            for _ in 0..6 {
+                mon(&tsock, "mouse_move 10 6");
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            mon(&tsock, &format!("screendump {}", tshot.to_str().unwrap()));
+        }
+    });
+    let out = boot_and_run(img, "fb", "fbdemo", "fb ok:", 90);
+    // parse the PPM (P6)
+    let data = std::fs::read(&shot).unwrap_or_default();
+    let mut it = data.splitn(2, |&b| b == b'\n');
+    let magic = it.next().unwrap_or(&[]).to_vec();
+    let rest = it.next().unwrap_or(&[]);
+    let mut hdr_end = 0;
+    let mut nl = 0;
+    for (i, &b) in rest.iter().enumerate() {
+        if b == b'\n' {
+            nl += 1;
+            if nl == 2 {
+                hdr_end = i + 1;
+                break;
+            }
+        }
+    }
+    let header = String::from_utf8_lossy(&rest[..hdr_end]).to_string();
+    let nums: Vec<usize> = header.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+    let pixels = &rest[hdr_end..];
+    let pix = |x: usize, y: usize| -> Option<(u8, u8, u8)> {
+        let (w, h) = (*nums.first()?, *nums.get(1)?);
+        if x >= w || y >= h {
+            return None;
+        }
+        let i = (y * w + x) * 3;
+        Some((*pixels.get(i)?, *pixels.get(i + 1)?, *pixels.get(i + 2)?))
+    };
+    let near = |a: Option<(u8, u8, u8)>, b: (u8, u8, u8)| {
+        a.is_some_and(|a| (a.0 as i32 - b.0 as i32).abs() < 24 && (a.1 as i32 - b.1 as i32).abs() < 24 && (a.2 as i32 - b.2 as i32).abs() < 24)
+    };
+    let cursor_end = out.lines().find(|l| l.contains("fb ok:")).map(str::trim);
+    // the cursor starts at (400,300) and the mouse moved +60 right and +36 down
+    let rect_ok = &magic == b"P6" && near(pix(200, 500), (255, 136, 0));
+    let cursor_ok = near(pix(400 + 60 + 4, 300 + 36 + 4), (255, 0, 255)) && near(pix(404, 304), (0, 0, 0));
+    if rect_ok && cursor_ok && cursor_end.is_some() {
+        println!("fb-test PASSED: {}", cursor_end.unwrap());
+        println!("                orange rectangle and the magenta cursor are on screen where the mouse put them");
+    } else {
+        eprintln!("  screendump header {:?}, demo said {:?}", header.trim(), cursor_end);
+        eprintln!("  rectangle pixel {:?}, cursor pixel {:?}, old cursor spot {:?}", pix(200, 500), pix(464, 340), pix(404, 304));
+        eprintln!("fb-test FAILED (rectangle {rect_ok}, cursor {cursor_ok})");
         exit(1);
     }
 }

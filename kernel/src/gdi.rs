@@ -74,6 +74,36 @@ fn fb() -> Option<&'static FbInfo> {
     FB.get()
 }
 
+/// Geometry of the boot framebuffer for `/dev/fb0`: `(width, height, pitch, r_shift, g_shift, b_shift)`.
+pub fn fb_geometry() -> Option<(u32, u32, u32, u8, u8, u8)> {
+    let f = fb()?;
+    Some((f.width, f.height, f.pitch, f.r_shift, f.g_shift, f.b_shift))
+}
+
+/// Copy `data` into the framebuffer at byte offset `off` (clipped to its size); bytes written.
+pub fn fb_write(off: usize, data: &[u8]) -> usize {
+    let Some(f) = fb() else { return 0 };
+    let size = f.pitch as usize * f.height as usize;
+    if off >= size {
+        return 0;
+    }
+    let n = data.len().min(size - off);
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), (f.virt as usize + off) as *mut u8, n) };
+    n
+}
+
+/// Copy framebuffer bytes at `off` into `out`; bytes read.
+pub fn fb_read(off: usize, out: &mut [u8]) -> usize {
+    let Some(f) = fb() else { return 0 };
+    let size = f.pitch as usize * f.height as usize;
+    if off >= size {
+        return 0;
+    }
+    let n = out.len().min(size - off);
+    unsafe { core::ptr::copy_nonoverlapping((f.virt as usize + off) as *const u8, out.as_mut_ptr(), n) };
+    n
+}
+
 /// `GetSystemMetrics(SM_CXSCREEN|SM_CYSCREEN)`'s backing data.
 pub fn screen_size() -> (u32, u32) {
     fb().map_or((0, 0), |f| (f.width, f.height))

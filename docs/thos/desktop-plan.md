@@ -94,6 +94,14 @@ Linux desktop allows — not just colours. Designing for that now:
 and clean shutdown (flush, stop other CPUs, B14). (The default boot is now just
 *bring-up → mount → login → shell*; self-tests are behind the `selftest` feature.)
 
+> **Status 2026-10-03:** Stage 0 is done (signals incl. Ctrl+C, IRQ-driven i8042 via the IO-APIC, scrollback,
+> `TIOCGWINSZ`). Stage 1 is mostly done: **PS/2 mouse/touchpad** with a kernel queue (`/dev/input/mice`,
+> pointer state in `ps2.rs`); EHCI and a userspace keyboard-layout table remain. Stage 2's milestone is
+> **met in its first form**: `/dev/fb0` (Linux fbdev: `FBIOGET_VSCREENINFO`/`FSCREENINFO`, `read`/`write`/`lseek`)
+> and the `fbdemo` program draw a rectangle and a cursor that follows the mouse; `cargo xtask fb-test` checks it
+> from the host with a QEMU `screendump`. Still open for Stage 2: `mmap` of the framebuffer (needs a "not owned" page
+> flag so teardown does not free device frames), a real display service that owns scanout, console hand-off.
+
 **Stage 1 — Input foundation.** PS/2 **mouse/touchpad** (the 5742G uses a PS/2
 Synaptics-class pad: start with plain relative mode, gestures later), a kernel
 input queue with timestamps, EHCI (USB 2) for external mice/keyboards, a
