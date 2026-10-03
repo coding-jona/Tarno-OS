@@ -252,6 +252,67 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout_ns: i64) -> i64 {
     }
 }
 
+/// `select` / `pselect6`: the `fd_set` flavour of [`sys_poll`]. `timeout_ns < 0` = forever.
+pub fn sys_select(nfds: u64, rd: u64, wr: u64, ex: u64, timeout_ns: i64) -> i64 {
+    if nfds > 1024 {
+        return EINVAL;
+    }
+    let words = (nfds as usize).div_ceil(64);
+    let bytes = words * 8;
+    let read_set = |p: u64| -> Result<alloc::vec::Vec<u64>, i64> {
+        if p == 0 {
+            return Ok(alloc::vec![0u64; words]);
+        }
+        (0..words).map(|i| usercopy::read_u64(p + 8 * i as u64)).collect()
+    };
+    let (want_r, want_w, _want_e) = match (read_set(rd), read_set(wr), read_set(ex)) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+    };
+    let task = match sched::current().task() { Some(t) => t, None => return EBADF };
+    let deadline = (timeout_ns >= 0).then(|| crate::timer::monotonic_ns().saturating_add(timeout_ns as u64));
+    loop {
+        let mut got_r = alloc::vec![0u64; words];
+        let mut got_w = alloc::vec![0u64; words];
+        let mut ready = 0i64;
+        for fd in 0..nfds as usize {
+            let (w, b) = (fd / 64, 1u64 << (fd % 64));
+            let (r_on, w_on) = (want_r[w] & b != 0, want_w[w] & b != 0);
+            if !r_on && !w_on {
+                continue;
+            }
+            let Some(f) = task.fd_get(fd as i32) else { return EBADF };
+            let ev = f.poll_mask((if r_on { POLLIN } else { 0 }) | (if w_on { POLLOUT } else { 0 }));
+            if r_on && ev & (POLLIN | crate::file::POLLHUP | POLLERR) != 0 {
+                got_r[w] |= b;
+                ready += 1;
+            }
+            if w_on && ev & (POLLOUT | POLLERR) != 0 {
+                got_w[w] |= b;
+                ready += 1;
+            }
+        }
+        let timed_out = deadline.is_some_and(|d| crate::timer::monotonic_ns() >= d);
+        if ready > 0 || timed_out {
+            for (p, set) in [(rd, &got_r), (wr, &got_w), (ex, &alloc::vec![0u64; words])] {
+                if p != 0 {
+                    for (i, v) in set.iter().enumerate() {
+                        if usercopy::write_u64(p + 8 * i as u64, *v).is_err() {
+                            return EFAULT;
+                        }
+                    }
+                }
+            }
+            let _ = bytes;
+            return ready;
+        }
+        if signal::interrupted() {
+            return -4;
+        }
+        crate::timer::sleep_ns(2_000_000);
+    }
+}
+
 #[allow(dead_code)]
 fn _unused() {
     let _ = (POLLOUT, process::current_pid());

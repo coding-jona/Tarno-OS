@@ -135,6 +135,8 @@ const SYS_SETSOCKOPT: u64 = 54;
 const SYS_GETSOCKOPT: u64 = 55;
 const SYS_ACCEPT4: u64 = 288;
 const SYS_PAUSE: u64 = 34;
+const SYS_SELECT: u64 = 23;
+const SYS_PSELECT6: u64 = 270;
 const SYS_ALARM: u64 = 37;
 const SYS_GETITIMER: u64 = 36;
 const SYS_SETITIMER: u64 = 38;
@@ -1358,6 +1360,36 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             sock_sys::sys_poll(a1, a2, ns)
         }
 
+        SYS_SELECT => {
+            // a5 = *timeval (sec, usec) or NULL
+            let ns = if a5 == 0 {
+                -1
+            } else {
+                match (usercopy::read_u64(a5), usercopy::read_u64(a5.wrapping_add(8))) {
+                    (Ok(s), Ok(u)) => (s as i64).saturating_mul(1_000_000_000).saturating_add((u as i64) * 1000),
+                    _ => {
+                        frame.rax = EFAULT as u64;
+                        return;
+                    }
+                }
+            };
+            sock_sys::sys_select(a1, a2, a3, a4, ns)
+        }
+        SYS_PSELECT6 => {
+            // a5 = *timespec or NULL
+            let ns = if a5 == 0 {
+                -1
+            } else {
+                match (usercopy::read_u64(a5), usercopy::read_u64(a5.wrapping_add(8))) {
+                    (Ok(s), Ok(n)) => (s as i64).saturating_mul(1_000_000_000).saturating_add(n as i64),
+                    _ => {
+                        frame.rax = EFAULT as u64;
+                        return;
+                    }
+                }
+            };
+            sock_sys::sys_select(a1, a2, a3, a4, ns)
+        }
         SYS_SOCKET => sock_sys::sys_socket(a1, a2, a3),
         SYS_BIND => sock_sys::sys_bind(a1, a2, a3),
         SYS_LISTEN => sock_sys::sys_listen(a1),

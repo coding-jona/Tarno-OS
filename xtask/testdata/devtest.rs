@@ -8,6 +8,12 @@ unsafe fn sys(n: u64, a: u64, b: u64, c: u64) -> i64 {
          out("rcx") _, out("r11") _);
     r
 }
+unsafe fn sys5(n: u64, a: u64, b: u64, c: u64, d: u64, e: u64) -> i64 {
+    let r: i64;
+    asm!("syscall", inlateout("rax") n => r, in("rdi") a, in("rsi") b, in("rdx") c,
+         in("r10") d, in("r8") e, out("rcx") _, out("r11") _);
+    r
+}
 fn open(path: &str, flags: u64) -> i64 {
     let mut p = path.as_bytes().to_vec();
     p.push(0);
@@ -42,7 +48,24 @@ fn main() {
     let t = open("/dev/tty", 1);
     if t < 0 { bad.push(format!("open /dev/tty = {t}")); } else if write(t, b"") != 0 { bad.push("write /dev/tty".into()); }
 
+    // select(): /dev/zero is always readable; an empty pipe times out with 0.
+    if z >= 0 {
+        let mut rd = [0u64; 1];
+        rd[0] = 1 << z;
+        let mut tv = [1i64, 0];
+        let n = unsafe { sys5(23, (z + 1) as u64, rd.as_mut_ptr() as u64, 0, 0, tv.as_mut_ptr() as u64) };
+        if n != 1 || rd[0] & (1 << z) == 0 { bad.push(format!("select(/dev/zero) = {n}")); }
+    }
+    let mut fds = [0i32; 2];
+    if unsafe { sys(22, fds.as_mut_ptr() as u64, 0, 0) } == 0 {
+        let mut rd = [0u64; 1];
+        rd[0] = 1 << fds[0];
+        let mut tv = [0i64, 100_000]; // 100 ms
+        let n = unsafe { sys5(23, (fds[0] + 1) as u64, rd.as_mut_ptr() as u64, 0, 0, tv.as_mut_ptr() as u64) };
+        if n != 0 || rd[0] != 0 { bad.push(format!("select(empty pipe, 100ms) = {n} (want 0)")); }
+    }
+
     if open("/dev/nonexistent", 0) != -2 { bad.push("/dev/nonexistent is not ENOENT".into()); }
 
-    if bad.is_empty() { println!("dev ok: null zero urandom tty"); } else { for b in &bad { println!("dev FAIL: {b}"); } }
+    if bad.is_empty() { println!("dev ok: null zero urandom tty select"); } else { for b in &bad { println!("dev FAIL: {b}"); } }
 }
