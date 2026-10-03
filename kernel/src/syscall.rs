@@ -139,6 +139,10 @@ const SYS_SETSOCKOPT: u64 = 54;
 const SYS_GETSOCKOPT: u64 = 55;
 const SYS_ACCEPT4: u64 = 288;
 const SYS_PAUSE: u64 = 34;
+const SYS_MINCORE: u64 = 27;
+const SYS_STATFS: u64 = 137;
+const SYS_FSTATFS: u64 = 138;
+const SYS_STATX: u64 = 332;
 const SYS_FSYNC: u64 = 74;
 const SYS_FDATASYNC: u64 = 75;
 const SYS_SELECT: u64 = 23;
@@ -433,6 +437,102 @@ fn sys_readlink(path_ptr: u64, buf: u64, size: u64) -> i64 {
             }
         }
         None => EINVAL,
+    }
+}
+
+/// `mincore(addr, len, vec)`: for every page of the range, 1 if it is mapped (everything mapped is
+/// resident — THOS never swaps), and `ENOMEM` as soon as a page is not mapped. Programs use that
+/// error to probe whether an address range is valid, so it must be real.
+fn sys_mincore(addr: u64, len: u64, vec: u64) -> i64 {
+    if addr & 0xFFF != 0 {
+        return EINVAL;
+    }
+    let Some(proc) = sched::current_proc() else { return EINVAL };
+    let pages = (len as usize).div_ceil(4096);
+    let Ok(out) = usercopy::slice_mut(vec, pages) else { return EFAULT };
+    for (i, b) in out.iter_mut().enumerate() {
+        if proc.translate(addr + 4096 * i as u64).is_none() {
+            return -12; // ENOMEM: part of the range is not mapped
+        }
+        *b = 1;
+    }
+    0
+}
+
+/// `statfs(path, buf)` / `fstatfs(fd, buf)`: the root filesystem's numbers (one filesystem).
+fn sys_statfs(buf: u64) -> i64 {
+    let Some(fs) = ext2::open().ok() else { return -5 };
+    let (bs, blocks, free, inodes, free_inodes) = fs.stats();
+    match usercopy::slice_mut(buf, 120) {
+        Ok(b) => {
+            b.fill(0);
+            let put = |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+            put(b, 0, 0xEF53); // f_type: ext2
+            put(b, 8, bs as u64);
+            put(b, 16, blocks as u64);
+            put(b, 24, free as u64);
+            put(b, 32, free as u64); // f_bavail
+            put(b, 40, inodes as u64);
+            put(b, 48, free_inodes as u64);
+            put(b, 64, 255); // f_namelen
+            put(b, 72, bs as u64); // f_frsize
+            0
+        }
+        Err(e) => e,
+    }
+}
+
+/// `statx(dirfd, path, flags, mask, buf)` — the same information as `stat`, in `struct statx`
+/// (256 bytes). Paths are resolved against the cwd (`dirfd` only matters with `AT_EMPTY_PATH`).
+fn sys_statx(dirfd: u64, path_ptr: u64, flags: u64, buf: u64) -> i64 {
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    let raw = match usercopy::cstr(path_ptr, 4096) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    // (mode, size, ino, uid, gid, atime, mtime, ctime)
+    let info: (u32, u64, u64, u32, u32, u32, u32, u32) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        let Some(f) = cur_fd(dirfd) else { return EBADF };
+        let (mode, size) = f.stat();
+        let (a, m, c) = f.times();
+        (mode, size, f.ino(), 0, 0, a, m, c)
+    } else {
+        let path = process::resolve_path(&raw);
+        if crate::procfs::is_proc(&path) {
+            let Some(f) = crate::procfs::open(&path) else { return ENOENT };
+            let (mode, size) = f.stat();
+            (mode, size, 0, 0, 0, 0, 0, 0)
+        } else if path.starts_with("/dev/") {
+            let Some(f) = crate::file::open_device(&path, true, false) else { return ENOENT };
+            let (mode, size) = f.stat();
+            (mode, size, 0, 0, 0, 0, 0, 0)
+        } else {
+            let Some(fs) = ext2::open().ok() else { return -5 };
+            let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
+            let n = fs.read_inode(ino);
+            (n.mode as u32, n.size, ino as u64, n.uid, n.gid, n.atime, n.mtime, n.ctime)
+        }
+    };
+    match usercopy::slice_mut(buf, 256) {
+        Ok(b) => {
+            b.fill(0);
+            b[0..4].copy_from_slice(&0x7ffu32.to_le_bytes()); // stx_mask: the basic stats
+            b[4..8].copy_from_slice(&4096u32.to_le_bytes()); // stx_blksize
+            b[16..20].copy_from_slice(&1u32.to_le_bytes()); // stx_nlink
+            b[20..24].copy_from_slice(&info.3.to_le_bytes());
+            b[24..28].copy_from_slice(&info.4.to_le_bytes());
+            b[28..30].copy_from_slice(&(info.0 as u16).to_le_bytes());
+            b[32..40].copy_from_slice(&info.2.to_le_bytes());
+            b[40..48].copy_from_slice(&info.1.to_le_bytes());
+            b[48..56].copy_from_slice(&info.1.div_ceil(512).to_le_bytes());
+            b[64..72].copy_from_slice(&(info.5 as i64).to_le_bytes()); // atime
+            b[96..104].copy_from_slice(&(info.7 as i64).to_le_bytes()); // ctime
+            b[112..120].copy_from_slice(&(info.6 as i64).to_le_bytes()); // mtime
+            b[136..140].copy_from_slice(&0u32.to_le_bytes()); // dev major
+            b[140..144].copy_from_slice(&1u32.to_le_bytes()); // dev minor
+            0
+        }
+        Err(e) => e,
     }
 }
 
@@ -1258,6 +1358,9 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_RT_SIGPENDING => signal::sys_sigpending(a1, a2),
         SYS_RT_SIGSUSPEND => signal::sys_sigsuspend(a1, a2),
         SYS_PAUSE => signal::sys_pause(),
+        SYS_MINCORE => sys_mincore(a1, a2, a3),
+        SYS_STATFS | SYS_FSTATFS => sys_statfs(a2),
+        SYS_STATX => sys_statx(a1, a2, a3, a5),
         SYS_FSYNC | SYS_FDATASYNC => cur_fd(a1).map_or(EBADF, |f| f.sync()),
         SYS_ALARM => crate::itimer::sys_alarm(a1),
         SYS_SETITIMER => crate::itimer::sys_setitimer(a1, a2, a3),

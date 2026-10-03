@@ -492,6 +492,12 @@ impl Ext2 {
         None
     }
 
+    /// `(block size, blocks, free blocks, inodes, free inodes)` from the superblock, for `statfs`.
+    pub fn stats(&self) -> (u32, u32, u32, u32, u32) {
+        let sb = disk_range(SB_OFFSET, 1024);
+        (self.block_size, le32(&sb[4..]), le32(&sb[12..]), le32(&sb[0..]), le32(&sb[16..]))
+    }
+
     /// Start a batched block-allocation transaction (see [`BlockTx`]).
     fn tx(&self) -> BlockTx<'_> {
         BlockTx { fs: self, bitmaps: BTreeMap::new(), free: BTreeMap::new(), delta: BTreeMap::new() }
