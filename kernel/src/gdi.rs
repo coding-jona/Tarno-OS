@@ -16,6 +16,7 @@ use spin::{Mutex, Once};
 
 struct FbInfo {
     virt: u64,
+    phys: u64,
     width: u32,
     height: u32,
     pitch: u32,
@@ -57,6 +58,7 @@ pub fn init(fb: &limine::framebuffer::Framebuffer, hhdm: u64) {
     let virt = crate::vmm::map_mmio(phys, len);
     FB.call_once(|| FbInfo {
         virt,
+        phys,
         width: fb.width as u32,
         height: fb.height as u32,
         pitch: fb.pitch as u32,
@@ -78,6 +80,12 @@ fn fb() -> Option<&'static FbInfo> {
 pub fn fb_geometry() -> Option<(u32, u32, u32, u8, u8, u8)> {
     let f = fb()?;
     Some((f.width, f.height, f.pitch, f.r_shift, f.g_shift, f.b_shift))
+}
+
+/// `(physical base, length)` of the framebuffer, for `mmap` of `/dev/fb0`.
+pub fn fb_phys() -> Option<(u64, u64)> {
+    let f = fb()?;
+    Some((f.phys, f.pitch as u64 * f.height as u64))
 }
 
 /// Copy `data` into the framebuffer at byte offset `off` (clipped to its size); bytes written.

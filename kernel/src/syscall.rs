@@ -362,6 +362,13 @@ fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> i6
         None
     } else {
         let Some(f) = cur_fd(fd) else { return EBADF };
+        if let Some((phys, dev_len)) = f.device_phys() {
+            // device memory (the framebuffer): shared, not copied
+            if off >= dev_len {
+                return EINVAL;
+            }
+            return proc.mmap_device(addr, fixed, len.min(dev_len - off), prot, phys + off) as i64;
+        }
         let save = f.seek(0, 1);
         if f.seek(off as i64, 0) < 0 {
             return EINVAL;

@@ -62,6 +62,10 @@ pub trait FileOps: Send + Sync {
     fn as_socket(&self) -> Option<&crate::net_sock::SockFile> {
         None
     }
+    /// For `mmap`: the device memory this file maps (`(physical base, length)`), if any.
+    fn device_phys(&self) -> Option<(u64, u64)> {
+        None
+    }
     /// A device-specific `ioctl`; `ENOTTY` for devices that have none.
     fn ioctl(&self, _cmd: u64, _arg: u64) -> i64 {
         -25
@@ -195,6 +199,9 @@ impl FileOps for FbFile {
     fn stat(&self) -> (u32, u64) {
         let size = crate::gdi::fb_geometry().map_or(0, |g| g.2 as u64 * g.1 as u64);
         (S_IFCHR | 0o666, size)
+    }
+    fn device_phys(&self) -> Option<(u64, u64)> {
+        crate::gdi::fb_phys()
     }
     fn ioctl(&self, cmd: u64, arg: u64) -> i64 {
         let Some((w, h, pitch, rs, gs, bs)) = crate::gdi::fb_geometry() else { return -19 };

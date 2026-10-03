@@ -92,7 +92,7 @@ impl Process {
     }
 
     /// Visit every present 4 KiB user page: `(virt, phys, writable, exec)`.
-    fn for_each_user_page(&self, mut f: impl FnMut(u64, u64, bool, bool)) {
+    fn for_each_user_page(&self, mut f: impl FnMut(u64, u64, bool, bool, bool)) {
         let hhdm = hhdm_offset();
         let tbl = |phys: u64| unsafe { &*((phys + hhdm) as *const PageTable) };
         // 0..256 = the whole user half. Index 0 matters: a static-musl ELF
@@ -131,6 +131,7 @@ impl Process {
                             e1.addr().as_u64(),
                             fl.contains(PageTableFlags::WRITABLE),
                             !fl.contains(PageTableFlags::NO_EXECUTE),
+                            fl.contains(vmm::DEVICE_PAGE),
                         );
                     }
                 }
@@ -207,17 +208,33 @@ impl Process {
     /// view (`NtMapViewOfSection`), whose frames are owned by the section, not by this process.
     fn release_page(&self, virt: u64) {
         let Some(phys) = self.translate(virt) else { return };
-        let shared = self
-            .views
-            .lock()
-            .iter()
-            .any(|v| virt >= v.base && virt < v.base + v.pages as u64 * 4096);
+        let shared = vmm::is_device_page(self.pml4_phys, virt)
+            || self
+                .views
+                .lock()
+                .iter()
+                .any(|v| virt >= v.base && virt < v.base + v.pages as u64 * 4096);
         vmm::unmap_page_in(self.pml4_phys, virt); // also flushes this CPU's TLB entry
         if !shared {
             FRAME_ALLOC.lock().dealloc(x86_64::structures::paging::PhysFrame::containing_address(
                 x86_64::PhysAddr::new(phys & !0xFFF),
             ));
         }
+    }
+
+    /// Map device memory (`phys..phys+len`, e.g. the framebuffer) into this process.
+    pub fn mmap_device(&self, addr: u64, fixed: bool, len: u64, prot: u64, phys: u64) -> u64 {
+        let len = (len + 0xFFF) & !0xFFF;
+        let base = if fixed { addr } else { self.next_user_va.fetch_add(len + 0x1000, Ordering::Relaxed) };
+        let mut off = 0;
+        while off < len {
+            if fixed {
+                self.release_page(base + off);
+            }
+            vmm::map_device_page_in(self.pml4_phys, base + off, phys + off, prot & 2 != 0);
+            off += 4096;
+        }
+        base
     }
 
     /// `munmap`: drop the mappings in `[addr, addr+len)` and return their frames.
@@ -394,7 +411,7 @@ impl Process {
                     let pt_phys = e2.addr().as_u64();
                     for i1 in 0..512usize {
                         let e1 = &tbl(pt_phys)[i1];
-                        if e1.flags().contains(PageTableFlags::PRESENT) {
+                        if e1.flags().contains(PageTableFlags::PRESENT) && !e1.flags().contains(vmm::DEVICE_PAGE) {
                             fa.dealloc(PhysFrame::containing_address(e1.addr()));
                         }
                     }
@@ -1491,7 +1508,12 @@ pub fn fork(frame: &UserFrame) -> i64 {
 
     let cspace = Process::new();
     cspace.copy_alloc_state_from(&pspace);
-    pspace.for_each_user_page(|virt, phys, w, x| {
+    pspace.for_each_user_page(|virt, phys, w, x, device| {
+        if device {
+            // device memory is shared, never copied (and never freed by either process)
+            vmm::map_device_page_in(cspace.pml4_phys, virt, phys, w);
+            return;
+        }
         let f = FRAME_ALLOC.lock().alloc().expect("fork: no frame");
         unsafe {
             core::ptr::copy_nonoverlapping(

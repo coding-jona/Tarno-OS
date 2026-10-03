@@ -219,6 +219,41 @@ pub fn protect_page_in(pml4_phys: u64, virt: u64, writable: bool, exec: bool) ->
 
 /// Map a 4 KiB page into an *arbitrary* PML4 (given by physical base). Used for
 /// per-process address spaces. Does not flush the TLB — the caller loads CR3.
+/// Software-available PTE bit marking a page that maps **device memory** (a framebuffer): its
+/// frame is not the process's to free, nor to copy on `fork`.
+pub const DEVICE_PAGE: F = F::BIT_9;
+
+/// Map a user page onto device memory (not RAM the allocator owns) and mark it [`DEVICE_PAGE`].
+pub fn map_device_page_in(pml4_phys: u64, virt: u64, phys: u64, writable: bool) {
+    map_page_in(pml4_phys, virt, phys, writable, true, false);
+    let hhdm = crate::mm::hhdm_offset();
+    let pml4: &mut PageTable = unsafe {
+        &mut *crate::mm::phys_to_virt(x86_64::PhysAddr::new(pml4_phys)).as_mut_ptr::<PageTable>()
+    };
+    let mut m = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(hhdm)) };
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    let mut f = F::PRESENT | F::USER_ACCESSIBLE | F::NO_EXECUTE | DEVICE_PAGE;
+    if writable {
+        f |= F::WRITABLE;
+    }
+    if let Ok(flush) = unsafe { m.update_flags(page, f) } {
+        flush.flush();
+    }
+}
+
+/// Is this user page a device mapping (see [`DEVICE_PAGE`])?
+pub fn is_device_page(pml4_phys: u64, virt: u64) -> bool {
+    let hhdm = crate::mm::hhdm_offset();
+    let pml4: &mut PageTable = unsafe {
+        &mut *crate::mm::phys_to_virt(x86_64::PhysAddr::new(pml4_phys)).as_mut_ptr::<PageTable>()
+    };
+    let m = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(hhdm)) };
+    matches!(
+        m.translate(VirtAddr::new(virt)),
+        x86_64::structures::paging::mapper::TranslateResult::Mapped { flags, .. } if flags.contains(DEVICE_PAGE)
+    )
+}
+
 pub fn map_page_in(pml4_phys: u64, virt: u64, phys: u64, writable: bool, user: bool, exec: bool) {
     let hhdm = crate::mm::hhdm_offset();
     let pml4: &mut PageTable = unsafe {

@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/mman.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -53,13 +54,26 @@ int main(void) {
     fflush(stdout);
     sleep(1);
 
-    fill_rect(100, 450, 200, 100, rgb(255, 136, 0));       // the orange rectangle
+    // The orange rectangle is drawn through an mmap of the framebuffer (shared device memory),
+    // the cursor below through write(): both paths must end up on screen.
+    uint8_t *map = mmap(0, (size_t)pitch * H, PROT_READ | PROT_WRITE, MAP_SHARED, fb, 0);
+    if (map == MAP_FAILED) {
+        puts("fb mmap FAIL");
+        fill_rect(100, 450, 200, 100, rgb(255, 136, 0));
+    } else {
+        for (int y = 450; y < 550; y++)
+            for (int x = 100; x < 300; x++) *(uint32_t *)(map + (size_t)y * pitch + (size_t)x * 4) = rgb(255, 136, 0);
+        /* "fb mmap ok" is printed at the end: a console line now could redraw the screen */
+    }
     int cx = 400, cy = 300;
     fill_rect(cx, cy, 12, 12, rgb(255, 0, 255));           // the cursor, magenta
-    struct pollfd p = { mice, POLLIN, 0 };
+    // Run until a key is pressed on the console (the test sends one after its screenshot), so
+    // nothing prints — and nothing redraws the console over the drawing — before the host looks.
+    struct pollfd p[2] = { { mice, POLLIN, 0 }, { 0, POLLIN, 0 } };
     int idle = 0;
-    while (idle < 30) {                                    // ~3 s of silence ends the demo
-        if (poll(&p, 1, 100) <= 0) { idle++; continue; }
+    while (idle < 600) {                                   // 60 s safety net
+        if (poll(p, 2, 100) <= 0) { idle++; continue; }
+        if (p[1].revents & POLLIN) { char c[16]; (void)!read(0, c, sizeof c); break; }
         idle = 0;
         unsigned char pkt[3];
         if (read(mice, pkt, 3) != 3) break;
@@ -73,6 +87,7 @@ int main(void) {
         if (cy > (int)H - 12) cy = H - 12;
         fill_rect(cx, cy, 12, 12, rgb(255, 0, 255));
     }
+    if (map != MAP_FAILED) { munmap(map, (size_t)pitch * H); puts("fb mmap ok"); }
     printf("fb ok: cursor ended at %d %d\n", cx, cy);
     return 0;
 }

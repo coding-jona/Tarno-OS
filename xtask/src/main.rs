@@ -4273,6 +4273,8 @@ fn fb_test(img: &Path) {
             }
             std::thread::sleep(std::time::Duration::from_millis(800));
             mon(&tsock, &format!("screendump {}", tshot.to_str().unwrap()));
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            mon(&tsock, "sendkey ret"); // lets the demo finish and print its result
         }
     });
     let out = boot_and_run(img, "fb", "fbdemo", "fb ok:", 90);
@@ -4307,16 +4309,17 @@ fn fb_test(img: &Path) {
         a.is_some_and(|a| (a.0 as i32 - b.0 as i32).abs() < 24 && (a.1 as i32 - b.1 as i32).abs() < 24 && (a.2 as i32 - b.2 as i32).abs() < 24)
     };
     let cursor_end = out.lines().find(|l| l.contains("fb ok:")).map(str::trim);
+    let mmap_ok = out.lines().any(|l| l.trim() == "fb mmap ok");
     // the cursor starts at (400,300) and the mouse moved +60 right and +36 down
     let rect_ok = &magic == b"P6" && near(pix(200, 500), (255, 136, 0));
     let cursor_ok = near(pix(400 + 60 + 4, 300 + 36 + 4), (255, 0, 255)) && near(pix(404, 304), (0, 0, 0));
-    if rect_ok && cursor_ok && cursor_end.is_some() {
+    if rect_ok && cursor_ok && mmap_ok && cursor_end.is_some() {
         println!("fb-test PASSED: {}", cursor_end.unwrap());
-        println!("                orange rectangle and the magenta cursor are on screen where the mouse put them");
+        println!("                orange rectangle (drawn through an mmap of the framebuffer) and the magenta cursor (write) are on screen where the mouse put them");
     } else {
         eprintln!("  screendump header {:?}, demo said {:?}", header.trim(), cursor_end);
         eprintln!("  rectangle pixel {:?}, cursor pixel {:?}, old cursor spot {:?}", pix(200, 500), pix(464, 340), pix(404, 304));
-        eprintln!("fb-test FAILED (rectangle {rect_ok}, cursor {cursor_ok})");
+        eprintln!("fb-test FAILED (rectangle {rect_ok}, cursor {cursor_ok}, mmap {mmap_ok})");
         exit(1);
     }
 }

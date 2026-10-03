@@ -99,8 +99,8 @@ and clean shutdown (flush, stop other CPUs, B14). (The default boot is now just
 > pointer state in `ps2.rs`); EHCI and a userspace keyboard-layout table remain. Stage 2's milestone is
 > **met in its first form**: `/dev/fb0` (Linux fbdev: `FBIOGET_VSCREENINFO`/`FSCREENINFO`, `read`/`write`/`lseek`)
 > and the `fbdemo` program draw a rectangle and a cursor that follows the mouse; `cargo xtask fb-test` checks it
-> from the host with a QEMU `screendump`. Still open for Stage 2: `mmap` of the framebuffer (needs a "not owned" page
-> flag so teardown does not free device frames), a real display service that owns scanout, console hand-off.
+> from the host with a QEMU `screendump`. `mmap` of `/dev/fb0` works too (device pages carry a software PTE flag so
+> teardown, `munmap` and `fork` never free or copy device frames). Still open for Stage 2: a real display service that owns scanout and a console hand-off.
 
 **Stage 1 — Input foundation.** PS/2 **mouse/touchpad** (the 5742G uses a PS/2
 Synaptics-class pad: start with plain relative mode, gestures later), a kernel
