@@ -217,16 +217,18 @@ fn main() {
         "proc-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
-            let out = boot_and_run(&img, "proc", "cat /proc/version; free; /busybox ps; echo zzz-$((11))", "zzz-11", 90);
+            let out = boot_and_run(&img, "proc", "cat /proc/version; free; ps; ps; ps; echo zzz-$((11))", "zzz-11", 90);
             let has = |needle: &str| out.lines().any(|l| l.contains(needle));
             let (ver, mem, ps_sh) = (has("Linux version"), has("Mem:"), out.lines().any(|l| l.contains("sh") && l.contains("/proc") == false && l.trim_start().starts_with(|c: char| c.is_ascii_digit())));
-            if ver && mem && ps_sh {
+            // Three forked `ps` runs must not fault at exit (B17: this used to crash in __run_exit_handlers).
+            let no_fault = !out.contains("page fault");
+            if ver && mem && ps_sh && no_fault {
                 println!("proc-test PASSED: /proc/version, `free` (reads /proc/meminfo) and `ps` (walks /proc/<pid>) work");
             } else {
                 for l in out.lines().filter(|l| l.contains("Linux") || l.contains("Mem") || l.contains("PID") || l.contains("COMMAND") || l.contains("proc") || l.contains("unhandled")) {
                     eprintln!("  {l}");
                 }
-                eprintln!("proc-test FAILED (version: {ver}, free: {mem}, ps lists the shell: {ps_sh})");
+                eprintln!("proc-test FAILED (version: {ver}, free: {mem}, ps lists the shell: {ps_sh}, no user fault: {no_fault})");
                 exit(1);
             }
         }
