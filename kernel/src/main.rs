@@ -1193,6 +1193,28 @@ fn group_tier_check(fs: &ext2::Ext2) {
 /// trace of a dead process's memory the isolation boundary is supposed to
 /// have closed) and, in the shared-section case, that only the process's
 /// *own* frames go back — a section still held elsewhere must survive.
+/// Drive the reaper until the free-frame count has not changed for 200 consecutive rounds
+/// (each round yields so exiting threads can finish switching away, then reaps).
+fn settled_free_frames() -> u64 {
+    let mut last = mm::FRAME_ALLOC.lock().free_frames();
+    let mut stable = 0;
+    for _ in 0..50_000 {
+        sched::yield_now();
+        sched::reap();
+        let now = mm::FRAME_ALLOC.lock().free_frames();
+        if now == last {
+            stable += 1;
+            if stable >= 200 {
+                break;
+            }
+        } else {
+            last = now;
+            stable = 0;
+        }
+    }
+    last
+}
+
 fn process_teardown_check(bin: &[u8]) {
     // Warm up once first — the loader's own one-time lazy setup shouldn't be
     // mistaken for a per-process leak.
@@ -1201,11 +1223,10 @@ fn process_teardown_check(bin: &[u8]) {
     while syscall::user_exits() < before_warmup + 1 {
         sched::yield_now();
     }
-    for _ in 0..40 {
-        sched::yield_now(); // let a still-switching-away thread finish (`finish_switch`
-        sched::reap(); // clears `running`) before reap() re-checks it — same pattern
-    } // the stress milestone's own reap-loop already uses.
-    let baseline = mm::FRAME_ALLOC.lock().free_frames();
+    // Wait until the free-frame count stops moving: with many CPUs, processes from the
+    // previous milestones can still be torn down in the background, and a baseline taken
+    // while they finish would read as a leak (or a negative one).
+    let baseline = settled_free_frames();
 
     const ROUNDS: u64 = 8;
     let start_exits = syscall::user_exits();
@@ -1219,11 +1240,7 @@ fn process_teardown_check(bin: &[u8]) {
     // is future work — see `sched::reap`'s doc comment); call it directly,
     // interleaved with `yield_now` so an exited thread's own CPU gets to run
     // `finish_switch` (clearing `running`) before reap() re-checks it.
-    for _ in 0..40 {
-        sched::yield_now();
-        sched::reap();
-    }
-    let after = mm::FRAME_ALLOC.lock().free_frames();
+    let after = settled_free_frames();
     assert_eq!(
         after, baseline,
         "process teardown leaked frames: {ROUNDS} processes spawned+exited, {baseline} -> {after} free frames"
