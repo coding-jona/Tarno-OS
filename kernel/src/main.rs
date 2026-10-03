@@ -46,6 +46,7 @@ mod gdi;
 mod gdt;
 mod gpt;
 mod idt;
+mod itimer;
 mod integrity;
 #[cfg(feature = "interactive")]
 mod login;
@@ -1554,6 +1555,7 @@ fn start_input_devices() {
         }
         Err(e) => kprintln!("THOS: net              {}", e),
     }
+    sched::spawn("itimer", itimer::timer_thread, 0);
 
     // PS/2 keyboard via the i8042 — the laptop target has no xHCI at all.
     match ps2::init() {

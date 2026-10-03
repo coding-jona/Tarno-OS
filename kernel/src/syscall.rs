@@ -135,6 +135,9 @@ const SYS_SETSOCKOPT: u64 = 54;
 const SYS_GETSOCKOPT: u64 = 55;
 const SYS_ACCEPT4: u64 = 288;
 const SYS_PAUSE: u64 = 34;
+const SYS_ALARM: u64 = 37;
+const SYS_GETITIMER: u64 = 36;
+const SYS_SETITIMER: u64 = 38;
 const SYS_GETRLIMIT: u64 = 97;
 const SYS_ACCESS: u64 = 21;
 const SYS_FACCESSAT: u64 = 269;
@@ -1234,6 +1237,9 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         SYS_RT_SIGPENDING => signal::sys_sigpending(a1, a2),
         SYS_RT_SIGSUSPEND => signal::sys_sigsuspend(a1, a2),
         SYS_PAUSE => signal::sys_pause(),
+        SYS_ALARM => crate::itimer::sys_alarm(a1),
+        SYS_SETITIMER => crate::itimer::sys_setitimer(a1, a2, a3),
+        SYS_GETITIMER => crate::itimer::sys_getitimer(a1, a2),
         SYS_SETPGID => sys_setpgid(a1, a2),
         SYS_SETSID => sys_setsid(),
         SYS_GETSID => match if a1 == 0 { sched::current().task() } else { process::find_task(a1) } {

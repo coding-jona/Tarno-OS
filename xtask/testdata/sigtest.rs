@@ -195,6 +195,13 @@ fn main() {
     let st = wait(c);
     if st != 13 { bad.push(format!("SIGPIPE: status {st:#x} (want 13; 0x500 = EPIPE without signal, 0x600 = no EPIPE)")); }
 
+    // 10. alarm(1): SIGALRM interrupts pause() about a second later
+    handle(14, 0);
+    let before = hits();
+    unsafe { sys(37, 1, 0, 0, 0) };
+    let r = unsafe { sys(34, 0, 0, 0, 0) };
+    if r != -4 || hits() != before + 1 { bad.push(format!("alarm: pause = {r}, handler runs = {}", hits() - before)); }
+
     // 9. kill(0 or pid) of a process that does not exist: ESRCH.
     if kill(99999, 0) != -3 { bad.push("kill(nonexistent) is not ESRCH".into()); }
 
