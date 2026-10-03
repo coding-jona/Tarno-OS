@@ -99,6 +99,22 @@ fn main() {
                 }
             }
         }
+        "fork-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            let out = boot_and_run(&img, "fork", "forktest; echo fk-after-$((11))", "fk-after-11", 90);
+            let ok = out.lines().find(|l| l.contains("fork ok:")).map(str::trim);
+            match ok {
+                Some(l) => println!("fork-test PASSED: {l}"),
+                None => {
+                    for l in out.lines().filter(|l| l.contains("fork") || l.contains("atexit") || l.contains("page fault") || l.contains("unhandled")) {
+                        eprintln!("  {l}");
+                    }
+                    eprintln!("fork-test FAILED");
+                    exit(1);
+                }
+            }
+        }
         "thr-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
@@ -490,6 +506,15 @@ fn disk_image() -> PathBuf {
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
+            let fk = root.join("target/forktest");
+            let fk_ok = Command::new("gcc")
+                .args(["-O1", "-o", fk.to_str().unwrap(), root.join("xtask/testdata/forktest.c").to_str().unwrap()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if fk_ok {
+                run(Command::new("debugfs").args(["-w", "-R", &format!("write {} forktest", fk.to_str().unwrap()), img.to_str().unwrap()]));
+            }
             if thr_ok {
                 run(Command::new("debugfs").args(["-w", "-R", &format!("write {} thrtest", thr.to_str().unwrap()), img.to_str().unwrap()]));
             }
