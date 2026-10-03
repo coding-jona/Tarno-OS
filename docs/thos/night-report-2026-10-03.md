@@ -75,3 +75,25 @@ Wochenlimit: 94 % → (Reset 0:00) → ca. 10 % bis jetzt; 5-Stunden-Fenster ca.
 3. B17 und B16 einkreisen (B17 mit einem reproduzierenden C-Test, B16 mit Scheduler-Tracing).
 4. Desktop-Plan beginnen: Maus ist da, `window`/`gdi` existieren; ein Compositor ist der nächste echte Schritt.
 5. Software installieren: ein kleines `apt`/`dpkg`-ähnliches Format oder direkt Alpine-`apk` (musl-dynamisch, braucht `ld-musl`) prüfen.
+
+
+## Nachtrag (bis 10:50 Uhr)
+
+Weitere Commits nach dem ersten Bericht:
+
+| Commit | Was |
+|---|---|
+| `cda298d` | `sendmsg`/`recvmsg`/`sendmmsg`/`recvmmsg` (der glibc-Resolver braucht `sendmmsg`); `dns-test` |
+| `9679a64` | **IRQ-getriebene PS/2-Tastatur und -Maus** über den I/O-APIC (IRQ 1/12), der Eingabe-Thread blockiert statt zu pollen (Polling bleibt als 50-ms-Sicherheitsnetz) |
+| `048dbad` | ext2: globaler Schreib-Lock gegen gleichzeitige Schreiber (Threads/SMP) |
+| `bf37f44` | **Streaming-Datei-I/O**: große Dateien (>256 KiB) werden blockweise gelesen statt komplett in den RAM geladen; Schreiben ist Write-back mit `fsync`; ext2-Allokation gebündelt: 1 MiB schreiben 28 s → 1,7 s |
+
+**Neu getestet und ehrlich bestanden:** `dns-test` löst `example.com` über das **echte Internet** auf (BusyBox `nslookup` über 10.0.2.3, nutzt die Host-Loopback nicht)
+und holt per BusyBox-`wget` `http://example.com/` per Namen ab (der glibc-Resolver liest das virtuelle `/etc/resolv.conf`). Ein früherer Lauf hatte einen einmaligen wget-Timeout (Host-Netz).
+
+**Abschluss-Suite 10:51 Uhr: 23 von 23 melden PASS** (kbd, dyn, thr, fork, proc, busybox, pipe, pe, bios, bios-kbd, shortcuts, longcmd,
+bios-power, random, mouse, ahci, ext2, fat, integrity, registry-crash, smp, dns, net). Einschränkung wie zuvor: **`net-test` ist „SKIPPED“** (Host-Loopback aus), nicht bestanden.
+Beim `smp-test` hat sich die Härtung bewährt (diesmal grün).
+
+**Noch offen (aktualisiert):** B17 (BusyBox `ps` im Fork-Kind beim Beenden), B16 (smp-Heisenbug), inkrementelles ext2-Schreiben (jeder Flush schreibt noch die ganze Datei),
+Dateien >64 MiB auf Images mit 1-KiB-Blöcken, IRQ-getriebenes Netzwerk, echte NIC-Treiber, thread-gerichtete Signale.
