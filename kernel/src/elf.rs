@@ -100,14 +100,18 @@ pub fn validate(image: &[u8]) -> Result<(), &'static str> {
         if p_offset.checked_add(p_filesz).map_or(true, |e| e > image.len() as u64) {
             return Err("segment data outside the file");
         }
-        if (e_type == 2 && p_vaddr == 0) || p_vaddr.checked_add(p_memsz).map_or(true, |e| e >= 1 << 40) {
+        // ET_EXEC lives at its own absolute addresses; ET_DYN is relocated by a base
+        // (PIE_BASE / INTERP_BASE), so its link-time addresses must stay small enough that
+        // base + address still lies in the user half.
+        let limit = if e_type == 2 { USER_TOP } else { 1 << 40 };
+        if (e_type == 2 && p_vaddr == 0) || p_vaddr.checked_add(p_memsz).map_or(true, |e| e >= limit) {
             return Err("segment outside the user address space");
         }
     }
     if loads == 0 {
         return Err("no PT_LOAD segments");
     }
-    if u64le(&image[24..]) >= (1 << 40) {
+    if u64le(&image[24..]) >= if e_type == 2 { USER_TOP } else { 1 << 40 } {
         return Err("entry point outside the user address space");
     }
     Ok(())

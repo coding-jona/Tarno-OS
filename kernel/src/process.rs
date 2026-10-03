@@ -183,7 +183,7 @@ impl Process {
         let mut v = base;
         while v < base + len {
             if fixed {
-                vmm::unmap_page_in(self.pml4_phys, v); // flushes this CPU's TLB entry
+                self.release_page(v); // MAP_FIXED replaces whatever was there
             }
             if prot != 0 {
                 let frame = FRAME_ALLOC.lock().alloc().expect("no frame for mmap");
@@ -203,12 +203,29 @@ impl Process {
         base
     }
 
-    /// `munmap`: drop the mappings in `[addr, addr+len)` (the frames are not returned yet).
+    /// Unmap one user page and give its frame back — unless it belongs to a shared section
+    /// view (`NtMapViewOfSection`), whose frames are owned by the section, not by this process.
+    fn release_page(&self, virt: u64) {
+        let Some(phys) = self.translate(virt) else { return };
+        let shared = self
+            .views
+            .lock()
+            .iter()
+            .any(|v| virt >= v.base && virt < v.base + v.pages as u64 * 4096);
+        vmm::unmap_page_in(self.pml4_phys, virt); // also flushes this CPU's TLB entry
+        if !shared {
+            FRAME_ALLOC.lock().dealloc(x86_64::structures::paging::PhysFrame::containing_address(
+                x86_64::PhysAddr::new(phys & !0xFFF),
+            ));
+        }
+    }
+
+    /// `munmap`: drop the mappings in `[addr, addr+len)` and return their frames.
     pub fn munmap(&self, addr: u64, len: u64) {
         let (start, end) = (addr & !0xFFF, (addr + len + 0xFFF) & !0xFFF);
         let mut v = start;
         while v < end {
-            vmm::unmap_page_in(self.pml4_phys, v);
+            self.release_page(v);
             v += 4096;
         }
     }
