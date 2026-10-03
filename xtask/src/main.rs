@@ -104,6 +104,24 @@ fn main() {
             let img = bios_image();
             fb_test(&img);
         }
+        "real-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            let out = boot_and_run(&img, "real", "/usr/bin/bash /real.sh", "real-script-done", 150);
+            let has = |needle: &str| out.lines().any(|l| l.trim() == needle);
+            let (bash, sed) = (has("bash-hello"), has("aXc"));
+            let grep_count = out.lines().any(|l| l.trim().parse::<u32>().map_or(false, |n| n >= 1))
+                && out.lines().any(|l| l.trim() == "busybox-links=1");
+            if bash && sed && grep_count {
+                println!("real-test PASSED: dynamically linked Debian bash, ls, grep and sed run (ld.so + libc/libtinfo/libselinux/libpcre2)");
+            } else {
+                for l in out.lines().filter(|l| !l.contains("THOS:")).take(30) {
+                    eprintln!("  {l}");
+                }
+                eprintln!("real-test FAILED (bash {bash}, grep|ls {grep_count}, sed {sed})");
+                exit(1);
+            }
+        }
         "mem-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
@@ -600,6 +618,14 @@ fn disk_image() -> PathBuf {
                 .unwrap_or(false);
             if fbd_ok {
                 run(Command::new("debugfs").args(["-w", "-R", &format!("write {} fbdemo", fbd.to_str().unwrap()), img.to_str().unwrap()]));
+            }
+            // Real Debian programs, dynamically linked: bash, ls, grep, sed with all their libraries.
+            let mut dirs: std::collections::BTreeSet<String> = ["/lib", "/lib64", "/lib/x86_64-linux-gnu"].iter().map(|s| s.to_string()).collect();
+            run(Command::new("debugfs").args(["-w", "-R", &format!("write {} real.sh", root.join("xtask/testdata/real.sh").to_str().unwrap()), img.to_str().unwrap()]));
+            for prog in ["/usr/bin/bash", "/usr/bin/ls", "/usr/bin/grep", "/usr/bin/sed"] {
+                if std::path::Path::new(prog).exists() {
+                    add_dynamic_program(&img, prog, &mut dirs);
+                }
             }
             let mt = root.join("target/memtest");
             let mt_ok = Command::new("gcc")
@@ -4324,6 +4350,48 @@ fn fb_test(img: &Path) {
         eprintln!("fb-test FAILED (rectangle {rect_ok}, cursor {cursor_ok}, mmap {mmap_ok})");
         exit(1);
     }
+}
+
+/// Copy a dynamically linked host program and every library `ldd` lists for it into the image
+/// at the same paths (so `ld.so`'s default search finds them). Returns the libraries copied.
+fn add_dynamic_program(img: &Path, host_path: &str, dirs_done: &mut std::collections::BTreeSet<String>) -> usize {
+    let out = Command::new("env")
+        .args(["-u", "LD_PRELOAD", "ldd", host_path])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let mut files: Vec<String> = vec![host_path.to_string()];
+    for tok in out.split_whitespace() {
+        if tok.starts_with('/') && std::path::Path::new(tok).exists() {
+            files.push(tok.to_string());
+        }
+    }
+    files.sort();
+    files.dedup();
+    let mk = |dir: &str, dirs_done: &mut std::collections::BTreeSet<String>| {
+        // debugfs has no `mkdir -p`: create every prefix once
+        let mut cur = String::new();
+        for part in dir.split('/').filter(|p| !p.is_empty()) {
+            cur.push('/');
+            cur.push_str(part);
+            if dirs_done.insert(cur.clone()) {
+                let _ = Command::new("debugfs").args(["-w", "-R", &format!("mkdir {cur}"), img.to_str().unwrap()]).output();
+            }
+        }
+    };
+    let mut n = 0;
+    for f in &files {
+        let real = std::fs::canonicalize(f).unwrap_or_else(|_| f.into());
+        // the image path keeps the *name the program asks for* (the symlink), the bytes come from the real file
+        let dest = if f.starts_with("/lib64/") { f.clone() } else { f.clone() };
+        if let Some(dir) = std::path::Path::new(&dest).parent() {
+            mk(dir.to_str().unwrap(), dirs_done);
+        }
+        let _ = Command::new("debugfs").args(["-w", "-R", &format!("rm {dest}"), img.to_str().unwrap()]).output();
+        let _ = Command::new("debugfs").args(["-w", "-R", &format!("write {} {dest}", real.to_str().unwrap()), img.to_str().unwrap()]).output();
+        n += 1;
+    }
+    n
 }
 
 fn random_test(img: &Path) {
