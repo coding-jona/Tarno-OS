@@ -46,6 +46,7 @@ mod gdi;
 mod gdt;
 mod gpt;
 mod idt;
+mod ioapic;
 mod itimer;
 mod integrity;
 #[cfg(feature = "interactive")]
@@ -291,6 +292,7 @@ fn acpi_apic_bringup() {
         .address as *const u8;
 
     let info = unsafe { acpi::parse(rsdp) };
+    ioapic::remember(&info);
     unsafe { power::init(rsdp) };
     let enabled = info.cpus.iter().filter(|c| c.enabled).count();
 
@@ -1565,7 +1567,11 @@ fn start_input_devices() {
                 Err(e) => kprintln!("THOS: ps2 mouse        {}", e),
             }
             sched::spawn("ps2-poll", ps2_poll_thread, 0);
-            kprintln!("THOS: ps2 ok           i8042 keyboard attached (poll thread up)");
+            if ps2::enable_irqs() {
+                kprintln!("THOS: ps2 ok           i8042 keyboard attached (IRQ 1/12 via the I/O APIC)");
+            } else {
+                kprintln!("THOS: ps2 ok           i8042 keyboard attached (poll thread up; no IRQ routing)");
+            }
         }
         Err(e) => kprintln!("THOS: ps2              {}", e),
     }
@@ -1655,7 +1661,7 @@ extern "C" fn ps2_poll_thread(_: usize) -> ! {
         if ps2::mouse_mid_packet() {
             sched::yield_now(); // the rest of the packet is ~1 ms away; don't lose it
         } else {
-            timer::sleep_ns(8_000_000);
+            ps2::wait_input(); // blocks until the keyboard/mouse interrupt (or a safety timeout)
         }
     }
 }

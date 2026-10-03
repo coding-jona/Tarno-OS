@@ -36,6 +36,9 @@ pub const SPURIOUS_VECTOR: u8 = 0xFF;
 pub const TIMER_VECTOR: u8 = 0x20;
 /// AHCI MSI-X / MSI completion interrupt.
 pub const AHCI_VECTOR: u8 = 0x21;
+/// PS/2 keyboard (ISA IRQ 1) and mouse (IRQ 12) via the I/O APIC.
+pub const KBD_VECTOR: u8 = 0x22;
+pub const MOUSE_VECTOR: u8 = 0x23;
 
 /// ~100 Hz.
 const TIMER_HZ: u32 = 100;

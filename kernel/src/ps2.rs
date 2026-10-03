@@ -376,16 +376,93 @@ impl Decoder {
     }
 }
 
-/// Next keyboard scancode byte if one is waiting (mouse bytes are skipped).
+// ---------------------------------------------------------------------------
+//  Input bytes: from the controller into a queue (interrupt or poll), then decoded
+// ---------------------------------------------------------------------------
+
+/// Bytes the controller delivered, not yet decoded: `0x100 | byte` for the mouse (aux port),
+/// the plain byte for the keyboard. The interrupt handler and the input thread both feed it,
+/// always with interrupts off, so a handler can never land inside the queue's own lock.
+static RING: Mutex<VecDeque<u16>> = Mutex::new(VecDeque::new());
+/// Serialises reads of the controller's data port between the interrupt handler (on one CPU)
+/// and a polling pass of the input thread (on another).
+static HW: Mutex<()> = Mutex::new(());
+static INPUT_WQ: WaitQueue = WaitQueue::new();
+static IRQ_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Move every byte the controller has into the queue. Interrupts must be off.
+fn pump_locked() {
+    let _hw = HW.lock();
+    let mut ring = RING.lock();
+    loop {
+        let st = unsafe { inb(STATUS) };
+        if st & ST_OUT_FULL == 0 {
+            break;
+        }
+        let b = unsafe { inb(DATA) } as u16;
+        if ring.len() >= 512 {
+            ring.pop_front();
+        }
+        ring.push_back(if st & ST_AUX != 0 { 0x100 | b } else { b });
+    }
+}
+
+/// The keyboard/mouse interrupt: collect the byte(s) and wake the input thread.
+pub fn irq() {
+    pump_locked(); // already in an interrupt: interrupts are off
+    INPUT_WQ.wake_one();
+}
+
+fn hw_pending() -> bool {
+    (unsafe { inb(STATUS) }) & ST_OUT_FULL != 0
+}
+
+/// Next keyboard scancode byte if one is waiting. Mouse bytes found on the way go to the
+/// mouse decoder.
 pub fn read_scancode() -> Option<u8> {
-    let st = unsafe { inb(STATUS) };
-    if st & ST_OUT_FULL == 0 {
-        return None;
+    loop {
+        let v = x86_64::instructions::interrupts::without_interrupts(|| {
+            pump_locked();
+            RING.lock().pop_front()
+        })?;
+        if v & 0x100 != 0 {
+            mouse_byte(v as u8);
+            continue;
+        }
+        return Some(v as u8);
     }
-    let b = unsafe { inb(DATA) };
-    if st & ST_AUX != 0 {
-        mouse_byte(b);
-        return None;
+}
+
+/// Sleep until there is input to read. With the interrupt routed this is a real block (woken
+/// by the handler; the 50 ms timeout is only a safety net); without it, a short poll sleep.
+pub fn wait_input() {
+    if IRQ_ACTIVE.load(Ordering::Acquire) {
+        let deadline = crate::timer::deadline_after_ns(50_000_000);
+        INPUT_WQ.wait_if_until(deadline, || RING.lock().is_empty() && !hw_pending());
+    } else {
+        crate::timer::sleep_ns(8_000_000);
     }
-    Some(b)
+}
+
+/// Turn the controller's keyboard and mouse interrupts on and route them through the I/O APIC.
+/// `false` (and everything keeps working by polling) if there is no I/O APIC to route them.
+pub fn enable_irqs() -> bool {
+    // read the config byte — first drain anything the polling path left in the output buffer
+    x86_64::instructions::interrupts::without_interrupts(pump_locked);
+    if !cmd(0x20) || !wait_out_full() {
+        return false;
+    }
+    let cfg = unsafe { inb(DATA) };
+    let dest = crate::apic::bsp_apic_id();
+    if !crate::ioapic::route_isa(1, crate::apic::KBD_VECTOR, dest)
+        || !crate::ioapic::route_isa(12, crate::apic::MOUSE_VECTOR, dest)
+    {
+        return false;
+    }
+    if !cmd(0x60) || !wait_in_empty() {
+        return false;
+    }
+    unsafe { outb(DATA, cfg | 0b11) }; // keyboard + aux interrupts on
+    IRQ_ACTIVE.store(true, Ordering::Release);
+    true
 }

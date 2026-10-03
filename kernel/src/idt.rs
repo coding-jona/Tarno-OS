@@ -89,12 +89,14 @@ core::arch::global_asm!(
 
 IRQ_ENTRY thos_irq_timer, thos_irq_timer_body
 IRQ_ENTRY thos_irq_ahci,  thos_irq_ahci_body
+IRQ_ENTRY thos_irq_input, thos_irq_input_body
 "#
 );
 
 extern "C" {
     fn thos_irq_timer();
     fn thos_irq_ahci();
+    fn thos_irq_input();
 }
 
 /// Body of the APIC timer IRQ — see the removed `apic_timer` for the previous
@@ -113,6 +115,13 @@ extern "C" fn thos_irq_timer_body(frame: *const u64) {
         crate::signal::irq_check_fatal();
     }
     crate::sched::on_tick();
+}
+
+/// PS/2 keyboard / mouse byte ready: stash it and wake the input thread.
+#[no_mangle]
+extern "C" fn thos_irq_input_body(_frame: *const u64) {
+    crate::ps2::irq();
+    apic::eoi();
 }
 
 #[no_mangle]
@@ -152,6 +161,8 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     unsafe {
         idt[apic::TIMER_VECTOR].set_handler_addr(a(thos_irq_timer));
         idt[apic::AHCI_VECTOR].set_handler_addr(a(thos_irq_ahci));
+        idt[apic::KBD_VECTOR].set_handler_addr(a(thos_irq_input));
+        idt[apic::MOUSE_VECTOR].set_handler_addr(a(thos_irq_input));
     }
     idt[apic::SPURIOUS_VECTOR].set_handler_fn(apic_spurious);
 
