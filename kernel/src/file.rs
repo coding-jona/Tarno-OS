@@ -75,6 +75,8 @@ pub enum DevKind {
     Zero,
     /// `/dev/random` and `/dev/urandom` — both the CSPRNG (never blocks once seeded).
     Random,
+    /// `/dev/input/mice`: raw PS/2 mouse packets.
+    Mice,
 }
 
 pub struct DevFile(pub DevKind);
@@ -91,6 +93,15 @@ impl FileOps for DevFile {
                 crate::random::fill(buf);
                 buf.len() as i64
             }
+            DevKind::Mice => crate::ps2::mouse_read(buf),
+        }
+    }
+    fn poll_mask(&self, want: u16) -> u16 {
+        match self.0 {
+            DevKind::Mice => {
+                if want & POLLIN != 0 && crate::ps2::mouse_ready() { POLLIN } else { 0 }
+            }
+            _ => want & (POLLIN | POLLOUT),
         }
     }
     fn write(&self, buf: &[u8]) -> i64 {
@@ -114,6 +125,7 @@ pub fn open_device(path: &str, want_read: bool, want_write: bool) -> Option<Arc<
         "/dev/null" => Arc::new(DevFile(DevKind::Null)),
         "/dev/zero" => Arc::new(DevFile(DevKind::Zero)),
         "/dev/urandom" | "/dev/random" => Arc::new(DevFile(DevKind::Random)),
+        "/dev/input/mice" | "/dev/input/mouse0" => Arc::new(DevFile(DevKind::Mice)),
         "/dev/tty" | "/dev/console" => {
             if want_read && !want_write {
                 Arc::new(KeyboardFile)

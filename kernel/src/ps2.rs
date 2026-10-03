@@ -6,6 +6,18 @@
 //! translation gives us regardless of the keyboard's native set) and turns them
 //! into the same 8-byte HID boot reports the xHCI path produces, so
 //! `console::feed_report` — line discipline, SAK and all — is shared.
+//!
+//! The same controller's second port carries the mouse / touchpad (standard 3-byte PS/2
+//! packets; the Synaptics/ELAN pads on laptops of that era speak this by default). Packets
+//! are decoded into a pointer position + buttons (`mouse_state`, for the desktop) and queued
+//! raw for `/dev/input/mice`.
+
+use alloc::collections::VecDeque;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+
+use spin::Mutex;
+
+use crate::wait::WaitQueue;
 
 const DATA: u16 = 0x60;
 const STATUS: u16 = 0x64; // read
@@ -40,6 +52,15 @@ fn wait_out_full() -> bool {
         }
     }
     false
+}
+
+/// Give a pending device response a moment to land in the output buffer.
+fn wait_out_full_short() {
+    for _ in 0..20_000 {
+        if unsafe { inb(STATUS) } & ST_OUT_FULL != 0 {
+            return;
+        }
+    }
 }
 
 fn cmd(c: u8) -> bool {
@@ -82,6 +103,155 @@ pub fn init() -> Result<(), &'static str> {
         unsafe { outb(DATA, 0xF4) };
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+//  Mouse (aux port)
+// ---------------------------------------------------------------------------
+
+static MOUSE_PRESENT: AtomicBool = AtomicBool::new(false);
+static MOUSE_X: AtomicI32 = AtomicI32::new(0);
+static MOUSE_Y: AtomicI32 = AtomicI32::new(0);
+static MOUSE_BTN: AtomicU8 = AtomicU8::new(0);
+/// Complete raw packets for `/dev/input/mice` (bounded: the oldest are dropped).
+static MOUSE_Q: Mutex<VecDeque<[u8; 3]>> = Mutex::new(VecDeque::new());
+static MOUSE_WQ: WaitQueue = WaitQueue::new();
+/// Packet assembly: bytes so far.
+static MOUSE_PKT: Mutex<([u8; 3], usize)> = Mutex::new(([0; 3], 0));
+
+fn aux_write(b: u8) -> bool {
+    cmd(0xD4) && wait_in_empty() && {
+        unsafe { outb(DATA, b) };
+        true
+    }
+}
+
+/// Wait for the device's ACK (0xFA) after an aux command.
+fn aux_ack() -> bool {
+    for _ in 0..8 {
+        if !wait_out_full() {
+            return false;
+        }
+        let b = unsafe { inb(DATA) };
+        if b == 0xFA {
+            return true;
+        }
+        if b == 0xFE || b == 0xFC {
+            return false; // resend / error
+        }
+    }
+    false
+}
+
+/// Enable the second port and start the mouse streaming (defaults, 100 Hz, reporting on).
+/// Call after [`init`], before the poll thread starts.
+pub fn init_mouse() -> Result<(), &'static str> {
+    // The keyboard's ACK to its enable-scanning command (0xFA) may still sit in the output
+    // buffer; reading it as the controller config byte below would disable the keyboard.
+    for _ in 0..8 {
+        wait_out_full_short();
+        if unsafe { inb(STATUS) } & ST_OUT_FULL == 0 {
+            break;
+        }
+        unsafe { inb(DATA) };
+    }
+    if !cmd(0xA8) {
+        return Err("i8042 aux enable timed out");
+    }
+    // Config: aux clock on (bit 5 clear), aux IRQ stays off (we poll).
+    if !cmd(0x20) || !wait_out_full() {
+        return Err("i8042 config read timed out");
+    }
+    let mut cfg = unsafe { inb(DATA) };
+    cfg &= !(1 << 5);
+    cfg &= !(1 << 1);
+    if !cmd(0x60) || !wait_in_empty() {
+        return Err("i8042 config write timed out");
+    }
+    unsafe { outb(DATA, cfg) };
+    if !aux_write(0xF6) || !aux_ack() {
+        return Err("no PS/2 mouse (no answer to set-defaults)");
+    }
+    if !aux_write(0xF4) || !aux_ack() {
+        return Err("PS/2 mouse refused enable-reporting");
+    }
+    MOUSE_PRESENT.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Pointer position (clamped to the screen) and button bits (1 = left, 2 = right, 4 = middle).
+pub fn mouse_state() -> (i32, i32, u8) {
+    (MOUSE_X.load(Ordering::Relaxed), MOUSE_Y.load(Ordering::Relaxed), MOUSE_BTN.load(Ordering::Relaxed))
+}
+
+fn mouse_byte(b: u8) {
+    if !MOUSE_PRESENT.load(Ordering::Acquire) {
+        return;
+    }
+    let mut p = MOUSE_PKT.lock();
+    let n = p.1;
+    if n == 0 && b & 0x08 == 0 {
+        return; // not a first byte (bit 3 is always set): resynchronise
+    }
+    p.0[n] = b;
+    p.1 += 1;
+    if p.1 < 3 {
+        return;
+    }
+    let pkt = p.0;
+    p.1 = 0;
+    drop(p);
+    if pkt[0] & 0xC0 != 0 {
+        return; // x/y overflow: discard
+    }
+    let dx = pkt[1] as i32 - if pkt[0] & 0x10 != 0 { 256 } else { 0 };
+    let dy = pkt[2] as i32 - if pkt[0] & 0x20 != 0 { 256 } else { 0 };
+    let (w, h) = crate::gdi::screen_size();
+    let (w, h) = (w.max(1) as i32, h.max(1) as i32);
+    let x = (MOUSE_X.load(Ordering::Relaxed) + dx).clamp(0, w - 1);
+    let y = (MOUSE_Y.load(Ordering::Relaxed) - dy).clamp(0, h - 1); // PS/2 y grows upward
+    MOUSE_X.store(x, Ordering::Relaxed);
+    MOUSE_Y.store(y, Ordering::Relaxed);
+    MOUSE_BTN.store(pkt[0] & 7, Ordering::Relaxed);
+    {
+        let mut q = MOUSE_Q.lock();
+        if q.len() >= 128 {
+            q.pop_front();
+        }
+        q.push_back(pkt);
+    }
+    MOUSE_WQ.wake_all();
+}
+
+/// `/dev/input/mice`: block until a raw 3-byte packet is available.
+pub fn mouse_read(buf: &mut [u8]) -> i64 {
+    if buf.is_empty() {
+        return 0;
+    }
+    loop {
+        if let Some(p) = MOUSE_Q.lock().pop_front() {
+            let n = buf.len().min(3);
+            buf[..n].copy_from_slice(&p[..n]);
+            return n as i64;
+        }
+        if !MOUSE_PRESENT.load(Ordering::Acquire) {
+            return -19; // ENODEV
+        }
+        if crate::signal::interrupted() {
+            return -4;
+        }
+        MOUSE_WQ.wait_if_intr(|| MOUSE_Q.lock().is_empty());
+    }
+}
+
+/// A mouse packet is half-received: the next byte is about a millisecond away, so the poll
+/// thread should not go to sleep yet (the controller holds only one byte).
+pub fn mouse_mid_packet() -> bool {
+    MOUSE_PKT.lock().1 > 0
+}
+
+pub fn mouse_ready() -> bool {
+    !MOUSE_Q.lock().is_empty()
 }
 
 /// Set-1 make code -> HID usage (plain keys).
@@ -214,6 +384,7 @@ pub fn read_scancode() -> Option<u8> {
     }
     let b = unsafe { inb(DATA) };
     if st & ST_AUX != 0 {
+        mouse_byte(b);
         return None;
     }
     Some(b)

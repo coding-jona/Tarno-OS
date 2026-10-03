@@ -78,6 +78,11 @@ fn main() {
             let img = bios_image();
             longcmd_test(&img);
         }
+        "mouse-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            mouse_test(&img);
+        }
         "net-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
@@ -392,6 +397,8 @@ fn disk_image() -> PathBuf {
         ("devtest.rs", "devtest"),
         // Socket test, run by `net-test` against host-side servers.
         ("nettest.rs", "nettest"),
+        // PS/2 mouse test, run by `mouse-test`.
+        ("mousetest.rs", "mousetest"),
         // getrandom quality test, run by `random-test`.
         ("randtest.rs", "randtest"),
     ] {
@@ -3964,6 +3971,42 @@ fn net_test(img: &Path) {
             eprintln!("  {l}");
         }
         eprintln!("net-test FAILED (gateway ping: {}, sockets: {}, wget: {})", gw.is_some(), sock.is_some(), wget);
+        exit(1);
+    }
+}
+
+/// PS/2 mouse: the guest reads /dev/input/mice while the host moves the pointer and presses
+/// the left button through the QEMU monitor.
+fn mouse_test(img: &Path) {
+    let root = workspace_root();
+    let log = root.join("target/mouse-serial.log");
+    let sock = root.join("target/mouse-mon.sock");
+    let (tlog, tsock) = (log.clone(), sock.clone());
+    std::thread::spawn(move || {
+        if wait_for(&tlog, "mouse ready", 200) {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            for _ in 0..6 {
+                mon(&tsock, "mouse_move 12 6");
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            mon(&tsock, "mouse_button 1");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            mon(&tsock, "mouse_button 0");
+            for _ in 0..3 {
+                mon(&tsock, "mouse_move -5 -5");
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+        }
+    });
+    let out = boot_and_run(img, "mouse", "mousetest", "mouse ok:", 60);
+    let ok = out.lines().find(|l| l.contains("mouse ok:")).map(str::trim);
+    if let Some(l) = ok {
+        println!("mouse-test PASSED: {l}");
+    } else {
+        for l in out.lines().filter(|l| l.contains("mouse")) {
+            eprintln!("  {l}");
+        }
+        eprintln!("mouse-test FAILED");
         exit(1);
     }
 }

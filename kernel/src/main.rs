@@ -1510,6 +1510,10 @@ fn start_input_devices() {
     // PS/2 keyboard via the i8042 — the laptop target has no xHCI at all.
     match ps2::init() {
         Ok(()) => {
+            match ps2::init_mouse() {
+                Ok(()) => kprintln!("THOS: ps2 mouse ok     PS/2 mouse / touchpad streaming (/dev/input/mice)"),
+                Err(e) => kprintln!("THOS: ps2 mouse        {}", e),
+            }
             sched::spawn("ps2-poll", ps2_poll_thread, 0);
             kprintln!("THOS: ps2 ok           i8042 keyboard attached (poll thread up)");
         }
@@ -1596,7 +1600,13 @@ extern "C" fn ps2_poll_thread(_: usize) -> ! {
                 console::feed_report(&r);
             }
         }
-        sched::yield_now();
+        // Poll every ~8 ms instead of spinning: a busy loop here would keep a core at 100 %
+        // on the 2010 laptop. (IRQ-driven input via the IO-APIC is the roadmap's B12.)
+        if ps2::mouse_mid_packet() {
+            sched::yield_now(); // the rest of the packet is ~1 ms away; don't lose it
+        } else {
+            timer::sleep_ns(8_000_000);
+        }
     }
 }
 
