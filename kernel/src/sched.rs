@@ -509,6 +509,19 @@ pub fn spawn_user_pe(name: &'static str, task: Arc<Task>, entry: u64, user_rsp: 
 
 /// Create a runnable user thread that resumes from a full [`UserFrame`] (a
 /// fork child).
+/// A new thread inside an existing task (`clone(CLONE_THREAD)`): its tid and
+/// `clear_child_tid` are registered before it can run.
+pub fn spawn_user_thread(task: Arc<Task>, frame: UserFrame, fsbase: u64, tid: u64, clear_tid: u64) -> u64 {
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    task.thread_spawned();
+    let tk = task.clone();
+    crate::process::register_thread(id, tid, clear_tid, &tk);
+    let t = Thread::spawned_user_frame(id, "thread", task, frame, fsbase);
+    tk.set_thread(Arc::downgrade(&t));
+    SCHED.lock().ready.push_back(t);
+    id
+}
+
 pub fn spawn_user_frame(name: &'static str, task: Arc<Task>, frame: UserFrame, fsbase: u64) -> u64 {
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     task.thread_spawned();

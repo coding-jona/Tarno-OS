@@ -230,16 +230,29 @@ impl Process {
         }
     }
 
-    /// `mprotect`: change the permissions of the pages that are mapped in the range.
-    pub fn mprotect(&self, addr: u64, len: u64, prot: u64) {
+    /// `mprotect`. `PROT_NONE` removes the pages (their frames go back — decommitting is what
+    /// allocators use it for); a real protection on pages that are not mapped yet maps them
+    /// zeroed (a `PROT_NONE` reservation being committed, e.g. a thread stack); mapped pages
+    /// just change their writable / executable bits.
+    pub fn mprotect(&self, addr: u64, len: u64, prot: u64) -> i64 {
         let (start, end) = (addr & !0xFFF, (addr + len + 0xFFF) & !0xFFF);
+        let (writable, exec) = (prot & 2 != 0, prot & 4 != 0);
         let mut v = start;
         while v < end {
-            if vmm::page_present_in(self.pml4_phys, v) {
-                let _ = self.protect(v, 4096, prot & 2 != 0, prot & 4 != 0);
+            if prot == 0 {
+                self.release_page(v);
+            } else if vmm::page_present_in(self.pml4_phys, v) {
+                let _ = self.protect(v, 4096, writable, exec);
+            } else {
+                let Some(frame) = FRAME_ALLOC.lock().alloc() else { return -12 }; // ENOMEM
+                unsafe {
+                    core::ptr::write_bytes(phys_to_virt(frame.start_address()).as_mut_ptr::<u8>(), 0, 4096);
+                }
+                self.map(v, frame.start_address().as_u64(), writable, exec);
             }
             v += 4096;
         }
+        0
     }
 
     /// Anonymous `mmap`: bump-allocate + map `len` bytes RW, return the base.
@@ -758,6 +771,11 @@ pub struct Task {
     /// `sched::reap` decrements it once a thread's stack is confirmed safe
     /// to free, and reclaims the address space right when it hits zero.
     active_threads: AtomicU64,
+    /// Threads that have not yet called exit (unlike `active_threads`, which counts until
+    /// the corpse is reaped): the last one to exit ends the process.
+    live_threads: AtomicU32,
+    /// Every thread of the task (weak), so exit_group / signals can wake them all.
+    threads: Mutex<Vec<alloc::sync::Weak<crate::sched::Thread>>>,
 }
 
 fn seed_fds() -> Vec<Fd> {
@@ -800,6 +818,8 @@ impl Task {
             trace: AtomicBool::new(false),
             is_pe: AtomicBool::new(false),
             active_threads: AtomicU64::new(0),
+            live_threads: AtomicU32::new(0),
+            threads: Mutex::new(Vec::new()),
         });
         TASKS.lock().insert(t.pid, t.clone());
         t
@@ -819,7 +839,11 @@ impl Task {
     }
     /// Remember the task's thread (weakly: the thread owns an `Arc<Task>`).
     pub fn set_thread(&self, t: alloc::sync::Weak<crate::sched::Thread>) {
-        *self.thread.lock() = Some(t);
+        self.threads.lock().push(t.clone());
+        let mut first = self.thread.lock();
+        if first.as_ref().map_or(true, |w| w.upgrade().is_none()) {
+            *first = Some(t);
+        }
     }
     pub fn thread(&self) -> Option<Arc<crate::sched::Thread>> {
         self.thread.lock().as_ref().and_then(|w| w.upgrade())
@@ -852,6 +876,21 @@ impl Task {
     /// `Thread` bound to this `Task`, the initial one included).
     pub(crate) fn thread_spawned(&self) {
         self.active_threads.fetch_add(1, Ordering::AcqRel);
+        self.live_threads.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// One of this task's threads is leaving (called by the thread itself). `true` if it was
+    /// the last live one, i.e. the whole process is ending.
+    pub fn thread_leaving(&self) -> bool {
+        self.live_threads.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+
+    /// Wake every thread of the task (it is exiting, or a signal is pending).
+    pub fn wake_all_threads(&self) {
+        let ts: Vec<Arc<crate::sched::Thread>> = self.threads.lock().iter().filter_map(|w| w.upgrade()).collect();
+        for t in ts {
+            sched::unblock(t);
+        }
     }
 
     /// Record that one of this task's threads is confirmed gone (`sched::reap`,
@@ -1282,6 +1321,7 @@ pub fn set_exit_status(code: i32) {
         t.fds.lock().clear();
         t.exited.store(true, Ordering::Release);
         notify_parent(&t);
+        t.wake_all_threads(); // the other threads see `exited` and die
     }
     CHILD_EXIT.wake_all(); // an interested parent may be blocked in wait4
 }
@@ -1581,4 +1621,91 @@ pub fn wait4(pid: i64, status_ptr: u64) -> i64 {
         }
         CHILD_EXIT.wait_if_intr(|| should_block_in_wait4(me, pid));
     }
+}
+
+
+// ---------------------------------------------------------------------------
+//  POSIX threads (clone(CLONE_THREAD))
+// ---------------------------------------------------------------------------
+
+/// Per-thread data of threads created by `clone`: scheduler thread id -> (tid, clear_child_tid).
+static THREAD_INFO: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
+/// tid -> task, for `tkill` / `tgkill` on secondary threads.
+static TID_TASKS: Mutex<BTreeMap<u64, alloc::sync::Weak<Task>>> = Mutex::new(BTreeMap::new());
+
+/// Called by the scheduler before a new thread can run.
+pub fn register_thread(sched_id: u64, tid: u64, clear_tid: u64, task: &Arc<Task>) {
+    THREAD_INFO.lock().insert(sched_id, (tid, clear_tid));
+    TID_TASKS.lock().insert(tid, Arc::downgrade(task));
+}
+
+/// The caller's POSIX thread id (the process id for the main thread). Not
+/// [`current_tid`], which is the scheduler's id that the NT personality keys things by.
+pub fn posix_tid() -> u64 {
+    let cur = sched::current();
+    if let Some(&(tid, _)) = THREAD_INFO.lock().get(&cur.id) {
+        return tid;
+    }
+    cur.task().map(|t| t.pid).unwrap_or(0)
+}
+
+/// `set_tid_address`: remember where to clear the tid when this thread exits; returns the tid.
+pub fn set_clear_tid(addr: u64) -> u64 {
+    let cur = sched::current();
+    let tid = posix_tid();
+    THREAD_INFO.lock().insert(cur.id, (tid, addr));
+    tid
+}
+
+/// The task a thread id belongs to (a pid, or a secondary thread's tid).
+pub fn task_of_tid(tid: u64) -> Option<Arc<Task>> {
+    if let Some(t) = find_task(tid) {
+        return Some(t);
+    }
+    TID_TASKS.lock().get(&tid).and_then(|w| w.upgrade()).filter(|t| !t.is_exited())
+}
+
+/// The calling thread is ending: clear its `clear_child_tid` word (waking a joiner) and drop
+/// its bookkeeping.
+pub fn thread_exit_cleanup() {
+    let cur = sched::current();
+    let info = THREAD_INFO.lock().remove(&cur.id);
+    if let Some((tid, clear)) = info {
+        TID_TASKS.lock().remove(&tid);
+        crate::futex::thread_cleared(clear);
+    }
+}
+
+/// `clone` with `CLONE_THREAD`: a new thread in the caller's task (same address space, fds,
+/// signal state) starting in the caller's context with `rax = 0` on `stack`.
+pub fn clone_thread(frame: &UserFrame, flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) -> i64 {
+    const CLONE_SETTLS: u64 = 0x80000;
+    const CLONE_PARENT_SETTID: u64 = 0x100000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+    const CLONE_CHILD_SETTID: u64 = 0x1000000;
+    let cur = sched::current();
+    let Some(task) = cur.task() else { return -22 };
+    let tid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    if flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
+        if let Err(e) = crate::usercopy::write_u32(ptid, tid as u32) {
+            return e;
+        }
+    }
+    if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
+        if let Err(e) = crate::usercopy::write_u32(ctid, tid as u32) {
+            return e;
+        }
+    }
+    let (cs, ss) = user_selectors();
+    let mut cf = *frame;
+    cf.rax = 0;
+    cf.cs = cs;
+    cf.ss = ss;
+    if stack != 0 {
+        cf.rsp = stack;
+    }
+    let fsbase = if flags & CLONE_SETTLS != 0 { tls } else { cur.fsbase() };
+    let clear = if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 };
+    sched::spawn_user_thread(task, cf, fsbase, tid, clear);
+    tid as i64
 }

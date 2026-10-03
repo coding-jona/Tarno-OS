@@ -99,6 +99,23 @@ fn main() {
                 }
             }
         }
+        "thr-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            let out = boot_and_run(&img, "thr", "thrtest; echo thr-after-$((11))", "thr-after-11", 120);
+            let ok = out.lines().find(|l| l.contains("thr ok:")).map(str::trim);
+            let alive = out.lines().any(|l| l.trim() == "thr-after-11");
+            match (ok, alive) {
+                (Some(l), true) => println!("thr-test PASSED: {l}; the shell came back after exit with a running thread"),
+                _ => {
+                    for l in out.lines().filter(|l| l.contains("thr") || l.contains("unhandled") || l.contains("killed") || l.contains("trap") || l.contains("fault")) {
+                        eprintln!("  {l}");
+                    }
+                    eprintln!("thr-test FAILED (threads ok: {}, shell back: {alive})", ok.is_some());
+                    exit(1);
+                }
+            }
+        }
         "net-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
@@ -450,6 +467,15 @@ fn disk_image() -> PathBuf {
         if built && std::path::Path::new(ld).exists() && std::path::Path::new(libc).exists() {
             for dir in ["lib64", "lib", "lib/x86_64-linux-gnu"] {
                 run(Command::new("debugfs").args(["-w", "-R", &format!("mkdir {dir}"), img.to_str().unwrap()]));
+            }
+            let thr = root.join("target/thrtest");
+            let thr_ok = Command::new("gcc")
+                .args(["-O1", "-pthread", "-o", thr.to_str().unwrap(), root.join("xtask/testdata/thrtest.c").to_str().unwrap()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if thr_ok {
+                run(Command::new("debugfs").args(["-w", "-R", &format!("write {} thrtest", thr.to_str().unwrap()), img.to_str().unwrap()]));
             }
             for (from, to) in [
                 (bin.to_str().unwrap(), "dyntest"),

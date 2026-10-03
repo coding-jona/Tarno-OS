@@ -135,6 +135,7 @@ const SYS_SETSOCKOPT: u64 = 54;
 const SYS_GETSOCKOPT: u64 = 55;
 const SYS_ACCEPT4: u64 = 288;
 const SYS_PAUSE: u64 = 34;
+const SYS_GETRLIMIT: u64 = 97;
 const SYS_ACCESS: u64 = 21;
 const SYS_FACCESSAT: u64 = 269;
 const SYS_PREAD64: u64 = 17;
@@ -370,6 +371,29 @@ fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> i6
         Some(buf)
     };
     proc.mmap_region(addr, fixed, len, prot, data.as_deref()) as i64
+}
+
+/// `prlimit64(pid, resource, new, old)` / `getrlimit(resource, rlim)`: report the limits (new
+/// limits are accepted and ignored). The numbers matter: glibc sizes thread stacks from
+/// `RLIMIT_STACK`, so garbage here means absurd allocations.
+fn sys_prlimit(resource: u64, _new: u64, old: u64) -> i64 {
+    const INF: u64 = u64::MAX;
+    let (cur, max) = match resource {
+        3 => (8 << 20, INF),     // RLIMIT_STACK: 8 MiB
+        7 => (1024, 4096),       // RLIMIT_NOFILE
+        4 => (0, INF),           // RLIMIT_CORE
+        6 => (4096, 4096),       // RLIMIT_NPROC (small: no fork bombs)
+        _ => (INF, INF),
+    };
+    if old != 0 {
+        if let Err(e) = usercopy::write_u64(old, cur) {
+            return e;
+        }
+        if let Err(e) = usercopy::write_u64(old.wrapping_add(8), max) {
+            return e;
+        }
+    }
+    0
 }
 
 /// `access(path, mode)` / `faccessat`: does the path exist, and may the caller use it so?
@@ -1137,10 +1161,7 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             _ => EINVAL,
         },
         SYS_MPROTECT => match sched::current_proc() {
-            Some(p) if a1 & 0xFFF == 0 && a1.saturating_add(a2) < usercopy::USER_TOP => {
-                p.mprotect(a1, a2, a3);
-                0
-            }
+            Some(p) if a1 & 0xFFF == 0 && a1.saturating_add(a2) < usercopy::USER_TOP => p.mprotect(a1, a2, a3),
             _ => EINVAL,
         },
         SYS_PREAD64 => sys_pread64(a1, a2, a3, a4),
@@ -1155,11 +1176,12 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             Err(e) => e,
         },
 
-        SYS_GETPID | SYS_GETTID => process::current_pid() as i64,
+        SYS_GETPID => process::current_pid() as i64,
+        SYS_GETTID => process::posix_tid() as i64,
         SYS_GETPPID => process::current_ppid() as i64,
         SYS_GETUID | SYS_GETEUID => process::current_uid() as i64,
         SYS_GETGID | SYS_GETEGID => process::current_gid() as i64,
-        SYS_SET_TID_ADDRESS => process::current_pid() as i64,
+        SYS_SET_TID_ADDRESS => process::set_clear_tid(a1) as i64,
         SYS_IOCTL => sys_ioctl(a1, a2, a3),
         SYS_RT_SIGACTION => signal::sys_sigaction(a1, a2, a3, a4),
         SYS_RT_SIGPROCMASK => signal::sys_sigprocmask(a1, a2, a3, a4),
@@ -1173,8 +1195,11 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             Some(t) => t.sid() as i64,
             None => -3, // ESRCH
         },
-        SYS_SET_ROBUST_LIST | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MADVISE | SYS_FUTEX
+        SYS_PRLIMIT64 => sys_prlimit(a2, a3, a4),
+        SYS_GETRLIMIT => sys_prlimit(a1, 0, a2),
+        SYS_SET_ROBUST_LIST | SYS_SIGALTSTACK | SYS_MADVISE
         | SYS_PRCTL | SYS_FCHDIR => 0,
+        SYS_FUTEX => crate::futex::sys_futex(a1, a2, a3, a4, a5, frame.r9),
         SYS_RSEQ => ENOSYS,
 
         // chdir: normalise against the cwd, verify it names a directory in ext2.
@@ -1350,8 +1375,8 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
 
         SYS_KILL => signal::sys_kill(a1 as i64, a2),
         // THOS has one thread per task, so a tid is a pid.
-        SYS_TKILL => signal::sys_kill(a1 as i64, a2),
-        SYS_TGKILL => signal::sys_kill(a2 as i64, a3),
+        SYS_TKILL => signal::sys_tkill(a1, a2),
+        SYS_TGKILL => signal::sys_tkill(a2, a3),
 
         // getcwd(buf, size): write the path + NUL, return its length incl. NUL.
         SYS_GETCWD => {
@@ -1385,8 +1410,15 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         // A shared-VM clone (threads) isn't supported yet.
         SYS_CLONE => {
             const CLONE_VM: u64 = 0x100;
-            if a1 & CLONE_VM != 0 {
-                ENOSYS
+            const CLONE_THREAD: u64 = 0x10000;
+            if a1 & CLONE_THREAD != 0 {
+                if a1 & CLONE_VM == 0 {
+                    EINVAL
+                } else {
+                    process::clone_thread(frame, a1, a2, a3, a4, a5)
+                }
+            } else if a1 & CLONE_VM != 0 {
+                ENOSYS // vfork-style shared-VM processes are not supported
             } else {
                 process::fork(frame)
             }
@@ -1399,9 +1431,24 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
 
         SYS_WAIT4 => process::wait4(a1 as i64, a2),
 
-        SYS_EXIT | SYS_EXIT_GROUP => {
+        // exit_group ends the whole process (the other threads notice and follow).
+        SYS_EXIT_GROUP => {
+            process::thread_exit_cleanup();
             process::set_exit_status(a1 as i32);
             USER_EXITS.fetch_add(1, Ordering::Release);
+            if let Some(t) = sched::current().task() {
+                t.thread_leaving();
+            }
+            sched::exit()
+        }
+        // exit ends only this thread; the last one to leave ends the process.
+        SYS_EXIT => {
+            let last = sched::current().task().map_or(true, |t| t.thread_leaving());
+            process::thread_exit_cleanup();
+            if last {
+                process::set_exit_status(a1 as i32);
+                USER_EXITS.fetch_add(1, Ordering::Release);
+            }
             sched::exit()
         }
 

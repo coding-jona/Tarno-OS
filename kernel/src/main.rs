@@ -73,6 +73,7 @@ mod vfs;
 mod vmm;
 mod window;
 mod fbcon;
+mod futex;
 mod power;
 mod mbr;
 mod ps2;

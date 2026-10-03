@@ -118,6 +118,11 @@ impl WaitQueue {
         })
     }
 
+    /// No thread is queued here.
+    pub fn is_empty(&self) -> bool {
+        self.waiters.lock().is_empty()
+    }
+
     /// Drop a specific thread from the queue (it was woken via the timer wheel,
     /// or its wait is otherwise over). No-op if it isn't queued.
     pub fn remove(&self, t: &Arc<Thread>) {

@@ -165,6 +165,9 @@ fn next_deliverable(st: &mut SigState) -> Option<u32> {
 /// Is there a signal the current process would act on (without consuming it)?
 pub fn interrupted() -> bool {
     let Some(task) = sched::current().task() else { return false };
+    if task.is_exited() {
+        return true; // the process is ending (exit_group / fatal signal): every wait returns
+    }
     let st = task.sig.lock();
     let avail = st.pending & !(st.blocked & !UNBLOCKABLE);
     (0..NSIG).any(|i| avail & (1 << i) != 0 && !is_ignored(&st, i + 1))
@@ -181,9 +184,7 @@ pub fn send(task: &Arc<Task>, sig: u32) {
         return;
     }
     task.sig.lock().pending |= bit(sig);
-    if let Some(t) = task.thread() {
-        sched::unblock(t);
-    }
+    task.wake_all_threads();
 }
 
 /// Send to the calling process (SIGPIPE).
@@ -203,6 +204,21 @@ pub fn send_pgrp(pgid: u64, sig: u32) -> usize {
         send(t, sig);
     }
     tasks.len()
+}
+
+/// `tkill(tid, sig)` / `tgkill`: a signal for one thread (delivered to the process, which is
+/// as precise as THOS's per-process signal state gets).
+pub fn sys_tkill(tid: u64, sig: u64) -> i64 {
+    if sig > NSIG as u64 {
+        return EINVAL;
+    }
+    let Some(task) = process::task_of_tid(tid) else { return ESRCH };
+    let my_uid = sched::current().task().map_or(0, |t| t.uid);
+    if my_uid != 0 && my_uid != task.uid {
+        return EPERM;
+    }
+    send(&task, sig as u32);
+    0
 }
 
 /// `kill(pid, sig)`.
@@ -367,6 +383,14 @@ pub fn sys_sigsuspend(mask: u64, size: u64) -> i64 {
 //  delivery
 // ---------------------------------------------------------------------------
 
+/// This thread is the casualty of its process ending: clear its tid word and leave without
+/// touching the already-recorded exit status.
+pub fn thread_die(task: &Arc<Task>) -> ! {
+    process::thread_exit_cleanup();
+    task.thread_leaving();
+    sched::exit()
+}
+
 /// End the process because of fatal signal `sig` (never returns).
 fn terminate(sig: u32) -> ! {
     process::set_term_signal(sig);
@@ -379,6 +403,9 @@ fn terminate(sig: u32) -> ! {
 /// killed with Ctrl+C or `kill -9`). Handled signals wait for the next syscall.
 pub fn irq_check_fatal() {
     let Some(task) = sched::current().task() else { return };
+    if task.is_exited() {
+        thread_die(&task);
+    }
     let sig = {
         let st = task.sig.lock();
         let avail = st.pending & !(st.blocked & !UNBLOCKABLE);
@@ -416,6 +443,9 @@ const SC_FPSTATE: usize = 24;
 /// `rax`), `nr` its number.
 pub fn deliver_at_syscall_exit(frame: &mut UserFrame, nr: u64, ret: &mut i64) {
     let Some(task) = sched::current().task() else { return };
+    if task.is_exited() {
+        thread_die(&task); // another thread called exit_group / was killed by a signal
+    }
     let (sig, act, old_mask) = {
         let mut st = task.sig.lock();
         let Some(sig) = next_deliverable(&mut st) else { return };

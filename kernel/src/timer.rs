@@ -79,6 +79,11 @@ pub fn disarm(t: &Arc<Thread>) {
 
 /// Block the current thread until tick `deadline` (or until something else wakes
 /// it — the caller re-checks its own condition). Safe from a PE syscall.
+/// The timer tick `ns` nanoseconds from now, rounded up and never early (one extra tick).
+pub fn deadline_after_ns(ns: u64) -> u64 {
+    now().saturating_add(ns.div_ceil(NS_PER_TICK).max(1) + 1)
+}
+
 pub fn sleep_until(deadline: u64) {
     if now() >= deadline {
         return;
