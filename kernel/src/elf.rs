@@ -1,21 +1,32 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Phase 2 — a minimal ELF64 loader.
 //!
-//! Static `ET_EXEC` only: iterate `PT_LOAD` segments, map fresh user frames at
-//! `p_vaddr`, copy `p_filesz` bytes from the image, zero the rest (bss). No
-//! dynamic linking, no `PT_INTERP`, no `ET_DYN`/PIE relocation yet — that comes
-//! with the userland loader (`ld.so` equivalent) in the POSIX personality.
+//! `ET_EXEC` and `ET_DYN` (PIE): iterate `PT_LOAD` segments, map fresh user frames at
+//! `base + p_vaddr`, copy `p_filesz` bytes from the image, zero the rest (bss). A
+//! `PT_INTERP` program (dynamically linked) gets its interpreter (`ld.so`) loaded at a
+//! second base and starts there, with `AT_BASE` / `AT_ENTRY` in the aux vector, exactly
+//! like Linux. The interpreter does the relocation and the library loading itself.
 
 use crate::mm::{phys_to_virt, FRAME_ALLOC};
 use crate::process::Process;
 
 pub struct Image {
+    /// First instruction to run: the program's own entry, or the interpreter's for a
+    /// dynamically linked program.
     pub entry: u64,
+    /// The program's entry point (`AT_ENTRY`).
+    pub prog_entry: u64,
+    /// Where the interpreter was loaded (`AT_BASE`), 0 if there is none.
+    pub interp_base: u64,
     /// Virtual address the program headers landed at (for `AT_PHDR`).
     pub phdr: u64,
     pub phent: u64,
     pub phnum: u64,
 }
+
+/// Load address of position-independent (`ET_DYN`) programs, and of their interpreter.
+const PIE_BASE: u64 = 0x0000_5555_5555_4000;
+const INTERP_BASE: u64 = 0x0000_7fff_f7c0_0000;
 
 fn u16le(b: &[u8]) -> u16 {
     u16::from_le_bytes(b[..2].try_into().unwrap())
@@ -46,8 +57,9 @@ pub fn validate(image: &[u8]) -> Result<(), &'static str> {
     if image[5] != 1 {
         return Err("not little-endian");
     }
-    if u16le(&image[16..]) != 2 {
-        return Err("not ET_EXEC");
+    let e_type = u16le(&image[16..]);
+    if e_type != 2 && e_type != 3 {
+        return Err("not ET_EXEC / ET_DYN");
     }
     if u16le(&image[18..]) != 0x3E {
         return Err("not x86-64");
@@ -68,6 +80,14 @@ pub fn validate(image: &[u8]) -> Result<(), &'static str> {
     let mut loads = 0;
     for i in 0..e_phnum {
         let ph = &image[(e_phoff + i * e_phentsize) as usize..];
+        if u32le(&ph[0..]) == 3 {
+            // PT_INTERP: a NUL-terminated path inside the file
+            let (o, n) = (u64le(&ph[8..]), u64le(&ph[32..]));
+            if n == 0 || n > 256 || o.checked_add(n).map_or(true, |e| e > image.len() as u64) {
+                return Err("bad PT_INTERP");
+            }
+            continue;
+        }
         if u32le(&ph[0..]) != 1 {
             continue;
         }
@@ -80,39 +100,62 @@ pub fn validate(image: &[u8]) -> Result<(), &'static str> {
         if p_offset.checked_add(p_filesz).map_or(true, |e| e > image.len() as u64) {
             return Err("segment data outside the file");
         }
-        if p_vaddr == 0 || p_vaddr.checked_add(p_memsz).map_or(true, |e| e >= USER_TOP) {
+        if (e_type == 2 && p_vaddr == 0) || p_vaddr.checked_add(p_memsz).map_or(true, |e| e >= 1 << 40) {
             return Err("segment outside the user address space");
         }
     }
     if loads == 0 {
         return Err("no PT_LOAD segments");
     }
-    if u64le(&image[24..]) >= USER_TOP {
+    if u64le(&image[24..]) >= (1 << 40) {
         return Err("entry point outside the user address space");
     }
     Ok(())
 }
 
+/// The `PT_INTERP` path of a validated image, if it has one.
+fn interp_path(image: &[u8]) -> Option<alloc::string::String> {
+    let e_phoff = u64le(&image[32..]);
+    let e_phentsize = u16le(&image[54..]) as u64;
+    let e_phnum = u16le(&image[56..]) as u64;
+    for i in 0..e_phnum {
+        let ph = &image[(e_phoff + i * e_phentsize) as usize..];
+        if u32le(&ph[0..]) == 3 {
+            let (o, n) = (u64le(&ph[8..]) as usize, u64le(&ph[32..]) as usize);
+            let raw = &image[o..o + n];
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            return core::str::from_utf8(&raw[..end]).ok().map(alloc::string::String::from);
+        }
+    }
+    None
+}
+
+/// Map `image` (and, for a dynamically linked program, its interpreter) into `proc`.
 pub fn load(proc: &Process, image: &[u8]) -> Result<Image, &'static str> {
     validate(image)?;
-    if image.len() < 64 || &image[0..4] != b"\x7FELF" {
-        return Err("not an ELF");
+    let base = if u16le(&image[16..]) == 3 { PIE_BASE } else { 0 };
+    let mut img = load_one(proc, image, base);
+    img.prog_entry = img.entry;
+    if let Some(path) = interp_path(image) {
+        let bytes = crate::ext2::open()
+            .ok()
+            .and_then(|fs| fs.read_path(&path))
+            .ok_or("interpreter not found")?;
+        validate(&bytes)?;
+        if u16le(&bytes[16..]) != 3 {
+            return Err("interpreter is not ET_DYN");
+        }
+        let interp = load_one(proc, &bytes, INTERP_BASE);
+        img.interp_base = INTERP_BASE;
+        img.entry = interp.entry;
     }
-    if image[4] != 2 {
-        return Err("not ELF64");
-    }
-    if image[5] != 1 {
-        return Err("not little-endian");
-    }
-    if u16le(&image[16..]) != 2 {
-        return Err("not ET_EXEC");
-    }
-    if u16le(&image[18..]) != 0x3E {
-        return Err("not x86-64");
-    }
+    Ok(img)
+}
 
+/// Map one validated ELF's `PT_LOAD` segments at `base` (0 for `ET_EXEC`).
+fn load_one(proc: &Process, image: &[u8], base: u64) -> Image {
     let e_entry = u64le(&image[24..]);
-    let e_phoff = u64le(&image[32..]) as u64;
+    let e_phoff = u64le(&image[32..]);
     let e_phentsize = u16le(&image[54..]) as u64;
     let e_phnum = u16le(&image[56..]) as u64;
 
@@ -124,23 +167,23 @@ pub fn load(proc: &Process, image: &[u8]) -> Result<Image, &'static str> {
         }
         let flags = u32le(&ph[4..]);
         let p_offset = u64le(&ph[8..]);
-        let p_vaddr = u64le(&ph[16..]);
+        let p_vaddr = base + u64le(&ph[16..]);
         let p_filesz = u64le(&ph[32..]);
         let p_memsz = u64le(&ph[40..]);
-        // Where did the program headers land? (the PT_LOAD whose file range
-        // covers e_phoff)
+        // Where did the program headers land? (the PT_LOAD whose file range covers e_phoff)
         if e_phoff >= p_offset && e_phoff < p_offset + p_filesz {
             phdr_vaddr = p_vaddr + (e_phoff - p_offset);
         }
         map_segment(proc, image, p_offset, p_vaddr, p_filesz, p_memsz, flags);
     }
-
-    Ok(Image {
-        entry: e_entry,
+    Image {
+        entry: base + e_entry,
+        prog_entry: 0,
+        interp_base: 0,
         phdr: phdr_vaddr,
         phent: e_phentsize,
         phnum: e_phnum,
-    })
+    }
 }
 
 fn map_segment(
@@ -158,25 +201,23 @@ fn map_segment(
     let mut page = vstart & !0xFFF;
 
     while page < vend {
-        let frame = FRAME_ALLOC.lock().alloc().expect("no frame for ELF segment");
-        let phys = frame.start_address();
-        let dst = phys_to_virt(phys).as_mut_ptr::<u8>();
-        unsafe { core::ptr::write_bytes(dst, 0, 4096) };
-
+        // Two segments can share a page (e.g. the end of text and the start of data in a
+        // library linked without page-aligned segments): map it once, fill it twice.
+        if proc.translate(page).is_none() {
+            let frame = FRAME_ALLOC.lock().alloc().expect("no frame for ELF segment");
+            let phys = frame.start_address();
+            unsafe { core::ptr::write_bytes(phys_to_virt(phys).as_mut_ptr::<u8>(), 0, 4096) };
+            // Map writable for now (a real loader tightens to W^X per p_flags once
+            // relocations are applied).
+            proc.map(page, phys.as_u64(), true, exec);
+        }
         let copy_lo = page.max(vstart);
         let copy_hi = (page + 4096).min(vstart + p_filesz);
         if copy_hi > copy_lo {
             let src = (p_offset + (copy_lo - vstart)) as usize;
             let n = (copy_hi - copy_lo) as usize;
-            let dst_off = (copy_lo - page) as usize;
-            unsafe {
-                core::ptr::copy_nonoverlapping(image[src..src + n].as_ptr(), dst.add(dst_off), n);
-            }
+            proc.write_user(copy_lo, &image[src..src + n]);
         }
-
-        // Map writable for now (a real loader tightens to W^X per p_flags once
-        // relocations are applied).
-        proc.map(page, phys.as_u64(), true, exec);
         page += 4096;
     }
 }

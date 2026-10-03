@@ -83,6 +83,22 @@ fn main() {
             let img = bios_image();
             mouse_test(&img);
         }
+        "dyn-test" => {
+            build_kernel_prod(&["interactive"]);
+            let img = bios_image();
+            let out = boot_and_run(&img, "dyn", "dyntest", "dyn ", 90);
+            let ok = out.lines().find(|l| l.contains("dyn ok:")).map(str::trim);
+            match ok {
+                Some(l) => println!("dyn-test PASSED: {l}"),
+                None => {
+                    for l in out.lines().filter(|l| l.contains("dyn") || l.contains("unhandled") || l.contains("killed") || l.contains("trap") || l.contains("fault")) {
+                        eprintln!("  {l}");
+                    }
+                    eprintln!("dyn-test FAILED");
+                    exit(1);
+                }
+            }
+        }
         "net-test" => {
             build_kernel_prod(&["interactive"]);
             let img = bios_image();
@@ -417,6 +433,34 @@ fn disk_image() -> PathBuf {
             "-w", "-R", &format!("write {} {name}", bin.to_str().unwrap()),
             img.to_str().unwrap(),
         ]));
+    }
+
+    // A dynamically linked glibc program plus the host's loader and libc: exercises PIE +
+    // PT_INTERP loading and file-backed mmap. (Debian paths; skipped if gcc/glibc are absent.)
+    {
+        let src = root.join("xtask/testdata/dyntest.c");
+        let bin = root.join("target/dyntest");
+        let ld = "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2";
+        let libc = "/lib/x86_64-linux-gnu/libc.so.6";
+        let built = Command::new("gcc")
+            .args(["-O1", "-o", bin.to_str().unwrap(), src.to_str().unwrap()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if built && std::path::Path::new(ld).exists() && std::path::Path::new(libc).exists() {
+            for dir in ["lib64", "lib", "lib/x86_64-linux-gnu"] {
+                run(Command::new("debugfs").args(["-w", "-R", &format!("mkdir {dir}"), img.to_str().unwrap()]));
+            }
+            for (from, to) in [
+                (bin.to_str().unwrap(), "dyntest"),
+                (ld, "lib64/ld-linux-x86-64.so.2"),
+                (libc, "lib/x86_64-linux-gnu/libc.so.6"),
+            ] {
+                run(Command::new("debugfs").args(["-w", "-R", &format!("write {from} {to}"), img.to_str().unwrap()]));
+            }
+        } else {
+            println!("note: gcc / glibc not found — the dynamic-loader test will not be in the image");
+        }
     }
 
     // A real, unmodified statically-linked BusyBox -> /busybox (Milestone 2:

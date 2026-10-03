@@ -135,6 +135,9 @@ const SYS_SETSOCKOPT: u64 = 54;
 const SYS_GETSOCKOPT: u64 = 55;
 const SYS_ACCEPT4: u64 = 288;
 const SYS_PAUSE: u64 = 34;
+const SYS_ACCESS: u64 = 21;
+const SYS_FACCESSAT: u64 = 269;
+const SYS_PREAD64: u64 = 17;
 const SYS_RT_SIGPENDING: u64 = 127;
 const SYS_RT_SIGSUSPEND: u64 = 130;
 const SYS_GETSID: u64 = 124;
@@ -320,6 +323,88 @@ fn sys_write(fd: u64, ptr: u64, len: u64) -> i64 {
         }
         None => EBADF,
     }
+}
+
+/// `mmap(addr, len, prot, flags, fd, off)`: anonymous or file-backed (private copy),
+/// optionally at a fixed address. Enough for `ld.so` and for `malloc`.
+fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> i64 {
+    const MAP_FIXED: u64 = 0x10;
+    const MAP_ANON: u64 = 0x20;
+    const ENOMEM: i64 = -12;
+    if len == 0 || len > 1 << 36 {
+        return EINVAL;
+    }
+    let fixed = flags & MAP_FIXED != 0;
+    if fixed && (addr & 0xFFF != 0 || addr < 0x10000 || addr.saturating_add(len) >= usercopy::USER_TOP) {
+        return EINVAL;
+    }
+    if off & 0xFFF != 0 {
+        return EINVAL;
+    }
+    let Some(proc) = sched::current_proc() else { return EINVAL };
+    // A real memory limit would go here; for now refuse absurd requests of free RAM.
+    if len > crate::mm::FRAME_ALLOC.lock().free_frames() * 4096 && prot != 0 {
+        return ENOMEM;
+    }
+    let data: Option<alloc::vec::Vec<u8>> = if flags & MAP_ANON != 0 {
+        None
+    } else {
+        let Some(f) = cur_fd(fd) else { return EBADF };
+        let save = f.seek(0, 1);
+        if f.seek(off as i64, 0) < 0 {
+            return EINVAL;
+        }
+        let mut buf = alloc::vec![0u8; len as usize];
+        let mut got = 0usize;
+        while got < buf.len() {
+            let n = f.read(&mut buf[got..]);
+            if n <= 0 {
+                break;
+            }
+            got += n as usize;
+        }
+        buf.truncate(got);
+        if save >= 0 {
+            f.seek(save, 0);
+        }
+        Some(buf)
+    };
+    proc.mmap_region(addr, fixed, len, prot, data.as_deref()) as i64
+}
+
+/// `access(path, mode)` / `faccessat`: does the path exist, and may the caller use it so?
+fn sys_access(path_ptr: u64, mode: u64) -> i64 {
+    let path = match user_path(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if path.starts_with("/dev/") {
+        return if crate::file::open_device(&path, true, false).is_some() { 0 } else { ENOENT };
+    }
+    let Some(task) = sched::current().task() else { return EBADF };
+    let Some(fs) = ext2::open().ok() else { return -5 };
+    let Some(ino) = fs.path_lookup(&path) else { return ENOENT };
+    let node = fs.read_inode(ino);
+    // mode bits: R_OK 4, W_OK 2, X_OK 1 (F_OK 0 only asks for existence)
+    if (mode & 4 != 0 && !node.access_ok(task.uid, task.gid, false))
+        || (mode & 2 != 0 && !node.access_ok(task.uid, task.gid, true))
+    {
+        return EACCES;
+    }
+    0
+}
+
+/// `pread64(fd, buf, count, offset)`: read at an offset without moving the file position.
+fn sys_pread64(fd: u64, ptr: u64, len: u64, off: u64) -> i64 {
+    let Some(f) = cur_fd(fd) else { return EBADF };
+    let Ok(buf) = usercopy::slice_mut(ptr, len as usize) else { return EFAULT };
+    let save = f.seek(0, 1);
+    if save < 0 || f.seek(off as i64, 0) < 0 {
+        return -29; // ESPIPE
+    }
+    let n = f.read(buf);
+    f.seek(save, 0);
+    n
 }
 
 fn sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
@@ -584,7 +669,7 @@ pub fn open_resolved_access(path: &str, want_read: bool, want_write: bool) -> i6
             fs.read_dir(ino).into_iter().map(|(i, t, n)| (i as u64, t, n)).collect();
         task.fd_alloc(crate::file::DirFile::new(&entries)) as i64
     } else {
-        task.fd_alloc(crate::file::Ext2File::new(path.into(), fs.read_file(&node))) as i64
+        task.fd_alloc(crate::file::Ext2File::new(path.into(), fs.read_file(&node)).with_ino(ino as u64)) as i64
     }
 }
 
@@ -598,6 +683,8 @@ fn sys_fstat(fd: u64, buf: u64) -> i64 {
     let (mode, size) = f.stat();
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, 144);
+        *(buf as *mut u64) = 1; // st_dev: one filesystem
+        *((buf + 8) as *mut u64) = f.ino(); // st_ino
         *((buf + 16) as *mut u64) = 1; // st_nlink
         *((buf + 24) as *mut u32) = mode;
         *((buf + 48) as *mut i64) = size as i64;
@@ -761,6 +848,8 @@ fn sys_newfstatat(dirfd: u64, path_ptr: u64, buf: u64, flags: u64) -> i64 {
     let node = fs.read_inode(ino);
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, 144);
+        *(buf as *mut u64) = 1; // st_dev
+        *((buf + 8) as *mut u64) = ino as u64; // st_ino
         *((buf + 16) as *mut u64) = 1;
         *((buf + 24) as *mut u32) = node.mode as u32;
         *((buf + 48) as *mut i64) = node.size as i64;
@@ -1039,7 +1128,24 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         },
 
         SYS_BRK => sched::current_proc().map(|p| p.brk(a1) as i64).unwrap_or(EINVAL),
-        SYS_MMAP => sched::current_proc().map(|p| p.mmap_anon(a2) as i64).unwrap_or(EINVAL),
+        SYS_MMAP => sys_mmap(a1, a2, a3, a4, a5, frame.r9),
+        SYS_MUNMAP => match sched::current_proc() {
+            Some(p) if a1 & 0xFFF == 0 && a2 > 0 && a1.saturating_add(a2) < usercopy::USER_TOP => {
+                p.munmap(a1, a2);
+                0
+            }
+            _ => EINVAL,
+        },
+        SYS_MPROTECT => match sched::current_proc() {
+            Some(p) if a1 & 0xFFF == 0 && a1.saturating_add(a2) < usercopy::USER_TOP => {
+                p.mprotect(a1, a2, a3);
+                0
+            }
+            _ => EINVAL,
+        },
+        SYS_PREAD64 => sys_pread64(a1, a2, a3, a4),
+        SYS_ACCESS => sys_access(a1, a2),
+        SYS_FACCESSAT => sys_access(a2, a3),
 
         SYS_GETRANDOM => match usercopy::slice_mut(a1, a2 as usize) {
             Ok(buf) => {
@@ -1067,8 +1173,8 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
             Some(t) => t.sid() as i64,
             None => -3, // ESRCH
         },
-        SYS_SET_ROBUST_LIST | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MPROTECT | SYS_MADVISE
-        | SYS_MUNMAP | SYS_FUTEX | SYS_PRCTL | SYS_FCHDIR => 0,
+        SYS_SET_ROBUST_LIST | SYS_PRLIMIT64 | SYS_SIGALTSTACK | SYS_MADVISE | SYS_FUTEX
+        | SYS_PRCTL | SYS_FCHDIR => 0,
         SYS_RSEQ => ENOSYS,
 
         // chdir: normalise against the cwd, verify it names a directory in ext2.
@@ -1317,6 +1423,14 @@ extern "C" fn thos_syscall_dispatch(frame: &mut UserFrame) {
         }
     };
 
+    if sched::current().task().map_or(false, |t| t.trace.load(Ordering::Relaxed)) {
+        let path = match nr {
+            2 | 21 | 4 | 6 | 89 => usercopy::cstr(a1, 200).unwrap_or_default(),
+            257 | 262 => usercopy::cstr(a2, 200).unwrap_or_default(),
+            _ => alloc::string::String::new(),
+        };
+        kprintln!("THOS: trace {} ({:#x}, {:#x}, {:#x}, {:#x}) {} -> {}", nr, a1, a2, a3, a4, path, ret);
+    }
     let mut ret = ret;
     // A write to a pipe nobody reads raises SIGPIPE — here, in the syscall layer, so
     // the kernel's own pipe writes (the security service) never kill their caller.

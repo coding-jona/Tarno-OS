@@ -49,6 +49,11 @@ pub trait FileOps: Send + Sync {
     fn poll_mask(&self, want: u16) -> u16 {
         want & (POLLIN | POLLOUT)
     }
+    /// `st_ino`: the inode number for files on the root filesystem (0 elsewhere). Programs —
+    /// `ld.so` above all — use (dev, ino) to tell whether two paths are the same file.
+    fn ino(&self) -> u64 {
+        0
+    }
     /// The socket behind this file, if it is one.
     fn as_socket(&self) -> Option<&crate::net_sock::SockFile> {
         None
@@ -241,15 +246,28 @@ pub struct Ext2File {
     path: String,
     buf: Mutex<Vec<u8>>,
     pos: AtomicUsize,
+    ino: core::sync::atomic::AtomicU64,
 }
 
 impl Ext2File {
     pub fn new(path: String, data: Vec<u8>) -> Arc<Self> {
-        Arc::new(Self { path, buf: Mutex::new(data), pos: AtomicUsize::new(0) })
+        Arc::new(Self {
+            path,
+            buf: Mutex::new(data),
+            pos: AtomicUsize::new(0),
+            ino: core::sync::atomic::AtomicU64::new(0),
+        })
+    }
+    pub fn with_ino(self: Arc<Self>, ino: u64) -> Arc<Self> {
+        self.ino.store(ino, Ordering::Relaxed);
+        self
     }
 }
 
 impl FileOps for Ext2File {
+    fn ino(&self) -> u64 {
+        self.ino.load(Ordering::Relaxed)
+    }
     fn read(&self, buf: &mut [u8]) -> i64 {
         let data = self.buf.lock();
         let pos = self.pos.load(Ordering::Relaxed);

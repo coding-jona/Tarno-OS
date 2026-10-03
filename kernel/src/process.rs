@@ -167,6 +167,64 @@ impl Process {
         req
     }
 
+    /// POSIX `mmap`: `fixed` places it at `addr` (replacing whatever was mapped there),
+    /// otherwise a fresh range is chosen. `prot == 0` only reserves address space (nothing
+    /// is mapped; `MAP_FIXED` over an old mapping removes it). With `file` the pages are
+    /// filled from `(data, offset)` — a private copy, which is what `MAP_PRIVATE` means.
+    /// Returns the base.
+    pub fn mmap_region(&self, addr: u64, fixed: bool, len: u64, prot: u64, data: Option<&[u8]>) -> u64 {
+        let len = (len + 0xFFF) & !0xFFF;
+        let base = if fixed {
+            addr
+        } else {
+            self.next_user_va.fetch_add(len + 0x1000, Ordering::Relaxed)
+        };
+        let (writable, exec) = (prot & 2 != 0, prot & 4 != 0);
+        let mut v = base;
+        while v < base + len {
+            if fixed {
+                vmm::unmap_page_in(self.pml4_phys, v); // flushes this CPU's TLB entry
+            }
+            if prot != 0 {
+                let frame = FRAME_ALLOC.lock().alloc().expect("no frame for mmap");
+                let dst = phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
+                unsafe { core::ptr::write_bytes(dst, 0, 4096) };
+                if let Some(d) = data {
+                    let off = (v - base) as usize;
+                    if off < d.len() {
+                        let n = (d.len() - off).min(4096);
+                        unsafe { core::ptr::copy_nonoverlapping(d.as_ptr().add(off), dst, n) };
+                    }
+                }
+                self.map(v, frame.start_address().as_u64(), writable, exec);
+            }
+            v += 4096;
+        }
+        base
+    }
+
+    /// `munmap`: drop the mappings in `[addr, addr+len)` (the frames are not returned yet).
+    pub fn munmap(&self, addr: u64, len: u64) {
+        let (start, end) = (addr & !0xFFF, (addr + len + 0xFFF) & !0xFFF);
+        let mut v = start;
+        while v < end {
+            vmm::unmap_page_in(self.pml4_phys, v);
+            v += 4096;
+        }
+    }
+
+    /// `mprotect`: change the permissions of the pages that are mapped in the range.
+    pub fn mprotect(&self, addr: u64, len: u64, prot: u64) {
+        let (start, end) = (addr & !0xFFF, (addr + len + 0xFFF) & !0xFFF);
+        let mut v = start;
+        while v < end {
+            if vmm::page_present_in(self.pml4_phys, v) {
+                let _ = self.protect(v, 4096, prot & 2 != 0, prot & 4 != 0);
+            }
+            v += 4096;
+        }
+    }
+
     /// Anonymous `mmap`: bump-allocate + map `len` bytes RW, return the base.
     pub fn mmap_anon(&self, len: u64) -> u64 {
         let len = (len + 0xFFF) & !0xFFF;
@@ -382,7 +440,9 @@ impl Process {
             *cur
         };
 
-        let rand_addr = push(&mut cur, &[0x5Au8; 16]); // AT_RANDOM material
+        let mut rnd = [0u8; 16];
+        crate::random::fill(&mut rnd); // AT_RANDOM: seeds the stack-protector canary / malloc
+        let rand_addr = push(&mut cur, &rnd);
         let cstr = |cur: &mut u64, s: &str| -> u64 {
             let mut b = s.as_bytes().to_vec();
             b.push(0);
@@ -393,15 +453,18 @@ impl Process {
         let execfn = arg_ptrs.first().copied().unwrap_or(0);
 
         // auxv (type, value) pairs — AT_NULL last.
-        let aux: [(u64, u64); 8] = [
-            (3, img.phdr),   // AT_PHDR
-            (4, img.phent),  // AT_PHENT
-            (5, img.phnum),  // AT_PHNUM
-            (6, 4096),       // AT_PAGESZ
-            (9, img.entry),  // AT_ENTRY
-            (25, rand_addr), // AT_RANDOM
-            (31, execfn),    // AT_EXECFN
-            (0, 0),          // AT_NULL
+        let aux: [(u64, u64); 11] = [
+            (3, img.phdr),        // AT_PHDR
+            (4, img.phent),       // AT_PHENT
+            (5, img.phnum),       // AT_PHNUM
+            (6, 4096),            // AT_PAGESZ
+            (7, img.interp_base), // AT_BASE (the interpreter's load address, 0 = none)
+            (9, img.prog_entry),  // AT_ENTRY
+            (17, 100),            // AT_CLKTCK
+            (23, 0),              // AT_SECURE
+            (25, rand_addr),      // AT_RANDOM
+            (31, execfn),         // AT_EXECFN
+            (0, 0),               // AT_NULL
         ];
 
         let words = 1                       // argc
@@ -664,6 +727,8 @@ pub struct Task {
     thread: Mutex<Option<alloc::sync::Weak<crate::sched::Thread>>>,
     /// Non-zero if the task ended because of that signal (`wait4` reports it).
     term_sig: AtomicU32,
+    /// Debug: log this task's system calls (set for dynamically linked programs for now).
+    pub trace: AtomicBool,
     /// `true` for a native PE image, `false` for an ELF — for a `ps` view.
     is_pe: AtomicBool,
     /// How many of this task's threads are still alive — *not* the same
@@ -715,6 +780,7 @@ impl Task {
             sig: Mutex::new(crate::signal::SigState::new()),
             thread: Mutex::new(None),
             term_sig: AtomicU32::new(0),
+            trace: AtomicBool::new(false),
             is_pe: AtomicBool::new(false),
             active_threads: AtomicU64::new(0),
         });
