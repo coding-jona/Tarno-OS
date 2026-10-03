@@ -89,10 +89,53 @@ fn main() {
     if n != 0 { bad.push(format!("read at EOF = {n}")); }
     unsafe { sys(3, fd as u64, 0, 0) };
     let rd_ms = now_ms() - t1;
+
+    // In-place update and append (the incremental ext2 path): overwrite 300 bytes in the middle
+    // of the file, then grow it by 5000 bytes at the end.
+    let mid = 0x40000u64 + 17;
+    let fd = unsafe { sys(2, PATH.as_ptr() as u64, 1, 0) }; // O_WRONLY, no truncate
+    if fd < 0 {
+        bad.push(format!("open for update = {fd}"));
+    } else {
+        let patch = [0xA5u8; 300];
+        unsafe { sys(8, fd as u64, mid, 0) };
+        let n = unsafe { sys(1, fd as u64, patch.as_ptr() as u64, 300) };
+        if n != 300 { bad.push(format!("overwrite = {n}")); }
+        unsafe { sys(8, fd as u64, 0, 2) }; // SEEK_END
+        let mut tail = vec![0u8; 5000];
+        for (i, b) in tail.iter_mut().enumerate() { *b = byte_at(SIZE + i as u64); }
+        let n = unsafe { sys(1, fd as u64, tail.as_ptr() as u64, 5000) };
+        if n != 5000 { bad.push(format!("append = {n}")); }
+        let fs = unsafe { sys(74, fd as u64, 0, 0) };
+        if fs != 0 { bad.push(format!("fsync after update = {fs}")); }
+        unsafe { sys(3, fd as u64, 0, 0) };
+    }
+    let fd = unsafe { sys(2, PATH.as_ptr() as u64, 0, 0) };
+    if fd >= 0 {
+        let mut st = [0u8; 144];
+        unsafe { sys(5, fd as u64, st.as_mut_ptr() as u64, 0) };
+        let mut size2 = 0u64;
+        for i in 0..8 { size2 |= (st[48 + i] as u64) << (8 * i); }
+        if size2 != SIZE + 5000 { bad.push(format!("size after append {size2}")); }
+        let mut b = [0u8; 400];
+        unsafe { sys(8, fd as u64, mid - 50, 0) };
+        let n = unsafe { sys(0, fd as u64, b.as_mut_ptr() as u64, 400) };
+        if n != 400 { bad.push(format!("read around the patch = {n}")); }
+        for i in 0..400usize {
+            let off = mid - 50 + i as u64;
+            let want = if (mid..mid + 300).contains(&off) { 0xA5 } else { byte_at(off) };
+            if b[i] != want { bad.push(format!("byte {off} after overwrite: {} want {}", b[i], want)); break; }
+        }
+        let mut tail = vec![0u8; 5000];
+        unsafe { sys(8, fd as u64, SIZE, 0) };
+        let n = unsafe { sys(0, fd as u64, tail.as_mut_ptr() as u64, 5000) };
+        if n != 5000 || (0..5000usize).any(|i| tail[i] != byte_at(SIZE + i as u64)) { bad.push(format!("appended tail wrong (read {n})")); }
+        unsafe { sys(3, fd as u64, 0, 0) };
+    } else { bad.push(format!("reopen after update = {fd}")); }
     unsafe { sys(87, PATH.as_ptr() as u64, 0, 0) }; // unlink
 
     if bad.is_empty() {
-        println!("stream ok: {SIZE} bytes, write {wr_ms} ms, read+seek {rd_ms} ms");
+        println!("stream ok: {SIZE} bytes, write {wr_ms} ms, read+seek {rd_ms} ms, in-place update + append");
     } else {
         for b in &bad { println!("stream FAIL: {b}"); }
     }

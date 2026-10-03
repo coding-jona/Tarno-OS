@@ -255,6 +255,10 @@ pub struct Ext2File {
     /// and every 64 KiB — not on every `write` call.
     unflushed: AtomicUsize,
     dirty: AtomicBool,
+    /// Byte range written since the last flush (`lo > hi` = nothing), so a flush can update
+    /// just those blocks on disk.
+    dirty_lo: AtomicUsize,
+    dirty_hi: AtomicUsize,
 }
 
 /// Bytes of writes after which the buffer is written to disk without waiting for a close.
@@ -267,9 +271,19 @@ impl Ext2File {
             return 0;
         }
         self.unflushed.store(0, Ordering::Relaxed);
+        let (lo, hi) = (self.dirty_lo.swap(usize::MAX, Ordering::Relaxed), self.dirty_hi.swap(0, Ordering::Relaxed));
         let Some(fs) = crate::ext2::open().ok() else { return EIO };
+        // Fast path: a file we opened by inode and only grew or overwrote — write just the
+        // changed blocks. Anything else (it shrank, created without an inode, no space for
+        // the incremental form) rewrites the whole file.
+        let ino = self.ino.load(Ordering::Relaxed);
+        if ino != 0 && fs.write_at(ino as u32, data, lo, hi).is_ok() {
+            return 0;
+        }
         if fs.write_path(&self.path, data).is_err() {
             self.dirty.store(true, Ordering::Release);
+            self.dirty_lo.fetch_min(lo, Ordering::Relaxed);
+            self.dirty_hi.fetch_max(hi, Ordering::Relaxed);
             return EIO;
         }
         0
@@ -283,6 +297,8 @@ impl Ext2File {
             ino: core::sync::atomic::AtomicU64::new(0),
             unflushed: AtomicUsize::new(0),
             dirty: AtomicBool::new(false),
+            dirty_lo: AtomicUsize::new(usize::MAX),
+            dirty_hi: AtomicUsize::new(0),
         })
     }
     pub fn with_ino(self: Arc<Self>, ino: u64) -> Arc<Self> {
@@ -418,6 +434,8 @@ impl FileOps for Ext2File {
         data[pos..pos + src.len()].copy_from_slice(src);
         self.pos.store(pos + src.len(), Ordering::Relaxed);
         self.dirty.store(true, Ordering::Release);
+        self.dirty_lo.fetch_min(pos, Ordering::Relaxed);
+        self.dirty_hi.fetch_max(pos + src.len(), Ordering::Relaxed);
         let total = self.unflushed.fetch_add(src.len(), Ordering::Relaxed) + src.len();
         // Flush after 64 KiB, or after half the file's size once it is bigger — so the number
         // of whole-file rewrites grows with log(size), not with size.

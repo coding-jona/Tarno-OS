@@ -613,6 +613,144 @@ impl Ext2 {
         tx.commit();
     }
 
+    /// Build the 15 inode block pointers (direct, single-, double-indirect) for a list of data
+    /// blocks (0 = hole), allocating and writing the indirect blocks. Returns the pointers and
+    /// the number of indirect blocks used; `None` if the file needs triple indirection or the
+    /// disk is full.
+    fn build_ptrs(&self, tx: &mut BlockTx<'_>, blocks: &[u32]) -> Option<([u32; 15], u32)> {
+        let bs = self.block_size as usize;
+        let per = bs / 4;
+        let mut ptrs = [0u32; 15];
+        let mut meta = 0u32;
+        let mut bi = 0usize;
+        while bi < blocks.len() && bi < 12 {
+            ptrs[bi] = blocks[bi];
+            bi += 1;
+        }
+        if bi < blocks.len() {
+            let ind = tx.alloc()?;
+            meta += 1;
+            let mut buf = vec![0u8; bs];
+            let mut k = 0;
+            while bi < blocks.len() && k < per {
+                buf[k * 4..k * 4 + 4].copy_from_slice(&blocks[bi].to_le_bytes());
+                bi += 1;
+                k += 1;
+            }
+            self.write_block(ind, &buf);
+            ptrs[12] = ind;
+        }
+        if bi < blocks.len() {
+            let dind = tx.alloc()?;
+            meta += 1;
+            let mut dbuf = vec![0u8; bs];
+            let mut j = 0;
+            while bi < blocks.len() && j < per {
+                let ind = tx.alloc()?;
+                meta += 1;
+                let mut buf = vec![0u8; bs];
+                let mut k = 0;
+                while bi < blocks.len() && k < per {
+                    buf[k * 4..k * 4 + 4].copy_from_slice(&blocks[bi].to_le_bytes());
+                    bi += 1;
+                    k += 1;
+                }
+                self.write_block(ind, &buf);
+                dbuf[j * 4..j * 4 + 4].copy_from_slice(&ind.to_le_bytes());
+                j += 1;
+            }
+            self.write_block(dind, &dbuf);
+            ptrs[13] = dind;
+        }
+        if bi < blocks.len() {
+            return None; // would need triple indirection
+        }
+        Some((ptrs, meta))
+    }
+
+    /// Incrementally update an existing regular file to `data`, of which only the byte range
+    /// `[lo, hi)` changed since the file on disk was last in sync: the blocks of that range are
+    /// overwritten in place, new blocks are appended when the file grew, and only the (few)
+    /// indirect blocks are rebuilt. Unchanged data blocks are not touched. `Err` when an
+    /// incremental update is not possible (the file shrank, it is not a regular file, no
+    /// space) — the caller then rewrites the whole file with [`Ext2::write_path`].
+    ///
+    /// Crash order, as in `write_path_owned`: new data and indirect blocks first, the inode
+    /// (one atomic sector write) second, the old indirect blocks freed last.
+    pub fn write_at(&self, ino: u32, data: &[u8], lo: usize, hi: usize) -> Result<(), &'static str> {
+        let _fs = FS_WRITE.lock();
+        let old = self.read_inode(ino);
+        if old.mode & 0xF000 != 0x8000 {
+            return Err("not a regular file");
+        }
+        let bs = self.block_size as usize;
+        let new_size = data.len();
+        let old_size = old.size as usize;
+        if new_size < old_size {
+            return Err("file shrank");
+        }
+        let old_blocks: Vec<u32> = if old_size == 0 { Vec::new() } else { self.block_map(&old) };
+        let needed = new_size.div_ceil(bs);
+        let mut blocks = old_blocks.clone();
+        blocks.resize(needed, 0);
+        let (first, last) = if hi > lo { (lo / bs, (hi - 1) / bs) } else { (usize::MAX, 0) };
+        let mut tx = self.tx();
+        let mut write = alloc::vec![false; needed];
+        for b in 0..needed {
+            let dirty = b >= first && b <= last;
+            let fresh = b >= old_blocks.len();
+            if blocks[b] == 0 && (fresh || dirty) {
+                blocks[b] = tx.alloc().ok_or("no space")?;
+                write[b] = true;
+            } else if dirty {
+                write[b] = true;
+            }
+        }
+        // Data: whole blocks from the in-memory buffer, consecutive blocks in one disk write.
+        let mut b = 0;
+        while b < needed {
+            if !write[b] || blocks[b] == 0 {
+                b += 1;
+                continue;
+            }
+            let mut e = b + 1;
+            while e < needed && write[e] && blocks[e] == blocks[e - 1] + 1 && (e - b) < 256 {
+                e += 1;
+            }
+            let mut run = alloc::vec![0u8; (e - b) * bs];
+            let from = b * bs;
+            let to = (e * bs).min(new_size);
+            run[..to - from].copy_from_slice(&data[from..to]);
+            disk_write(blocks[b] as u64 * bs as u64, &run);
+            b = e;
+        }
+        let (ptrs, meta) = self.build_ptrs(&mut tx, &blocks).ok_or("no space / file too large")?;
+        tx.commit();
+        let used = blocks.iter().filter(|&&x| x != 0).count() as u32 + meta;
+        let blocks512 = used * (self.block_size / 512);
+        let (mode, uid, gid) = (old.mode, old.uid, old.gid);
+        self.patch_inode(ino, |raw| {
+            let links = le16(&raw[26..]);
+            set_inode(raw, mode, uid, gid, new_size as u64, links, blocks512, &ptrs);
+        });
+        // The old indirect blocks are garbage now (the data blocks live on).
+        let mut gone = self.tx();
+        if old.block[12] != 0 {
+            gone.release(old.block[12]);
+        }
+        if old.block[13] != 0 {
+            for c in self.block(old.block[13]).chunks_exact(4) {
+                if le32(c) != 0 {
+                    gone.release(le32(c));
+                }
+            }
+            gone.release(old.block[13]);
+        }
+        gone.commit();
+        self.sync_backups();
+        Ok(())
+    }
+
     /// Allocate + fill data blocks for `data`. Returns `(block[15], i_blocks)`
     /// where `i_blocks` counts data + indirect blocks in 512-byte units.
     fn lay_out_data(&self, data: &[u8]) -> Option<([u32; 15], u32)> {
